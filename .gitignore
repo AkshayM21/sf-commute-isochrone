@@ -13,3 +13,8 @@ REPORT.md
 # private config
 .env
 .dest_cache.json
+
+# test artifacts
+tests/e2e/screens/
+tests/**/__pycache__/
+.pytest_cache/

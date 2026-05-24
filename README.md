@@ -35,8 +35,10 @@ cd sf-commute-isochrone
 # 1. Configure your destination + token (this file is gitignored)
 cp .env.example .env
 #    then edit .env and set:
-#      DEFAULT_ADDRESS=...      (an address in SF to geocode), and
-#      API511_TOKEN=...         (your free 511.org token)
+#      DEFAULT_ADDRESS=...      (an address in SF to geocode),
+#      API511_TOKEN=...         (your free 511.org token), and
+#      GEOAPIFY_KEY=...         (free key for address search + autocomplete;
+#                                omit to fall back to keyless Photon)
 
 # 2. Install the environment and download all input data
 bash scripts/setup.sh

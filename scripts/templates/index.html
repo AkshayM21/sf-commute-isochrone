@@ -43,6 +43,73 @@
   .bd .gm:hover{text-decoration:underline}
   .bd .foot{color:#5c6470;margin-top:5px;font-size:10.5px}
   .credit{padding:9px 16px;color:#5c6470;font-size:10.5px;border-top:1px solid var(--line)}
+  /* --- added: refine button + fast-map note --- */
+  .btn{width:100%;background:var(--accent);color:#06121f;border:0;padding:9px;border-radius:8px;
+    font-weight:600;font-size:13px;cursor:pointer}.btn:disabled{opacity:.55;cursor:default}
+  .btn.sec{background:#11141a;color:var(--ink);border:1px solid var(--line);font-weight:600}
+  .note{color:var(--mut);font-size:11px;margin-top:6px;line-height:1.4}
+  /* --- added: autocomplete dropdown --- */
+  .acwrap{position:relative;flex:1}.acwrap input{width:100%}
+  #ac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:1200;background:#0e1116;
+    border:1px solid var(--line);border-radius:8px;overflow:hidden;display:none;box-shadow:0 10px 28px rgba(0,0,0,.5)}
+  #ac.open{display:block}
+  .ac-item{padding:8px 10px;font-size:12.5px;color:var(--ink);cursor:pointer;border-bottom:1px solid #1c2027;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ac-item:last-child{border-bottom:0}.ac-item.hl,.ac-item:hover{background:#1f2530}
+  /* --- added: export controls --- */
+  .export{display:flex;gap:6px;padding:7px 16px 11px}
+  .export button{flex:1;background:#11141a;color:var(--ink);border:1px solid var(--line);
+    padding:7px;border-radius:8px;font-size:11.5px;cursor:pointer}.export button:hover{background:#1f2530}
+  /* --- added: toast --- */
+  #toast{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);z-index:1300;
+    background:#2a2f3a;color:var(--ink);border:1px solid var(--line);padding:9px 15px;border-radius:20px;
+    font-size:12.5px;display:none;box-shadow:0 6px 20px rgba(0,0,0,.5);max-width:84%;text-align:center}
+  /* --- added: how-it-works link + modal --- */
+  .info-link{color:var(--accent);font-size:11.5px;cursor:pointer;text-decoration:none;margin-left:6px}
+  .info-link:hover{text-decoration:underline}
+  #howmodal{position:absolute;inset:0;z-index:1400;background:rgba(4,6,9,.6);display:none;
+    align-items:center;justify-content:center;padding:18px}
+  #howmodal.open{display:flex}
+  #howmodal .card{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:14px;
+    max-width:420px;padding:20px 22px;box-shadow:0 14px 40px rgba(0,0,0,.6);font-size:13.5px;line-height:1.55}
+  #howmodal .card h2{margin:0 0 10px;font-size:15px}
+  #howmodal .card .x{float:right;cursor:pointer;color:var(--mut);font-size:18px;line-height:1;margin:-4px -4px 0 0}
+  #howmodal .card .x:hover{color:var(--ink)}
+  /* --- added: mobile bottom-sheet handle (hidden on desktop) --- */
+  #sheetbtn{display:none}
+  /* ============ responsive layer (<=719px): desktop >=720px stays byte-identical ============ */
+  @media (max-width:719px){
+    #map{inset:0}
+    /* panel becomes a collapsible bottom sheet */
+    #panel{top:auto;right:0;left:0;bottom:0;width:100%;height:auto;max-height:78vh;
+      border-left:0;border-top:1px solid var(--line);border-radius:16px 16px 0 0;
+      transform:translateY(calc(100% - 52px));transition:transform .28s ease;box-shadow:0 -8px 30px rgba(0,0,0,.55)}
+    #panel.open{transform:translateY(0)}
+    /* a fixed grab handle at the top of the sheet to open/close */
+    #sheetbtn{display:flex;align-items:center;justify-content:center;gap:8px;height:52px;flex:0 0 auto;
+      cursor:pointer;color:var(--ink);font-size:13px;font-weight:600;border-bottom:1px solid var(--line);
+      background:var(--panel);border-radius:16px 16px 0 0;position:relative;touch-action:manipulation}
+    #sheetbtn:before{content:"";position:absolute;top:7px;left:50%;transform:translateX(-50%);
+      width:38px;height:4px;border-radius:3px;background:#3a414d}
+    #panel h1{padding-top:8px}
+    #list{max-height:34vh}
+    /* bigger tap targets */
+    .addr input,.acwrap input{padding:11px;font-size:15px}
+    .addr button,.btn{padding:12px}
+    .seg button{padding:11px;font-size:13.5px}
+    .ac-item{padding:12px 11px;font-size:14px}
+    input[type=range]{height:26px}
+    .export button{padding:11px;font-size:12.5px}
+    .nb{padding:11px 16px;font-size:14px}
+    /* legend: compact + above the sheet handle so it never covers panel/map controls */
+    #legend{left:8px;right:8px;bottom:60px;padding:8px 11px;font-size:11px}
+    #legend .bar{width:auto}
+    #busy{top:8px;left:8px;font-size:12px}
+    #toast{bottom:64px}
+    /* breakdown popup fills more width on small screens */
+    .bd{width:auto;max-width:78vw}
+    .leaflet-popup-content{max-width:80vw}
+    #howmodal .card{font-size:14px}
+  }
 </style></head>
 <body>
 <div id="map"></div><div id="busy">computing…</div>
@@ -50,12 +117,16 @@
   <div style="background:rgba(20,23,29,.94);color:#e8eaed;padding:18px 24px;border:1px solid #272b34;border-radius:12px;font-size:15px;text-align:center;box-shadow:0 10px 34px rgba(0,0,0,.55)">
     Enter your workplace address  →<br><span style="color:#9aa3af;font-size:12.5px">(top-right) to map your commute</span></div></div>
 <div id="panel">
-  <h1>Commute to your workplace</h1>
-  <div class="sub">Enter your workplace address to begin. <b>Hover</b> any area for its time + the route
+  <div id="sheetbtn" aria-label="Toggle controls">Controls</div>
+  <h1>Commute to your workplace <a class="info-link" id="howlink" role="button" tabindex="0">How it works</a></h1>
+  <div class="sub">Enter your workplace address to begin. <b>Hover or tap</b> any area for its time + the route
     behind it; <b>click</b> to pin it with a Google Maps link.</div>
   <div class="ctl"><div class="lab">Workplace</div>
-    <div class="addr"><input id="addr" placeholder="e.g. 1 Market St"><button id="go">Set</button></div>
-    <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div></div>
+    <div class="addr"><div class="acwrap"><input id="addr" placeholder="e.g. 1 Market St" autocomplete="off"
+      role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="ac"><div id="ac" role="listbox"></div></div><button id="go">Set</button></div>
+    <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div>
+    <button id="refine" class="btn sec" style="margin-top:9px" disabled>Refine — exact (~30s)</button>
+    <div class="note">Fast map is an estimate (±~2 min). Click <b>Refine</b> to sharpen to exact times.</div></div>
   <div class="ctl"><div class="lab">Time estimate</div>
     <div class="seg" id="metric"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
   <div class="ctl"><div class="lab">Color by</div>
@@ -71,17 +142,30 @@
       <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span style="color:#f6a04d">Bus</span></label>
       <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span style="color:#5cd65c">Cable</span></label>
     </div></div>
-  <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods</div></div>
+  <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods <span id="nbcount" style="color:var(--mut);text-transform:none;letter-spacing:0;font-weight:400"></span></div></div>
   <div id="list"></div>
+  <div class="export"><button id="copylist">Copy list</button><button id="dlcsv">Download CSV</button></div>
   <div class="credit">R5/r5py · Muni (511) + BART + Caltrain · network kept warm; only the matrix recomputes.
-    Live map is a fast reverse-routing approximation (~±2 min); <b>scripts/isochrone.py</b> is the exact build.</div>
+    Live map is a fast reverse-routing approximation (~±2 min); <b>scripts/isochrone.py</b> is the exact build.
+    Geocoding © <a href="https://www.geoapify.com/" target="_blank" style="color:#5c6470">Geoapify</a>, © OpenStreetMap.</div>
 </div>
 <div id="legend"><b id="legtitle">Realistic door-to-door (min)</b><div class="bar"></div>
   <div class="sc"></div></div>
+<div id="toast"></div>
+<div id="howmodal"><div class="card">
+  <span class="x" id="howx" role="button" aria-label="Close">&times;</span>
+  <h2>How it works</h2>
+  <div>Door-to-door times by <b>walking + public transit only</b> (Muni / BART / Caltrain) —
+  no driving or biking — on real schedules leaving ~8:35am on a weekday.
+  The fast map is an estimate (±~2 min); click <b>Refine</b> for exact times.
+  <b>Hover or tap</b> any area for the route behind the number.</div>
+</div></div>
 <script>
 /*__VIZ__*/
 const CELLS=__CELLS__, LINES=__LINES__;
 let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
+let CURLABEL="";                                  // current workplace label (for permalink + dest line)
+const TOUCH = ("ontouchstart" in window) || (navigator.maxTouchPoints>0) || window.matchMedia("(max-width:719px)").matches;
 let SCALE=ramp(ideal).S;                          // current time->color scale (recomputed in redraw)
 let BDCACHE={};                                   // per-cell route breakdown cache (cleared on new workplace)
 const gmaps=(olat,olon)=>gmapsURL(olat,olon,DESTLL[0],DESTLL[1]);
@@ -135,12 +219,17 @@ function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){set
     const d=await r.json();if(my!==bdToken)return;if(!d.error)BDCACHE[id]=d;d.name=f.properties.n;setHTML(bdHTML(d));
   }catch(e){if(my===bdToken)setHTML("error");}},150);}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
-  l.on("mouseover",()=>{if(!DESTLL)return;l.setStyle({weight:1.4,color:"#fff"});
-    l.bindTooltip("",{className:"tt",sticky:true,opacity:1}).openTooltip();
-    loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});});
-  l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);});
+  // Desktop: hover shows the sticky breakdown tooltip. Touch has no hover, so we skip it
+  // (a leftover sticky tooltip on tap is confusing) and rely on click/tap -> popup below.
+  if(!TOUCH){
+    l.on("mouseover",()=>{if(!DESTLL)return;l.setStyle({weight:1.4,color:"#fff"});
+      l.bindTooltip("",{className:"tt",sticky:true,opacity:1}).openTooltip();
+      loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});});
+    l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);});
+  }
+  // Click (desktop) / tap (touch): same breakdown content, shown as a popup.
   l.on("click",()=>{if(!DESTLL)return;
-    l.bindPopup("…",{maxWidth:285}).openPopup();
+    l.bindPopup("…",{maxWidth:285,autoPan:true,autoPanPadding:[24,24]}).openPopup();
     loadBreak(f,h=>{if(l.getPopup())l.setPopupContent(h);});});
 }}).addTo(map);
 // transit-line overlays (off by default; non-interactive so cells stay hoverable)
@@ -157,7 +246,11 @@ let pin=null;   // workplace marker — set via the address box only (no map-cli
 function redraw(){SCALE=ramp(ideal).S;layer.setStyle(style);legend();renderList();}
 function renderList(){const rows=Object.entries(NB).filter(([k,v])=>v!=null).sort((a,b)=>a[1]-b[1]);
   document.getElementById("list").innerHTML=rows.map(([n,v])=>{const c=v<=thr?color(v):"#555";
-    return `<div class="nb"><span><span style="color:${c}">●</span> ${n}</span><span class="t" style="color:${c}">${v}<small> min</small></span></div>`;}).join("");}
+    return `<div class="nb"><span><span style="color:${c}">●</span> ${n}</span><span class="t" style="color:${c}">${v}<small> min</small></span></div>`;}).join("");
+  const under=rows.filter(([n,v])=>v<=thr).length;
+  document.getElementById("nbcount").textContent=DESTLL?` — ${under} ≤ ${thr} min`:"";}
+// neighborhoods currently at/under the Max-commute threshold (ranked), for export
+function nbUnder(){return Object.entries(NB).filter(([n,v])=>v!=null&&v<=thr).sort((a,b)=>a[1]-b[1]);}
 function aggregate(){const acc={};CELLS.features.forEach(f=>{const v=val(f.properties.id),n=f.properties.n;
   if(v==null||!n)return;(acc[n]=acc[n]||[]).push(v);});NB={};
   for(const n in acc){acc[n].sort((a,b)=>a-b);NB[n]=acc[n][Math.floor(acc[n].length/2)];}}
@@ -165,7 +258,8 @@ function busy(t){const b=document.getElementById("busy");if(t){b.textContent=t;b
 async function setWorkplace(lat,lon,label){
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   document.getElementById("prompt").style.display="none";
-  DESTLL=[lat,lon];ATTR={};LINECOLOR={};BDCACHE={};
+  DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};
+  document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
   if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
   map.setView([lat,lon],12.6);
   try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
@@ -175,37 +269,169 @@ async function setWorkplace(lat,lon,label){
     TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
     aggregate();redraw();
   }catch(e){if(myGen===GEN){busy(false);alert("compute failed: "+e);}return;}
-  busy("refining (exact)…");                          // pipeline: exact pass refines the approximation
-  try{const r2=await fetch(`/compute_exact?lat=${lat}&lon=${lon}`);
-    if(myGen!==GEN)return;
-    if(r2.ok){const d2=await r2.json();if(myGen!==GEN)return;TT=d2.cells;
-      document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
-      aggregate();redraw();}
-  }catch(e){/* keep the fast approximation if exact isn't available */}
   if(myGen!==GEN)return;
   busy(false);
+  document.getElementById("refine").disabled=false;  // exact pass is now opt-in via the button
+  syncHash();
   if(cmode=="line")loadAttribution();
 }
-async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping lines…");
-  try{const r=await fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+// ---- opt-in exact refine (was auto; now on-demand). 503-aware with one retry. ------------
+async function refine(){
+  if(!DESTLL)return;const myGen=GEN;const [lat,lon]=DESTLL;const label=CURLABEL;
+  const btn=document.getElementById("refine");btn.disabled=true;busy("refining (exact)…");
+  const doFetch=()=>fetch(`/compute_exact?lat=${lat}&lon=${lon}`);
+  try{
+    let r=await doFetch();
     if(myGen!==GEN)return;
+    if(r.status===503){                               // server busy with another heavy job
+      const wait=retryAfter(r);toast(`Server busy — retrying…`);
+      await sleep(wait);if(myGen!==GEN)return;
+      r=await doFetch();if(myGen!==GEN)return;
+      if(r.status===503){toast("Server busy, try Refine again in a moment.");return;}
+    }
+    if(r.ok){const d2=await r.json();if(myGen!==GEN)return;TT=d2.cells;
+      document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
+      aggregate();redraw();
+      if(cmode=="line")loadAttribution();             // re-derive lines off the exact result
+    }
+  }catch(e){/* keep the fast approximation if exact isn't available */}
+  finally{if(myGen===GEN){busy(false);btn.disabled=false;}}
+}
+async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping lines…");
+  const doFetch=()=>fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+  try{let r=await doFetch();
+    if(myGen!==GEN)return;
+    if(r.status===503){                               // busy — retry once after Retry-After
+      const wait=retryAfter(r);toast("Server busy — retrying…");
+      await sleep(wait);if(myGen!==GEN)return;
+      r=await doFetch();if(myGen!==GEN)return;
+      if(r.status===503){toast("Server busy, try the line map again in a moment.");
+        document.getElementById("legtitle").textContent="line map unavailable yet";return;}
+    }
     if(r.ok){const a=await r.json();if(myGen!==GEN)return;ATTR=a;buildLineColors();redraw();}
     else{document.getElementById("legtitle").textContent="line map unavailable yet";}
   }catch(e){}finally{if(myGen===GEN)busy(false);}}
+// ---- small shared utils for busy handling + toasts --------------------------------------
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function retryAfter(r){const h=r.headers.get("Retry-After");const s=h?parseFloat(h):NaN;
+  return (Number.isFinite(s)&&s>0?s:4)*1000;}        // default 4s per the API contract
+let toastTimer;
+function toast(msg,ms){const t=document.getElementById("toast");t.textContent=msg;t.style.display="block";
+  clearTimeout(toastTimer);toastTimer=setTimeout(()=>{t.style.display="none";},ms||3500);}
 function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onclick=()=>{
-  document.querySelectorAll(`#${id} button`).forEach(x=>x.classList.remove("on"));b.classList.add("on");set(b.dataset.v);aggregate();redraw();});}
+  document.querySelectorAll(`#${id} button`).forEach(x=>x.classList.remove("on"));b.classList.add("on");set(b.dataset.v);aggregate();redraw();syncHash();});}
+function setSeg(id,v){document.querySelectorAll(`#${id} button`).forEach(b=>b.classList.toggle("on",b.dataset.v===v));}
 seg("metric",v=>metric=v);
 seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
-document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();};
-document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();};
-document.getElementById("go").onclick=async()=>{const q=document.getElementById("addr").value;
-  if(!q)return;busy("finding address…");
+document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();syncHash();};
+document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();syncHash();};
+async function geocodeSet(q){if(!q)return;busy("finding address…");closeAC();
   try{const r=await fetch(`/geocode?q=${encodeURIComponent(q)}`);const d=await r.json();
     if(d.lat){busy(false);setWorkplace(d.lat,d.lon,q);}   // keep the user's typed string verbatim
-    else{busy(false);alert("address not found");}}catch(e){busy(false);alert(e);}};
-document.getElementById("addr").addEventListener("keydown",e=>{if(e.key=="Enter")document.getElementById("go").click();});
+    else{busy(false);alert("address not found");}}catch(e){busy(false);alert(e);}}
+document.getElementById("go").onclick=()=>geocodeSet(document.getElementById("addr").value);
+document.getElementById("refine").onclick=refine;
+
+/* ============ Feature 3: address autocomplete ============ */
+const addrEl=document.getElementById("addr"),acEl=document.getElementById("ac");
+let acItems=[],acIdx=-1,acTimer,acToken=0;
+function closeAC(){acEl.classList.remove("open");acEl.innerHTML="";acItems=[];acIdx=-1;addrEl.setAttribute("aria-expanded","false");}
+function renderAC(){if(!acItems.length){closeAC();return;}
+  acEl.innerHTML=acItems.map((it,i)=>`<div class="ac-item${i===acIdx?" hl":""}" role="option" data-i="${i}">${escapeHTML(it.label)}</div>`).join("");
+  acEl.classList.add("open");addrEl.setAttribute("aria-expanded","true");}
+function escapeHTML(s){return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+acEl.addEventListener("mousedown",e=>{const el=e.target.closest(".ac-item");if(!el)return;
+  e.preventDefault();const it=acItems[+el.dataset.i];if(it){chooseAC(it);}});
+function chooseAC(it){addrEl.value=it.label;closeAC();setWorkplace(it.lat,it.lon,it.label);}
+addrEl.addEventListener("input",()=>{const q=addrEl.value.trim();clearTimeout(acTimer);
+  if(q.length<3){closeAC();return;}
+  acTimer=setTimeout(async()=>{const my=++acToken;
+    try{const r=await fetch(`/autocomplete?q=${encodeURIComponent(q)}`);if(!r.ok){return;}
+      const d=await r.json();if(my!==acToken)return;
+      acItems=(d.results||[]).slice(0,6);acIdx=-1;renderAC();
+    }catch(e){}},250);});
+addrEl.addEventListener("keydown",e=>{
+  const open=acEl.classList.contains("open");
+  if(e.key==="ArrowDown"&&open){e.preventDefault();acIdx=(acIdx+1)%acItems.length;renderAC();}
+  else if(e.key==="ArrowUp"&&open){e.preventDefault();acIdx=(acIdx-1+acItems.length)%acItems.length;renderAC();}
+  else if(e.key==="Enter"){e.preventDefault();
+    if(open&&acIdx>=0&&acItems[acIdx])chooseAC(acItems[acIdx]);
+    else geocodeSet(addrEl.value);}                   // fall back to /geocode of typed text
+  else if(e.key==="Escape"){closeAC();}});
+addrEl.addEventListener("blur",()=>setTimeout(closeAC,120));  // allow click/mousedown to land first
+
+/* ============ Feature 6: neighborhoods export ============ */
+function exportRows(){return nbUnder().map(([n,v])=>[n,v]);}
+document.getElementById("copylist").onclick=async()=>{const rows=exportRows();
+  if(!rows.length){toast("No neighborhoods under the current max.");return;}
+  const text=rows.map(r=>`${r[0]}\t${r[1]}`).join("\n");
+  try{await navigator.clipboard.writeText(text);toast(`Copied ${rows.length} neighborhoods.`);}
+  catch(e){ // clipboard API may be blocked (insecure ctx); fall back to a textarea select
+    const ta=document.createElement("textarea");ta.value=text;document.body.appendChild(ta);ta.select();
+    try{document.execCommand("copy");toast(`Copied ${rows.length} neighborhoods.`);}catch(_){toast("Copy failed.");}
+    document.body.removeChild(ta);}};
+document.getElementById("dlcsv").onclick=()=>{const rows=exportRows();
+  if(!rows.length){toast("No neighborhoods under the current max.");return;}
+  const csv="name,minutes\n"+rows.map(r=>`${csvCell(r[0])},${r[1]}`).join("\n");
+  const blob=new Blob([csv],{type:"text/csv;charset=utf-8"});const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");a.href=url;
+  a.download=`sf-neighborhoods-under-${thr}min-${metric==="r"?"realistic":"bestcase"}.csv`;
+  document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);};
+function csvCell(s){s=String(s);return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;}
+
+/* ============ Feature 7: how-it-works modal ============ */
+const howModal=document.getElementById("howmodal");
+function openHow(){howModal.classList.add("open");}function closeHow(){howModal.classList.remove("open");}
+document.getElementById("howlink").onclick=openHow;
+document.getElementById("howlink").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();openHow();}});
+document.getElementById("howx").onclick=closeHow;
+howModal.addEventListener("click",e=>{if(e.target===howModal)closeHow();});
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeHow();});
+
+/* ============ Feature 5: mobile bottom-sheet toggle ============ */
+const panelEl=document.getElementById("panel");
+document.getElementById("sheetbtn").onclick=()=>panelEl.classList.toggle("open");
+
+/* ============ Feature 4: shareable permalink (URL hash) ============ */
+// Format: #wp=<lat>,<lon>,<encodedLabel>&ideal=<n>&thr=<n>&metric=<r|b>&cmode=<time|line>
+let hashTimer,applyingHash=false;
+function syncHash(){if(applyingHash)return;clearTimeout(hashTimer);
+  hashTimer=setTimeout(()=>{
+    const parts=[];
+    if(DESTLL)parts.push(`wp=${DESTLL[0].toFixed(6)},${DESTLL[1].toFixed(6)},${encodeURIComponent(CURLABEL)}`);
+    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`);
+    const h="#"+parts.join("&");
+    if(("#"+location.hash.replace(/^#/,""))!==h){history.replaceState(null,"",h);}
+  },300);}
+function parseHash(){const h=location.hash.replace(/^#/,"");if(!h)return null;
+  const o={};h.split("&").forEach(kv=>{const i=kv.indexOf("=");if(i<0)return;
+    o[kv.slice(0,i)]=kv.slice(i+1);});
+  return o;}
+function applyHash(o){applyingHash=true;
+  if(o.ideal!=null&&Number.isFinite(+o.ideal)){ideal=Math.min(45,Math.max(10,+o.ideal));
+    document.getElementById("ideal").value=ideal;document.getElementById("idval").textContent=ideal;}
+  if(o.thr!=null&&Number.isFinite(+o.thr)){thr=Math.min(70,Math.max(10,+o.thr));
+    document.getElementById("thr").value=thr;document.getElementById("thrval").textContent=thr;}
+  if(o.metric==="r"||o.metric==="b"){metric=o.metric;setSeg("metric",metric);}
+  if(o.cmode==="time"||o.cmode==="line"){cmode=o.cmode;setSeg("cmode",cmode);}
+  applyingHash=false;
+  if(o.wp){const wseg=o.wp.split(",");const lat=+wseg[0],lon=+wseg[1];
+    const label=decodeURIComponent(wseg.slice(2).join(","));
+    if(Number.isFinite(lat)&&Number.isFinite(lon)){
+      document.getElementById("addr").value=label||"";
+      setWorkplace(lat,lon,label);return true;}}
+  return false;}
+
 legend();   // draw the legend; map stays blank until you set an address
-try{const wp=JSON.parse(localStorage.getItem("wp_v1")||"null");   // restore last workplace
-  if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);}
-}catch(e){}
+// Boot: hash takes precedence over localStorage (Feature 4).
+(function boot(){
+  const o=parseHash();
+  if(o&&o.wp){applyHash(o);return;}
+  if(o){applyHash(o);}                                 // restore sliders/metric/cmode even without wp
+  try{const wp=JSON.parse(localStorage.getItem("wp_v1")||"null");   // restore last workplace
+    if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){
+      document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);}
+  }catch(e){}
+  redraw();
+})();
 </script></body></html>

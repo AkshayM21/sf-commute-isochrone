@@ -18,11 +18,13 @@ persists it. Two distinct computations power the map (see CLAUDE.md/Issues.md):
                 on demand, color-by-line builds the whole grid lazily on first toggle.
 """
 import os, sys, json, copy, threading, datetime as dt
+from collections import OrderedDict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd, geopandas as gpd, shapely
 from shapely.geometry import Point
 from flask import Flask, request, jsonify
+from flask_limiter import Limiter
 
 # Cap the JVM heap BEFORE r5py starts the JVM (imported via core.network below). r5py
 # defaults -Xmx to 80% of TOTAL system RAM — fine locally, but on a small hosting box that
@@ -35,6 +37,8 @@ if _r5_mem and "--max-memory" not in sys.argv and "-m" not in sys.argv:
 from core import config, feeds, grid, network, geo
 from core.network import MAX_INT32
 import com.conveyal.r5            # JVM already started by core.network's r5py import
+
+config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the geocoder
 
 HERE = Path(__file__).resolve().parent
 GRID_M = int(os.environ.get("GRID_M", str(config.GRID_M)))
@@ -148,11 +152,21 @@ def _reset_caches():
         _CELL_CACHE.clear()
 
 
-def _itineraries_cached(dlat, dlon):
+class _Busy(Exception):
+    """Raised when a heavy full-grid build is needed but _HEAVY_LOCK is already held; the
+    /attribution route turns this into a 503 instead of blocking behind the running job."""
+
+
+def _itineraries_cached(dlat, dlon, *, nonblock=False):
     """Full per-cell itinerary map for (dlat,dlon) -> {cellId: itin dict}, built LAZILY (only
     on demand from /attribution) and cached. If another thread is already building this
     destination, wait for its result (in-flight de-dup). The build takes _HEAVY_LOCK so it
-    serialises against /compute_exact."""
+    serialises against /compute_exact.
+
+    With ``nonblock=True``: if THIS call is the one that would do the build and _HEAVY_LOCK is
+    already held by another heavy job, raise _Busy (-> 503) instead of blocking. A call that
+    is merely WAITING on another thread's in-flight build still waits (it isn't the one doing
+    the work). A cache hit never blocks regardless."""
     key = _dest_key(dlat, dlon)
     with _ITIN_CACHE_LOCK:
         if key in _ITIN_CACHE:
@@ -168,15 +182,24 @@ def _itineraries_cached(dlat, dlon):
         event.wait()
         return _ITIN_CACHE.get(key, {})
     gen = _current_generation()  # cancel token: bail if a newer workplace is set mid-build
+    locked = False
     try:
-        with _HEAVY_LOCK:
-            itins = prewarm_itineraries(dlat, dlon, gen)
-        with _ITIN_CACHE_LOCK:
-            _ITIN_CACHE[key] = itins
+        if nonblock:
+            if not _HEAVY_LOCK.acquire(blocking=False):
+                raise _Busy()
+        else:
+            _HEAVY_LOCK.acquire()
+        locked = True
+        itins = prewarm_itineraries(dlat, dlon, gen)
+        if itins:                    # never cache an empty result (a superseded/partial build
+            with _ITIN_CACHE_LOCK:   # would otherwise poison this workplace until the next /compute)
+                _ITIN_CACHE[key] = itins
         return itins
     except _Superseded:
         return {}                # newer workplace set; abandon this stale full-grid build
     finally:
+        if locked:
+            _HEAVY_LOCK.release()
         with _ITIN_CACHE_LOCK:
             _ITIN_INFLIGHT.pop(key, None)
         event.set()
@@ -191,13 +214,65 @@ def _dominant_line(itin):
     return max(rides, key=lambda l: l["min"])["line"]
 
 
-def _attribution_from_cache(dlat, dlon):
+def _attribution_from_cache(dlat, dlon, *, nonblock=False):
     """{cellId: dominantLine} derived from the shared per-cell itinerary cache (building the
-    full grid lazily if needed)."""
-    return {cid: _dominant_line(it) for cid, it in _itineraries_cached(dlat, dlon).items()}
+    full grid lazily if needed). ``nonblock`` propagates the non-blocking heavy-lock policy
+    (raise _Busy -> 503 instead of queueing behind a running heavy job)."""
+    itins = _itineraries_cached(dlat, dlon, nonblock=nonblock)
+    return {cid: _dominant_line(it) for cid, it in itins.items()}
+
+
+# ---- Coarse-coords RESULT cache for the heavy endpoints (A4) ---------------------------
+# A bounded LRU caching the FINAL JSON-able results of /compute_exact and /attribution,
+# keyed by (round(lat,3), round(lon,3)) (~110m). A hit returns the same result with no R5
+# work and without taking _HEAVY_LOCK — so a repeated/nearby workplace (e.g. localStorage
+# auto-restore, or panning back) is instant. This is SEPARATE from the per-workplace
+# itinerary caches (_ITIN_CACHE/_CELL_CACHE), which key on the finer _dest_key and back
+# /itinerary. The cached values are deep-copied on read so callers can't mutate the store.
+_RESULT_CACHE_MAX = 150
+_EXACT_RESULT_CACHE = OrderedDict()       # coarse_key -> {id: [best, real]} (exact cells)
+_ATTR_RESULT_CACHE = OrderedDict()        # coarse_key -> {cellId: dominantLine}
+_RESULT_CACHE_LOCK = threading.Lock()
+
+
+def _coarse_key(lat, lon):
+    """~110m bucket for the heavy-result cache."""
+    return (round(float(lat), 3), round(float(lon), 3))
+
+
+def _result_cache_get(store, key):
+    with _RESULT_CACHE_LOCK:
+        if key in store:
+            store.move_to_end(key)
+            return copy.deepcopy(store[key])   # don't hand out the cached object
+    return None
+
+
+def _result_cache_put(store, key, value):
+    with _RESULT_CACHE_LOCK:
+        store[key] = copy.deepcopy(value)      # store our own copy
+        store.move_to_end(key)
+        while len(store) > _RESULT_CACHE_MAX:
+            store.popitem(last=False)
 
 
 app = Flask(__name__)
+
+# ---- Rate limiting (Flask-Limiter, in-memory) -----------------------------------------
+# Single-process app, so the default in-memory store is correct (no Redis needed). Per-IP
+# limits are applied per endpoint below via @limiter.limit. The key func prefers the FIRST
+# hop in X-Forwarded-For (the real client when behind a proxy) and falls back to the socket
+# peer when the header is absent/blank — so it's safe both behind a proxy and run directly.
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        first = fwd.split(",")[0].strip()
+        if first:
+            return first
+    return request.remote_addr or "127.0.0.1"
+
+
+limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
 
 
 # ---- Map TIME: fast reverse approximation + exact forward refine ----------------------
@@ -260,6 +335,7 @@ def _map_cancelable(fn, indices, gen):
 
 
 @app.route("/compute")
+@limiter.limit("60/minute")
 def _compute():
     global _LAST_DEST_KEY
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
@@ -281,16 +357,31 @@ def _compute():
 
 
 @app.route("/compute_exact")
+@limiter.limit("12/minute")
 def _compute_exact():
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
+    ckey = _coarse_key(lat, lon)
+    # CACHE HIT (~110m): return the same result instantly — no R5 work, no lock, and the
+    # generation/supersede dance is irrelevant since there's nothing to cancel.
+    cached = _result_cache_get(_EXACT_RESULT_CACHE, ckey)
+    if cached is not None:
+        print(f"[exact] ({lat:.4f},{lon:.4f}) cached -> {len(cached)} cells")
+        return jsonify({"dest": [lat, lon], "cells": cached, "ms": 0})
     t0 = dt.datetime.now()
     gen = _current_generation()           # cancel token: abort if a newer workplace is set
+    # Non-blocking: if a heavy job is already running, tell the client to retry rather than
+    # queueing behind a ~30s burst. Release the lock in finally so a crash can't wedge it.
+    if not _HEAVY_LOCK.acquire(blocking=False):
+        print(f"[exact] ({lat:.4f},{lon:.4f}) busy -> 503")
+        return jsonify({"busy": True}), 503, {"Retry-After": "4"}
     try:
-        with _HEAVY_LOCK:                  # one heavy job at a time; hover stays free
-            cells = compute_exact(lat, lon, gen)
+        cells = compute_exact(lat, lon, gen)   # one heavy job at a time; hover stays free
     except _Superseded:
         print(f"[exact] ({lat:.4f},{lon:.4f}) superseded -> 409")
         return jsonify({"error": "superseded"}), 409
+    finally:
+        _HEAVY_LOCK.release()
+    _result_cache_put(_EXACT_RESULT_CACHE, ckey, cells)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[exact] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
@@ -346,8 +437,14 @@ def _build_itin(p50, itin_map, route_name_fn):
     best = min(cands, key=_score)
     ties = [c for c in cands if _score(c) == _score(best)]
     if len(ties) > 1:
-        best = min(ties, key=lambda c: tuple(route_name_fn(l.route)
-                                             for l in c[1].transitLegs(_TRANSIT_LAYER)))
+        # Among equally-fast iterations, prefer FEWER transit legs (fewer transfers) — the
+        # route a human would actually take — then route-name signature for deterministic,
+        # reboot-stable tie-breaking. (Doesn't change the time/color, only which equal-time
+        # path is shown. A genuinely faster multi-transfer route still wins on _score.)
+        def _simplicity(c):
+            legs = list(c[1].transitLegs(_TRANSIT_LAYER))
+            return (len(legs), tuple(route_name_fn(l.route) for l in legs))
+        best = min(ties, key=_simplicity)
     _, rseq, it = best
     ss = rseq.stopSequence
     rt = ss.rideTimesSeconds
@@ -461,6 +558,7 @@ def fastest_itin(olat, olon, dlat, dlon):
 
 
 @app.route("/itinerary")
+@limiter.limit("120/minute")
 def _itinerary():
     cid = request.args.get("id")
     if cid is not None and cid in ORIGIN_LL:
@@ -493,15 +591,31 @@ def _itinerary():
 
 
 @app.route("/attribution")
+@limiter.limit("12/minute")
 def _attribution():
     """The "color by line" map: dominant transit line per cell. The ONLY trigger for the
     full-grid itinerary build (lazy here, on the user's first toggle). Cached + in-flight
     de-duped, so /itinerary also benefits once it has run."""
     dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
+    ckey = _coarse_key(dlat, dlon)
+    # CACHE HIT (~110m): return the same attribution dict instantly — no R5 work, no lock.
+    cached_res = _result_cache_get(_ATTR_RESULT_CACHE, ckey)
+    if cached_res is not None:
+        print(f"[attr] ({dlat:.4f},{dlon:.4f}) cached -> {len(cached_res)} cells")
+        return jsonify(cached_res)
     t0 = dt.datetime.now()
     with _ITIN_CACHE_LOCK:
         cached = _dest_key(dlat, dlon) in _ITIN_CACHE
-    attr = _attribution_from_cache(dlat, dlon)
+    # Non-blocking: a build needed while another heavy job runs -> 503 (don't queue ~48s).
+    try:
+        attr = _attribution_from_cache(dlat, dlon, nonblock=True)
+    except _Busy:
+        print(f"[attr] ({dlat:.4f},{dlon:.4f}) busy -> 503")
+        return jsonify({"busy": True}), 503, {"Retry-After": "4"}
+    # Only cache a real result. A superseded build (workplace changed mid-build) returns {};
+    # caching that would poison this ~110m bucket and make color-by-line return {} forever.
+    if attr:
+        _result_cache_put(_ATTR_RESULT_CACHE, ckey, attr)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[attr] ({dlat:.4f},{dlon:.4f}) {ms:.0f}ms -> {len(attr)} cells"
           f"{' (cached)' if cached else ''}")
@@ -509,6 +623,7 @@ def _attribution():
 
 
 @app.route("/geocode")
+@limiter.limit("60/minute")
 def _geocode():
     q = request.args.get("q", "")
     if not q.strip():
@@ -520,6 +635,23 @@ def _geocode():
     except (OSError, ValueError, KeyError):
         return jsonify({"error": "geocoding failed"}), 502
     return jsonify({"lat": lat, "lon": lon, "label": label})
+
+
+@app.route("/autocomplete")
+@limiter.limit("120/minute")
+def _autocomplete():
+    """Type-ahead suggestions for the workplace box. {"results":[{"label","lat","lon"}, ...]}
+    with at most 6 entries. Blank/too-short q -> {"results":[]} (don't hit the geocoder for a
+    single character). Upstream failures degrade to an empty list rather than an error so the
+    box stays usable."""
+    q = request.args.get("q", "")
+    if len(q.strip()) < 2:
+        return jsonify({"results": []})
+    try:
+        results = geo.autocomplete(q, limit=6)
+    except (OSError, ValueError, KeyError):
+        return jsonify({"results": []})
+    return jsonify({"results": results})
 
 
 # ---- Page (built once at boot from the template + shared viz.js) -----------------------

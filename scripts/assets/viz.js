@@ -25,9 +25,19 @@ function colorScale(v, S){
   return rgb(S[S.length-1][1]);
 }
 
-// Google Maps transit-directions deep link.
+// Google Maps transit deep link, departing the upcoming Monday ~8:30am (matches the model).
+// Uses Google's UNOFFICIAL data= format because the documented ?api=1 form can't set a
+// departure time: !7e2=depart-at, !8j<epoch>=time, !3e3=transit. Google reads the epoch's
+// UTC wall-clock as local, so build it with Date.UTC (no timezone conversion) — verified to
+// render "Depart 8:30 AM" with morning trips. (Brittle: relies on an undocumented format.)
+function _nextMon830(){
+  const d = new Date();
+  d.setDate(d.getDate() + (((1 - d.getDay() + 7) % 7) || 7));   // upcoming Monday (not today)
+  return Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), 8, 30, 0) / 1000);
+}
 function gmapsURL(olat,olon,dlat,dlon){
-  return `https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${dlat},${dlon}&travelmode=transit`;
+  const t = _nextMon830();
+  return `https://www.google.com/maps/dir/${olat},${olon}/${dlat},${dlon}/@${dlat},${dlon},14z/data=!4m6!4m5!2m3!6e0!7e2!8j${t}!3e3`;
 }
 
 // Transit-mode colors — used by both the overlay lines and the breakdown chips.
