@@ -17,7 +17,7 @@ import numpy as np, pandas as pd, geopandas as gpd, shapely
 from shapely.geometry import Point, box
 from flask import Flask, request, jsonify
 
-from r5py import TransportNetwork, TravelTimeMatrix, DetailedItineraries, TransportMode
+from r5py import TransportNetwork, TravelTimeMatrix, TransportMode
 from r5py.r5.regional_task import RegionalTask
 import com.conveyal.r5            # JVM already started by the r5py imports above
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
@@ -85,6 +85,9 @@ print(f"[boot] ready: {len(GRID)} origins ({len(SNAPPED_GRID)} on-network). "
 _EXACT_IDS = list(SNAPPED_GRID.id)
 _EXACT_GEOMS = list(SNAPPED_GRID.geometry)
 MAX_INT32 = (2 ** 31) - 1
+# The TransitLayer is needed to materialise a recorded path's transit legs (route names,
+# board/alight stops). It's read-only and shared across threads like the rest of NET.
+_TRANSIT_LAYER = NET._transport_network.transitLayer
 
 # Thread pool for the EXACT recompute. R5 routing is read-only against the shared
 # warm TransportNetwork and each task clones its own Java RegionalTask, so per-origin
@@ -112,16 +115,19 @@ _HEAVY_LOCK = threading.Lock()
 _EXACT_PENDING = 0
 _EXACT_PENDING_LOCK = threading.Lock()
 
-# ---- Attribution prewarm cache --------------------------------------------------------
-# The "color by line" map (~30s) is computed for the WHOLE grid, keyed only by the
-# workplace. So the moment a workplace is set (the very first /compute hit), we kick off
-# the attribution in a BACKGROUND thread and cache it by destination. By the time the user
-# flips to "Primary line" and the frontend calls /attribution, the answer is usually
-# already cached and returns instantly -- no frontend change needed. /attribution serves
-# the cache on a destination match, otherwise computes (and caches) synchronously.
-_ATTR_CACHE = {}                 # dest_key -> {cellId: line}
-_ATTR_INFLIGHT = {}             # dest_key -> threading.Event (compute in progress)
-_ATTR_CACHE_LOCK = threading.Lock()
+# ---- Shared per-cell itinerary + attribution prewarm cache ----------------------------
+# ONE background pass (~30s, keyed by workplace) computes the FULL exact itinerary for
+# EVERY grid cell using R5's recorded paths (the SAME forward cell->workplace journeys
+# behind compute_exact, so each itinerary's total == the cell's exact map-color value).
+# The moment a workplace is set (first /compute hit) we kick this off in a BACKGROUND
+# thread and cache it by destination:
+#   _ITIN_CACHE[dest_key] = {cellId: {total, xfers, legs:[...]}}
+# /itinerary then serves a cached cell instantly (~ms, no R5 call, no heavy lock), and
+# /attribution derives the "color by line" map from the SAME cache (the dominant line of
+# each cached itinerary). Both endpoints share this one prewarm -- no double work.
+_ITIN_CACHE = {}                 # dest_key -> {cellId: itinerary dict}
+_ITIN_INFLIGHT = {}             # dest_key -> threading.Event (compute in progress)
+_ITIN_CACHE_LOCK = threading.Lock()
 _PREWARM_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prewarm")
 
 
@@ -129,25 +135,26 @@ def _dest_key(lat, lon):
     return (round(float(lat), 5), round(float(lon), 5))
 
 
-def _attribution_cached(dlat, dlon, background=False):
-    """Return attribution for (dlat,dlon), using/populating the prewarm cache. If another
-    thread is already computing this destination, wait for it instead of recomputing.
-    When ``background`` (the prewarm), yield to any pending /compute_exact before grabbing
-    the heavy lock so the user-facing time refine always goes first."""
+def _itineraries_cached(dlat, dlon, background=False):
+    """Return the full per-cell itinerary map for (dlat,dlon) -> {cellId: itin dict},
+    using/populating the shared prewarm cache. If another thread is already computing this
+    destination, wait for it instead of recomputing. When ``background`` (the prewarm),
+    yield to any pending /compute_exact before grabbing the heavy lock so the user-facing
+    time refine always goes first."""
     key = _dest_key(dlat, dlon)
-    with _ATTR_CACHE_LOCK:
-        if key in _ATTR_CACHE:
-            return _ATTR_CACHE[key]
-        event = _ATTR_INFLIGHT.get(key)
+    with _ITIN_CACHE_LOCK:
+        if key in _ITIN_CACHE:
+            return _ITIN_CACHE[key]
+        event = _ITIN_INFLIGHT.get(key)
         if event is None:
             event = threading.Event()
-            _ATTR_INFLIGHT[key] = event
+            _ITIN_INFLIGHT[key] = event
             owner = True
         else:
             owner = False
     if not owner:                # someone else is computing it; wait for their result
         event.wait()
-        return _ATTR_CACHE.get(key, {})
+        return _ITIN_CACHE.get(key, {})
     try:
         if background:
             # The frontend sends /compute -> (prewarm fires) -> /compute_exact almost
@@ -162,24 +169,40 @@ def _attribution_cached(dlat, dlon, background=False):
                     break
                 time.sleep(0.1)
         with _HEAVY_LOCK:        # serialise vs /compute_exact so cores aren't thrashed
-            attr = attribution(dlat, dlon)
-        with _ATTR_CACHE_LOCK:
-            _ATTR_CACHE[key] = attr
-        return attr
+            itins = prewarm_itineraries(dlat, dlon)
+        with _ITIN_CACHE_LOCK:
+            _ITIN_CACHE[key] = itins
+        return itins
     finally:
-        with _ATTR_CACHE_LOCK:
-            _ATTR_INFLIGHT.pop(key, None)
+        with _ITIN_CACHE_LOCK:
+            _ITIN_INFLIGHT.pop(key, None)
         event.set()
 
 
-def _prewarm_attribution(dlat, dlon):
-    """Fire-and-forget: compute+cache attribution for a just-set workplace, in the
-    background, unless it's already cached or in flight."""
+def _dominant_line(itin):
+    """The "color by line" attribution for a cached itinerary: the transit leg carrying
+    the most ride time, or 'walk only' when the trip has no transit legs."""
+    rides = [l for l in itin["legs"] if l["mode"] != "walk"]
+    if not rides:
+        return "walk only"
+    return max(rides, key=lambda l: l["min"])["line"]
+
+
+def _attribution_from_cache(dlat, dlon, background=False):
+    """Derive {cellId: dominantLine} from the shared per-cell itinerary cache (building it
+    if needed). Same answer the old standalone attribution() gave, from one shared pass."""
+    return {cid: _dominant_line(it) for cid, it in
+            _itineraries_cached(dlat, dlon, background).items()}
+
+
+def _prewarm_itineraries(dlat, dlon):
+    """Fire-and-forget: compute+cache the full per-cell itineraries for a just-set
+    workplace, in the background, unless already cached or in flight."""
     key = _dest_key(dlat, dlon)
-    with _ATTR_CACHE_LOCK:
-        if key in _ATTR_CACHE or key in _ATTR_INFLIGHT:
+    with _ITIN_CACHE_LOCK:
+        if key in _ITIN_CACHE or key in _ITIN_INFLIGHT:
             return
-    _PREWARM_POOL.submit(_attribution_cached, dlat, dlon, True)
+    _PREWARM_POOL.submit(_itineraries_cached, dlat, dlon, True)
 
 
 app = Flask(__name__)
@@ -278,47 +301,6 @@ def _compute_exact():
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
-def fastest_itin(olat, olon, dlat, dlon):
-    origin = gpd.GeoDataFrame({"id": ["o"]}, geometry=[Point(olon, olat)], crs="EPSG:4326")
-    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs="EPSG:4326")
-    di = DetailedItineraries(NET, origins=origin, destinations=dest, departure=DEP,
-                             transport_modes=[TransportMode.TRANSIT, TransportMode.WALK],
-                             snap_to_network=True, force_all_to_all=True)
-    df = pd.DataFrame(di)
-    if df.empty:
-        return None
-    df["tt"] = pd.to_timedelta(df["travel_time"]).dt.total_seconds() / 60
-    df["wt"] = pd.to_timedelta(df["wait_time"]).dt.total_seconds() / 60
-    tot = df.groupby("option").apply(lambda x: x["tt"].sum() + x["wt"].sum(), include_groups=False)
-    best = tot.idxmin()
-    legs = df[df["option"] == best].sort_values("segment")
-    out, rides = [], 0
-    for _, l in legs.iterrows():
-        mode = str(l["transport_mode"]).split(".")[-1]
-        if mode == "WALK":
-            if l["tt"] >= 1:
-                out.append({"mode": "walk", "line": None, "min": round(l["tt"])})
-        else:
-            rides += 1
-            line = route_name(l["route_id"], l.get("feed"))
-            out.append({"mode": mode.lower(), "line": line,
-                        "min": round(l["tt"]), "wait": round(l["wt"])})
-    return {"total": round(float(tot[best])), "xfers": max(0, rides - 1), "legs": out}
-
-
-@app.route("/itinerary")
-def _itinerary():
-    cid = request.args.get("id")
-    if cid is not None and cid in ORIGIN_LL:
-        olat, olon = ORIGIN_LL[cid]
-    else:
-        olat, olon = float(request.args["olat"]), float(request.args["olon"])
-    dlat, dlon = float(request.args["dlat"]), float(request.args["dlon"])
-    res = fastest_itin(olat, olon, dlat, dlon) or {"error": "no route"}
-    res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
-    return jsonify(res)
-
-
 def _path_route_name(raw):
     """R5 records a path leg's route as a string "NAME (route_id)" where NAME is the
     GTFS route_short_name/long_name resolved within the leg's own feed -- i.e. already
@@ -330,73 +312,209 @@ def _path_route_name(raw):
     return s[:i] if i > 0 else s
 
 
-def attribution(dlat, dlon):
-    """Primary transit line per grid cell for the "color by line" map (JOB 3).
+_TINY_HOP_MIN = 2.0   # suppress sub-2-min transit hops (fold into adjacent walk)
 
-    Returns {cellId: primaryLineName} for the fastest trip TO the workplace, where the
-    primary line is the route carrying the most in-vehicle time ("walk only" if walk
-    beats transit). Cell ids match GRID/SNAPPED_GRID; unreachable cells are omitted.
 
-    SPEED: detailed per-leg routing (DetailedItineraries / TripPlanner) is ~1-3s/origin
-    -- full access/egress street search to every reachable stop plus shapely geometry per
-    leg -- so all ~1362 cells take >8 min. But we don't need geometry, only "which line
-    dominates". R5's TravelTimeComputer can RECORD PATHS (`includePathResults`) using the
-    SAME fast one-to-all machinery as the exact matrix (JOB 1): we route each cell ->
-    workplace with path recording on, read back the recorded transit legs (route name +
-    in-vehicle time, already feed-aware), and pick the dominant line. This is ~20ms/origin
-    -- ~100x faster than detailed routing -- so we attribute ALL cells at full resolution
-    (no subsampling) in ~25-30s, parallelised across the same thread pool as the exact
-    matrix."""
+def _build_itin(p50, itin_map, route_name_fn):
+    """Turn an R5 recorded-path result for ONE cell into the /itinerary JSON breakdown.
+
+    ``p50`` is the cell's authoritative realistic travel time (minutes) -- the SAME value
+    compute_exact colors the map with -- and ``itin_map`` is that cell's path-result
+    multimap (RouteSequence -> Iterations), as produced with includePathResults. We:
+      1. pick the recorded ITERATION whose total best matches p50 (so the breakdown's total
+         == the cell's exact map color, fixing the old "breakdown != color" mismatch);
+      2. read the EXACT per-leg components from R5 -- ride time per leg comes from the
+         StopSequence's rideTimesSeconds (the TransitLeg.inVehicleTime field is unreliable
+         in this build), wait per leg from the iteration's waitTimes, plus access/egress
+         walk and the aggregate transfer-walk time;
+      3. lay them out as walk[access] -> (wait+ride) per leg -> walk[transfer] -> ... ->
+         walk[egress], so the legs ALWAYS sum exactly to round(p50);
+      4. FOLD any sub-2-min transit hop into the surrounding walk (its ride+wait time
+         becomes walking), so we never show nonsense like "ride the 14 for 1 minute";
+      5. round and reconcile any residual into a walk leg so the displayed legs still sum
+         to round(p50).
+    Returns {total, xfers, legs:[{mode, line, min, wait?}]}."""
+    total = float(p50)
+    walk_only = {"total": round(total), "xfers": 0,
+                 "legs": [{"mode": "walk", "line": None, "min": round(total)}]}
+    cands = []
+    for e in list(itin_map.entrySet()):
+        rseq = e.getKey()
+        for it in e.getValue():
+            cands.append((it.totalTime, rseq, it))
+    if not cands:
+        return walk_only
+    # iteration whose total best matches the authoritative p50 (tie -> faster trip)
+    _, rseq, it = min(cands, key=lambda c: (abs(round(c[0] / 60.0) - p50), c[0]))
+    ss = rseq.stopSequence
+    rt = ss.rideTimesSeconds
+    rides = [rt.get(i) / 60.0 for i in range(rt.size())] if rt is not None else []
+    n = len(rides)
+    if n == 0:                                  # reachable on foot only
+        return walk_only
+    legs_meta = list(rseq.transitLegs(_TRANSIT_LAYER))
+    waits = [it.waitTimes.get(i) / 60.0 for i in range(it.waitTimes.size())]
+    acc = (ss.access.time / 60.0) if ss.access else 0.0
+    egr = (ss.egress.time / 60.0) if ss.egress else 0.0
+    xfer = ss.transferTime(it) / 60.0
+    # walk buckets around the n rides: walk[0]=access ... walk[n]=egress; the aggregate
+    # transfer-walk time is split evenly across the n-1 inter-ride gaps.
+    walk = [0.0] * (n + 1)
+    walk[0] = acc
+    walk[n] += egr
+    if n > 1:
+        per = xfer / (n - 1)
+        for i in range(1, n):
+            walk[i] += per
+    # fold tiny rides (and their wait) into the preceding walk bucket
+    kept = []
+    for i in range(n):
+        if rides[i] < _TINY_HOP_MIN:
+            walk[i] += rides[i] + waits[i]
+        else:
+            kept.append(i)
+    legs = []
+
+    def push_walk(m):
+        if m <= 0:
+            return
+        if legs and legs[-1]["mode"] == "walk":
+            legs[-1]["min"] += m
+        else:
+            legs.append({"mode": "walk", "line": None, "min": m})
+
+    cursor = 0
+    for i in kept:
+        push_walk(sum(walk[cursor:i + 1]))
+        legs.append({"mode": "transit", "line": route_name_fn(legs_meta[i].route),
+                     "min": rides[i], "wait": waits[i]})
+        cursor = i + 1
+    push_walk(sum(walk[cursor:n + 1]))
+    # round each leg; then reconcile so the shown legs sum EXACTLY to round(total)
+    for l in legs:
+        l["min"] = round(l["min"])
+        if "wait" in l:
+            l["wait"] = round(l["wait"])
+    legs = [l for l in legs if not (l["mode"] == "walk" and l["min"] <= 0)]
+    rides_kept = sum(1 for l in legs if l["mode"] != "walk")
+    cur = sum(l["min"] for l in legs) + sum(l.get("wait", 0) for l in legs)
+    diff = round(total) - cur
+    if diff != 0:
+        walks = [l for l in legs if l["mode"] == "walk"]
+        if walks:
+            walks[-1]["min"] = max(0, walks[-1]["min"] + diff)
+        elif diff > 0:
+            legs.append({"mode": "walk", "line": None, "min": diff})
+        legs = [l for l in legs if not (l["mode"] == "walk" and l["min"] <= 0)]
+    return {"total": round(total), "xfers": max(0, rides_kept - 1), "legs": legs}
+
+
+def prewarm_itineraries(dlat, dlon):
+    """Full exact itinerary for EVERY grid cell -> workplace, via R5 recorded paths.
+
+    This is the per-cell breakdown analogue of compute_exact / attribution: route every
+    cell -> workplace ONCE with includePathResults, and for each cell build the full
+    door-to-door breakdown ({total, xfers, legs}) with _build_itin. Because these are the
+    same forward (cell->workplace) journeys behind compute_exact, every itinerary's total
+    equals that cell's exact map-color value. Runs ~30s on the shared thread pool (in the
+    background prewarm); /itinerary then serves a cell from this cache instantly, and
+    /attribution derives the dominant line per cell from it. Returns {cellId: itin dict}."""
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs="EPSG:4326")
-
     template = RegionalTask(
         NET, origin=None, destinations=dest,
         departure=DEP, departure_time_window=WINDOW, max_time=dt.timedelta(minutes=75),
         transport_modes=[TransportMode.TRANSIT, TransportMode.WALK],
-        percentiles=[50], speed_walking=4.8)
+        percentiles=[5, 50], speed_walking=4.8)
     template.destinations = dest
     template._regional_task.includePathResults = True   # record paths, not just times
-    template._regional_task.nPathsPerTarget = 1         # only need the single best path
+    template._regional_task.nPathsPerTarget = 8         # a few options to find the p50 one
 
     def _one(i):
         req = copy.copy(template)
         req.origin = _EXACT_GEOMS[i]
         result = com.conveyal.r5.analyst.TravelTimeComputer(req, NET).computeTravelTimes()
-        paths = result.paths
-        if paths is None:
-            return _EXACT_IDS[i], None
-        # one destination -> one entry; each is a path template with its transit legs and
-        # a set of iterations (one per departure minute in the window). Pick the template
-        # whose best (min totalTime) iteration is fastest -> that's the cell's fastest trip.
-        best_pit = None; best_t = None
-        for pit in paths.getPathIterationsForDestination():
-            mt = None
-            for it in pit.iterations:
-                if mt is None or it.totalTime < mt:
-                    mt = it.totalTime
-            if mt is not None and (best_t is None or mt < best_t):
-                best_t = mt; best_pit = pit
-        if best_pit is None:
+        p50 = result.travelTimes.getValues()[1][0]      # realistic (matches compute_exact)
+        if p50 == MAX_INT32:
             return _EXACT_IDS[i], None                  # unreachable -> omit
-        legs = list(best_pit.transitLegs)
-        if not legs:
-            return _EXACT_IDS[i], "walk only"           # reachable on foot, no transit
-        dominant = max(legs, key=lambda lg: lg.inVehicleTime)
-        return _EXACT_IDS[i], _path_route_name(dominant.route)
+        paths = result.paths
+        itin_map = paths.iterationsForPathTemplates[0].asMap() if paths is not None else None
+        if itin_map is None:
+            return _EXACT_IDS[i], {"total": int(p50), "xfers": 0,
+                                   "legs": [{"mode": "walk", "line": None, "min": int(p50)}]}
+        return _EXACT_IDS[i], _build_itin(p50, itin_map, _path_route_name)
 
-    attr = {}
-    for cid, line in _EXACT_POOL.map(_one, range(len(_EXACT_IDS)), chunksize=8):
-        if line is not None:                            # omit unreachable cells
-            attr[cid] = line
-    return attr
+    itins = {}
+    for cid, itin in _EXACT_POOL.map(_one, range(len(_EXACT_IDS)), chunksize=8):
+        if itin is not None:
+            itins[cid] = itin
+    return itins
+
+
+def fastest_itin(olat, olon, dlat, dlon):
+    """On-demand single-OD breakdown via R5 recorded paths -- the FALLBACK for /itinerary
+    cache misses (off-grid points, or before the prewarm has finished). Mirrors exactly
+    what the prewarm caches: route this one origin -> workplace with path recording, take
+    the p50 (realistic) time, and build the same breakdown with _build_itin, so a cold
+    lookup reads identically to a cached one and its total matches the map color."""
+    o = NET.snap_to_network(gpd.GeoSeries([Point(olon, olat)], crs="EPSG:4326")).iloc[0]
+    if o.is_empty:
+        return None
+    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs="EPSG:4326")
+    template = RegionalTask(
+        NET, origin=None, destinations=dest,
+        departure=DEP, departure_time_window=WINDOW, max_time=dt.timedelta(minutes=75),
+        transport_modes=[TransportMode.TRANSIT, TransportMode.WALK],
+        percentiles=[5, 50], speed_walking=4.8)
+    template.destinations = dest
+    template._regional_task.includePathResults = True
+    template._regional_task.nPathsPerTarget = 8
+    req = copy.copy(template)
+    req.origin = o
+    result = com.conveyal.r5.analyst.TravelTimeComputer(req, NET).computeTravelTimes()
+    p50 = result.travelTimes.getValues()[1][0]
+    if p50 == MAX_INT32:
+        return None
+    paths = result.paths
+    itin_map = paths.iterationsForPathTemplates[0].asMap() if paths is not None else None
+    if itin_map is None:
+        return {"total": int(p50), "xfers": 0,
+                "legs": [{"mode": "walk", "line": None, "min": int(p50)}]}
+    return _build_itin(p50, itin_map, _path_route_name)
+
+
+@app.route("/itinerary")
+def _itinerary():
+    cid = request.args.get("id")
+    if cid is not None and cid in ORIGIN_LL:
+        olat, olon = ORIGIN_LL[cid]
+    else:
+        olat, olon = float(request.args["olat"]), float(request.args["olon"])
+    dlat, dlon = float(request.args["dlat"]), float(request.args["dlon"])
+    res = None
+    # FAST PATH: serve the prewarmed per-cell cache (a plain dict lookup; no R5 call, no
+    # heavy lock) so hover/click is ~instant once the workplace's prewarm has run.
+    if cid is not None:
+        with _ITIN_CACHE_LOCK:
+            cached = _ITIN_CACHE.get(_dest_key(dlat, dlon))
+        if cached is not None and cid in cached:
+            res = cached[cid]
+    # FALLBACK: cache miss (off-grid point, or prewarm not finished) -> compute on demand.
+    if res is None:
+        res = fastest_itin(olat, olon, dlat, dlon) or {"error": "no route"}
+    res = dict(res)                       # don't mutate the cached object with olat/olon
+    res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
+    return jsonify(res)
 
 
 @app.route("/attribution")
 def _attribution():
+    """The "color by line" map: dominant transit line per cell, DERIVED from the shared
+    per-cell itinerary prewarm cache (one pass feeds both /itinerary and /attribution)."""
     dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
     t0 = dt.datetime.now()
-    cached = _dest_key(dlat, dlon) in _ATTR_CACHE
-    attr = _attribution_cached(dlat, dlon)   # serve prewarm cache, or compute+cache now
+    with _ITIN_CACHE_LOCK:
+        cached = _dest_key(dlat, dlon) in _ITIN_CACHE
+    attr = _attribution_from_cache(dlat, dlon)   # serve prewarm cache, or compute+cache now
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[attr] ({dlat:.4f},{dlon:.4f}) {ms:.0f}ms -> {len(attr)} cells"
           f"{' (cached)' if cached else ''}")
@@ -410,9 +528,10 @@ def _compute():
     cells = compute(lat, lon)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[compute] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
-    # The address was just set -> start the (~30s) line-attribution in the background now,
-    # so it's cached and instant if/when the user switches to "Primary line". No FE change.
-    _prewarm_attribution(lat, lon)
+    # The address was just set -> start the (~30s) per-cell itinerary prewarm in the
+    # background now, so /itinerary (hover/click breakdown) is an instant cache hit and the
+    # "Primary line" attribution is ready too -- both from this one pass. No FE change.
+    _prewarm_itineraries(lat, lon)
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
