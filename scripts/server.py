@@ -102,6 +102,35 @@ def compute(lat, lon):
     return cells
 
 
+def compute_exact(lat, lon):
+    """EXACT (forward) door-to-door: route every grid cell -> workplace. This is the
+    slow, accurate direction (one routing tree per origin). The /compute approximation
+    refines to this. (A subagent parallelizes this further.)"""
+    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(lon, lat)], crs="EPSG:4326")
+    ttm = TravelTimeMatrix(
+        NET, origins=SNAPPED_GRID, destinations=dest, snap_to_network=False,
+        departure=DEP, departure_time_window=WINDOW, max_time=dt.timedelta(minutes=75),
+        transport_modes=[TransportMode.TRANSIT, TransportMode.WALK],
+        percentiles=[5, 50], speed_walking=4.8)
+    ttm = pd.DataFrame(ttm)
+    cells = {}
+    for _, r in ttm.iterrows():
+        b, rl = r["travel_time_p5"], r["travel_time_p50"]
+        cells[str(r["from_id"])] = [None if pd.isna(b) else int(b),
+                                    None if pd.isna(rl) else int(rl)]
+    return cells
+
+
+@app.route("/compute_exact")
+def _compute_exact():
+    lat = float(request.args["lat"]); lon = float(request.args["lon"])
+    t0 = dt.datetime.now()
+    cells = compute_exact(lat, lon)
+    ms = (dt.datetime.now() - t0).total_seconds() * 1000
+    print(f"[exact] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
+    return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
+
+
 def fastest_itin(olat, olon, dlat, dlon):
     origin = gpd.GeoDataFrame({"id": ["o"]}, geometry=[Point(olon, olat)], crs="EPSG:4326")
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs="EPSG:4326")
@@ -219,16 +248,20 @@ PAGE = r"""<!DOCTYPE html>
 </style></head>
 <body>
 <div id="map"></div><div id="busy">computing…</div>
+<div id="prompt" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1050;pointer-events:none">
+  <div style="background:rgba(20,23,29,.94);color:#e8eaed;padding:18px 24px;border:1px solid #272b34;border-radius:12px;font-size:15px;text-align:center;box-shadow:0 10px 34px rgba(0,0,0,.55)">
+    Enter your workplace address  →<br><span style="color:#9aa3af;font-size:12.5px">(top-right) to map your commute</span></div></div>
 <div id="panel">
   <h1>Commute to your workplace</h1>
-  <div class="sub">Set your workplace (type an address, <b>click the map</b>, or <b>drag the pin</b>);
-    the map recomputes walk+Muni+BART times (~9am) from across SF. <b>Hover any area</b> for the
-    actual route behind its time.</div>
+  <div class="sub">Enter your workplace address to begin. <b>Hover</b> any area for its time + the route
+    behind it; <b>click</b> to pin it with a Google Maps link.</div>
   <div class="ctl"><div class="lab">Workplace</div>
     <div class="addr"><input id="addr" placeholder="e.g. 1 Market St"><button id="go">Set</button></div>
     <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div></div>
   <div class="ctl"><div class="lab">Time estimate</div>
     <div class="seg" id="metric"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
+  <div class="ctl"><div class="lab">Color by</div>
+    <div class="seg" id="cmode"><button data-v="time" class="on">Time</button><button data-v="line">Primary line</button></div></div>
   <div class="ctl"><div class="lab">Sweet spot — green ≤ <span class="val" id="idval">25</span> min (recolors)</div>
     <input type="range" id="ideal" min="10" max="45" value="25"></div>
   <div class="ctl"><div class="lab">Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</div>
@@ -240,8 +273,6 @@ PAGE = r"""<!DOCTYPE html>
       <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span style="color:#f6a04d">Bus</span></label>
       <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span style="color:#5cd65c">Cable</span></label>
     </div></div>
-  <div class="ctl" id="bd"><div class="lab">Route breakdown <span style="text-transform:none;letter-spacing:0;color:#5c6470">— hover an area</span></div>
-    <div id="bdbody" style="font-size:12.5px;color:var(--mut);line-height:1.6">Hover the map to see the trip behind a cell's time.</div></div>
   <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods</div></div>
   <div id="list"></div>
   <div class="credit">R5/r5py · Muni (511) + BART · network kept warm; only the matrix recomputes.
@@ -251,7 +282,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="sc"></div></div>
 <script>
 const CELLS=__CELLS__, LINES=__LINES__, DEFAULT=__DEFAULT__;
-let metric="r", ideal=25, thr=40, TT={}, NB={}, DESTLL=DEFAULT.slice(0,2);
+let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={};
 const gmaps=(olat,olon)=>`https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${DESTLL[0]},${DESTLL[1]}&travelmode=transit`;
 let bdToken=0;  // cancels stale hover-breakdown fetches
 const map=L.map("map").setView([37.762,-122.43],12.3);
@@ -263,35 +294,46 @@ function ramp(){const hi=ideal+25;return {hi,S:[[0,[0,104,55]],[ideal*.45,[26,15
 function color(v){if(v==null)return null;const {S}=ramp();if(v<=0)return rgb(S[0][1]);
   for(let i=1;i<S.length;i++){if(v<=S[i][0]){const a=S[i-1],b=S[i],t=(v-a[0])/((b[0]-a[0])||1);
     return rgb(a[1].map((c,j)=>Math.round(c+(b[1][j]-c)*t)));}}return rgb(S.at(-1)[1]);}
-function legend(){const {hi,S}=ramp();
-  document.querySelector("#legend .bar").style.background="linear-gradient(90deg,"+
-    S.map(s=>rgb(s[1])+" "+Math.round(s[0]/hi*100)+"%").join(",")+")";
-  document.querySelector("#legend .sc").innerHTML=`<span>0</span><span>${ideal} (ideal)</span><span>${hi}+</span>`;
+function legend(){const sc=document.querySelector("#legend .sc"),bar=document.querySelector("#legend .bar");
+  if(cmode=="line"){bar.style.display="none";sc.style.flexWrap="wrap";
+    const ord=Object.keys(LINECOLOR);
+    sc.innerHTML=ord.length?ord.slice(0,16).map(l=>`<span style="white-space:nowrap;margin:0 8px 3px 0"><span style="display:inline-block;width:9px;height:9px;background:${LINECOLOR[l]};border-radius:2px"></span> ${l}</span>`).join(""):"computing line map…";
+    document.getElementById("legtitle").textContent="Primary transit line per area";return;}
+  const {hi,S}=ramp();bar.style.display="block";sc.style.flexWrap="nowrap";
+  bar.style.background="linear-gradient(90deg,"+S.map(s=>rgb(s[1])+" "+Math.round(s[0]/hi*100)+"%").join(",")+")";
+  sc.innerHTML=`<span>0</span><span>${ideal} (ideal)</span><span>${hi}+</span>`;
   document.getElementById("legtitle").textContent=(metric=="r"?"Realistic":"Best-case")+" door-to-door (min)";}
 function val(id){const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
-function style(f){const v=val(f.properties.id);if(v==null||v>thr)return{fillOpacity:0,opacity:0,weight:0};
+function style(f){const id=f.properties.id,v=val(id);
+  if(v==null||v>thr)return{fillOpacity:0,opacity:0,weight:0};
+  if(cmode=="line"){const ln=ATTR[id];return ln?{fillColor:LINECOLOR[ln]||"#888",fillOpacity:.76,weight:0}:{fillColor:"#888",fillOpacity:.06,weight:0};}
   return{fillColor:color(v),fillOpacity:.72,weight:0};}
-function renderBreak(d){const bd=document.getElementById("bdbody");
-  if(d.error){bd.innerHTML="<span style='color:#9aa3af'>no transit route found within ~75 min</span>";return;}
+function buildLineColors(){const PAL=["#e6194B","#3cb44b","#ffe119","#4363d8","#f58231","#911eb4","#42d4f4","#f032e6","#bfef45","#fabed4","#469990","#dcbeff","#9A6324","#800000","#aaffc3","#808000","#000075"];
+  const cnt={};Object.values(ATTR).forEach(l=>cnt[l]=(cnt[l]||0)+1);
+  LINECOLOR={};Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]).forEach((l,i)=>LINECOLOR[l]=l=="walk only"?"#7fd1ff":PAL[i%PAL.length]);}
+function bdHTML(d){
+  if(d.error)return `<span style="color:#9aa3af">no transit route found (~75 min cap)</span>`;
   const chain=d.legs.map(g=>g.line?`<b style="color:#5ab0ff">${g.line}</b> ${g.min}m`:`walk ${g.min}m`).join(" → ");
-  bd.innerHTML=`<b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}`+
-    `<div style="margin-top:5px">${chain}</div>`+
-    `<div style="margin-top:7px"><a href="${gmaps(d.olat,d.olon)}" target="_blank" style="color:#5ab0ff">Open in Google Maps ↗</a></div>`+
-    `<div style="color:#5c6470;margin-top:4px;font-size:11px">typical fastest trip (~8:35am)</div>`;}
+  return `<div style="max-width:245px"><b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}`+
+    `<div style="margin-top:4px;line-height:1.6">${chain}</div>`+
+    `<div style="margin-top:6px"><a href="${gmaps(d.olat,d.olon)}" target="_blank" style="color:#5ab0ff">Open in Google Maps ↗</a></div>`+
+    `<div style="color:#5c6470;margin-top:3px;font-size:11px">typical fastest trip (~8:35am)</div></div>`;}
 let bdTimer;
-function hoverBreak(f){const v=val(f.properties.id);if(v==null)return;
-  document.getElementById("bdbody").innerHTML=`<b>${f.properties.n||""}</b> · ${v} min<div style="color:#9aa3af;margin-top:4px">loading route…</div>`;
+function loadBreak(f,setHTML){const v=val(f.properties.id);if(v==null){setHTML("—");return;}
+  setHTML(`<b>${f.properties.n||""}</b> · ${v} min<div style="color:#9aa3af;margin-top:3px">loading route…</div>`);
   clearTimeout(bdTimer);const my=++bdToken;
   bdTimer=setTimeout(async()=>{try{
     const r=await fetch(`/itinerary?id=${f.properties.id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
-    const d=await r.json();if(my!==bdToken)return;d.name=f.properties.n;renderBreak(d);
-  }catch(e){if(my===bdToken)document.getElementById("bdbody").innerHTML="error";}},180);}
+    const d=await r.json();if(my!==bdToken)return;d.name=f.properties.n;setHTML(bdHTML(d));
+  }catch(e){if(my===bdToken)setHTML("error");}},150);}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
-  l.on("mouseover",()=>{const v=val(f.properties.id);l.setStyle({weight:1.4,color:"#fff"});
-    l.bindTooltip(`${f.properties.n||"—"} · <b>${v==null?"—":v+" min"}</b>`,{className:"tt",sticky:true}).openTooltip();
-    hoverBreak(f);});
-  l.on("mouseout",()=>layer.resetStyle(l));
-  l.on("click",()=>hoverBreak(f));
+  l.on("mouseover",()=>{if(!DESTLL)return;l.setStyle({weight:1.4,color:"#fff"});
+    l.bindTooltip("",{className:"tt",sticky:true,opacity:1}).openTooltip();
+    loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});});
+  l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);});
+  l.on("click",()=>{if(!DESTLL)return;
+    l.bindPopup("…",{maxWidth:285}).openPopup();
+    loadBreak(f,h=>{if(l.getPopup())l.setPopupContent(h);});});
 }}).addTo(map);
 // transit-line overlays (off by default; non-interactive so cells stay hoverable)
 const LINESTYLE={bus:{color:"#f6a04d",weight:1.3,opacity:.5},metro:{color:"#ff6b6b",weight:2.4,opacity:.85},
@@ -302,9 +344,7 @@ const overlays={};
   {style:()=>LINESTYLE[m],interactive:false});});
 document.querySelectorAll("input[data-m]").forEach(cb=>cb.onchange=()=>{
   const m=cb.dataset.m;if(cb.checked)overlays[m].addTo(map);else map.removeLayer(overlays[m]);});
-const pin=L.marker(DEFAULT.slice(0,2),{draggable:true}).addTo(map);
-pin.on("dragend",()=>{const p=pin.getLatLng();run(p.lat,p.lng,"(dropped pin)");});
-map.on("click",e=>{pin.setLatLng(e.latlng);run(e.latlng.lat,e.latlng.lng,"(map click)");});
+let pin=null;   // workplace marker — set via the address box only (no map-click / drag)
 
 function redraw(){layer.setStyle(style);legend();renderList();}
 function renderList(){const rows=Object.entries(NB).filter(([k,v])=>v!=null).sort((a,b)=>a[1]-b[1]);
@@ -313,22 +353,44 @@ function renderList(){const rows=Object.entries(NB).filter(([k,v])=>v!=null).sor
 function aggregate(){const acc={};CELLS.features.forEach(f=>{const v=val(f.properties.id),n=f.properties.n;
   if(v==null||!n)return;(acc[n]=acc[n]||[]).push(v);});NB={};
   for(const n in acc){acc[n].sort((a,b)=>a-b);NB[n]=acc[n][Math.floor(acc[n].length/2)];}}
-async function run(lat,lon,label){document.getElementById("busy").style.display="block";
+function busy(t){const b=document.getElementById("busy");if(t){b.textContent=t;b.style.display="block";}else b.style.display="none";}
+async function setWorkplace(lat,lon,label){
+  document.getElementById("prompt").style.display="none";
+  DESTLL=[lat,lon];ATTR={};LINECOLOR={};
+  if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
+  map.setView([lat,lon],12.6);
+  busy("estimating…");
   try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}`);const d=await r.json();
-    TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  ${d.ms}ms`;
-    aggregate();redraw();}catch(e){alert("compute failed: "+e);}finally{document.getElementById("busy").style.display="none";}}
+    TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
+    aggregate();redraw();
+  }catch(e){busy(false);alert("compute failed: "+e);return;}
+  busy("refining (exact)…");                       // pipeline: exact pass refines the approximation
+  try{const r2=await fetch(`/compute_exact?lat=${lat}&lon=${lon}`);
+    if(r2.ok){const d2=await r2.json();TT=d2.cells;
+      document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
+      aggregate();redraw();}
+  }catch(e){/* keep the fast approximation if exact isn't available */}
+  busy(false);
+  if(cmode=="line")loadAttribution();
+}
+async function loadAttribution(){if(!DESTLL)return;busy("mapping lines…");
+  try{const r=await fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+    if(r.ok){ATTR=await r.json();buildLineColors();redraw();}
+    else{document.getElementById("legtitle").textContent="line map unavailable yet";}
+  }catch(e){}finally{busy(false);}}
 function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onclick=()=>{
   document.querySelectorAll(`#${id} button`).forEach(x=>x.classList.remove("on"));b.classList.add("on");set(b.dataset.v);aggregate();redraw();});}
 seg("metric",v=>metric=v);
+seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
 document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();};
 document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();};
 document.getElementById("go").onclick=async()=>{const q=document.getElementById("addr").value;
-  if(!q)return;document.getElementById("busy").style.display="block";
+  if(!q)return;busy("finding address…");
   try{const r=await fetch(`/geocode?q=${encodeURIComponent(q)}`);const d=await r.json();
-    if(d.lat){pin.setLatLng([d.lat,d.lon]);map.setView([d.lat,d.lon],13);run(d.lat,d.lon,d.label.split(",").slice(0,2).join(","));}
-    else alert("address not found");}catch(e){alert(e);}finally{document.getElementById("busy").style.display="none";}};
+    if(d.lat){busy(false);setWorkplace(d.lat,d.lon,d.label.split(",").slice(0,2).join(","));}
+    else{busy(false);alert("address not found");}}catch(e){busy(false);alert(e);}};
 document.getElementById("addr").addEventListener("keydown",e=>{if(e.key=="Enter")document.getElementById("go").click();});
-run(DEFAULT[0],DEFAULT[1],DEFAULT[2]);   // initial
+legend();   // draw the legend; map stays blank until you set an address
 </script></body></html>"""
 
 
