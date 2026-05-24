@@ -19,6 +19,7 @@ from flask import Flask, request, jsonify
 from r5py import TransportNetwork, TravelTimeMatrix, DetailedItineraries, TransportMode
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
 from itineraries import load_routes
+from route_map import route_shapes
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -29,6 +30,7 @@ WINDOW = dt.timedelta(minutes=int(os.environ.get("WINDOW_MIN", "30")))
 DEFAULT = (DEST_LAT, DEST_LON, DEST_LABEL)
 GTFS = [DATA / "muni_current.zip", DATA / "bart_gtfs.zip"]
 ROUTES = load_routes(GTFS)
+LINES = route_shapes(GTFS)          # GTFS line geometries for the overlay
 
 print(f"[boot] building grid @ {GRID_M}m + loading R5 network (once)...")
 NEIGH = gpd.read_file(DATA / "sf_neighborhoods.geojson").to_crs("EPSG:4326")
@@ -117,7 +119,9 @@ def _itinerary():
     else:
         olat, olon = float(request.args["olat"]), float(request.args["olon"])
     dlat, dlon = float(request.args["dlat"]), float(request.args["dlon"])
-    return jsonify(fastest_itin(olat, olon, dlat, dlon) or {"error": "no route"})
+    res = fastest_itin(olat, olon, dlat, dlon) or {"error": "no route"}
+    res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
+    return jsonify(res)
 
 
 @app.route("/compute")
@@ -153,6 +157,7 @@ def _geocode():
 @app.route("/")
 def _index():
     return PAGE.replace("__CELLS__", json.dumps(CELLS_GEOJSON)) \
+               .replace("__LINES__", json.dumps(LINES)) \
                .replace("__DEFAULT__", json.dumps(DEFAULT))
 
 
@@ -192,8 +197,9 @@ PAGE = r"""<!DOCTYPE html>
 <div id="map"></div><div id="busy">computing…</div>
 <div id="panel">
   <h1>Commute to your workplace</h1>
-  <div class="sub">Type an address, <b>click the map</b>, or <b>drag the pin</b> — the map recomputes
-    walk+Muni+BART door-to-door times (~9am) from across SF.</div>
+  <div class="sub">Set your workplace (type an address, <b>click the map</b>, or <b>drag the pin</b>);
+    the map recomputes walk+Muni+BART times (~9am) from across SF. <b>Hover any area</b> for the
+    actual route behind its time.</div>
   <div class="ctl"><div class="lab">Workplace</div>
     <div class="addr"><input id="addr" placeholder="e.g. 1 Market St"><button id="go">Set</button></div>
     <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div></div>
@@ -203,6 +209,15 @@ PAGE = r"""<!DOCTYPE html>
     <input type="range" id="ideal" min="10" max="45" value="25"></div>
   <div class="ctl"><div class="lab">Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</div>
     <input type="range" id="thr" min="10" max="70" value="40"></div>
+  <div class="ctl"><div class="lab">Overlay real transit lines</div>
+    <div style="display:flex;flex-wrap:wrap;gap:11px;font-size:12.5px">
+      <label style="cursor:pointer"><input type="checkbox" data-m="bart"> <span style="color:#6f8cff">BART</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="metro"> <span style="color:#ff6b6b">Metro</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span style="color:#f6a04d">Bus</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span style="color:#5cd65c">Cable</span></label>
+    </div></div>
+  <div class="ctl" id="bd"><div class="lab">Route breakdown <span style="text-transform:none;letter-spacing:0;color:#5c6470">— hover an area</span></div>
+    <div id="bdbody" style="font-size:12.5px;color:var(--mut);line-height:1.6">Hover the map to see the trip behind a cell's time.</div></div>
   <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods</div></div>
   <div id="list"></div>
   <div class="credit">R5/r5py · Muni (511) + BART · network kept warm; only the matrix recomputes.</div>
@@ -210,8 +225,10 @@ PAGE = r"""<!DOCTYPE html>
 <div id="legend"><b id="legtitle">Realistic door-to-door (min)</b><div class="bar"></div>
   <div class="sc"></div></div>
 <script>
-const CELLS=__CELLS__, DEFAULT=__DEFAULT__;
+const CELLS=__CELLS__, LINES=__LINES__, DEFAULT=__DEFAULT__;
 let metric="r", ideal=25, thr=40, TT={}, NB={}, DESTLL=DEFAULT.slice(0,2);
+const gmaps=(olat,olon)=>`https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${DESTLL[0]},${DESTLL[1]}&travelmode=transit`;
+let bdToken=0;  // cancels stale hover-breakdown fetches
 const map=L.map("map").setView([37.762,-122.43],12.3);
 L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{maxZoom:19}).addTo(map);
 const rgb=c=>`rgb(${c[0]},${c[1]},${c[2]})`;
@@ -229,17 +246,37 @@ function legend(){const {hi,S}=ramp();
 function val(id){const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
 function style(f){const v=val(f.properties.id);if(v==null||v>thr)return{fillOpacity:0,opacity:0,weight:0};
   return{fillColor:color(v),fillOpacity:.72,weight:0};}
+function renderBreak(d){const bd=document.getElementById("bdbody");
+  if(d.error){bd.innerHTML="<span style='color:#9aa3af'>no transit route found within ~75 min</span>";return;}
+  const chain=d.legs.map(g=>g.line?`<b style="color:#5ab0ff">${g.line}</b> ${g.min}m`:`walk ${g.min}m`).join(" → ");
+  bd.innerHTML=`<b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}`+
+    `<div style="margin-top:5px">${chain}</div>`+
+    `<div style="margin-top:7px"><a href="${gmaps(d.olat,d.olon)}" target="_blank" style="color:#5ab0ff">Open in Google Maps ↗</a></div>`+
+    `<div style="color:#5c6470;margin-top:4px;font-size:11px">typical fastest trip (~8:35am)</div>`;}
+let bdTimer;
+function hoverBreak(f){const v=val(f.properties.id);if(v==null)return;
+  document.getElementById("bdbody").innerHTML=`<b>${f.properties.n||""}</b> · ${v} min<div style="color:#9aa3af;margin-top:4px">loading route…</div>`;
+  clearTimeout(bdTimer);const my=++bdToken;
+  bdTimer=setTimeout(async()=>{try{
+    const r=await fetch(`/itinerary?id=${f.properties.id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+    const d=await r.json();if(my!==bdToken)return;d.name=f.properties.n;renderBreak(d);
+  }catch(e){if(my===bdToken)document.getElementById("bdbody").innerHTML="error";}},180);}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
-  l.on("mouseover",()=>{const v=val(f.properties.id);
-    l.bindTooltip(`${f.properties.n||"—"}<br><b>${v==null?"—":v+" min"}</b><br><span style="color:#9aa3af">click for route</span>`,{className:"tt",sticky:true}).openTooltip();});
-  l.on("click",async()=>{const v=val(f.properties.id);if(v==null)return;
-    l.bindPopup("computing route…").openPopup();
-    try{const r=await fetch(`/itinerary?id=${f.properties.id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);const d=await r.json();
-      if(d.error){l.setPopupContent("no transit route found");return;}
-      const chain=d.legs.map(g=>g.line?`<b style="color:#5ab0ff">${g.line}</b> ${g.min}m`:`walk ${g.min}m`).join(" → ");
-      l.setPopupContent(`<div style="font:12.5px sans-serif;max-width:235px"><b>${f.properties.n||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}<div style="margin-top:5px;line-height:1.65">${chain}</div><div style="color:#9aa3af;margin-top:5px;font-size:11px">typical fastest trip (~8:35am)</div></div>`);
-    }catch(e){l.setPopupContent("error");}});
+  l.on("mouseover",()=>{const v=val(f.properties.id);l.setStyle({weight:1.4,color:"#fff"});
+    l.bindTooltip(`${f.properties.n||"—"} · <b>${v==null?"—":v+" min"}</b>`,{className:"tt",sticky:true}).openTooltip();
+    hoverBreak(f);});
+  l.on("mouseout",()=>layer.resetStyle(l));
+  l.on("click",()=>hoverBreak(f));
 }}).addTo(map);
+// transit-line overlays (off by default; non-interactive so cells stay hoverable)
+const LINESTYLE={bus:{color:"#f6a04d",weight:1.3,opacity:.5},metro:{color:"#ff6b6b",weight:2.4,opacity:.85},
+  cable:{color:"#5cd65c",weight:2,opacity:.8},bart:{color:"#6f8cff",weight:3,opacity:.85}};
+const overlays={};
+["bart","metro","bus","cable"].forEach(m=>{overlays[m]=L.geoJSON(
+  {type:"FeatureCollection",features:LINES.features.filter(f=>f.properties.mode===m)},
+  {style:()=>LINESTYLE[m],interactive:false});});
+document.querySelectorAll("input[data-m]").forEach(cb=>cb.onchange=()=>{
+  const m=cb.dataset.m;if(cb.checked)overlays[m].addTo(map);else map.removeLayer(overlays[m]);});
 const pin=L.marker(DEFAULT.slice(0,2),{draggable:true}).addTo(map);
 pin.on("dragend",()=>{const p=pin.getLatLng();run(p.lat,p.lng,"(dropped pin)");});
 map.on("click",e=>{pin.setLatLng(e.latlng);run(e.latlng.lat,e.latlng.lng,"(map click)");});

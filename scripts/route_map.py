@@ -21,7 +21,7 @@ from itineraries import load_routes
 ROOT = Path(__file__).resolve().parents[1]
 DATA, OUT = ROOT / "data", ROOT / "out"
 UTM = "EPSG:32610"
-GRID_M = 400
+GRID_M = 400   # granular; DetailedItineraries per cell is heavy, so this run is slow (one-time)
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
 
 
@@ -35,6 +35,39 @@ def build_grid(neigh):
     g = g[g.within(poly)].reset_index(drop=True)
     g["id"] = g.index.astype(str)
     return g.to_crs("EPSG:4326")
+
+
+def route_shapes(gtfs_paths):
+    """One representative (longest) shape per route, classified by mode, for an overlay."""
+    import zipfile, io
+    MODE = {"0": "metro", "1": "bart", "2": "bart", "5": "cable", "3": "bus"}
+    feats = []
+    for p in gtfs_paths:
+        with zipfile.ZipFile(p) as z:
+            names = z.namelist()
+            if "shapes.txt" not in names:
+                continue
+            shapes = pd.read_csv(io.BytesIO(z.read("shapes.txt")), dtype={"shape_id": str})
+            trips = pd.read_csv(io.BytesIO(z.read("trips.txt")), dtype=str).dropna(subset=["shape_id"])
+            routes = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
+            rtype = dict(zip(routes.route_id, routes.route_type))
+            rname = dict(zip(routes.route_id,
+                             routes.get("route_short_name", routes["route_id"]).fillna(routes["route_id"])))
+            cnt = shapes.groupby("shape_id").size()
+            best = {}
+            for sid, rid in zip(trips.shape_id, trips.route_id):
+                if rid not in best or cnt.get(sid, 0) > cnt.get(best[rid], 0):
+                    best[rid] = sid
+            for rid, sid in best.items():
+                pts = shapes[shapes.shape_id == sid].sort_values("shape_pt_sequence")
+                coords = pts[["shape_pt_lon", "shape_pt_lat"]].astype(float).values.tolist()
+                if len(coords) < 2:
+                    continue
+                feats.append({"type": "Feature",
+                              "geometry": {"type": "LineString", "coordinates": coords},
+                              "properties": {"mode": MODE.get(str(rtype.get(rid, "3")), "bus"),
+                                             "name": str(rname.get(rid, rid))}})
+    return {"type": "FeatureCollection", "features": feats}
 
 
 def main():
@@ -87,6 +120,8 @@ def main():
     gm = g.to_crs(UTM)
     half = GRID_M / 2
     cells = g.copy()
+    cells["olat"] = g.geometry.y.values
+    cells["olon"] = g.geometry.x.values
     cells["geometry"] = gpd.GeoSeries(
         [box(p.x-half, p.y-half, p.x+half, p.y+half) for p in gm.geometry],
         crs=UTM).to_crs("EPSG:4326").values
@@ -99,8 +134,11 @@ def main():
         feats.append({
             "type": "Feature",
             "geometry": json.loads(gpd.GeoSeries([r["geometry"]]).to_json())["features"][0]["geometry"],
-            "properties": {"t": rec["t"], "chain": rec["chain"], "prim": rec["prim"]}})
+            "properties": {"t": rec["t"], "chain": rec["chain"], "prim": rec["prim"],
+                           "olat": round(r["olat"], 5), "olon": round(r["olon"], 5)}})
     fc = {"type": "FeatureCollection", "features": feats}
+    lines = route_shapes(gtfs)
+    print(f"overlay: {len(lines['features'])} route shapes")
 
     # line frequency for legend ordering
     from collections import Counter
@@ -110,6 +148,7 @@ def main():
 
     html = TEMPLATE.replace("__DATA__", json.dumps(fc)) \
                    .replace("__ORDER__", json.dumps(order)) \
+                   .replace("__LINES__", json.dumps(lines)) \
                    .replace("__DEST__", json.dumps([DEST_LAT, DEST_LON])) \
                    .replace("__LABEL__", DEST_LABEL)
     (OUT / "route_explorer.html").write_text(html)
@@ -153,12 +192,20 @@ TEMPLATE = r"""<!DOCTYPE html>
     (the leg with the most ride time). <b>Click a cell</b> for the full route;
     <b>click a line</b> below to isolate its commute-shed. <span class="dot"></span>= __LABEL__.</div>
   <div class="bar"><button id="all">Show all</button><button id="none">Hide all</button></div>
+  <div class="ovl" style="padding:9px 16px;border-top:1px solid var(--line);font-size:12.5px;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+    <span style="color:var(--mut);width:100%;font-size:11px;text-transform:uppercase;letter-spacing:.06em">Overlay real lines</span>
+    <label style="cursor:pointer"><input type="checkbox" data-m="bart"> <span style="color:#4363d8">BART</span></label>
+    <label style="cursor:pointer"><input type="checkbox" data-m="metro"> <span style="color:#e6194B">Metro</span></label>
+    <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span style="color:#f58231">Bus</span></label>
+    <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span style="color:#3cb44b">Cable</span></label>
+  </div>
   <div id="legend"></div>
   <div class="credit">r5py / R5 · Muni (511, current) + BART · fastest single 8:35am itinerary.
     "walk only" = faster on foot than any transit.</div>
 </div>
 <script>
-const CELLS=__DATA__, ORDER=__ORDER__, DEST=__DEST__;
+const CELLS=__DATA__, ORDER=__ORDER__, LINES=__LINES__, DEST=__DEST__;
+const gmaps=(olat,olon)=>`https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${DEST[0]},${DEST[1]}&travelmode=transit`;
 const PALETTE=["#e6194B","#3cb44b","#ffe119","#4363d8","#f58231","#911eb4","#42d4f4",
  "#f032e6","#bfef45","#fabed4","#469990","#dcbeff","#9A6324","#fffac8","#800000",
  "#aaffc3","#808000","#ffd8b1","#000075","#a9a9a9"];
@@ -175,10 +222,21 @@ function style(f){const p=f.properties;
   return {fillColor:colorOf[p.prim]||"#999",fillOpacity:.74,color:"#0b0d10",weight:.3};}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
   const p=f.properties;
-  l.bindPopup(`<div class="pop"><b>${p.prim}</b> · ${p.t} min<div class="ch">${p.chain}</div></div>`);
+  l.bindPopup(`<div class="pop"><b>${p.prim}</b> · ${p.t} min<div class="ch">${p.chain}</div>`+
+    `<a href="${gmaps(p.olat,p.olon)}" target="_blank" style="color:#5ab0ff;display:inline-block;margin-top:6px">Open in Google Maps ↗</a></div>`);
   l.on("mouseover",()=>l.setStyle({weight:1.5,color:"#fff"}));
   l.on("mouseout",()=>layer.resetStyle(l));
 }}).addTo(map);
+
+// transit-line overlays (off by default; non-interactive so cell clicks pass through)
+const LINESTYLE={bus:{color:"#f58231",weight:1.4,opacity:.55},metro:{color:"#e6194B",weight:2.6,opacity:.85},
+  cable:{color:"#3cb44b",weight:2.2,opacity:.8},bart:{color:"#4363d8",weight:3.2,opacity:.85}};
+const overlays={};
+["bart","metro","bus","cable"].forEach(m=>{overlays[m]=L.geoJSON(
+  {type:"FeatureCollection",features:LINES.features.filter(f=>f.properties.mode===m)},
+  {style:()=>LINESTYLE[m],interactive:false});});
+document.querySelectorAll(".ovl input").forEach(cb=>cb.onchange=()=>{
+  const m=cb.dataset.m; if(cb.checked) overlays[m].addTo(map); else map.removeLayer(overlays[m]);});
 
 L.marker(DEST,{icon:L.divIcon({className:"",html:'<div style="width:14px;height:14px;border-radius:50%;background:#ffd23f;border:2px solid #000;box-shadow:0 0 6px #000"></div>',iconSize:[14,14]})}).addTo(map);
 

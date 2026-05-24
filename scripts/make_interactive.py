@@ -152,6 +152,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 </div>
 <script>
 const CELLS=__DATA__, NB=__NB__, DEST=__DEST__;
+const gmaps=(olat,olon)=>`https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${DEST[0]},${DEST[1]}&travelmode=transit`;
 let metric="r", scen="f", thr=35, ideal=25;
 const key=()=>metric+scen; // rf, bf, rm, bm
 
@@ -211,7 +212,9 @@ function renderList(){
   document.getElementById("list").innerHTML=rows.map(n=>{
     const v=n[k]; const c=v<=thr?color(v):"#555";
     return `<div class="nb" data-lat="${n.lat}" data-lon="${n.lon}">
-      <span><span style="color:${c}">●</span> ${n.name}</span>
+      <span><span style="color:${c}">●</span> ${n.name}
+        <a href="${gmaps(n.lat,n.lon)}" target="_blank" title="Open transit directions in Google Maps"
+           onclick="event.stopPropagation()" style="color:#5ab0ff;text-decoration:none;margin-left:4px">↗</a></span>
       <span class="t" style="color:${c}">${v}<small> min</small></span></div>`;}).join("");
   document.querySelectorAll(".nb").forEach(el=>el.onclick=()=>
     map.flyTo([+el.dataset.lat,+el.dataset.lon],14,{duration:.7}));
