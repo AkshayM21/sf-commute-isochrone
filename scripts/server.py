@@ -27,13 +27,21 @@ from route_map import route_shapes
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 UTM = "EPSG:32610"
-GRID_M = int(os.environ.get("GRID_M", "200"))   # fine grid is fine — reverse routing is sub-second
-DEP = dt.datetime(2026, 5, 20, 8, 35)
+GRID_M = int(os.environ.get("GRID_M", "200"))   # cell size (m); 200m = finest (~3000 cells).
+# Heat scales with cell COUNT (one R5 tree per cell); 200m kept per preference. Override with
+# GRID_M=250/300 for a cooler/faster exact refine (the fast /compute is sub-second at any size).
 WINDOW = dt.timedelta(minutes=int(os.environ.get("WINDOW_MIN", "30")))
 DEFAULT = (DEST_LAT, DEST_LON, DEST_LABEL)
 GTFS = [DATA / "muni_current.zip", DATA / "bart_gtfs.zip", DATA / "caltrain.zip"]
 ROUTES = load_routes(GTFS)
 LINES = route_shapes(GTFS)          # GTFS line geometries for the overlay
+# Model date: auto-pick a weekday with trips in ALL loaded feeds, so a future data repull
+# (whose feed window may not include a hardcoded date) keeps working instead of silently
+# returning no service. (#18)
+from isochrone import pick_service_date
+_SVC_DATE = pick_service_date(GTFS)
+DEP = dt.datetime(_SVC_DATE.year, _SVC_DATE.month, _SVC_DATE.day, 8, 35)
+print(f"[boot] modeling weekday {_SVC_DATE} @ 8:35am")
 
 
 def route_name(route_id, feed):
@@ -91,55 +99,90 @@ _TRANSIT_LAYER = NET._transport_network.transitLayer
 # Thread pool for the EXACT recompute. R5 routing is read-only against the shared
 # warm TransportNetwork and each task clones its own Java RegionalTask, so per-origin
 # routing parallelises safely across threads in this one JVM (same pattern r5py's own
-# DetailedItineraries uses via joblib). ~8 threads is the sweet spot on this box:
-# the Java RAPTOR releases the GIL, but Python-side result extraction does not, so the
-# real-world speedup tops out ~4.8x around the physical-core count (benchmarked).
+# DetailedItineraries uses via joblib). The Java RAPTOR releases the GIL, but Python-side
+# result extraction does not, so the real-world speedup tops out ~4.8x around the
+# physical-core count (benchmarked).
+#
+# HEAT: the exact pass drives ~700-790% CPU (an all-cores burst) -- that is the fan. To
+# leave the machine some thermal/interactive headroom we default the pool to
+# (physical cores - 2) instead of pinning every core. On this 11-core M3 Pro that is 9
+# threads; measured cost is a small wall-time increase for a noticeably cooler burst (the
+# routing is so parallel that the last couple of cores add little, and we leave them for
+# the OS / browser). Override with EXACT_THREADS=N. (See JOB 3.)
 _N_PHYS = os.cpu_count() or 8
-EXACT_THREADS = int(os.environ.get("EXACT_THREADS", str(min(8, _N_PHYS))))
+EXACT_THREADS = int(os.environ.get("EXACT_THREADS", str(max(2, _N_PHYS - 2))))
 _EXACT_POOL = ThreadPoolExecutor(max_workers=EXACT_THREADS,
                                  thread_name_prefix="r5-exact")
 
-# Serialise heavy routing jobs (/compute_exact, /attribution) against each other so a
-# single heavy request can use all cores; concurrent heavy requests would just thrash
-# the same cores and also blow up transient memory. Light /itinerary (one OD pair) and
-# the fast /compute do NOT take this lock, so hover stays responsive while a heavy
-# refine/attribution job runs. (See JOB 2.)
+# ---- Generation / cancel token (JOB 2) ------------------------------------------------
+# Each new workplace (/compute hit) bumps _GENERATION. The long all-cores jobs
+# (compute_exact, the lazy attribution prewarm) read the generation they started under and,
+# between origin chunks, bail out the moment it changes -- so rapidly retyping the address
+# does NOT stack multiple ~14-32s exact bursts or a stale full-grid prewarm on top of each
+# other. A superseded /compute_exact returns HTTP 409 (the frontend already swallows a
+# non-ok exact and keeps the fast approximation), and a superseded prewarm just stops.
+_GENERATION = 0
+_GEN_LOCK = threading.Lock()
+
+
+def _bump_generation():
+    global _GENERATION
+    with _GEN_LOCK:
+        _GENERATION += 1
+        return _GENERATION
+
+
+def _current_generation():
+    with _GEN_LOCK:
+        return _GENERATION
+
+
+class _Superseded(Exception):
+    """Raised inside a heavy job when a newer workplace has been set (cancel token)."""
+
+# Serialise heavy routing jobs (/compute_exact, the lazy /attribution full-grid build)
+# against each other so a single heavy request can use all cores; concurrent heavy requests
+# would just thrash the same cores and also blow up transient memory. Light /itinerary (one
+# OD pair) and the fast /compute do NOT take this lock, so hover stays responsive while a
+# heavy refine/attribution job runs. (See JOB 2.)
 _HEAVY_LOCK = threading.Lock()
 
-# The user-facing exact refine (/compute_exact) takes PRIORITY over the background
-# attribution prewarm: the frontend calls /compute (which kicks off the prewarm) and then
-# /compute_exact, so we must not let the ~30s prewarm grab _HEAVY_LOCK ahead of the exact
-# pass. _EXACT_PENDING counts exact jobs that are waiting-for or holding the lock; the
-# prewarm spins (briefly) until it's zero before acquiring, so exact always wins the lock.
-_EXACT_PENDING = 0
-_EXACT_PENDING_LOCK = threading.Lock()
-
-# ---- Shared per-cell itinerary + attribution prewarm cache ----------------------------
-# ONE background pass (~30s, keyed by workplace) computes the FULL exact itinerary for
-# EVERY grid cell using R5's recorded paths (the SAME forward cell->workplace journeys
-# behind compute_exact, so each itinerary's total == the cell's exact map-color value).
-# The moment a workplace is set (first /compute hit) we kick this off in a BACKGROUND
-# thread and cache it by destination:
+# ---- Shared per-cell itinerary + attribution cache ------------------------------------
+# The FULL-grid pass (~30-60s, keyed by workplace) computes the exact itinerary for EVERY
+# grid cell using R5's recorded paths (the SAME forward cell->workplace journeys behind
+# compute_exact, so each itinerary's total == the cell's exact map-color value):
 #   _ITIN_CACHE[dest_key] = {cellId: {total, xfers, legs:[...]}}
-# /itinerary then serves a cached cell instantly (~ms, no R5 call, no heavy lock), and
-# /attribution derives the "color by line" map from the SAME cache (the dominant line of
-# each cached itinerary). Both endpoints share this one prewarm -- no double work.
-_ITIN_CACHE = {}                 # dest_key -> {cellId: itinerary dict}
-_ITIN_INFLIGHT = {}             # dest_key -> threading.Event (compute in progress)
+#
+# HEAT (JOB 1): this all-cores pass is the single biggest CPU cost of an address-set
+# (~200 CPU-sec @ GRID_M=300, ~65-80% of the total), and in the common flow -- set address,
+# look at the time map, hover a few cells -- it is PURE SPECULATION: nothing needs the full
+# grid unless the user toggles "Color by -> Primary line". So we NO LONGER auto-run it from
+# /compute. It is built LAZILY, on the first /attribution request, with the existing
+# in-flight de-dup so concurrent callers share one pass. Hover (/itinerary) does NOT need
+# it: a cache miss computes a SINGLE cell on demand (~100ms via fastest_itin) and caches it
+# in _CELL_CACHE, so the common flow computes only the cells actually hovered, not all 3000.
+# /attribution still derives "color by line" from this same full-grid pass.
+_ITIN_CACHE = {}                 # dest_key -> {cellId: itinerary dict}  (full-grid build)
+_ITIN_INFLIGHT = {}             # dest_key -> threading.Event (full-grid build in progress)
 _ITIN_CACHE_LOCK = threading.Lock()
-_PREWARM_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prewarm")
+# Per-cell on-demand cache for hover: dest_key -> {cellId: itinerary dict}. Populated one
+# cell at a time by /itinerary cache misses (and read by /attribution if it ever wants a
+# single cell). Kept separate from the full-grid cache so a later full prewarm can simply
+# replace the dest's dict wholesale without losing hovered cells.
+_CELL_CACHE = {}
+_CELL_CACHE_LOCK = threading.Lock()
 
 
 def _dest_key(lat, lon):
     return (round(float(lat), 5), round(float(lon), 5))
 
 
-def _itineraries_cached(dlat, dlon, background=False):
+def _itineraries_cached(dlat, dlon):
     """Return the full per-cell itinerary map for (dlat,dlon) -> {cellId: itin dict},
-    using/populating the shared prewarm cache. If another thread is already computing this
-    destination, wait for it instead of recomputing. When ``background`` (the prewarm),
-    yield to any pending /compute_exact before grabbing the heavy lock so the user-facing
-    time refine always goes first."""
+    building it LAZILY (JOB 1: only on demand from /attribution, never auto from /compute)
+    and caching the result. If another thread is already building this destination, wait for
+    its result instead of recomputing (in-flight de-dup). The build itself takes _HEAVY_LOCK
+    so it serialises against /compute_exact and the two all-cores jobs don't thrash cores."""
     key = _dest_key(dlat, dlon)
     with _ITIN_CACHE_LOCK:
         if key in _ITIN_CACHE:
@@ -151,27 +194,18 @@ def _itineraries_cached(dlat, dlon, background=False):
             owner = True
         else:
             owner = False
-    if not owner:                # someone else is computing it; wait for their result
+    if not owner:                # someone else is building it; wait for their result
         event.wait()
         return _ITIN_CACHE.get(key, {})
+    gen = _current_generation()  # cancel token: bail if a newer workplace is set mid-build
     try:
-        if background:
-            # The frontend sends /compute -> (prewarm fires) -> /compute_exact almost
-            # immediately. Give that exact request a moment to register as pending, then
-            # always yield to any pending/active exact before grabbing the heavy lock, so
-            # the user-facing time refine finishes first and the prewarm fills in after.
-            time.sleep(2.0)
-            while True:
-                with _EXACT_PENDING_LOCK:
-                    clear = _EXACT_PENDING == 0
-                if clear:
-                    break
-                time.sleep(0.1)
         with _HEAVY_LOCK:        # serialise vs /compute_exact so cores aren't thrashed
-            itins = prewarm_itineraries(dlat, dlon)
+            itins = prewarm_itineraries(dlat, dlon, gen)
         with _ITIN_CACHE_LOCK:
             _ITIN_CACHE[key] = itins
         return itins
+    except _Superseded:
+        return {}                # newer workplace set; abandon this stale full-grid build
     finally:
         with _ITIN_CACHE_LOCK:
             _ITIN_INFLIGHT.pop(key, None)
@@ -187,21 +221,11 @@ def _dominant_line(itin):
     return max(rides, key=lambda l: l["min"])["line"]
 
 
-def _attribution_from_cache(dlat, dlon, background=False):
-    """Derive {cellId: dominantLine} from the shared per-cell itinerary cache (building it
-    if needed). Same answer the old standalone attribution() gave, from one shared pass."""
+def _attribution_from_cache(dlat, dlon):
+    """Derive {cellId: dominantLine} from the shared per-cell itinerary cache (building the
+    full grid LAZILY if needed). Same answer the old standalone attribution() gave."""
     return {cid: _dominant_line(it) for cid, it in
-            _itineraries_cached(dlat, dlon, background).items()}
-
-
-def _prewarm_itineraries(dlat, dlon):
-    """Fire-and-forget: compute+cache the full per-cell itineraries for a just-set
-    workplace, in the background, unless already cached or in flight."""
-    key = _dest_key(dlat, dlon)
-    with _ITIN_CACHE_LOCK:
-        if key in _ITIN_CACHE or key in _ITIN_INFLIGHT:
-            return
-    _PREWARM_POOL.submit(_itineraries_cached, dlat, dlon, True)
+            _itineraries_cached(dlat, dlon).items()}
 
 
 app = Flask(__name__)
@@ -238,7 +262,7 @@ def compute(lat, lon):
     return cells
 
 
-def compute_exact(lat, lon):
+def compute_exact(lat, lon, gen):
     """EXACT (forward) door-to-door: route every grid cell -> workplace. This is the
     slow, accurate direction (one R5 routing tree per origin).
 
@@ -254,7 +278,12 @@ def compute_exact(lat, lon):
     [5=best, 50=realistic] percentiles untouched, since shrinking the window saves only
     ~3s but costs ~2 min MAE and drops reachable cells. Measured: ~66s -> ~14s (~4.7x).
 
-    Returns the same shape as before: {id: [best, real]}."""
+    Returns the same shape as before: {id: [best, real]}.
+
+    CANCELLATION (JOB 2): ``gen`` is the generation this job started under. We submit the
+    origins to the pool in waves and, between waves, bail (raise _Superseded) if a newer
+    workplace has been set -- so retyping the address fast doesn't stack multiple all-cores
+    exact bursts; the superseded one stops queueing further origins almost immediately."""
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(lon, lat)], crs="EPSG:4326")
 
     # Build the routing template once (sets destination point set + linkage cache, in
@@ -277,24 +306,44 @@ def compute_exact(lat, lon):
                                None if rl == MAX_INT32 else rl]
 
     cells = {}
-    for cid, pair in _EXACT_POOL.map(_one, range(len(_EXACT_IDS)), chunksize=8):
+    for cid, pair in _map_cancelable(_one, range(len(_EXACT_IDS)), gen):
         cells[cid] = pair
     return cells
 
 
+# Wave size for the cancelable pool map: how many origins we queue at once before we re-check
+# the cancel token. Big enough that the pool stays saturated (all EXACT_THREADS busy), small
+# enough that a superseded job stops within a fraction of a second.
+_CANCEL_WAVE = 64
+
+
+def _map_cancelable(fn, indices, gen):
+    """Like _EXACT_POOL.map(fn, indices) but submitted in waves; between waves, if the global
+    generation has moved past ``gen`` (a newer workplace was set), raise _Superseded so the
+    stale all-cores job stops queueing/collecting more work. Yields fn(i) results in order
+    within each wave. (See JOB 2 cancellation.)"""
+    indices = list(indices)
+    for start in range(0, len(indices), _CANCEL_WAVE):
+        if _current_generation() != gen:
+            raise _Superseded()
+        wave = indices[start:start + _CANCEL_WAVE]
+        for res in _EXACT_POOL.map(fn, wave, chunksize=8):
+            yield res
+
+
 @app.route("/compute_exact")
 def _compute_exact():
-    global _EXACT_PENDING
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
     t0 = dt.datetime.now()
-    with _EXACT_PENDING_LOCK:             # mark exact as pending so the prewarm yields
-        _EXACT_PENDING += 1
+    gen = _current_generation()           # cancel token: abort if a newer workplace is set
     try:
         with _HEAVY_LOCK:                  # one heavy job at a time; hover stays free
-            cells = compute_exact(lat, lon)
-    finally:
-        with _EXACT_PENDING_LOCK:
-            _EXACT_PENDING -= 1
+            cells = compute_exact(lat, lon, gen)
+    except _Superseded:
+        # A newer workplace was set while this exact pass was queued/running. The frontend
+        # treats a non-ok exact as "keep the fast approximation", so 409 is safe + cheap.
+        print(f"[exact] ({lat:.4f},{lon:.4f}) superseded -> 409")
+        return jsonify({"error": "superseded"}), 409
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[exact] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
@@ -408,16 +457,18 @@ def _build_itin(p50, itin_map, route_name_fn):
     return {"total": round(total), "xfers": max(0, rides_kept - 1), "legs": legs}
 
 
-def prewarm_itineraries(dlat, dlon):
+def prewarm_itineraries(dlat, dlon, gen):
     """Full exact itinerary for EVERY grid cell -> workplace, via R5 recorded paths.
 
     This is the per-cell breakdown analogue of compute_exact / attribution: route every
     cell -> workplace ONCE with includePathResults, and for each cell build the full
     door-to-door breakdown ({total, xfers, legs}) with _build_itin. Because these are the
     same forward (cell->workplace) journeys behind compute_exact, every itinerary's total
-    equals that cell's exact map-color value. Runs ~30s on the shared thread pool (in the
-    background prewarm); /itinerary then serves a cell from this cache instantly, and
-    /attribution derives the dominant line per cell from it. Returns {cellId: itin dict}."""
+    equals that cell's exact map-color value. Runs ~30-60s on the shared thread pool, built
+    LAZILY on the first /attribution request (JOB 1); /attribution then derives the dominant
+    line per cell from it, and any hovered cell that hasn't been cached one-at-a-time gets
+    served from it too. ``gen`` is the cancel token (JOB 2): if a newer workplace is set
+    mid-build the wave loop raises _Superseded. Returns {cellId: itin dict}."""
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs="EPSG:4326")
     template = RegionalTask(
         NET, origin=None, destinations=dest,
@@ -443,7 +494,7 @@ def prewarm_itineraries(dlat, dlon):
         return _EXACT_IDS[i], _build_itin(p50, itin_map, _path_route_name)
 
     itins = {}
-    for cid, itin in _EXACT_POOL.map(_one, range(len(_EXACT_IDS)), chunksize=8):
+    for cid, itin in _map_cancelable(_one, range(len(_EXACT_IDS)), gen):
         if itin is not None:
             itins[cid] = itin
     return itins
@@ -489,17 +540,29 @@ def _itinerary():
     else:
         olat, olon = float(request.args["olat"]), float(request.args["olon"])
     dlat, dlon = float(request.args["dlat"]), float(request.args["dlon"])
+    dkey = _dest_key(dlat, dlon)
     res = None
-    # FAST PATH: serve the prewarmed per-cell cache (a plain dict lookup; no R5 call, no
-    # heavy lock) so hover/click is ~instant once the workplace's prewarm has run.
+    # FAST PATH 1: serve the full-grid cache if the user has already triggered color-by-line
+    # (a plain dict lookup; no R5 call, no heavy lock).
     if cid is not None:
         with _ITIN_CACHE_LOCK:
-            cached = _ITIN_CACHE.get(_dest_key(dlat, dlon))
-        if cached is not None and cid in cached:
-            res = cached[cid]
-    # FALLBACK: cache miss (off-grid point, or prewarm not finished) -> compute on demand.
+            full = _ITIN_CACHE.get(dkey)
+        if full is not None and cid in full:
+            res = full[cid]
+    # FAST PATH 2: serve the per-cell on-demand cache -- the cell was hovered before, so its
+    # single-cell itinerary is already cached (JOB 1: no full-grid prewarm needed for hover).
+    if res is None and cid is not None:
+        with _CELL_CACHE_LOCK:
+            res = (_CELL_CACHE.get(dkey) or {}).get(cid)
+    # FALLBACK: first touch of this cell (or an off-grid point) -> compute ONE cell on demand
+    # (~100ms via the recorded-path router, identical to what the full grid would cache) and
+    # cache it so the next hover of the same cell is instant. Common flow (set address -> see
+    # colors -> hover a few cells) thus computes only the cells actually hovered, not all 3000.
     if res is None:
         res = fastest_itin(olat, olon, dlat, dlon) or {"error": "no route"}
+        if cid is not None and "error" not in res:
+            with _CELL_CACHE_LOCK:
+                _CELL_CACHE.setdefault(dkey, {})[cid] = res
     res = dict(res)                       # don't mutate the cached object with olat/olon
     res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
     return jsonify(res)
@@ -507,8 +570,10 @@ def _itinerary():
 
 @app.route("/attribution")
 def _attribution():
-    """The "color by line" map: dominant transit line per cell, DERIVED from the shared
-    per-cell itinerary prewarm cache (one pass feeds both /itinerary and /attribution)."""
+    """The "color by line" map: dominant transit line per cell. This is the ONLY trigger for
+    the full-grid itinerary build (JOB 1: built lazily here, on the user's first toggle of
+    "Color by -> Primary line", instead of speculatively from every /compute). The build is
+    cached + in-flight de-duped, so /itinerary also benefits once it has run."""
     dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
     t0 = dt.datetime.now()
     with _ITIN_CACHE_LOCK:
@@ -523,14 +588,18 @@ def _attribution():
 @app.route("/compute")
 def _compute():
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
+    # A new workplace was just set -> bump the generation so any in-flight exact pass or
+    # full-grid itinerary build for a PREVIOUS address cancels itself between waves (JOB 2),
+    # instead of stacking another ~14-32s all-cores burst on top of this one.
+    gen = _bump_generation()
     t0 = dt.datetime.now()
     cells = compute(lat, lon)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[compute] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
-    # The address was just set -> start the (~30s) per-cell itinerary prewarm in the
-    # background now, so /itinerary (hover/click breakdown) is an instant cache hit and the
-    # "Primary line" attribution is ready too -- both from this one pass. No FE change.
-    _prewarm_itineraries(lat, lon)
+    print(f"[compute] ({lat:.4f},{lon:.4f}) {ms:.0f}ms gen={gen}")
+    # JOB 1: we DELIBERATELY no longer kick off the ~30-60s full-grid itinerary prewarm here.
+    # It was pure speculation (~65-80% of an address-set's CPU) that the common flow never
+    # used. Hover (/itinerary) now computes one cell on demand; the full grid is built lazily
+    # only when the user toggles "Color by -> Primary line" (/attribution). No FE change.
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -643,7 +712,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="sc"></div></div>
 <script>
 const CELLS=__CELLS__, LINES=__LINES__, DEFAULT=__DEFAULT__;
-let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={};
+let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
 const gmaps=(olat,olon)=>`https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${DESTLL[0]},${DESTLL[1]}&travelmode=transit`;
 let bdToken=0;  // cancels stale hover-breakdown fetches
 const map=L.map("map",{preferCanvas:true}).setView([37.762,-122.43],12.3);  // canvas: 3k polygons stay light on CPU
@@ -728,30 +797,35 @@ function aggregate(){const acc={};CELLS.features.forEach(f=>{const v=val(f.prope
   for(const n in acc){acc[n].sort((a,b)=>a-b);NB[n]=acc[n][Math.floor(acc[n].length/2)];}}
 function busy(t){const b=document.getElementById("busy");if(t){b.textContent=t;b.style.display="block";}else b.style.display="none";}
 async function setWorkplace(lat,lon,label){
+  const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   document.getElementById("prompt").style.display="none";
   DESTLL=[lat,lon];ATTR={};LINECOLOR={};
   if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
   map.setView([lat,lon],12.6);
+  try{localStorage.setItem("wp",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
   busy("estimating…");
   try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}`);const d=await r.json();
+    if(myGen!==GEN)return;                            // a newer address took over → drop this
     TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
-    try{localStorage.setItem("wp",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
     aggregate();redraw();
-  }catch(e){busy(false);alert("compute failed: "+e);return;}
-  busy("refining (exact)…");                       // pipeline: exact pass refines the approximation
+  }catch(e){if(myGen===GEN){busy(false);alert("compute failed: "+e);}return;}
+  busy("refining (exact)…");                          // pipeline: exact pass refines the approximation
   try{const r2=await fetch(`/compute_exact?lat=${lat}&lon=${lon}`);
-    if(r2.ok){const d2=await r2.json();TT=d2.cells;
+    if(myGen!==GEN)return;
+    if(r2.ok){const d2=await r2.json();if(myGen!==GEN)return;TT=d2.cells;
       document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
       aggregate();redraw();}
   }catch(e){/* keep the fast approximation if exact isn't available */}
+  if(myGen!==GEN)return;
   busy(false);
   if(cmode=="line")loadAttribution();
 }
-async function loadAttribution(){if(!DESTLL)return;busy("mapping lines…");
+async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping lines…");
   try{const r=await fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
-    if(r.ok){ATTR=await r.json();buildLineColors();redraw();}
+    if(myGen!==GEN)return;
+    if(r.ok){const a=await r.json();if(myGen!==GEN)return;ATTR=a;buildLineColors();redraw();}
     else{document.getElementById("legtitle").textContent="line map unavailable yet";}
-  }catch(e){}finally{busy(false);}}
+  }catch(e){}finally{if(myGen===GEN)busy(false);}}
 function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onclick=()=>{
   document.querySelectorAll(`#${id} button`).forEach(x=>x.classList.remove("on"));b.classList.add("on");set(b.dataset.v);aggregate();redraw();});}
 seg("metric",v=>metric=v);
@@ -761,7 +835,7 @@ document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getEleme
 document.getElementById("go").onclick=async()=>{const q=document.getElementById("addr").value;
   if(!q)return;busy("finding address…");
   try{const r=await fetch(`/geocode?q=${encodeURIComponent(q)}`);const d=await r.json();
-    if(d.lat){busy(false);setWorkplace(d.lat,d.lon,d.label.split(",").slice(0,2).join(","));}
+    if(d.lat){busy(false);setWorkplace(d.lat,d.lon,q);}   // keep the user's typed string verbatim
     else{busy(false);alert("address not found");}}catch(e){busy(false);alert(e);}};
 document.getElementById("addr").addEventListener("keydown",e=>{if(e.key=="Enter")document.getElementById("go").click();});
 legend();   // draw the legend; map stays blank until you set an address
