@@ -131,6 +131,8 @@
     <div class="seg" id="metric"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
   <div class="ctl"><div class="lab">Color by</div>
     <div class="seg" id="cmode"><button data-v="time" class="on">Time</button><button data-v="line">Primary line</button></div></div>
+  <div class="ctl"><div class="lab">Max transfers</div>
+    <div class="seg" id="maxrides"><button data-v="0">0</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="any" class="on">Any</button></div></div>
   <div class="ctl"><div class="lab">Sweet spot — green ≤ <span class="val" id="idval">25</span> min (recolors)</div>
     <input type="range" id="ideal" min="10" max="45" value="25"></div>
   <div class="ctl"><div class="lab">Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</div>
@@ -164,6 +166,12 @@
 /*__VIZ__*/
 const CELLS=__CELLS__, LINES=__LINES__;
 let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
+let maxxfers="any";   // "0"/"1"/"2" transfers, or "any" (the R5 default 8-ride cap)
+// UI transfers -> R5 ride cap (rides = transfers + 1). "any" stays unset so the URL and
+// thus the server result are byte-identical to the no-maxrides baseline.
+function ridesParam(){
+  if(maxxfers==="any")return "";
+  const n=+maxxfers;return Number.isFinite(n)?`&maxrides=${n+1}`:"";}
 let CURLABEL="";                                  // current workplace label (for permalink + dest line)
 const TOUCH = ("ontouchstart" in window) || (navigator.maxTouchPoints>0) || window.matchMedia("(max-width:719px)").matches;
 let SCALE=ramp(ideal).S;                          // current time->color scale (recomputed in redraw)
@@ -215,7 +223,7 @@ function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){set
   setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
   bdTimer=setTimeout(async()=>{try{
-    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}`);
     const d=await r.json();if(my!==bdToken)return;if(!d.error)BDCACHE[id]=d;d.name=f.properties.n;setHTML(bdHTML(d));
   }catch(e){if(my===bdToken)setHTML("error");}},150);}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
@@ -264,7 +272,7 @@ async function setWorkplace(lat,lon,label){
   map.setView([lat,lon],12.6);
   try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
   busy("estimating…");
-  try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}`);const d=await r.json();
+  try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}`);const d=await r.json();
     if(myGen!==GEN)return;                            // a newer address took over → drop this
     TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
     aggregate();redraw();
@@ -285,7 +293,7 @@ async function setWorkplace(lat,lon,label){
 async function refine(){
   if(!DESTLL)return;const myGen=GEN;const [lat,lon]=DESTLL;const label=CURLABEL;
   const btn=document.getElementById("refine");btn.disabled=true;busy("refining (exact)…");
-  const doFetch=()=>fetch(`/compute_exact?lat=${lat}&lon=${lon}`);
+  const doFetch=()=>fetch(`/compute_exact?lat=${lat}&lon=${lon}${ridesParam()}`);
   try{
     let r=await doFetch();
     if(myGen!==GEN)return;
@@ -304,7 +312,7 @@ async function refine(){
   finally{if(myGen===GEN){busy(false);btn.disabled=false;}}
 }
 async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping lines…");
-  const doFetch=()=>fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+  const doFetch=()=>fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}`);
   try{let r=await doFetch();
     if(myGen!==GEN)return;
     if(r.status===503){                               // busy — retry once after Retry-After
@@ -329,6 +337,18 @@ function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onc
 function setSeg(id,v){document.querySelectorAll(`#${id} button`).forEach(b=>b.classList.toggle("on",b.dataset.v===v));}
 seg("metric",v=>metric=v);
 seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
+// Max transfers is NOT a client-only restyle: a new cap changes the colored TIMES, so it
+// must re-run the map (re-/compute + auto-refine) and invalidate the stale breakdowns. We
+// don't use seg() here (which only aggregate/redraw/syncHash). Always syncHash so the cap is
+// in the permalink even with no workplace yet.
+document.querySelectorAll("#maxrides button").forEach(b=>b.onclick=()=>{
+  if(b.dataset.v===maxxfers)return;                       // no-op if unchanged
+  document.querySelectorAll("#maxrides button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on");maxxfers=b.dataset.v;
+  BDCACHE={};                                             // breakdowns were for the old cap
+  syncHash();
+  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL);   // recompute + auto-refine the map
+});
 document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();syncHash();};
 document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();syncHash();};
 async function geocodeSet(q){if(!q)return;busy("finding address…");closeAC();
@@ -399,13 +419,13 @@ const panelEl=document.getElementById("panel");
 document.getElementById("sheetbtn").onclick=()=>panelEl.classList.toggle("open");
 
 /* ============ Feature 4: shareable permalink (URL hash) ============ */
-// Format: #wp=<lat>,<lon>,<encodedLabel>&ideal=<n>&thr=<n>&metric=<r|b>&cmode=<time|line>
+// Format: #wp=<lat>,<lon>,<encodedLabel>&ideal=<n>&thr=<n>&metric=<r|b>&cmode=<time|line>&mt=<0|1|2|any>
 let hashTimer,applyingHash=false;
 function syncHash(){if(applyingHash)return;clearTimeout(hashTimer);
   hashTimer=setTimeout(()=>{
     const parts=[];
     if(DESTLL)parts.push(`wp=${DESTLL[0].toFixed(6)},${DESTLL[1].toFixed(6)},${encodeURIComponent(CURLABEL)}`);
-    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`);
+    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`,`mt=${maxxfers}`);
     const h="#"+parts.join("&");
     if(("#"+location.hash.replace(/^#/,""))!==h){history.replaceState(null,"",h);}
   },300);}
@@ -420,6 +440,7 @@ function applyHash(o){applyingHash=true;
     document.getElementById("thr").value=thr;document.getElementById("thrval").textContent=thr;}
   if(o.metric==="r"||o.metric==="b"){metric=o.metric;setSeg("metric",metric);}
   if(o.cmode==="time"||o.cmode==="line"){cmode=o.cmode;setSeg("cmode",cmode);}
+  if(["0","1","2","any"].includes(o.mt)){maxxfers=o.mt;setSeg("maxrides",maxxfers);}
   applyingHash=false;
   if(o.wp){const wseg=o.wp.split(",");const lat=+wseg[0],lon=+wseg[1];
     const label=decodeURIComponent(wseg.slice(2).join(","));

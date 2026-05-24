@@ -35,7 +35,7 @@ if _r5_mem and "--max-memory" not in sys.argv and "-m" not in sys.argv:
     sys.argv += ["--max-memory", _r5_mem]
 
 from core import config, feeds, grid, network, geo
-from core.network import MAX_INT32
+from core.network import MAX_INT32, DEFAULT_MAX_RIDES
 import com.conveyal.r5            # JVM already started by core.network's r5py import
 
 config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the geocoder
@@ -138,8 +138,14 @@ _CELL_CACHE_LOCK = threading.Lock()
 _LAST_DEST_KEY = None            # workplace of the last /compute; a CHANGE clears the caches above
 
 
-def _dest_key(lat, lon):
-    return (round(float(lat), 5), round(float(lon), 5))
+def _dest_key(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+    """Per-workplace cache key for the breakdown caches (_ITIN_CACHE/_CELL_CACHE/
+    _ITIN_INFLIGHT) and the _LAST_DEST_KEY change-detector. A capped result is a DIFFERENT
+    journey than the uncapped one, so the cap is part of the key — otherwise a maxrides=1
+    breakdown would poison the uncapped cell (and vice-versa). At the R5 default the key is
+    the same 2-tuple as before, so the baseline (and existing key callers) is unchanged."""
+    base = (round(float(lat), 5), round(float(lon), 5))
+    return base if max_rides == DEFAULT_MAX_RIDES else base + (int(max_rides),)
 
 
 def _reset_caches():
@@ -157,7 +163,7 @@ class _Busy(Exception):
     /attribution route turns this into a 503 instead of blocking behind the running job."""
 
 
-def _itineraries_cached(dlat, dlon, *, nonblock=False):
+def _itineraries_cached(dlat, dlon, *, nonblock=False, max_rides=DEFAULT_MAX_RIDES):
     """Full per-cell itinerary map for (dlat,dlon) -> {cellId: itin dict}, built LAZILY (only
     on demand from /attribution) and cached. If another thread is already building this
     destination, wait for its result (in-flight de-dup). The build takes _HEAVY_LOCK so it
@@ -166,8 +172,9 @@ def _itineraries_cached(dlat, dlon, *, nonblock=False):
     With ``nonblock=True``: if THIS call is the one that would do the build and _HEAVY_LOCK is
     already held by another heavy job, raise _Busy (-> 503) instead of blocking. A call that
     is merely WAITING on another thread's in-flight build still waits (it isn't the one doing
-    the work). A cache hit never blocks regardless."""
-    key = _dest_key(dlat, dlon)
+    the work). A cache hit never blocks regardless. ``max_rides`` is part of the cache key so
+    a capped build can't be served for an uncapped request."""
+    key = _dest_key(dlat, dlon, max_rides)
     with _ITIN_CACHE_LOCK:
         if key in _ITIN_CACHE:
             return _ITIN_CACHE[key]
@@ -190,7 +197,7 @@ def _itineraries_cached(dlat, dlon, *, nonblock=False):
         else:
             _HEAVY_LOCK.acquire()
         locked = True
-        itins = prewarm_itineraries(dlat, dlon, gen)
+        itins = prewarm_itineraries(dlat, dlon, gen, max_rides)
         if itins:                    # never cache an empty result (a superseded/partial build
             with _ITIN_CACHE_LOCK:   # would otherwise poison this workplace until the next /compute)
                 _ITIN_CACHE[key] = itins
@@ -214,11 +221,12 @@ def _dominant_line(itin):
     return max(rides, key=lambda l: l["min"])["line"]
 
 
-def _attribution_from_cache(dlat, dlon, *, nonblock=False):
+def _attribution_from_cache(dlat, dlon, *, nonblock=False, max_rides=DEFAULT_MAX_RIDES):
     """{cellId: dominantLine} derived from the shared per-cell itinerary cache (building the
     full grid lazily if needed). ``nonblock`` propagates the non-blocking heavy-lock policy
-    (raise _Busy -> 503 instead of queueing behind a running heavy job)."""
-    itins = _itineraries_cached(dlat, dlon, nonblock=nonblock)
+    (raise _Busy -> 503 instead of queueing behind a running heavy job). ``max_rides`` keys
+    the underlying itinerary cache."""
+    itins = _itineraries_cached(dlat, dlon, nonblock=nonblock, max_rides=max_rides)
     return {cid: _dominant_line(it) for cid, it in itins.items()}
 
 
@@ -235,9 +243,28 @@ _ATTR_RESULT_CACHE = OrderedDict()        # coarse_key -> {cellId: dominantLine}
 _RESULT_CACHE_LOCK = threading.Lock()
 
 
-def _coarse_key(lat, lon):
-    """~110m bucket for the heavy-result cache."""
-    return (round(float(lat), 3), round(float(lon), 3))
+def _coarse_key(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+    """~110m bucket for the heavy-result cache (_EXACT_RESULT_CACHE/_ATTR_RESULT_CACHE).
+    Like _dest_key, the transfer cap is part of the key so a capped result can't be served
+    for an uncapped request. At the R5 default the key is the same 2-tuple as before, so the
+    baseline cache behavior (and existing callers) is unchanged."""
+    base = (round(float(lat), 3), round(float(lon), 3))
+    return base if max_rides == DEFAULT_MAX_RIDES else base + (int(max_rides),)
+
+
+def _req_max_rides():
+    """Parse the ``maxrides`` query param into an R5 ride cap. Absent/blank/invalid ->
+    DEFAULT_MAX_RIDES (today's behavior). The frontend sends rides directly (transfers+1):
+    0 transfers -> 1, 1 -> 2, 2 -> 3, "Any" -> 8. We clamp to [1, DEFAULT_MAX_RIDES] so a
+    bogus value can't disable transit (rides must be >= 1) or exceed the model default."""
+    raw = request.args.get("maxrides")
+    if raw is None or not str(raw).strip():
+        return DEFAULT_MAX_RIDES
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_RIDES
+    return max(1, min(DEFAULT_MAX_RIDES, v))
 
 
 def _result_cache_get(store, key):
@@ -276,7 +303,7 @@ limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
 
 
 # ---- Map TIME: fast reverse approximation + exact forward refine ----------------------
-def compute(lat, lon):
+def compute(lat, lon, max_rides=DEFAULT_MAX_RIDES):
     """Door-to-door times from every grid cell TO (lat, lon), as {id: [best, real]}.
 
     FAST APPROXIMATION (reverse one-to-many): R5 is dramatically faster computing one routing
@@ -286,7 +313,8 @@ def compute(lat, lon):
     symmetric, so this has a small error (measured MAE ~2 min vs the exact method); the exact
     forward pass below refines it, and scripts/isochrone.py is the offline reference."""
     origin = gpd.GeoDataFrame({"id": ["w"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    ttm = pd.DataFrame(network.travel_time_matrix(NET, origin, SNAPPED_GRID, DEP))
+    ttm = pd.DataFrame(network.travel_time_matrix(NET, origin, SNAPPED_GRID, DEP,
+                                                  max_rides=max_rides))
     cells = {}
     for _, r in ttm.iterrows():
         b, rl = r["travel_time_p5"], r["travel_time_p50"]
@@ -295,14 +323,14 @@ def compute(lat, lon):
     return cells
 
 
-def compute_exact(lat, lon, gen):
+def compute_exact(lat, lon, gen, max_rides=DEFAULT_MAX_RIDES):
     """EXACT (forward) door-to-door: route every grid cell -> workplace (one tree per origin),
     the slow accurate direction. r5py's TravelTimeMatrix runs these trees serially; here we
     drive R5's TravelTimeComputer directly from the thread pool (each thread clones the Java
     RegionalTask), which is bit-exact to the serial matrix but ~4.7x faster. ``gen`` is the
     cancel token (see _map_cancelable). Returns {id: [best, real]}."""
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    template = network.routing_template(NET, dest, DEP)
+    template = network.routing_template(NET, dest, DEP, max_rides=max_rides)
 
     def _one(i):
         req = copy.copy(template)        # clones the underlying Java RegionalTask
@@ -339,20 +367,22 @@ def _map_cancelable(fn, indices, gen):
 def _compute():
     global _LAST_DEST_KEY
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
-    key = _dest_key(lat, lon)
+    max_rides = _req_max_rides()
+    key = _dest_key(lat, lon, max_rides)
     if key != _LAST_DEST_KEY:
-        # Genuinely new workplace: bump the generation (cancels any in-flight exact/attribution
-        # job for the PREVIOUS address between waves) and drop its breakdown caches. Re-submitting
-        # the same address (e.g. the localStorage auto-restore on refresh) keeps the caches.
+        # Genuinely new workplace (or a changed transfer cap — different colored times, so
+        # treat it as new): bump the generation (cancels any in-flight exact/attribution job
+        # for the PREVIOUS key between waves) and drop its breakdown caches. Re-submitting the
+        # same address + cap (e.g. the localStorage auto-restore on refresh) keeps the caches.
         _LAST_DEST_KEY = key
         gen = _bump_generation()
         _reset_caches()
     else:
         gen = _current_generation()
     t0 = dt.datetime.now()
-    cells = compute(lat, lon)
+    cells = compute(lat, lon, max_rides)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[compute] ({lat:.4f},{lon:.4f}) {ms:.0f}ms gen={gen}")
+    print(f"[compute] ({lat:.4f},{lon:.4f}) rides={max_rides} {ms:.0f}ms gen={gen}")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -360,12 +390,13 @@ def _compute():
 @limiter.limit("12/minute")
 def _compute_exact():
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
-    ckey = _coarse_key(lat, lon)
+    max_rides = _req_max_rides()
+    ckey = _coarse_key(lat, lon, max_rides)
     # CACHE HIT (~110m): return the same result instantly — no R5 work, no lock, and the
     # generation/supersede dance is irrelevant since there's nothing to cancel.
     cached = _result_cache_get(_EXACT_RESULT_CACHE, ckey)
     if cached is not None:
-        print(f"[exact] ({lat:.4f},{lon:.4f}) cached -> {len(cached)} cells")
+        print(f"[exact] ({lat:.4f},{lon:.4f}) rides={max_rides} cached -> {len(cached)} cells")
         return jsonify({"dest": [lat, lon], "cells": cached, "ms": 0})
     t0 = dt.datetime.now()
     gen = _current_generation()           # cancel token: abort if a newer workplace is set
@@ -375,7 +406,7 @@ def _compute_exact():
         print(f"[exact] ({lat:.4f},{lon:.4f}) busy -> 503")
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
     try:
-        cells = compute_exact(lat, lon, gen)   # one heavy job at a time; hover stays free
+        cells = compute_exact(lat, lon, gen, max_rides)   # one heavy job at a time; hover stays free
     except _Superseded:
         print(f"[exact] ({lat:.4f},{lon:.4f}) superseded -> 409")
         return jsonify({"error": "superseded"}), 409
@@ -383,7 +414,7 @@ def _compute_exact():
         _HEAVY_LOCK.release()
     _result_cache_put(_EXACT_RESULT_CACHE, ckey, cells)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[exact] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
+    print(f"[exact] ({lat:.4f},{lon:.4f}) rides={max_rides} {ms:.0f}ms")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -525,13 +556,13 @@ def _recorded_itin(req):
     return _build_itin(p50, itin_map, _path_route_name)
 
 
-def prewarm_itineraries(dlat, dlon, gen):
+def prewarm_itineraries(dlat, dlon, gen, max_rides=DEFAULT_MAX_RIDES):
     """Full exact itinerary for EVERY grid cell -> workplace via R5 recorded paths. These are
     the same forward journeys behind compute_exact, so each itinerary's total equals that
     cell's exact map color. Built lazily on the first /attribution request; ``gen`` is the
     cancel token. Returns {cellId: itin dict}."""
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs=config.WGS)
-    template = network.routing_template(NET, dest, DEP, paths=True)
+    template = network.routing_template(NET, dest, DEP, paths=True, max_rides=max_rides)
 
     def _one(i):
         req = copy.copy(template)
@@ -545,14 +576,15 @@ def prewarm_itineraries(dlat, dlon, gen):
     return itins
 
 
-def fastest_itin(olat, olon, dlat, dlon):
+def fastest_itin(olat, olon, dlat, dlon, max_rides=DEFAULT_MAX_RIDES):
     """On-demand single-OD breakdown — the fallback for /itinerary cache misses (off-grid
     points, or before any prewarm). Mirrors exactly what the prewarm caches."""
     o = NET.snap_to_network(gpd.GeoSeries([Point(olon, olat)], crs=config.WGS)).iloc[0]
     if o.is_empty:
         return None
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs=config.WGS)
-    req = network.routing_template(NET, dest, DEP, paths=True)   # fresh, single-use; no clone needed
+    req = network.routing_template(NET, dest, DEP, paths=True,    # fresh, single-use; no clone needed
+                                  max_rides=max_rides)
     req.origin = o
     return _recorded_itin(req)
 
@@ -566,7 +598,10 @@ def _itinerary():
     else:
         olat, olon = float(request.args["olat"]), float(request.args["olon"])
     dlat, dlon = float(request.args["dlat"]), float(request.args["dlon"])
-    dkey = _dest_key(dlat, dlon)
+    # Same transfer cap the map used, so the breakdown total matches the cell's colored time
+    # (and so it hits the SAME _dest_key-bucketed cache as the matching /compute).
+    max_rides = _req_max_rides()
+    dkey = _dest_key(dlat, dlon, max_rides)
     res = None
     # FAST PATH 1: the full-grid cache (present once color-by-line has been triggered).
     if cid is not None:
@@ -581,7 +616,7 @@ def _itinerary():
     # FALLBACK: first touch of this cell (or an off-grid point) -> compute ONE cell on demand
     # (~100ms) and cache it. The common flow thus computes only the cells actually hovered.
     if res is None:
-        res = fastest_itin(olat, olon, dlat, dlon) or {"error": "no route"}
+        res = fastest_itin(olat, olon, dlat, dlon, max_rides) or {"error": "no route"}
         if cid is not None and "error" not in res:
             with _CELL_CACHE_LOCK:
                 _CELL_CACHE.setdefault(dkey, {})[cid] = res
@@ -597,18 +632,19 @@ def _attribution():
     full-grid itinerary build (lazy here, on the user's first toggle). Cached + in-flight
     de-duped, so /itinerary also benefits once it has run."""
     dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
-    ckey = _coarse_key(dlat, dlon)
+    max_rides = _req_max_rides()
+    ckey = _coarse_key(dlat, dlon, max_rides)
     # CACHE HIT (~110m): return the same attribution dict instantly — no R5 work, no lock.
     cached_res = _result_cache_get(_ATTR_RESULT_CACHE, ckey)
     if cached_res is not None:
-        print(f"[attr] ({dlat:.4f},{dlon:.4f}) cached -> {len(cached_res)} cells")
+        print(f"[attr] ({dlat:.4f},{dlon:.4f}) rides={max_rides} cached -> {len(cached_res)} cells")
         return jsonify(cached_res)
     t0 = dt.datetime.now()
     with _ITIN_CACHE_LOCK:
-        cached = _dest_key(dlat, dlon) in _ITIN_CACHE
+        cached = _dest_key(dlat, dlon, max_rides) in _ITIN_CACHE
     # Non-blocking: a build needed while another heavy job runs -> 503 (don't queue ~48s).
     try:
-        attr = _attribution_from_cache(dlat, dlon, nonblock=True)
+        attr = _attribution_from_cache(dlat, dlon, nonblock=True, max_rides=max_rides)
     except _Busy:
         print(f"[attr] ({dlat:.4f},{dlon:.4f}) busy -> 503")
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
