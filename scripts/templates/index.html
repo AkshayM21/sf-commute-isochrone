@@ -166,6 +166,7 @@
 /*__VIZ__*/
 const CELLS=__CELLS__, LINES=__LINES__;
 let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
+let EXACT=false;   // true once the exact refine has replaced the fast map (so hover==map, not a contradicting exact number on a fast cell)
 let maxxfers="any";   // "0"/"1"/"2" transfers, or "any" (the R5 default 8-ride cap)
 // UI transfers -> R5 ride cap (rides = transfers + 1). "any" stays unset so the URL and
 // thus the server result are byte-identical to the no-maxrides baseline.
@@ -219,6 +220,9 @@ function bdHTML(d){
     `<div class="foot">typical fastest trip (~8:35am)</div></div>`;}
 let bdTimer;
 function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){setHTML("—");return;}
+  if(!EXACT){   // map still on the fast estimate — show the SAME value (no contradicting exact breakdown yet)
+    setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ~${v} min <span style="color:#9aa3af;font-weight:400">estimate</span></div><div style="color:#9aa3af">refining to exact times + route…</div></div>`);
+    return;}
   if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n});setHTML(bdHTML(d));return;}
   setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
@@ -274,7 +278,7 @@ async function setWorkplace(lat,lon,label){
   busy("estimating…");
   try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}`);const d=await r.json();
     if(myGen!==GEN)return;                            // a newer address took over → drop this
-    TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
+    TT=d.cells;EXACT=false;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
     aggregate();redraw();
   }catch(e){if(myGen===GEN){busy(false);alert("compute failed: "+e);}return;}
   if(myGen!==GEN)return;
@@ -303,7 +307,7 @@ async function refine(){
       r=await doFetch();if(myGen!==GEN)return;
       if(r.status===503){toast("Server busy, try Refine again in a moment.");return;}
     }
-    if(r.ok){const d2=await r.json();if(myGen!==GEN)return;TT=d2.cells;
+    if(r.ok){const d2=await r.json();if(myGen!==GEN)return;TT=d2.cells;EXACT=true;
       document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
       aggregate();redraw();
       if(cmode=="line")loadAttribution();             // re-derive lines off the exact result
