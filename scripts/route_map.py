@@ -9,93 +9,37 @@ chain. Emit out/route_explorer.html:
   - click a cell -> full route + time
   - click a line in the legend -> show only that line's "commute-shed"
 """
-import sys, json, datetime as dt
+import sys, json
 from pathlib import Path
-import numpy as np, pandas as pd, geopandas as gpd
-from shapely.geometry import Point, box
-from r5py import TransportNetwork, DetailedItineraries, TransportMode
+import pandas as pd, geopandas as gpd
+from shapely.geometry import Point
+from r5py import DetailedItineraries, TransportMode
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from itineraries import load_routes
+from core import config, feeds, grid, network
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA, OUT = ROOT / "data", ROOT / "out"
-UTM = "EPSG:32610"
+OUT = config.OUT
 GRID_M = 400   # granular; DetailedItineraries per cell is heavy, so this run is slow (one-time)
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
 
 
-def build_grid(neigh):
-    poly = neigh.to_crs(UTM).union_all()
-    minx, miny, maxx, maxy = poly.bounds
-    xs = np.arange(minx + GRID_M / 2, maxx, GRID_M)
-    ys = np.arange(miny + GRID_M / 2, maxy, GRID_M)
-    pts = [Point(x, y) for x in xs for y in ys]
-    g = gpd.GeoDataFrame(geometry=pts, crs=UTM)
-    g = g[g.within(poly)].reset_index(drop=True)
-    g["id"] = g.index.astype(str)
-    return g.to_crs("EPSG:4326")
-
-
-def route_shapes(gtfs_paths):
-    """One representative (longest) shape per route, classified by mode, for an overlay."""
-    import zipfile, io
-    MODE = {"0": "metro", "1": "bart", "2": "bart", "5": "cable", "3": "bus"}
-    feats = []
-    for p in gtfs_paths:
-        with zipfile.ZipFile(p) as z:
-            names = z.namelist()
-            if "shapes.txt" not in names:
-                continue
-            shapes = pd.read_csv(io.BytesIO(z.read("shapes.txt")), dtype={"shape_id": str})
-            trips = pd.read_csv(io.BytesIO(z.read("trips.txt")), dtype=str).dropna(subset=["shape_id"])
-            routes = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
-            rtype = dict(zip(routes.route_id, routes.route_type))
-            rname = dict(zip(routes.route_id,
-                             routes.get("route_short_name", routes["route_id"]).fillna(routes["route_id"])))
-            cnt = shapes.groupby("shape_id").size()
-            best = {}
-            for sid, rid in zip(trips.shape_id, trips.route_id):
-                if rid not in best or cnt.get(sid, 0) > cnt.get(best[rid], 0):
-                    best[rid] = sid
-            for rid, sid in best.items():
-                pts = shapes[shapes.shape_id == sid].sort_values("shape_pt_sequence")
-                coords = pts[["shape_pt_lon", "shape_pt_lat"]].astype(float).values.tolist()
-                if len(coords) < 2:
-                    continue
-                feats.append({"type": "Feature",
-                              "geometry": {"type": "LineString", "coordinates": coords},
-                              "properties": {"mode": MODE.get(str(rtype.get(rid, "3")), "bus"),
-                                             "name": str(rname.get(rid, rid))}})
-    return {"type": "FeatureCollection", "features": feats}
-
-
 def main():
-    gtfs = [DATA / "muni_current.zip", DATA / "bart_gtfs.zip"]
-    routes = load_routes(gtfs)
-    neigh = gpd.read_file(DATA / "sf_neighborhoods.geojson").to_crs("EPSG:4326")
-    g = build_grid(neigh)
+    gtfs = config.gtfs_paths()
+    routes = feeds.load_routes(gtfs)
+    neigh = grid.load_neighborhoods()
+    g = grid.build_grid(neigh, GRID_M)
     print(f"grid: {len(g)} cells @ {GRID_M}m")
-    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(DEST_LON, DEST_LAT)], crs="EPSG:4326")
+    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(DEST_LON, DEST_LAT)], crs=config.WGS)
 
-    net = TransportNetwork(str(DATA / "osm_sf.pbf"), [str(p) for p in gtfs])
+    net = network.build_network(gtfs)
     di = DetailedItineraries(
         net, origins=g, destinations=dest,
-        departure=dt.datetime(2026, 5, 20, 8, 35),
+        departure=config.departure(feeds.pick_service_date(gtfs)),
         transport_modes=[TransportMode.TRANSIT, TransportMode.WALK],
         snap_to_network=True, force_all_to_all=True)
     df = pd.DataFrame(di)
     df["tt"] = pd.to_timedelta(df["travel_time"]).dt.total_seconds() / 60
     df["wt"] = pd.to_timedelta(df["wait_time"]).dt.total_seconds() / 60
-
-    def rn(rid, feed):
-        if pd.isna(rid):
-            return None
-        try:
-            k = str(int(float(rid)))
-        except (ValueError, TypeError):
-            k = str(rid)
-        return routes.get(str(feed), {}).get(k, k)
 
     recs = {}
     for oid, gg in df.groupby("from_id"):
@@ -109,7 +53,7 @@ def main():
                 if l["tt"] >= 1:
                     chain.append(f"walk {l['tt']:.0f}m")
             else:
-                nm = rn(l["route_id"], l.get("feed")) or mode
+                nm = feeds.route_name(l["route_id"], l.get("feed"), routes) or mode
                 chain.append(f"{nm} {l['tt']:.0f}m")
                 if l["tt"] > pmax:
                     pmax, primary = l["tt"], nm
@@ -117,14 +61,10 @@ def main():
                      "prim": primary or "walk only"}
 
     # cells
-    gm = g.to_crs(UTM)
-    half = GRID_M / 2
     cells = g.copy()
     cells["olat"] = g.geometry.y.values
     cells["olon"] = g.geometry.x.values
-    cells["geometry"] = gpd.GeoSeries(
-        [box(p.x-half, p.y-half, p.x+half, p.y+half) for p in gm.geometry],
-        crs=UTM).to_crs("EPSG:4326").values
+    cells["geometry"] = grid.square_cells(g, GRID_M).values
 
     feats = []
     for _, r in cells.iterrows():
@@ -137,7 +77,7 @@ def main():
             "properties": {"t": rec["t"], "chain": rec["chain"], "prim": rec["prim"],
                            "olat": round(r["olat"], 5), "olon": round(r["olon"], 5)}})
     fc = {"type": "FeatureCollection", "features": feats}
-    lines = route_shapes(gtfs)
+    lines = feeds.route_shapes(gtfs)
     print(f"overlay: {len(lines['features'])} route shapes")
 
     # line frequency for legend ordering
@@ -200,7 +140,7 @@ TEMPLATE = r"""<!DOCTYPE html>
     <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span style="color:#3cb44b">Cable</span></label>
   </div>
   <div id="legend"></div>
-  <div class="credit">r5py / R5 · Muni (511, current) + BART · fastest single 8:35am itinerary.
+  <div class="credit">r5py / R5 · Muni (511, current) + BART + Caltrain · fastest single 8:35am itinerary.
     "walk only" = faster on foot than any transit.</div>
 </div>
 <script>

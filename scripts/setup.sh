@@ -64,6 +64,22 @@ else
   missing=1
 fi
 
+# curl (downloads every dataset)
+if command -v curl >/dev/null 2>&1; then
+  ok "curl ($(curl --version 2>/dev/null | head -n1 || echo present))"
+else
+  err "curl not found. Install it, e.g.  brew install curl"
+  missing=1
+fi
+
+# unzip (validates the GTFS feeds)
+if command -v unzip >/dev/null 2>&1; then
+  ok "unzip (present)"
+else
+  err "unzip not found. Install it, e.g.  brew install unzip"
+  missing=1
+fi
+
 if [ "$missing" -ne 0 ]; then
   err "Resolve the prerequisites above and re-run scripts/setup.sh."
   exit 1
@@ -89,14 +105,23 @@ ok "dependencies installed"
 # ---------------------------------------------------------------------------
 # 3. Load .env and require the 511 token
 # ---------------------------------------------------------------------------
+# Read a single KEY's value from .env WITHOUT executing the file. Sourcing .env
+# breaks on multi-word unquoted values (e.g. DEFAULT_ADDRESS=1 Ferry Building),
+# so we extract only the one key we need: tolerate a leading `export `, optional
+# surrounding whitespace, and surrounding single/double quotes.
+env_value () {
+  local key="$1" file="$ROOT/.env"
+  [ -f "$file" ] || return 0
+  sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" "$file" \
+    | tail -1 | sed -e 's/^["'\'']//' -e 's/["'\'']$//'
+}
+
 say "511.org API token"
 if [ -f "$ROOT/.env" ]; then
-  # Export simple KEY=VALUE lines from .env without executing the file.
-  set -a
-  # shellcheck disable=SC1090
-  . "$ROOT/.env"
-  set +a
-  ok "loaded .env"
+  if [ -z "${API511_TOKEN:-}" ]; then
+    API511_TOKEN="$(env_value API511_TOKEN)"
+  fi
+  ok "read .env"
 else
   echo "  no .env found (copy .env.example to .env to configure the destination)"
 fi
@@ -115,10 +140,14 @@ ok "API511_TOKEN present"
 # ---------------------------------------------------------------------------
 mkdir -p "$DATA"
 
-# Validate a zip contains a GTFS routes.txt (catches HTML/error bodies).
+# Clean up any leftover partial downloads on exit (success or failure).
+trap 'rm -f "$DATA"/*.part 2>/dev/null || true' EXIT
+
+# Validate a zip contains a GTFS routes.txt (catches HTML/error bodies). Anchored
+# match so it only accepts a real top-level or nested routes.txt entry.
 valid_gtfs_zip () {
   local f="$1"
-  [ -s "$f" ] && unzip -l "$f" >/dev/null 2>&1 && unzip -l "$f" | grep -q "routes.txt"
+  [ -s "$f" ] && unzip -l "$f" >/dev/null 2>&1 && unzip -l "$f" | grep -qE '(^|/)routes\.txt$'
 }
 
 # Validate a file is non-empty JSON/GeoJSON.
@@ -134,10 +163,13 @@ if [ -s "$DATA/osm_sf.pbf" ]; then
 else
   if [ ! -s "$DATA/norcal.osm.pbf" ]; then
     echo "  downloading Geofabrik NorCal extract (~640 MB)..."
+    # Download to a temp .part and rename only on success, so an interrupted
+    # download never leaves a truncated file that looks "present" on re-run.
     curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
       --connect-timeout 25 --max-time 1800 \
-      -o "$DATA/norcal.osm.pbf" \
-      "https://download.geofabrik.de/north-america/us/california/norcal-latest.osm.pbf"
+      -o "$DATA/norcal.osm.pbf.part" \
+      "https://download.geofabrik.de/north-america/us/california/norcal-latest.osm.pbf" \
+      && mv "$DATA/norcal.osm.pbf.part" "$DATA/norcal.osm.pbf"
   else
     ok "norcal.osm.pbf already present (skipping download)"
   fi
@@ -162,8 +194,9 @@ else
   echo "  downloading BART GTFS..."
   curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
     --connect-timeout 25 --max-time 240 \
-    -o "$DATA/bart_gtfs.zip" \
-    "https://www.bart.gov/dev/schedules/google_transit.zip"
+    -o "$DATA/bart_gtfs.zip.part" \
+    "https://www.bart.gov/dev/schedules/google_transit.zip" \
+    && mv "$DATA/bart_gtfs.zip.part" "$DATA/bart_gtfs.zip"
   if valid_gtfs_zip "$DATA/bart_gtfs.zip"; then
     ok "bart_gtfs.zip downloaded ($(ls -lh "$DATA/bart_gtfs.zip" | awk '{print $5}'))"
   else
@@ -173,17 +206,24 @@ else
   fi
 fi
 
-# --- Muni GTFS (via 511) -------------------------------------------------
-say "Muni GTFS (data/muni_current.zip via 511.org)"
-if valid_gtfs_zip "$DATA/muni_current.zip"; then
-  ok "muni_current.zip already present"
+# --- Muni + Caltrain GTFS (via 511) --------------------------------------
+# A single fetch_511.sh run pulls both operators (SF=Muni, CT=Caltrain).
+say "Muni + Caltrain GTFS (data/muni_current.zip + data/caltrain.zip via 511.org)"
+if valid_gtfs_zip "$DATA/muni_current.zip" && valid_gtfs_zip "$DATA/caltrain.zip"; then
+  ok "muni_current.zip and caltrain.zip already present"
 else
-  echo "  fetching current Muni feed from 511.org..."
+  echo "  fetching current Muni + Caltrain feeds from 511.org..."
   API511_TOKEN="$API511_TOKEN" bash "$ROOT/scripts/fetch_511.sh"
   if valid_gtfs_zip "$DATA/muni_current.zip"; then
     ok "muni_current.zip ready ($(ls -lh "$DATA/muni_current.zip" | awk '{print $5}'))"
   else
     err "Muni feed is not a valid GTFS zip after fetch_511.sh."
+    exit 1
+  fi
+  if valid_gtfs_zip "$DATA/caltrain.zip"; then
+    ok "caltrain.zip ready ($(ls -lh "$DATA/caltrain.zip" | awk '{print $5}'))"
+  else
+    err "Caltrain feed is not a valid GTFS zip after fetch_511.sh."
     exit 1
   fi
 fi
@@ -196,8 +236,9 @@ else
   echo "  downloading DataSF 'SF Find Neighborhoods' (gfpk-269f)..."
   curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
     --connect-timeout 25 --max-time 120 \
-    -o "$DATA/sf_neighborhoods.geojson" \
-    'https://data.sfgov.org/resource/gfpk-269f.geojson?$limit=300'
+    -o "$DATA/sf_neighborhoods.geojson.part" \
+    'https://data.sfgov.org/resource/gfpk-269f.geojson?$limit=300' \
+    && mv "$DATA/sf_neighborhoods.geojson.part" "$DATA/sf_neighborhoods.geojson"
   if valid_geojson "$DATA/sf_neighborhoods.geojson"; then
     ok "sf_neighborhoods.geojson downloaded ($(ls -lh "$DATA/sf_neighborhoods.geojson" | awk '{print $5}'))"
   else

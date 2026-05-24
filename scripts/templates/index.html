@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SF Commute Explorer — set your own workplace</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root{--panel:#171a21;--ink:#e8eaed;--mut:#9aa3af;--line:#272b34;--accent:#5ab0ff}
+  *{box-sizing:border-box} html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  #map{position:absolute;inset:0;background:#0b0d10}.leaflet-container{background:#0b0d10}
+  #panel{position:absolute;top:0;right:0;width:330px;height:100%;background:var(--panel);color:var(--ink);
+    z-index:1000;display:flex;flex-direction:column;border-left:1px solid var(--line)}
+  h1{font-size:15px;margin:0;padding:14px 16px 3px}.sub{color:var(--mut);font-size:12px;padding:0 16px 10px;line-height:1.45}
+  .ctl{padding:9px 16px;border-top:1px solid var(--line)}
+  .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-bottom:7px}
+  .addr{display:flex;gap:6px}.addr input{flex:1;background:#0e1116;border:1px solid var(--line);color:var(--ink);
+    padding:8px;border-radius:8px;font-size:13px}.addr button{background:var(--accent);color:#06121f;border:0;
+    padding:0 12px;border-radius:8px;font-weight:600;cursor:pointer}
+  .seg{display:flex;gap:6px}.seg button{flex:1;background:#11141a;color:var(--ink);border:1px solid var(--line);
+    padding:7px;border-radius:8px;font-size:12.5px;cursor:pointer}.seg button.on{background:var(--accent);color:#06121f;font-weight:600;border-color:var(--accent)}
+  input[type=range]{width:100%;accent-color:var(--accent)} .val{color:var(--accent);font-weight:600}
+  #list{flex:1;overflow:auto;border-top:1px solid var(--line)}
+  .nb{display:flex;justify-content:space-between;padding:7px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid #1c2027}
+  .nb:hover{background:#1f2530}.nb .t{font-variant-numeric:tabular-nums;font-weight:600}.nb small{color:var(--mut)}
+  #legend{position:absolute;left:14px;bottom:16px;z-index:1000;background:rgba(20,23,29,.92);color:var(--ink);
+    padding:11px 13px;border:1px solid var(--line);border-radius:10px;font-size:12px}
+  #legend .bar{height:11px;width:240px;border-radius:3px;margin:7px 0 4px}
+  #legend .sc{display:flex;justify-content:space-between;color:var(--mut);font-size:11px}
+  #busy{position:absolute;top:12px;left:12px;z-index:1100;background:var(--accent);color:#06121f;font-weight:600;
+    padding:7px 12px;border-radius:20px;font-size:12.5px;display:none;box-shadow:0 2px 10px rgba(0,0,0,.4)}
+  .leaflet-tooltip.tt{background:#11141a;border:1px solid var(--line);color:var(--ink);white-space:normal;padding:0;box-shadow:0 6px 20px rgba(0,0,0,.45)}
+  .leaflet-tooltip.tt:before{border:none!important}
+  .leaflet-popup-content{margin:0;font-size:12.5px}
+  .leaflet-popup-content-wrapper{background:#11141a;color:var(--ink);border:1px solid var(--line);border-radius:10px}
+  .leaflet-popup-tip{background:#11141a}
+  .bd{width:238px;padding:11px 13px;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
+  .bd .h{font-size:13px;margin-bottom:8px}
+  .bd .legs{display:flex;flex-wrap:wrap;gap:5px 5px;align-items:center}
+  .bd .leg{padding:1px 7px;border-radius:7px;white-space:nowrap;font-size:11.5px;font-weight:600}
+  .bd .walk{background:#262b33;color:#b6bdc8;font-weight:500}
+  .bd .wait{color:#8089b3;font-style:italic;font-weight:500;padding:1px 3px;background:repeating-linear-gradient(45deg,#1c2030,#1c2030 3px,#161a26 3px,#161a26 6px);border-radius:6px}
+  .bd .arr{color:#4b515c;font-size:10px}
+  .bd .gm{color:#5ab0ff;display:inline-block;margin-top:9px;font-weight:600;text-decoration:none}
+  .bd .gm:hover{text-decoration:underline}
+  .bd .foot{color:#5c6470;margin-top:5px;font-size:10.5px}
+  .credit{padding:9px 16px;color:#5c6470;font-size:10.5px;border-top:1px solid var(--line)}
+</style></head>
+<body>
+<div id="map"></div><div id="busy">computing…</div>
+<div id="prompt" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1050;pointer-events:none">
+  <div style="background:rgba(20,23,29,.94);color:#e8eaed;padding:18px 24px;border:1px solid #272b34;border-radius:12px;font-size:15px;text-align:center;box-shadow:0 10px 34px rgba(0,0,0,.55)">
+    Enter your workplace address  →<br><span style="color:#9aa3af;font-size:12.5px">(top-right) to map your commute</span></div></div>
+<div id="panel">
+  <h1>Commute to your workplace</h1>
+  <div class="sub">Enter your workplace address to begin. <b>Hover</b> any area for its time + the route
+    behind it; <b>click</b> to pin it with a Google Maps link.</div>
+  <div class="ctl"><div class="lab">Workplace</div>
+    <div class="addr"><input id="addr" placeholder="e.g. 1 Market St"><button id="go">Set</button></div>
+    <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div></div>
+  <div class="ctl"><div class="lab">Time estimate</div>
+    <div class="seg" id="metric"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
+  <div class="ctl"><div class="lab">Color by</div>
+    <div class="seg" id="cmode"><button data-v="time" class="on">Time</button><button data-v="line">Primary line</button></div></div>
+  <div class="ctl"><div class="lab">Sweet spot — green ≤ <span class="val" id="idval">25</span> min (recolors)</div>
+    <input type="range" id="ideal" min="10" max="45" value="25"></div>
+  <div class="ctl"><div class="lab">Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</div>
+    <input type="range" id="thr" min="10" max="70" value="40"></div>
+  <div class="ctl"><div class="lab">Overlay real transit lines</div>
+    <div style="display:flex;flex-wrap:wrap;gap:11px;font-size:12.5px">
+      <label style="cursor:pointer"><input type="checkbox" data-m="bart"> <span style="color:#6f8cff">BART</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="metro"> <span style="color:#ff6b6b">Metro</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span style="color:#f6a04d">Bus</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span style="color:#5cd65c">Cable</span></label>
+    </div></div>
+  <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods</div></div>
+  <div id="list"></div>
+  <div class="credit">R5/r5py · Muni (511) + BART + Caltrain · network kept warm; only the matrix recomputes.
+    Live map is a fast reverse-routing approximation (~±2 min); <b>scripts/isochrone.py</b> is the exact build.</div>
+</div>
+<div id="legend"><b id="legtitle">Realistic door-to-door (min)</b><div class="bar"></div>
+  <div class="sc"></div></div>
+<script>
+/*__VIZ__*/
+const CELLS=__CELLS__, LINES=__LINES__;
+let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
+let SCALE=ramp(ideal).S;                          // current time->color scale (recomputed in redraw)
+let BDCACHE={};                                   // per-cell route breakdown cache (cleared on new workplace)
+const gmaps=(olat,olon)=>gmapsURL(olat,olon,DESTLL[0],DESTLL[1]);
+const color=v=>colorScale(v,SCALE);
+let bdToken=0;  // cancels stale hover-breakdown fetches
+const map=L.map("map",{preferCanvas:true}).setView([37.762,-122.43],12.3);  // canvas: 3k polygons stay light on CPU
+L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{maxZoom:19}).addTo(map);
+function legend(){const sc=document.querySelector("#legend .sc"),bar=document.querySelector("#legend .bar");
+  if(cmode=="line"){bar.style.display="none";sc.style.flexWrap="wrap";
+    const ord=Object.keys(LINECOLOR);
+    sc.innerHTML=ord.length?ord.slice(0,16).map(l=>`<span style="white-space:nowrap;margin:0 8px 3px 0"><span style="display:inline-block;width:9px;height:9px;background:${LINECOLOR[l]};border-radius:2px"></span> ${l}</span>`).join(""):"computing line map…";
+    document.getElementById("legtitle").textContent="Primary transit line per area";return;}
+  const {hi,S}=ramp(ideal);bar.style.display="block";sc.style.flexWrap="nowrap";
+  bar.style.background="linear-gradient(90deg,"+S.map(s=>rgb(s[1])+" "+Math.round(s[0]/hi*100)+"%").join(",")+")";
+  sc.innerHTML=`<span>0</span><span>${ideal} (ideal)</span><span>${hi}+</span>`;
+  document.getElementById("legtitle").textContent=(metric=="r"?"Realistic":"Best-case")+" door-to-door (min)";}
+function val(id){const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
+function style(f){const id=f.properties.id,v=val(id);
+  if(v==null||v>thr)return{fillOpacity:0,opacity:0,weight:0};
+  if(cmode=="line"){const ln=ATTR[id];return ln?{fillColor:LINECOLOR[ln]||"#888",fillOpacity:.76,weight:0}:{fillColor:"#888",fillOpacity:.06,weight:0};}
+  return{fillColor:color(v),fillOpacity:.72,weight:0};}
+function buildLineColors(){const PAL=["#e6194B","#3cb44b","#ffe119","#4363d8","#f58231","#911eb4","#42d4f4","#f032e6","#bfef45","#fabed4","#469990","#dcbeff","#9A6324","#800000","#aaffc3","#808000","#000075"];
+  const cnt={};Object.values(ATTR).forEach(l=>cnt[l]=(cnt[l]||0)+1);
+  LINECOLOR={};Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]).forEach((l,i)=>LINECOLOR[l]=l=="walk only"?"#7fd1ff":PAL[i%PAL.length]);}
+function lineColor(line){  // match the overlay legend colors
+  if(/^(Red|Yellow|Blue|Green|Orange|Gr[ae]y)-[NSEW]$/i.test(line))return MODECOLOR.bart;
+  if(["PM","PH","CA"].includes(line))return MODECOLOR.cable;
+  if(/^[JKLMNT]$/.test(line)||line==="KLM")return MODECOLOR.metro;
+  return MODECOLOR.bus;
+}
+function bdHTML(d){
+  if(d.error)return `<div class="bd"><span style="color:#9aa3af">No transit route within ~75 min.</span></div>`;
+  const chips=[];
+  d.legs.forEach(g=>{
+    if(!g.line){chips.push(`<span class="leg walk">walk ${g.min}m</span>`);return;}
+    if(g.wait&&g.wait>=1)chips.push(`<span class="leg wait">wait ${g.wait}m</span>`);
+    const c=lineColor(g.line);
+    chips.push(`<span class="leg" style="background:${c}26;color:${c};border:1px solid ${c}55">${g.line} · ${g.min}m</span>`);
+  });
+  return `<div class="bd"><div class="h"><b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}</div>`+
+    `<div class="legs">${chips.join('<span class="arr">▸</span>')}</div>`+
+    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
+    `<div class="foot">typical fastest trip (~8:35am)</div></div>`;}
+let bdTimer;
+function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){setHTML("—");return;}
+  if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n});setHTML(bdHTML(d));return;}
+  setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
+  clearTimeout(bdTimer);const my=++bdToken;
+  bdTimer=setTimeout(async()=>{try{
+    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+    const d=await r.json();if(my!==bdToken)return;if(!d.error)BDCACHE[id]=d;d.name=f.properties.n;setHTML(bdHTML(d));
+  }catch(e){if(my===bdToken)setHTML("error");}},150);}
+const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
+  l.on("mouseover",()=>{if(!DESTLL)return;l.setStyle({weight:1.4,color:"#fff"});
+    l.bindTooltip("",{className:"tt",sticky:true,opacity:1}).openTooltip();
+    loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});});
+  l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);});
+  l.on("click",()=>{if(!DESTLL)return;
+    l.bindPopup("…",{maxWidth:285}).openPopup();
+    loadBreak(f,h=>{if(l.getPopup())l.setPopupContent(h);});});
+}}).addTo(map);
+// transit-line overlays (off by default; non-interactive so cells stay hoverable)
+const LINESTYLE={bus:{color:MODECOLOR.bus,weight:1.3,opacity:.5},metro:{color:MODECOLOR.metro,weight:2.4,opacity:.85},
+  cable:{color:MODECOLOR.cable,weight:2,opacity:.8},bart:{color:MODECOLOR.bart,weight:3,opacity:.85}};
+const overlays={};
+["bart","metro","bus","cable"].forEach(m=>{overlays[m]=L.geoJSON(
+  {type:"FeatureCollection",features:LINES.features.filter(f=>f.properties.mode===m)},
+  {style:()=>LINESTYLE[m],interactive:false});});
+document.querySelectorAll("input[data-m]").forEach(cb=>cb.onchange=()=>{
+  const m=cb.dataset.m;if(cb.checked)overlays[m].addTo(map);else map.removeLayer(overlays[m]);});
+let pin=null;   // workplace marker — set via the address box only (no map-click / drag)
+
+function redraw(){SCALE=ramp(ideal).S;layer.setStyle(style);legend();renderList();}
+function renderList(){const rows=Object.entries(NB).filter(([k,v])=>v!=null).sort((a,b)=>a[1]-b[1]);
+  document.getElementById("list").innerHTML=rows.map(([n,v])=>{const c=v<=thr?color(v):"#555";
+    return `<div class="nb"><span><span style="color:${c}">●</span> ${n}</span><span class="t" style="color:${c}">${v}<small> min</small></span></div>`;}).join("");}
+function aggregate(){const acc={};CELLS.features.forEach(f=>{const v=val(f.properties.id),n=f.properties.n;
+  if(v==null||!n)return;(acc[n]=acc[n]||[]).push(v);});NB={};
+  for(const n in acc){acc[n].sort((a,b)=>a-b);NB[n]=acc[n][Math.floor(acc[n].length/2)];}}
+function busy(t){const b=document.getElementById("busy");if(t){b.textContent=t;b.style.display="block";}else b.style.display="none";}
+async function setWorkplace(lat,lon,label){
+  const myGen=++GEN;                                 // bump: cancels stale in-flight responses
+  document.getElementById("prompt").style.display="none";
+  DESTLL=[lat,lon];ATTR={};LINECOLOR={};BDCACHE={};
+  if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
+  map.setView([lat,lon],12.6);
+  try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
+  busy("estimating…");
+  try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}`);const d=await r.json();
+    if(myGen!==GEN)return;                            // a newer address took over → drop this
+    TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
+    aggregate();redraw();
+  }catch(e){if(myGen===GEN){busy(false);alert("compute failed: "+e);}return;}
+  busy("refining (exact)…");                          // pipeline: exact pass refines the approximation
+  try{const r2=await fetch(`/compute_exact?lat=${lat}&lon=${lon}`);
+    if(myGen!==GEN)return;
+    if(r2.ok){const d2=await r2.json();if(myGen!==GEN)return;TT=d2.cells;
+      document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
+      aggregate();redraw();}
+  }catch(e){/* keep the fast approximation if exact isn't available */}
+  if(myGen!==GEN)return;
+  busy(false);
+  if(cmode=="line")loadAttribution();
+}
+async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping lines…");
+  try{const r=await fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
+    if(myGen!==GEN)return;
+    if(r.ok){const a=await r.json();if(myGen!==GEN)return;ATTR=a;buildLineColors();redraw();}
+    else{document.getElementById("legtitle").textContent="line map unavailable yet";}
+  }catch(e){}finally{if(myGen===GEN)busy(false);}}
+function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onclick=()=>{
+  document.querySelectorAll(`#${id} button`).forEach(x=>x.classList.remove("on"));b.classList.add("on");set(b.dataset.v);aggregate();redraw();});}
+seg("metric",v=>metric=v);
+seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
+document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();};
+document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();};
+document.getElementById("go").onclick=async()=>{const q=document.getElementById("addr").value;
+  if(!q)return;busy("finding address…");
+  try{const r=await fetch(`/geocode?q=${encodeURIComponent(q)}`);const d=await r.json();
+    if(d.lat){busy(false);setWorkplace(d.lat,d.lon,q);}   // keep the user's typed string verbatim
+    else{busy(false);alert("address not found");}}catch(e){busy(false);alert(e);}};
+document.getElementById("addr").addEventListener("keydown",e=>{if(e.key=="Enter")document.getElementById("go").click();});
+legend();   // draw the legend; map stays blank until you set an address
+try{const wp=JSON.parse(localStorage.getItem("wp_v1")||"null");   // restore last workplace
+  if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);}
+}catch(e){}
+</script></body></html>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
 Build a standalone interactive HTML map (out/commute_explorer.html) from the
-full (Muni+BART) and Muni-only travel-time grids.
+full (Muni+BART+Caltrain) and Muni-only travel-time grids.
 
 Controls in the page:
   - Metric:   Realistic (median, incl. wait)  vs  Best-case  ("conservative on/off")
@@ -11,21 +11,15 @@ Controls in the page:
 """
 import json
 from pathlib import Path
-import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import box
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data"
-OUT = ROOT / "out"
-UTM = "EPSG:32610"
-GRID_M = 200
+from core import config, grid
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
 
 
 def load(tag):
-    g = gpd.read_file(OUT / f"grid_traveltimes_{tag}.gpkg")[["id", "best_min", "real_min", "geometry"]]
+    g = gpd.read_file(config.OUT / f"grid_traveltimes_{tag}.gpkg")[["id", "best_min", "real_min", "geometry"]]
     return g.rename(columns={"best_min": f"best_{tag}", "real_min": f"real_{tag}"})
 
 
@@ -34,16 +28,12 @@ def main():
     muni = load("munionly")[["id", "best_munionly", "real_munionly"]]
     g = full.merge(muni, on="id", how="left")
 
-    neigh = gpd.read_file(DATA / "sf_neighborhoods.geojson").to_crs("EPSG:4326")
+    neigh = grid.load_neighborhoods()
     g = gpd.sjoin(g, neigh[["name", "geometry"]], how="left", predicate="within").drop(columns="index_right")
 
     # square cells (200m) from the point grid
-    gm = g.to_crs(UTM)
-    half = GRID_M / 2
     cells = g.copy()
-    cells["geometry"] = gpd.GeoSeries(
-        [box(p.x-half, p.y-half, p.x+half, p.y+half) for p in gm.geometry],
-        crs=UTM).to_crs("EPSG:4326").values
+    cells["geometry"] = grid.square_cells(g.geometry, config.GRID_M).values
 
     def clean(v):
         return None if pd.isna(v) else round(float(v), 1)
@@ -68,7 +58,7 @@ def main():
         c = neigh[neigh["name"] == name]
         if not len(c):
             continue
-        cen = c.to_crs(UTM).geometry.centroid.to_crs("EPSG:4326").iloc[0]
+        cen = c.to_crs(config.UTM).geometry.centroid.to_crs(config.WGS).iloc[0]
         rows.append({
             "name": name, "lat": round(cen.y, 5), "lon": round(cen.x, 5),
             "rf": clean(sub["real_full"].median()), "bf": clean(sub["best_full"].median()),
@@ -76,11 +66,15 @@ def main():
         })
     nb = [r for r in rows if r["rf"] is not None]
 
-    html = TEMPLATE.replace("__DATA__", json.dumps(fc)) \
+    # Inline the shared viz.js FIRST (so the page is self-contained and its time->color ramp /
+    # gmaps link can't drift from the live server's), then substitute the data tokens.
+    viz_text = (Path(__file__).resolve().parent / "assets" / "viz.js").read_text()
+    html = TEMPLATE.replace("/*__VIZ__*/", viz_text) \
+                   .replace("__DATA__", json.dumps(fc)) \
                    .replace("__NB__", json.dumps(nb)) \
                    .replace("__DEST__", json.dumps([DEST_LAT, DEST_LON])) \
                    .replace("__LABEL__", DEST_LABEL)
-    (OUT / "commute_explorer.html").write_text(html)
+    (config.OUT / "commute_explorer.html").write_text(html)
     print(f"Wrote out/commute_explorer.html  ({len(feats)} cells, {len(nb)} neighborhoods)")
 
 
@@ -139,7 +133,7 @@ TEMPLATE = r"""<!DOCTYPE html>
       <button data-v="b">Best-case</button></div></div>
   <div class="ctl"><div class="lab">Transit modes</div>
     <div class="seg" id="scenario">
-      <button data-v="f" class="on">Muni + BART</button>
+      <button data-v="f" class="on">Muni + BART + Caltrain</button>
       <button data-v="m">Muni only</button></div></div>
   <div class="ctl"><div class="lab">Sweet spot — green ≤ <span id="idval">25</span> min <span style="color:#5c6470;text-transform:none;letter-spacing:0">(recolors only)</span></div>
     <input type="range" id="ideal" min="10" max="45" value="25" step="1"></div>
@@ -147,37 +141,22 @@ TEMPLATE = r"""<!DOCTYPE html>
     <input type="range" id="thr" min="10" max="60" value="35" step="1"></div>
   <div class="ctl" style="padding-bottom:6px"><div class="lab">Neighborhoods (by current estimate)</div></div>
   <div id="list"></div>
-  <div class="credit">Engine: Conveyal R5 (r5py) · Muni GTFS (511.org, current) + BART · OSM walk network.
-    Best-case = 5th pct over 8:00–8:45 window; realistic = median.</div>
+  <div class="credit">Engine: Conveyal R5 (r5py) · Muni (511.org) + BART + Caltrain · OSM walk network.
+    Best-case = 5th pct over the ~8:35am departure window; realistic = median.</div>
 </div>
 <script>
+/*__VIZ__*/
 const CELLS=__DATA__, NB=__NB__, DEST=__DEST__;
-const gmaps=(olat,olon)=>`https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${DEST[0]},${DEST[1]}&travelmode=transit`;
+const gmaps=(olat,olon)=>gmapsURL(olat,olon,DEST[0],DEST[1]);
 let metric="r", scen="f", thr=35, ideal=25;
+let SCALE=ramp(ideal).S;                     // current color scale (recomputed once per redraw)
+const color=v=>colorScale(v,SCALE);
 const key=()=>metric+scen; // rf, bf, rm, bm
 
 const map=L.map("map",{zoomControl:true}).setView([37.773,-122.42],12.4);
 L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
   {maxZoom:19,attribution:"© OpenStreetMap, © CARTO"}).addTo(map);
 
-// gradient ANCHORED at a configurable "sweet spot" (green->yellow pivot),
-// independent of the max-commute filter. green below `ideal`, pale-yellow AT it,
-// warming to red by ideal+25.
-function ramp(ideal){
-  const hi=ideal+25;
-  return {hi, S:[[0,[0,104,55]],[ideal*0.45,[26,152,80]],[ideal*0.72,[102,189,99]],
-    [ideal*0.9,[166,217,106]],[ideal,[255,255,191]],
-    [ideal+(hi-ideal)*0.35,[253,174,97]],[ideal+(hi-ideal)*0.7,[244,109,67]],[hi,[215,48,39]]]};
-}
-function color(v){
-  if(v==null) return null;
-  const {S}=ramp(ideal);
-  if(v<=0) return rgb(S[0][1]);
-  for(let i=1;i<S.length;i++){if(v<=S[i][0]){
-    const a=S[i-1],b=S[i],t=(v-a[0])/((b[0]-a[0])||1);
-    return rgb(a[1].map((c,j)=>Math.round(c+(b[1][j]-c)*t)));}}
-  return rgb(S[S.length-1][1]);
-}
 function legendGradient(){
   const {hi,S}=ramp(ideal);
   const css=S.map(s=>`rgb(${s[1].join(",")}) ${Math.round(s[0]/hi*100)}%`).join(",");
@@ -185,26 +164,26 @@ function legendGradient(){
   document.querySelector("#legend .sc").innerHTML=
     `<span>0</span><span>${ideal} (ideal)</span><span>${hi}+</span>`;
 }
-const rgb=c=>`rgb(${c[0]},${c[1]},${c[2]})`;
 
 function val(p){return p[key()];}
 function style(f){
   const v=val(f.properties);
   if(v==null||v>thr) return {fillOpacity:0,opacity:0,weight:0};
-  return {fillColor:color(v),fillOpacity:.72,color:color(v),weight:0};
+  const c=color(v);
+  return {fillColor:c,fillOpacity:.72,color:c,weight:0};
 }
 const layer=L.geoJSON(CELLS,{style,
   onEachFeature:(f,l)=>{l.on("mouseover",()=>{const p=f.properties,v=val(p);
     l.bindTooltip(`${p.n||"—"}<br><b>${v==null?"—":v+" min"}</b> `+
-      `<small>(${metric=="r"?"realistic":"best"}, ${scen=="f"?"Muni+BART":"Muni only"})</small>`,
+      `<small>(${metric=="r"?"realistic":"best"}, ${scen=="f"?"Muni+BART+Caltrain":"Muni only"})</small>`,
       {className:"tt",sticky:true}).openTooltip();});}
 }).addTo(map);
 
 L.marker(DEST,{icon:L.divIcon({className:"",html:'<div style="width:14px;height:14px;border-radius:50%;background:#ffd23f;border:2px solid #000;box-shadow:0 0 6px #000"></div>',iconSize:[14,14]})}).addTo(map).bindPopup("__LABEL__");
 
-function redraw(){layer.setStyle(style);legendGradient();
+function redraw(){SCALE=ramp(ideal).S;layer.setStyle(style);legendGradient();
   document.getElementById("legtitle").textContent=
-    (metric=="r"?"Realistic":"Best-case")+" door-to-door (min) · "+(scen=="f"?"Muni+BART":"Muni only");
+    (metric=="r"?"Realistic":"Best-case")+" door-to-door (min) · "+(scen=="f"?"Muni+BART+Caltrain":"Muni only");
   renderList();}
 function renderList(){
   const k=key();

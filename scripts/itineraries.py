@@ -3,15 +3,12 @@
 Fastest door-to-door itineraries from representative SF origins to the workplace,
 using r5py DetailedItineraries (shows the actual legs: walk / which line / transfer).
 """
-import argparse, datetime as dt
-from pathlib import Path
+import argparse
 import pandas as pd, geopandas as gpd
 from shapely.geometry import Point
-from r5py import TransportNetwork, DetailedItineraries, TransportMode
+from r5py import DetailedItineraries, TransportMode
 
-ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data"
-OUT = ROOT / "out"
+from core import config, feeds, network
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
 
 # representative points across the city (lat, lon)
@@ -41,68 +38,24 @@ ORIGINS = {
 }
 
 
-def load_routes(gtfs_paths):
-    """Return {feed_stem: {route_id: name}} so colliding IDs across feeds
-    (Muni '8' vs BART '8'=Red-N) resolve correctly via the leg's `feed`."""
-    import zipfile, io
-    m = {}
-    for p in gtfs_paths:
-        stem = Path(p).stem
-        d = {}
-        with zipfile.ZipFile(p) as z:
-            r = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
-            for _, row in r.iterrows():
-                name = (row.get("route_short_name") or row.get("route_long_name")
-                        or row.get("route_id"))
-                d[str(row["route_id"])] = str(name).strip()
-        m[stem] = d
-    return m
-
-
-def pick_wednesday(gtfs_paths):
-    import zipfile, io
-    starts, ends = [], []
-    for p in gtfs_paths:
-        with zipfile.ZipFile(p) as z:
-            df = pd.read_csv(io.BytesIO(z.read("calendar.txt")), dtype=str)
-            df = df[df["wednesday"] == "1"]
-            starts.append(df["start_date"].astype(int).min())
-            ends.append(df["end_date"].astype(int).max())
-    lo, hi = max(starts), min(ends)
-    d = dt.datetime.strptime(str(lo), "%Y%m%d").date() + dt.timedelta(days=7)
-    while d.weekday() != 2:
-        d += dt.timedelta(days=1)
-    if d > dt.datetime.strptime(str(hi), "%Y%m%d").date():
-        d -= dt.timedelta(days=7)
-    return d
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gtfs", nargs="+", default=None)
     args = ap.parse_args()
-    if args.gtfs:
-        gtfs = [DATA / g if not Path(g).is_absolute() else Path(g) for g in args.gtfs]
-    else:
-        muni = DATA / "muni_current.zip"
-        if not muni.exists():
-            muni = DATA / "muni_gtfs_2022_fallback.zip"
-        gtfs = [muni, DATA / "bart_gtfs.zip"]
-    gtfs = [p for p in gtfs if p.exists()]
+    gtfs = config.gtfs_paths(extra=args.gtfs)
     print("GTFS:", [p.name for p in gtfs])
 
-    d = pick_wednesday(gtfs)
-    departure = dt.datetime(d.year, d.month, d.day, 8, 15)
+    departure = config.departure(feeds.pick_service_date(gtfs))
     print("departure:", departure)
 
     origins = gpd.GeoDataFrame(
         {"id": list(ORIGINS.keys())},
         geometry=[Point(lon, lat) for lat, lon in ORIGINS.values()],
-        crs="EPSG:4326")
+        crs=config.WGS)
     dest = gpd.GeoDataFrame({"id": [DEST_LABEL]},
-                            geometry=[Point(DEST_LON, DEST_LAT)], crs="EPSG:4326")
+                            geometry=[Point(DEST_LON, DEST_LAT)], crs=config.WGS)
 
-    net = TransportNetwork(str(DATA / "osm_sf.pbf"), [str(p) for p in gtfs])
+    net = network.build_network(gtfs)
     di = DetailedItineraries(
         net, origins=origins, destinations=dest,
         departure=departure,
@@ -110,23 +63,14 @@ def main():
         snap_to_network=True, force_all_to_all=True,
     )
     df = pd.DataFrame(di)
-    df.to_csv(OUT / "itineraries_raw.csv", index=False)
-    summarize(df, load_routes(gtfs))
+    df.to_csv(config.OUT / "itineraries_raw.csv", index=False)
+    summarize(df, feeds.load_routes(gtfs))
 
 
 def summarize(df, routes):
     df = df.copy()
     df["tt"] = pd.to_timedelta(df["travel_time"]).dt.total_seconds() / 60
     df["wt"] = pd.to_timedelta(df["wait_time"]).dt.total_seconds() / 60
-
-    def routename(rid, feed):
-        if pd.isna(rid):
-            return None
-        try:
-            key = str(int(float(rid)))
-        except (ValueError, TypeError):
-            key = str(rid)
-        return routes.get(str(feed), {}).get(key, key)
 
     def modestr(m):
         return str(m).split(".")[-1]
@@ -147,7 +91,7 @@ def summarize(df, routes):
                     parts.append(f"walk {leg['tt']:.0f}m")
             else:
                 nrides += 1
-                rn = routename(leg["route_id"], leg.get("feed")) or mode
+                rn = feeds.route_name(leg["route_id"], leg.get("feed"), routes) or mode
                 parts.append(f"{rn} {leg['tt']:.0f}m")
         rows.append((totals[best], oid, max(0, nrides - 1), " → ".join(parts)))
     for total, oid, nxfer, chain in sorted(rows):

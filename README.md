@@ -1,8 +1,8 @@
 # SF Commute Isochrone
 
 Find **where in San Francisco you can live and still reach a workplace you
-choose within N minutes** by **walking + Muni + BART**, arriving on a weekday
-morning — rendered as an interactive map.
+choose within N minutes** by **walking + Muni + BART + Caltrain**, arriving on a
+weekday morning — rendered as an interactive map.
 
 For a 200m grid of origin points across SF, the tool routes door-to-door
 (walk → wait → transit incl. transfers → walk) to your chosen destination using
@@ -21,8 +21,8 @@ Two numbers per location:
 - **Java 21** (R5 is a JVM routing engine) — e.g. `brew install openjdk@21`
 - **uv** (Python env + package manager) — `curl -LsSf https://astral.sh/uv/install.sh | sh` or `brew install uv`
 - **osmium-tool** (clips the OSM extract to SF) — `brew install osmium-tool`
-- A **free 511.org API token** for the current Muni feed — get one at
-  <https://511.org/open-data/token>
+- A **free 511.org API token** for the current Muni + Caltrain feeds — get one
+  at <https://511.org/open-data/token>
 
 `setup.sh` checks each of these and prints install hints if anything is missing.
 
@@ -64,7 +64,7 @@ Tunable via environment variables:
 
 | Var          | Default | Meaning                                          |
 |--------------|---------|--------------------------------------------------|
-| `GRID_M`     | `250`   | grid resolution in meters (smaller = finer/slower) |
+| `GRID_M`     | `200`   | grid resolution in meters (smaller = finer/slower) |
 | `WINDOW_MIN` | `30`    | departure-time window in minutes                 |
 | `PORT`       | `8000`  | server port                                      |
 
@@ -80,7 +80,7 @@ Generate the standalone HTML map, ranked CSV, and per-cell travel-time grids in
 ```bash
 PY=.venv/bin/python
 
-# full network (Muni + BART)
+# full network (Muni + BART + Caltrain)
 $PY scripts/isochrone.py --tag full
 
 # Muni only (for the "BART off" comparison)
@@ -107,7 +107,7 @@ $PY scripts/route_map.py      # which transit routes dominate each area
 | Flag      | Description                                                        |
 |-----------|-------------------------------------------------------------------|
 | `--tag`   | suffix for output filenames (e.g. `full`, `munionly`)             |
-| `--gtfs`  | GTFS zip(s) to use (default: `muni_current.zip` + `bart_gtfs.zip`) |
+| `--gtfs`  | extra GTFS zip(s) added to the default `muni_current.zip` + `bart_gtfs.zip` + `caltrain.zip` feeds |
 | `--limit` | randomly subsample N grid origins for a fast validation run        |
 
 ## How the destination works
@@ -128,8 +128,10 @@ to force a fresh geocode.
 All inputs are downloaded by `setup.sh` into `data/` (gitignored):
 
 - **Muni GTFS** — [511 SF Bay Open Data](https://511.org/open-data) (current
-  feed via `scripts/fetch_511.sh`)
-- **BART GTFS** — [BART developer feed](https://www.bart.gov/dev/schedules/google_transit.zip)
+  feed, operator `SF`, via `scripts/fetch_511.sh` → `data/muni_current.zip`)
+- **Caltrain GTFS** — [511 SF Bay Open Data](https://511.org/open-data) (current
+  feed, operator `CT`, via `scripts/fetch_511.sh` → `data/caltrain.zip`)
+- **BART GTFS** — [BART developer feed](https://www.bart.gov/dev/schedules/google_transit.zip) (→ `data/bart_gtfs.zip`)
 - **OpenStreetMap** — [Geofabrik](https://download.geofabrik.de/) NorCal
   extract, clipped to SF with `osmium` (© OpenStreetMap contributors)
 - **Neighborhoods** — [DataSF](https://data.sfgov.org/) "SF Find
