@@ -233,17 +233,11 @@ say "SF neighborhoods (data/sf_neighborhoods.geojson via DataSF)"
 if valid_geojson "$DATA/sf_neighborhoods.geojson"; then
   ok "sf_neighborhoods.geojson already present"
 else
-  echo "  downloading DataSF 'SF Find Neighborhoods' (gfpk-269f)..."
-  curl -fL --retry 4 --retry-delay 3 --retry-all-errors \
-    --connect-timeout 25 --max-time 120 \
-    -o "$DATA/sf_neighborhoods.geojson.part" \
-    'https://data.sfgov.org/resource/gfpk-269f.geojson?$limit=300' \
-    && mv "$DATA/sf_neighborhoods.geojson.part" "$DATA/sf_neighborhoods.geojson"
-  if valid_geojson "$DATA/sf_neighborhoods.geojson"; then
-    ok "sf_neighborhoods.geojson downloaded ($(ls -lh "$DATA/sf_neighborhoods.geojson" | awk '{print $5}'))"
+  echo "  building from DataSF Realtor Neighborhoods + Find-Neighborhoods Chinatown/Japantown..."
+  if "$PY" "$ROOT/scripts/build_neighborhoods.py" && valid_geojson "$DATA/sf_neighborhoods.geojson"; then
+    ok "sf_neighborhoods.geojson built ($(ls -lh "$DATA/sf_neighborhoods.geojson" | awk '{print $5}'))"
   else
-    err "Neighborhoods download is not valid GeoJSON. First bytes:"
-    head -c 200 "$DATA/sf_neighborhoods.geojson" >&2; echo >&2
+    err "Neighborhoods build failed (scripts/build_neighborhoods.py)."
     exit 1
   fi
 fi
