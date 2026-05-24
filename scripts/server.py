@@ -17,12 +17,20 @@ persists it. Two distinct computations power the map (see CLAUDE.md/Issues.md):
   * route LEGS — /itinerary + /attribution use R5 recorded paths; hover computes one cell
                 on demand, color-by-line builds the whole grid lazily on first toggle.
 """
-import os, json, copy, threading, datetime as dt
+import os, sys, json, copy, threading, datetime as dt
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd, geopandas as gpd, shapely
 from shapely.geometry import Point
 from flask import Flask, request, jsonify
+
+# Cap the JVM heap BEFORE r5py starts the JVM (imported via core.network below). r5py
+# defaults -Xmx to 80% of TOTAL system RAM — fine locally, but on a small hosting box that
+# over-reserves and risks OOM. Set R5_MAX_MEMORY (e.g. "1200M" or "70%") to cap it; unset
+# keeps r5py's default. r5py reads this from its --max-memory option.
+_r5_mem = os.environ.get("R5_MAX_MEMORY")
+if _r5_mem and "--max-memory" not in sys.argv and "-m" not in sys.argv:
+    sys.argv += ["--max-memory", _r5_mem]
 
 from core import config, feeds, grid, network, geo
 from core.network import MAX_INT32
