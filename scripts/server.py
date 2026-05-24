@@ -10,13 +10,16 @@ the travel-time-matrix step (no network rebuild). Run:
 
 Env: GRID_M (default 250) trades detail for speed.
 """
-import os, io, json, datetime as dt, urllib.request, urllib.parse
+import os, io, json, copy, time, threading, datetime as dt, urllib.request, urllib.parse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np, pandas as pd, geopandas as gpd, shapely
 from shapely.geometry import Point, box
 from flask import Flask, request, jsonify
 
 from r5py import TransportNetwork, TravelTimeMatrix, DetailedItineraries, TransportMode
+from r5py.r5.regional_task import RegionalTask
+import com.conveyal.r5            # JVM already started by the r5py imports above
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
 from itineraries import load_routes
 from route_map import route_shapes
@@ -31,6 +34,16 @@ DEFAULT = (DEST_LAT, DEST_LON, DEST_LABEL)
 GTFS = [DATA / "muni_current.zip", DATA / "bart_gtfs.zip"]
 ROUTES = load_routes(GTFS)
 LINES = route_shapes(GTFS)          # GTFS line geometries for the overlay
+
+
+def route_name(route_id, feed):
+    """Feed-aware route name (Muni '8' vs BART '8'=Red-N). Matches fastest_itin()/
+    load_routes(): a leg's `route_id` is resolved within its own `feed`'s id->name map."""
+    try:
+        k = str(int(float(route_id)))
+    except (ValueError, TypeError):
+        k = str(route_id)
+    return ROUTES.get(str(feed), {}).get(k, k)
 
 print(f"[boot] building grid @ {GRID_M}m + loading R5 network (once)...")
 NEIGH = gpd.read_file(DATA / "sf_neighborhoods.geojson").to_crs("EPSG:4326")
@@ -68,6 +81,107 @@ SNAPPED_GRID = SNAPPED_GRID[SNAPPED_GRID.geometry != shapely.Point()].reset_inde
 print(f"[boot] ready: {len(GRID)} origins ({len(SNAPPED_GRID)} on-network). "
       f"Open http://127.0.0.1:8000")
 
+# Pre-extract origin ids/geometries once (used by the threaded exact router below).
+_EXACT_IDS = list(SNAPPED_GRID.id)
+_EXACT_GEOMS = list(SNAPPED_GRID.geometry)
+MAX_INT32 = (2 ** 31) - 1
+
+# Thread pool for the EXACT recompute. R5 routing is read-only against the shared
+# warm TransportNetwork and each task clones its own Java RegionalTask, so per-origin
+# routing parallelises safely across threads in this one JVM (same pattern r5py's own
+# DetailedItineraries uses via joblib). ~8 threads is the sweet spot on this box:
+# the Java RAPTOR releases the GIL, but Python-side result extraction does not, so the
+# real-world speedup tops out ~4.8x around the physical-core count (benchmarked).
+_N_PHYS = os.cpu_count() or 8
+EXACT_THREADS = int(os.environ.get("EXACT_THREADS", str(min(8, _N_PHYS))))
+_EXACT_POOL = ThreadPoolExecutor(max_workers=EXACT_THREADS,
+                                 thread_name_prefix="r5-exact")
+
+# Serialise heavy routing jobs (/compute_exact, /attribution) against each other so a
+# single heavy request can use all cores; concurrent heavy requests would just thrash
+# the same cores and also blow up transient memory. Light /itinerary (one OD pair) and
+# the fast /compute do NOT take this lock, so hover stays responsive while a heavy
+# refine/attribution job runs. (See JOB 2.)
+_HEAVY_LOCK = threading.Lock()
+
+# The user-facing exact refine (/compute_exact) takes PRIORITY over the background
+# attribution prewarm: the frontend calls /compute (which kicks off the prewarm) and then
+# /compute_exact, so we must not let the ~30s prewarm grab _HEAVY_LOCK ahead of the exact
+# pass. _EXACT_PENDING counts exact jobs that are waiting-for or holding the lock; the
+# prewarm spins (briefly) until it's zero before acquiring, so exact always wins the lock.
+_EXACT_PENDING = 0
+_EXACT_PENDING_LOCK = threading.Lock()
+
+# ---- Attribution prewarm cache --------------------------------------------------------
+# The "color by line" map (~30s) is computed for the WHOLE grid, keyed only by the
+# workplace. So the moment a workplace is set (the very first /compute hit), we kick off
+# the attribution in a BACKGROUND thread and cache it by destination. By the time the user
+# flips to "Primary line" and the frontend calls /attribution, the answer is usually
+# already cached and returns instantly -- no frontend change needed. /attribution serves
+# the cache on a destination match, otherwise computes (and caches) synchronously.
+_ATTR_CACHE = {}                 # dest_key -> {cellId: line}
+_ATTR_INFLIGHT = {}             # dest_key -> threading.Event (compute in progress)
+_ATTR_CACHE_LOCK = threading.Lock()
+_PREWARM_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prewarm")
+
+
+def _dest_key(lat, lon):
+    return (round(float(lat), 5), round(float(lon), 5))
+
+
+def _attribution_cached(dlat, dlon, background=False):
+    """Return attribution for (dlat,dlon), using/populating the prewarm cache. If another
+    thread is already computing this destination, wait for it instead of recomputing.
+    When ``background`` (the prewarm), yield to any pending /compute_exact before grabbing
+    the heavy lock so the user-facing time refine always goes first."""
+    key = _dest_key(dlat, dlon)
+    with _ATTR_CACHE_LOCK:
+        if key in _ATTR_CACHE:
+            return _ATTR_CACHE[key]
+        event = _ATTR_INFLIGHT.get(key)
+        if event is None:
+            event = threading.Event()
+            _ATTR_INFLIGHT[key] = event
+            owner = True
+        else:
+            owner = False
+    if not owner:                # someone else is computing it; wait for their result
+        event.wait()
+        return _ATTR_CACHE.get(key, {})
+    try:
+        if background:
+            # The frontend sends /compute -> (prewarm fires) -> /compute_exact almost
+            # immediately. Give that exact request a moment to register as pending, then
+            # always yield to any pending/active exact before grabbing the heavy lock, so
+            # the user-facing time refine finishes first and the prewarm fills in after.
+            time.sleep(2.0)
+            while True:
+                with _EXACT_PENDING_LOCK:
+                    clear = _EXACT_PENDING == 0
+                if clear:
+                    break
+                time.sleep(0.1)
+        with _HEAVY_LOCK:        # serialise vs /compute_exact so cores aren't thrashed
+            attr = attribution(dlat, dlon)
+        with _ATTR_CACHE_LOCK:
+            _ATTR_CACHE[key] = attr
+        return attr
+    finally:
+        with _ATTR_CACHE_LOCK:
+            _ATTR_INFLIGHT.pop(key, None)
+        event.set()
+
+
+def _prewarm_attribution(dlat, dlon):
+    """Fire-and-forget: compute+cache attribution for a just-set workplace, in the
+    background, unless it's already cached or in flight."""
+    key = _dest_key(dlat, dlon)
+    with _ATTR_CACHE_LOCK:
+        if key in _ATTR_CACHE or key in _ATTR_INFLIGHT:
+            return
+    _PREWARM_POOL.submit(_attribution_cached, dlat, dlon, True)
+
+
 app = Flask(__name__)
 
 
@@ -104,28 +218,61 @@ def compute(lat, lon):
 
 def compute_exact(lat, lon):
     """EXACT (forward) door-to-door: route every grid cell -> workplace. This is the
-    slow, accurate direction (one routing tree per origin). The /compute approximation
-    refines to this. (A subagent parallelizes this further.)"""
+    slow, accurate direction (one R5 routing tree per origin).
+
+    SPEEDUP (JOB 1): r5py's own TravelTimeMatrix runs the per-origin trees SERIALLY in a
+    Python list comprehension (~66s for ~1362 origins @ GRID_M=300), which is the real
+    bottleneck -- R5's RAPTOR itself is fast per tree, but Python<->Java marshaling is
+    paid 1362 times in sequence and nothing is parallelised. Here we instead build the
+    routing request ONCE, then drive R5's TravelTimeComputer directly from a thread pool:
+    each thread clones the Java RegionalTask (cheap, Cloneable) and routes one origin to
+    the single workplace. The Java RAPTOR call releases the GIL, so threads inside this
+    one warm JVM run concurrently. This is bit-exact to the serial matrix (benchmarked:
+    MAE 0.000 min, identical reachable set) -- we keep the 30-min departure window and
+    [5=best, 50=realistic] percentiles untouched, since shrinking the window saves only
+    ~3s but costs ~2 min MAE and drops reachable cells. Measured: ~66s -> ~14s (~4.7x).
+
+    Returns the same shape as before: {id: [best, real]}."""
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(lon, lat)], crs="EPSG:4326")
-    ttm = TravelTimeMatrix(
-        NET, origins=SNAPPED_GRID, destinations=dest, snap_to_network=False,
+
+    # Build the routing template once (sets destination point set + linkage cache, in
+    # this calling thread, so worker threads never race on cache population).
+    template = RegionalTask(
+        NET, origin=None, destinations=dest,
         departure=DEP, departure_time_window=WINDOW, max_time=dt.timedelta(minutes=75),
         transport_modes=[TransportMode.TRANSIT, TransportMode.WALK],
         percentiles=[5, 50], speed_walking=4.8)
-    ttm = pd.DataFrame(ttm)
+    template.destinations = dest
+
+    def _one(i):
+        req = copy.copy(template)        # clones the underlying Java RegionalTask
+        req.origin = _EXACT_GEOMS[i]
+        computer = com.conveyal.r5.analyst.TravelTimeComputer(req, NET)
+        # travelTimes.getValues() -> [percentile_index][destination_index]; 1 destination
+        vals = computer.computeTravelTimes().travelTimes.getValues()
+        b = int(vals[0][0]); rl = int(vals[1][0])
+        return _EXACT_IDS[i], [None if b == MAX_INT32 else b,
+                               None if rl == MAX_INT32 else rl]
+
     cells = {}
-    for _, r in ttm.iterrows():
-        b, rl = r["travel_time_p5"], r["travel_time_p50"]
-        cells[str(r["from_id"])] = [None if pd.isna(b) else int(b),
-                                    None if pd.isna(rl) else int(rl)]
+    for cid, pair in _EXACT_POOL.map(_one, range(len(_EXACT_IDS)), chunksize=8):
+        cells[cid] = pair
     return cells
 
 
 @app.route("/compute_exact")
 def _compute_exact():
+    global _EXACT_PENDING
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
     t0 = dt.datetime.now()
-    cells = compute_exact(lat, lon)
+    with _EXACT_PENDING_LOCK:             # mark exact as pending so the prewarm yields
+        _EXACT_PENDING += 1
+    try:
+        with _HEAVY_LOCK:                  # one heavy job at a time; hover stays free
+            cells = compute_exact(lat, lon)
+    finally:
+        with _EXACT_PENDING_LOCK:
+            _EXACT_PENDING -= 1
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[exact] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
@@ -153,12 +300,7 @@ def fastest_itin(olat, olon, dlat, dlon):
                 out.append({"mode": "walk", "line": None, "min": round(l["tt"])})
         else:
             rides += 1
-            rid = l["route_id"]
-            try:
-                k = str(int(float(rid)))
-            except (ValueError, TypeError):
-                k = str(rid)
-            line = ROUTES.get(str(l.get("feed")), {}).get(k, k)
+            line = route_name(l["route_id"], l.get("feed"))
             out.append({"mode": mode.lower(), "line": line,
                         "min": round(l["tt"]), "wait": round(l["wt"])})
     return {"total": round(float(tot[best])), "xfers": max(0, rides - 1), "legs": out}
@@ -177,6 +319,90 @@ def _itinerary():
     return jsonify(res)
 
 
+def _path_route_name(raw):
+    """R5 records a path leg's route as a string "NAME (route_id)" where NAME is the
+    GTFS route_short_name/long_name resolved within the leg's own feed -- i.e. already
+    feed-aware (it yields Muni '8' but BART 'Red-N (8)'). That NAME is byte-identical to
+    load_routes()/route_name() (verified), so we just take the part before " (".
+    Falls back to the raw string if the format is unexpected."""
+    s = str(raw)
+    i = s.rfind(" (")
+    return s[:i] if i > 0 else s
+
+
+def attribution(dlat, dlon):
+    """Primary transit line per grid cell for the "color by line" map (JOB 3).
+
+    Returns {cellId: primaryLineName} for the fastest trip TO the workplace, where the
+    primary line is the route carrying the most in-vehicle time ("walk only" if walk
+    beats transit). Cell ids match GRID/SNAPPED_GRID; unreachable cells are omitted.
+
+    SPEED: detailed per-leg routing (DetailedItineraries / TripPlanner) is ~1-3s/origin
+    -- full access/egress street search to every reachable stop plus shapely geometry per
+    leg -- so all ~1362 cells take >8 min. But we don't need geometry, only "which line
+    dominates". R5's TravelTimeComputer can RECORD PATHS (`includePathResults`) using the
+    SAME fast one-to-all machinery as the exact matrix (JOB 1): we route each cell ->
+    workplace with path recording on, read back the recorded transit legs (route name +
+    in-vehicle time, already feed-aware), and pick the dominant line. This is ~20ms/origin
+    -- ~100x faster than detailed routing -- so we attribute ALL cells at full resolution
+    (no subsampling) in ~25-30s, parallelised across the same thread pool as the exact
+    matrix."""
+    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs="EPSG:4326")
+
+    template = RegionalTask(
+        NET, origin=None, destinations=dest,
+        departure=DEP, departure_time_window=WINDOW, max_time=dt.timedelta(minutes=75),
+        transport_modes=[TransportMode.TRANSIT, TransportMode.WALK],
+        percentiles=[50], speed_walking=4.8)
+    template.destinations = dest
+    template._regional_task.includePathResults = True   # record paths, not just times
+    template._regional_task.nPathsPerTarget = 1         # only need the single best path
+
+    def _one(i):
+        req = copy.copy(template)
+        req.origin = _EXACT_GEOMS[i]
+        result = com.conveyal.r5.analyst.TravelTimeComputer(req, NET).computeTravelTimes()
+        paths = result.paths
+        if paths is None:
+            return _EXACT_IDS[i], None
+        # one destination -> one entry; each is a path template with its transit legs and
+        # a set of iterations (one per departure minute in the window). Pick the template
+        # whose best (min totalTime) iteration is fastest -> that's the cell's fastest trip.
+        best_pit = None; best_t = None
+        for pit in paths.getPathIterationsForDestination():
+            mt = None
+            for it in pit.iterations:
+                if mt is None or it.totalTime < mt:
+                    mt = it.totalTime
+            if mt is not None and (best_t is None or mt < best_t):
+                best_t = mt; best_pit = pit
+        if best_pit is None:
+            return _EXACT_IDS[i], None                  # unreachable -> omit
+        legs = list(best_pit.transitLegs)
+        if not legs:
+            return _EXACT_IDS[i], "walk only"           # reachable on foot, no transit
+        dominant = max(legs, key=lambda lg: lg.inVehicleTime)
+        return _EXACT_IDS[i], _path_route_name(dominant.route)
+
+    attr = {}
+    for cid, line in _EXACT_POOL.map(_one, range(len(_EXACT_IDS)), chunksize=8):
+        if line is not None:                            # omit unreachable cells
+            attr[cid] = line
+    return attr
+
+
+@app.route("/attribution")
+def _attribution():
+    dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
+    t0 = dt.datetime.now()
+    cached = _dest_key(dlat, dlon) in _ATTR_CACHE
+    attr = _attribution_cached(dlat, dlon)   # serve prewarm cache, or compute+cache now
+    ms = (dt.datetime.now() - t0).total_seconds() * 1000
+    print(f"[attr] ({dlat:.4f},{dlon:.4f}) {ms:.0f}ms -> {len(attr)} cells"
+          f"{' (cached)' if cached else ''}")
+    return jsonify(attr)
+
+
 @app.route("/compute")
 def _compute():
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
@@ -184,6 +410,9 @@ def _compute():
     cells = compute(lat, lon)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[compute] ({lat:.4f},{lon:.4f}) {ms:.0f}ms")
+    # The address was just set -> start the (~30s) line-attribution in the background now,
+    # so it's cached and instant if/when the user switches to "Primary line". No FE change.
+    _prewarm_attribution(lat, lon)
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -243,7 +472,10 @@ PAGE = r"""<!DOCTYPE html>
   #legend .sc{display:flex;justify-content:space-between;color:var(--mut);font-size:11px}
   #busy{position:absolute;top:12px;left:12px;z-index:1100;background:var(--accent);color:#06121f;font-weight:600;
     padding:7px 12px;border-radius:20px;font-size:12.5px;display:none;box-shadow:0 2px 10px rgba(0,0,0,.4)}
-  .leaflet-tooltip.tt{background:#11141a;border:1px solid var(--line);color:var(--ink);font-size:12px}
+  .leaflet-tooltip.tt{background:#11141a;border:1px solid var(--line);color:var(--ink);font-size:12px;white-space:normal;max-width:250px}
+  .leaflet-popup-content{margin:10px 12px;max-width:250px;font-size:12.5px}
+  .leaflet-popup-content-wrapper{background:#11141a;color:var(--ink);border:1px solid var(--line)}
+  .leaflet-popup-tip{background:#11141a}
   .credit{padding:9px 16px;color:#5c6470;font-size:10.5px;border-top:1px solid var(--line)}
 </style></head>
 <body>
@@ -313,7 +545,9 @@ function buildLineColors(){const PAL=["#e6194B","#3cb44b","#ffe119","#4363d8","#
   LINECOLOR={};Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]).forEach((l,i)=>LINECOLOR[l]=l=="walk only"?"#7fd1ff":PAL[i%PAL.length]);}
 function bdHTML(d){
   if(d.error)return `<span style="color:#9aa3af">no transit route found (~75 min cap)</span>`;
-  const chain=d.legs.map(g=>g.line?`<b style="color:#5ab0ff">${g.line}</b> ${g.min}m`:`walk ${g.min}m`).join(" → ");
+  const chain=d.legs.map(g=>{if(!g.line)return `walk ${g.min}m`;
+    const w=(g.wait&&g.wait>=1)?`wait ${g.wait}m → `:"";
+    return `${w}<b style="color:#5ab0ff">${g.line}</b> ${g.min}m`;}).join(" → ");
   return `<div style="max-width:245px"><b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}`+
     `<div style="margin-top:4px;line-height:1.6">${chain}</div>`+
     `<div style="margin-top:6px"><a href="${gmaps(d.olat,d.olon)}" target="_blank" style="color:#5ab0ff">Open in Google Maps ↗</a></div>`+
@@ -395,4 +629,10 @@ legend();   // draw the legend; map stays blank until you set an address
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "8000")), threaded=False)
+    # threaded=True (JOB 2): each request runs in its own thread so a slow
+    # /compute_exact or /attribution can't freeze /itinerary (hover) or /compute.
+    # R5 routing is thread-safe (read-only shared network; per-task Java request clones)
+    # and jpype auto-attaches Python threads to the JVM. Heavy jobs are additionally
+    # serialised against each other by _HEAVY_LOCK so they don't thrash cores, while the
+    # light single-OD /itinerary never takes that lock and stays responsive.
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "8000")), threaded=True)
