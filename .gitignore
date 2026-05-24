@@ -1,0 +1,16 @@
+# data + r5py network cache
+data/*.pbf
+data/*.zip
+data/*.geojson
+data/*.mapdb*
+.venv/
+__pycache__/
+*.pyc
+
+# generated, address-specific outputs (personal — keep local)
+out/
+REPORT.md
+
+# private config
+.env
+.dest_cache.json
