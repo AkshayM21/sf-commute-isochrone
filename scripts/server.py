@@ -591,10 +591,21 @@ PAGE = r"""<!DOCTYPE html>
   #legend .sc{display:flex;justify-content:space-between;color:var(--mut);font-size:11px}
   #busy{position:absolute;top:12px;left:12px;z-index:1100;background:var(--accent);color:#06121f;font-weight:600;
     padding:7px 12px;border-radius:20px;font-size:12.5px;display:none;box-shadow:0 2px 10px rgba(0,0,0,.4)}
-  .leaflet-tooltip.tt{background:#11141a;border:1px solid var(--line);color:var(--ink);font-size:12px;white-space:normal;max-width:250px}
-  .leaflet-popup-content{margin:10px 12px;max-width:250px;font-size:12.5px}
-  .leaflet-popup-content-wrapper{background:#11141a;color:var(--ink);border:1px solid var(--line)}
+  .leaflet-tooltip.tt{background:#11141a;border:1px solid var(--line);color:var(--ink);white-space:normal;padding:0;box-shadow:0 6px 20px rgba(0,0,0,.45)}
+  .leaflet-tooltip.tt:before{border:none!important}
+  .leaflet-popup-content{margin:0;font-size:12.5px}
+  .leaflet-popup-content-wrapper{background:#11141a;color:var(--ink);border:1px solid var(--line);border-radius:10px}
   .leaflet-popup-tip{background:#11141a}
+  .bd{width:238px;padding:11px 13px;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
+  .bd .h{font-size:13px;margin-bottom:8px}
+  .bd .legs{display:flex;flex-wrap:wrap;gap:5px 5px;align-items:center}
+  .bd .leg{padding:1px 7px;border-radius:7px;white-space:nowrap;font-size:11.5px;font-weight:600}
+  .bd .walk{background:#262b33;color:#b6bdc8;font-weight:500}
+  .bd .wait{color:#8089b3;font-style:italic;font-weight:500;padding:1px 3px;background:repeating-linear-gradient(45deg,#1c2030,#1c2030 3px,#161a26 3px,#161a26 6px);border-radius:6px}
+  .bd .arr{color:#4b515c;font-size:10px}
+  .bd .gm{color:#5ab0ff;display:inline-block;margin-top:9px;font-weight:600;text-decoration:none}
+  .bd .gm:hover{text-decoration:underline}
+  .bd .foot{color:#5c6470;margin-top:5px;font-size:10.5px}
   .credit{padding:9px 16px;color:#5c6470;font-size:10.5px;border-top:1px solid var(--line)}
 </style></head>
 <body>
@@ -662,18 +673,28 @@ function style(f){const id=f.properties.id,v=val(id);
 function buildLineColors(){const PAL=["#e6194B","#3cb44b","#ffe119","#4363d8","#f58231","#911eb4","#42d4f4","#f032e6","#bfef45","#fabed4","#469990","#dcbeff","#9A6324","#800000","#aaffc3","#808000","#000075"];
   const cnt={};Object.values(ATTR).forEach(l=>cnt[l]=(cnt[l]||0)+1);
   LINECOLOR={};Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]).forEach((l,i)=>LINECOLOR[l]=l=="walk only"?"#7fd1ff":PAL[i%PAL.length]);}
+function lineColor(line){  // match the overlay legend colors
+  if(/^(Red|Yellow|Blue|Green|Orange|Gr[ae]y)-[NSEW]$/i.test(line))return "#6f8cff";  // BART
+  if(["PM","PH","CA"].includes(line))return "#5cd65c";                                 // cable
+  if(/^[JKLMNT]$/.test(line)||line==="KLM")return "#ff6b6b";                           // Muni Metro
+  return "#f6a04d";                                                                    // bus
+}
 function bdHTML(d){
-  if(d.error)return `<span style="color:#9aa3af">no transit route found (~75 min cap)</span>`;
-  const chain=d.legs.map(g=>{if(!g.line)return `walk ${g.min}m`;
-    const w=(g.wait&&g.wait>=1)?`wait ${g.wait}m → `:"";
-    return `${w}<b style="color:#5ab0ff">${g.line}</b> ${g.min}m`;}).join(" → ");
-  return `<div style="max-width:245px"><b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}`+
-    `<div style="margin-top:4px;line-height:1.6">${chain}</div>`+
-    `<div style="margin-top:6px"><a href="${gmaps(d.olat,d.olon)}" target="_blank" style="color:#5ab0ff">Open in Google Maps ↗</a></div>`+
-    `<div style="color:#5c6470;margin-top:3px;font-size:11px">typical fastest trip (~8:35am)</div></div>`;}
+  if(d.error)return `<div class="bd"><span style="color:#9aa3af">No transit route within ~75 min.</span></div>`;
+  const chips=[];
+  d.legs.forEach(g=>{
+    if(!g.line){chips.push(`<span class="leg walk">walk ${g.min}m</span>`);return;}
+    if(g.wait&&g.wait>=1)chips.push(`<span class="leg wait">wait ${g.wait}m</span>`);
+    const c=lineColor(g.line);
+    chips.push(`<span class="leg" style="background:${c}26;color:${c};border:1px solid ${c}55">${g.line} · ${g.min}m</span>`);
+  });
+  return `<div class="bd"><div class="h"><b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}</div>`+
+    `<div class="legs">${chips.join('<span class="arr">▸</span>')}</div>`+
+    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
+    `<div class="foot">typical fastest trip (~8:35am)</div></div>`;}
 let bdTimer;
 function loadBreak(f,setHTML){const v=val(f.properties.id);if(v==null){setHTML("—");return;}
-  setHTML(`<b>${f.properties.n||""}</b> · ${v} min<div style="color:#9aa3af;margin-top:3px">loading route…</div>`);
+  setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
   bdTimer=setTimeout(async()=>{try{
     const r=await fetch(`/itinerary?id=${f.properties.id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}`);
@@ -715,6 +736,7 @@ async function setWorkplace(lat,lon,label){
   busy("estimating…");
   try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}`);const d=await r.json();
     TT=d.cells;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
+    try{localStorage.setItem("wp",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
     aggregate();redraw();
   }catch(e){busy(false);alert("compute failed: "+e);return;}
   busy("refining (exact)…");                       // pipeline: exact pass refines the approximation
@@ -744,6 +766,9 @@ document.getElementById("go").onclick=async()=>{const q=document.getElementById(
     else{busy(false);alert("address not found");}}catch(e){busy(false);alert(e);}};
 document.getElementById("addr").addEventListener("keydown",e=>{if(e.key=="Enter")document.getElementById("go").click();});
 legend();   // draw the legend; map stays blank until you set an address
+try{const wp=JSON.parse(localStorage.getItem("wp")||"null");   // restore last workplace
+  if(wp&&wp.lat){document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);}
+}catch(e){}
 </script></body></html>"""
 
 
