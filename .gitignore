@@ -18,3 +18,9 @@ REPORT.md
 tests/e2e/screens/
 tests/**/__pycache__/
 .pytest_cache/
+
+# precompute prototype build artifacts
+prototypes/**/artifacts/
+prototypes/**/*.npz
+prototypes/**/*.log
+prototypes/**/__pycache__/
