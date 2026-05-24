@@ -38,7 +38,13 @@ def square_cells(points, grid_m=config.GRID_M):
         crs=config.UTM).to_crs(config.WGS)
 
 
-def attach_neighborhoods(cells, neigh, how="left", predicate="intersects"):
-    """Spatial-join a neighborhood `name` onto each cell (one row per cell)."""
-    j = gpd.sjoin(cells, neigh[["name", "geometry"]], how=how, predicate=predicate)
-    return j.drop_duplicates("id").drop(columns="index_right")
+def attach_neighborhoods(cells, neigh):
+    """Label each cell with the neighborhood CONTAINING its centroid — one deterministic
+    neighborhood per cell. (A 200m square can straddle several neighborhoods; an
+    intersects-join + dedupe would pick an arbitrary one, mislabeling border cells.)
+    Returns `cells` with a `name` column added."""
+    cent = cells.geometry.to_crs(config.UTM).centroid.to_crs(config.WGS)
+    pts = gpd.GeoDataFrame({"id": cells["id"].values}, geometry=cent.values, crs=config.WGS)
+    lab = gpd.sjoin(pts, neigh[["name", "geometry"]], how="left", predicate="within") \
+             .drop_duplicates("id")[["id", "name"]]
+    return cells.merge(lab, on="id", how="left")

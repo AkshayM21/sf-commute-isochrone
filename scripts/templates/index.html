@@ -18,7 +18,7 @@
   .seg{display:flex;gap:6px}.seg button{flex:1;background:#11141a;color:var(--ink);border:1px solid var(--line);
     padding:7px;border-radius:8px;font-size:12.5px;cursor:pointer}.seg button.on{background:var(--accent);color:#06121f;font-weight:600;border-color:var(--accent)}
   input[type=range]{width:100%;accent-color:var(--accent)} .val{color:var(--accent);font-weight:600}
-  #list{flex:1;overflow:auto;border-top:1px solid var(--line)}
+  #list{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--line)}
   .nb{display:flex;justify-content:space-between;padding:7px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid #1c2027}
   .nb:hover{background:#1f2530}.nb .t{font-variant-numeric:tabular-nums;font-weight:600}.nb small{color:var(--mut)}
   #legend{position:absolute;left:14px;bottom:16px;z-index:1000;background:rgba(20,23,29,.92);color:var(--ink);
@@ -126,7 +126,7 @@
       role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="ac"><div id="ac" role="listbox"></div></div><button id="go">Set</button></div>
     <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div>
     <button id="refine" class="btn sec" style="margin-top:9px" disabled>Refine — exact (~30s)</button>
-    <div class="note">Fast map is an estimate (±~2 min). Click <b>Refine</b> to sharpen to exact times.</div></div>
+    <div class="note">Fast map (±~2 min) auto-sharpens to exact times. Use <b>Refine</b> to re-run the exact pass.</div></div>
   <div class="ctl"><div class="lab">Time estimate</div>
     <div class="seg" id="metric"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
   <div class="ctl"><div class="lab">Color by</div>
@@ -157,7 +157,7 @@
   <h2>How it works</h2>
   <div>Door-to-door times by <b>walking + public transit only</b> (Muni / BART / Caltrain) —
   no driving or biking — on real schedules leaving ~8:35am on a weekday.
-  The fast map is an estimate (±~2 min); click <b>Refine</b> for exact times.
+  The fast map is an estimate (±~2 min) that auto-sharpens to exact times (Refine re-runs it).
   <b>Hover or tap</b> any area for the route behind the number.</div>
 </div></div>
 <script>
@@ -271,11 +271,17 @@ async function setWorkplace(lat,lon,label){
   }catch(e){if(myGen===GEN){busy(false);alert("compute failed: "+e);}return;}
   if(myGen!==GEN)return;
   busy(false);
-  document.getElementById("refine").disabled=false;  // exact pass is now opt-in via the button
+  document.getElementById("refine").disabled=false;  // also re-refinable on demand via the button
   syncHash();
   if(cmode=="line")loadAttribution();
+  // Auto-sharpen the fast approximation to the EXACT map so the colors/filter match the hover
+  // breakdown (which is always exact). Safe under load: refine() is 503-aware and silently keeps
+  // the fast map when the server is busy; its own generation guard drops this if the address
+  // changes again before the exact pass returns.
+  if(myGen===GEN)refine();
 }
-// ---- opt-in exact refine (was auto; now on-demand). 503-aware with one retry. ------------
+// ---- exact refine: auto-run after every address (above) AND re-runnable via the button.
+//      503-aware with one retry; keeps the fast approximation if exact is unavailable/busy. ----
 async function refine(){
   if(!DESTLL)return;const myGen=GEN;const [lat,lon]=DESTLL;const label=CURLABEL;
   const btn=document.getElementById("refine");btn.disabled=true;busy("refining (exact)…");
