@@ -31,7 +31,7 @@ GRID_M = int(os.environ.get("GRID_M", "200"))   # fine grid is fine — reverse 
 DEP = dt.datetime(2026, 5, 20, 8, 35)
 WINDOW = dt.timedelta(minutes=int(os.environ.get("WINDOW_MIN", "30")))
 DEFAULT = (DEST_LAT, DEST_LON, DEST_LABEL)
-GTFS = [DATA / "muni_current.zip", DATA / "bart_gtfs.zip"]
+GTFS = [DATA / "muni_current.zip", DATA / "bart_gtfs.zip", DATA / "caltrain.zip"]
 ROUTES = load_routes(GTFS)
 LINES = route_shapes(GTFS)          # GTFS line geometries for the overlay
 
@@ -68,8 +68,7 @@ CELLS_GEOJSON = json.loads(_cells.to_json())
 for f in CELLS_GEOJSON["features"]:
     f["properties"] = {"id": f["properties"]["id"], "n": f["properties"].get("name")}
 
-NET = TransportNetwork(str(DATA / "osm_sf.pbf"),
-                       [str(DATA / "muni_current.zip"), str(DATA / "bart_gtfs.zip")])
+NET = TransportNetwork(str(DATA / "osm_sf.pbf"), [str(p) for p in GTFS])
 
 # Pre-snap the grid to the street network ONCE at startup. This lets every
 # /compute call pass snap_to_network=False (no re-snapping 1000+ points per
@@ -647,7 +646,7 @@ const CELLS=__CELLS__, LINES=__LINES__, DEFAULT=__DEFAULT__;
 let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={};
 const gmaps=(olat,olon)=>`https://www.google.com/maps/dir/?api=1&origin=${olat},${olon}&destination=${DESTLL[0]},${DESTLL[1]}&travelmode=transit`;
 let bdToken=0;  // cancels stale hover-breakdown fetches
-const map=L.map("map").setView([37.762,-122.43],12.3);
+const map=L.map("map",{preferCanvas:true}).setView([37.762,-122.43],12.3);  // canvas: 3k polygons stay light on CPU
 L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{maxZoom:19}).addTo(map);
 const rgb=c=>`rgb(${c[0]},${c[1]},${c[2]})`;
 function ramp(){const hi=ideal+25;return {hi,S:[[0,[0,104,55]],[ideal*.45,[26,152,80]],[ideal*.72,[102,189,99]],
