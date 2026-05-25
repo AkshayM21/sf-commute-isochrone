@@ -10,6 +10,14 @@ real GTFS schedules and the OpenStreetMap walking network, via the Conveyal
 **R5** routing engine (`r5py`). Results are aggregated to the 117 SF "Find
 Neighborhoods" and ranked by travel time.
 
+> **Note (2026-05-25): the live server now defaults to a JVM-free stack** — a self-built reverse
+> RAPTOR transit router + a hill-aware (Tobler) walk router — so **Java/R5 is no longer required to
+> run it** (~245 MB RSS, no JVM). The map is now an **arrive-by-9:00am** estimate with a
+> realistic-vs-best-case toggle, a service-noise fragility overlay, and a slow/med/fast walk-speed
+> control. R5 is kept only for offline oracle/validation and as a fallback. See **RAPTOR.md** for the
+> engine + the one-time bakes (`fetch_dem.sh` → `build_walk_graph.py` → `bake_walk_access.py`); the
+> prereqs/quick-start below still describe the original R5 build and are being updated.
+
 Two numbers per location:
 - **best-case** — 5th percentile over the morning departure window (you time
   departures well; transfers still modeled)

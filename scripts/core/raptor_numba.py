@@ -369,3 +369,90 @@ def montecarlo(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_t
                 m = capf
             commute_all[ci, r] = m
     return commute_all
+
+
+# ----------------------------------------------- committed-plan Monte-Carlo (forward sim)
+# The clairvoyant `montecarlo` above re-optimizes the WHOLE journey per draw (it dodges a
+# missed transfer by picking a different first train, knowing the delays in advance) -> it is a
+# LOWER bound on real variance. This kernel commits the FIRST leg from the unperturbed plan
+# (departure + line + board stop, no foreknowledge), then per draw: board the next available trip
+# on the committed line, ride to the committed alight, and re-optimize the TAIL from the ACTUAL
+# (late) arrival via the perturbed reverse profile. So a late first leg that blows the transfer
+# eats a real headway -> a higher, more honest realistic + fragility. Tail stays clairvoyant
+# (you have real-time info en route), so it remains a TIGHTER lower bound, not the full truth.
+
+@njit(parallel=True, nogil=True, cache=True)
+def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
+                         pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos,
+                         tr_off, tr_to, tr_time, egress_g, egress_w, deadlines, board_slack,
+                         max_rounds, commit_home, commit_kind, commit_walk0, commit_pi,
+                         commit_bpos, commit_apos, commit_as, perfect, max_min,
+                         delta0_all, slope_all):
+    """commute_all[n_cells, R] float minutes for R draws, COMMITTED-PLAN semantics. Per draw:
+    perturb -> reverse profile; per transit cell: catch the next trip on the committed pattern at
+    the committed board position (>= arrival + board_slack), ride to the committed alight, then read
+    the earliest workplace arrival from that alight at the ACTUAL arrival time off the perturbed
+    profile. Deterministic (walk-only) cells take ``perfect`` every draw; unreachable -> cap."""
+    R = delta0_all.shape[0]
+    n_cells = commit_home.shape[0]
+    nd = deadlines.shape[0]
+    np_len = pat_dep.shape[0]
+    commute_all = np.empty((n_cells, R), dtype=np.float64)
+    capf = np.float64(max_min)
+    for r in prange(R):
+        dep_r = np.empty(np_len, dtype=np.int64)
+        arr_r = np.empty(np_len, dtype=np.int64)
+        _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
+                 delta0_all[r], slope_all[r], dep_r, arr_r)
+        latest = _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
+                          pat_stops, dep_r, arr_r, ras_off, ras_pat, ras_pos,
+                          tr_off, tr_to, tr_time, egress_g, egress_w, deadlines,
+                          board_slack, max_rounds)
+        for ci in range(n_cells):
+            k = commit_kind[ci]
+            if k != 2:                                   # unreachable (0) or deterministic walk (1)
+                p = perfect[ci]
+                if k == 0 or p < 0:
+                    commute_all[ci, r] = capf
+                else:
+                    commute_all[ci, r] = capf if p > capf else np.float64(p)
+                continue
+            pi = commit_pi[ci]
+            ns = pat_nstops[pi]
+            nt = pat_ntrips[pi]
+            mbase = pat_mat_off[pi]
+            bpos = commit_bpos[ci]
+            apos = commit_apos[ci]
+            # arrive at the committed board stop, then catch the next available trip on the line
+            key = commit_home[ci] + commit_walk0[ci] + board_slack
+            lo = 0
+            hi = nt
+            while lo < hi:                               # first trip with perturbed dep >= key
+                mid = (lo + hi) >> 1
+                if dep_r[mbase + mid * ns + bpos] < key:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo >= nt:                                 # missed the last trip on the committed line
+                commute_all[ci, r] = capf
+                continue
+            arr_as = arr_r[mbase + lo * ns + apos]       # ACTUAL (late) arrival at the transfer stop
+            s = commit_as[ci]
+            lo2 = 0                                      # earliest deadline reachable from there now
+            hi2 = nd
+            while lo2 < hi2:
+                mid = (lo2 + hi2) >> 1
+                if latest[s, mid] < arr_as:
+                    lo2 = mid + 1
+                else:
+                    hi2 = mid
+            if lo2 >= nd:                                # can't reach work within the horizon
+                commute_all[ci, r] = capf
+                continue
+            tt = (deadlines[lo2] - commit_home[ci]) / 60.0
+            if tt < 0.0:
+                tt = 0.0
+            if tt > capf:
+                tt = capf
+            commute_all[ci, r] = tt
+    return commute_all

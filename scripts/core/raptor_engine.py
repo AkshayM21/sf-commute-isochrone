@@ -28,6 +28,11 @@ ARRIVE_BY_HM = (9, 0)                             # product target: arrive by 09
 # --- service-noise Monte-Carlo (realistic + fragility + alt-lines) --------------------
 MC_DRAWS = int(os.environ.get("RAPTOR_MC_DRAWS", "24"))       # draws for realistic/fragility
 MC_ALT_DRAWS = int(os.environ.get("RAPTOR_MC_ALT_DRAWS", "4"))  # traced draws for alt-lines (pricier)
+# committed-plan vs clairvoyant realistic. Committed (default) FIXES the first leg from the
+# published plan then re-optimizes the tail from the actual late arrival -> a higher, more honest
+# realistic + fragility. Clairvoyant (RAPTOR_MC_COMMITTED=0) re-optimizes the whole journey with
+# foreknowledge -> an optimistic lower bound (route resilience). See RAPTOR.md.
+MC_COMMITTED = os.environ.get("RAPTOR_MC_COMMITTED", "1").lower() in ("1", "true", "yes", "on")
 MC_SHAPE = float(os.environ.get("RAPTOR_MC_SHAPE", "2.0"))   # Gamma shape (spread); mean=shape*scale
 # mean INITIAL delay (sec) + fractional DRIFT slope, by mode/operator (env-overridable). Buses are
 # the noisiest, rail the steadiest; Caltrain/BART keyed on feed (BART=1, Caltrain=2).
@@ -189,7 +194,8 @@ class RaptorEngine:
         return mu, sl
 
     def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
-                   seed=None, alt_draws=None, walk_scalar=1.0):
+                   seed=None, alt_draws=None, walk_scalar=1.0, committed=None,
+                   max_rounds=MAX_ROUNDS):
         """Service-noise MC for a workplace. Returns dict of cell-aligned arrays:
           realistic int32  p50 door-to-door commute over draws (clamped >= ``perfect``)
           frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number)
@@ -197,9 +203,12 @@ class RaptorEngine:
           stuck     float  fraction of draws where the cell hits the cap (last-train/peak risk)
           alt       list[dict|None]  {line: votes} alternative lines that serve the cell under
                                      delays (re-routes), from ``alt_draws`` traced perturbed trees
-        Each draw perturbs the schedule and re-optimizes, so the spread captures missed-transfer
-        RE-ROUTING (take the next local), not just same-line headway. Lazy + cached per workplace
-        by the caller; never on the hover path. ``seed`` makes it reproducible per workplace."""
+        ``committed`` (default ``MC_COMMITTED``=True): fix the first leg from the published plan and
+        re-optimize the tail from the actual late arrival -> the honest "I missed my transfer and ate
+        a headway" cost. ``committed=False`` is the clairvoyant lower bound (re-route the whole
+        journey with foreknowledge). Lazy + cached per workplace by the caller; never on the hover
+        path. ``seed`` makes it reproducible per workplace."""
+        committed = MC_COMMITTED if committed is None else bool(committed)
         nR = MC_DRAWS if n_draws is None else int(n_draws)
         egress_g = np.asarray(egress_g, np.int32)
         ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
@@ -211,11 +220,23 @@ class RaptorEngine:
         T = mu_trip.shape[0]
         delta0_all = rng.gamma(k, mu_trip / k, size=(nR, T))
         slope_all = rng.gamma(k, np.maximum(slope_trip, 1e-9) / k, size=(nR, T))
-        d_med = self.dep_sec + self.win_sec // 2
-        cm = R.montecarlo_commute(self.data, egress_g, ew, self.Tgrid,
-                                  self.access_off, self.access_to, aw, pw,
-                                  np.int64(d_med), self.max_min, delta0_all, slope_all,
-                                  board_slack=BOARD_SLACK, max_rounds=MAX_ROUNDS)
+        if committed:
+            # the committed plan + perfect map come from the SAME unperturbed arrive-by tree
+            tree = self.journey_tree(egress_g, egress_w, purewalk, max_rounds=max_rounds,
+                                     walk_scalar=walk_scalar)
+            legs = tree.committed_first_legs()
+            if perfect is None:
+                perfect, _ = tree.commute_and_dominant()
+            cm = R.montecarlo_commute_committed(self.data, egress_g, ew, self.Tgrid, legs,
+                                                np.asarray(perfect, np.int32), self.max_min,
+                                                delta0_all, slope_all, board_slack=BOARD_SLACK,
+                                                max_rounds=max_rounds)
+        else:
+            d_med = self.dep_sec + self.win_sec // 2
+            cm = R.montecarlo_commute(self.data, egress_g, ew, self.Tgrid,
+                                      self.access_off, self.access_to, aw, pw,
+                                      np.int64(d_med), self.max_min, delta0_all, slope_all,
+                                      board_slack=BOARD_SLACK, max_rounds=max_rounds)
         p50 = np.percentile(cm, 50, axis=1)
         p90 = np.percentile(cm, 90, axis=1)
         realistic = np.ceil(p50).astype(np.int32)
@@ -227,10 +248,11 @@ class RaptorEngine:
             m = perfect >= 0
             realistic[m] = np.maximum(realistic[m], perfect[m].astype(np.int32))
         alt = self._mc_alt_lines(egress_g, ew, pw, aw, delta0_all, slope_all,
-                                 MC_ALT_DRAWS if alt_draws is None else int(alt_draws))
+                                 MC_ALT_DRAWS if alt_draws is None else int(alt_draws), max_rounds)
         return dict(realistic=realistic, frag=frag, std=std, stuck=stuck, alt=alt)
 
-    def _mc_alt_lines(self, egress_g, egress_w, purewalk, access_w, delta0_all, slope_all, K):
+    def _mc_alt_lines(self, egress_g, egress_w, purewalk, access_w, delta0_all, slope_all, K,
+                      max_rounds=MAX_ROUNDS):
         """{line: votes} per cell: dominant line across ``K`` perturbed arrive-by traced trees
         (so a delayed express lets the next local show up as an alternative). Reuses the validated
         JourneyTree; pricier than the numpy MC, so K is small + env-tunable."""
@@ -245,7 +267,7 @@ class RaptorEngine:
             dep, arr = R.apply_delays(self.data, delta0_all[kk], slope_all[kk], off)
             pdata = dict(self.data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
             par = R.reverse_raptor_traced(pdata, egress_g, target - egress_w, egress_w,
-                                          max_rounds=MAX_ROUNDS, board_slack=BOARD_SLACK)
+                                          max_rounds=max_rounds, board_slack=BOARD_SLACK)
             tree = raptor_journey.JourneyTree(pdata, par, self.access_off, self.access_to,
                                               access_w, purewalk, target, self.max_min)
             _, dom = tree.commute_and_dominant()

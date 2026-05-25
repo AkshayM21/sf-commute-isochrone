@@ -130,12 +130,24 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   Gamma` with means by mode/operator (bus noisiest, rail steadiest; keyed on `pat_mode`+`pat_feed`).
   A per-pattern **FIFO cumulative-max clamp** (no overtaking on the arr OR dep column) keeps the
   per-position binary search valid (tested).
-- **Hot path** (`raptor_numba.montecarlo`, `parallel=True` nogil): draws run in `prange`, each
-  thread holding ONE perturbed schedule + ONE latest profile, **streaming** each draw's per-cell
-  median-departure commute into `commute_all[n_cells, R]` (never R×n_stops). ~**0.1 s** for 24
-  draws (full grid). Per-cell outputs: `realistic = p50` (clamped ≥ perfect), `frag = p90−p50`
-  (the "bad-day +Y" headline), `std`, `stuck` (fraction of draws hitting the cap = last-train/
-  peak risk).
+- **Hot path** (`parallel=True` nogil): draws run in `prange`, each thread holding ONE perturbed
+  schedule + ONE latest profile, **streaming** each draw's per-cell commute into
+  `commute_all[n_cells, R]` (never R×n_stops). ~**0.1–0.2 s** for 24 draws (full grid). Per-cell
+  outputs: `realistic = p50` (clamped ≥ perfect), `frag = p90−p50` (the "bad-day +Y" headline),
+  `std`, `stuck` (fraction of draws hitting the cap = last-train/peak risk). Two models share this
+  machinery (perturb → reverse profile → per-cell readout), differing only in the readout:
+  - **COMMITTED-PLAN (the default `realistic`, `RAPTOR_MC_COMMITTED=1`, `raptor_numba.montecarlo_committed`):**
+    you commit your departure + first leg from the *published* plan (`JourneyTree.committed_first_legs`
+    extracts, per cell, the committed home departure + first board pattern/position/alight from the
+    unperturbed arrive-by tree — no foreknowledge of delays). Per draw it boards the **next available
+    trip on that committed line** (a late earlier train you can also catch), rides to the committed
+    alight, then re-optimizes the **tail** from the *actual* (late) arrival via the perturbed reverse
+    profile. So a late first leg that blows a transfer **eats a real headway**. Reads **+1.7 min above**
+    the clairvoyant model (agg 44.0 vs 42.2 over 5 workplaces), much more on tight-transfer cells
+    (downtown `frag90` 20 vs westportal 18). `perfect ≤ committed` holds by construction (asserted).
+  - **CLAIRVOYANT (`RAPTOR_MC_COMMITTED=0`, `raptor_numba.montecarlo`):** re-optimizes the WHOLE
+    journey per draw with foreknowledge (miss the express → the min over patterns lands on the next
+    local at the fixed median departure). An optimistic LOWER bound = route *resilience*.
 - **Alt-lines** (`RaptorEngine._mc_alt_lines`): the dominant line across ~4 *traced* perturbed
   arrive-by trees (reuses `JourneyTree`), so a delayed express lets the next local show up. Pricier
   (pure-python trace, ~0.7 s for 4 draws), env-tunable (`RAPTOR_MC_ALT_DRAWS`), excludes the cell's
@@ -146,20 +158,23 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   perfect-timing journey (hover == perfect-map exact); realistic/fragility/alt are header
   annotations. The `Realistic`/`Best-case` `#metric` toggle now switches MC-p50 ↔ perfect.
 
-**Validation** (`scripts/raptor_validate_mc.py`, `tests/test_raptor.py::test_mc_*`): realistic vs
-R5's *schedule-perfect* p50 — MAE **2.19**, bias **+1.14** (mildly positive: delays only add time;
-larger in fragile peripheral workplaces like bayview +2.4), **0** `perfect ≤ realistic` violations,
-FIFO-clamp sortedness. There is no true R5 ground truth for a *delayed* commute, so this bounds
-realistic's drift from schedule-perfect rather than measuring error.
+**Validation** (`scripts/raptor_validate_mc.py`, `tests/test_raptor.py::test_mc_*`): both modes at
+the same seed vs R5's *schedule-perfect* p50 (NOT ground truth for a delayed commute — both should
+sit ABOVE it). Aggregate over 5 workplaces: clairvoyant **42.2**, committed **44.0** (bias vs R5
+**+2.94**); **committed ≥ clairvoyant** and **0** `perfect ≤ committed` violations are asserted, plus
+FIFO-clamp sortedness and numba==python (the committed kernel agrees with the pure-python reference
+within ≤2 min at the served p50, the same transfer-relaxation tolerance as the depart-after kernel).
 
-> **Caveat (documented limit):** the MC re-routes **clairvoyantly** (it knows the perturbed schedule
-> at home), so `realistic` is a **lower bound** on real "committed-plan" variance — it answers "is
-> there a good alternative under bad conditions" (route *resilience*), not "I'm on the platform and
-> just missed it." A committed-plan MC (fix departure + first leg, re-optimize the tail) is the more
-> expensive future upgrade.
+> **Caveat (smaller now, not gone):** the committed model fixes only the FIRST leg; the **tail** still
+> re-optimizes clairvoyantly (you have real-time info en route, e.g. you check the app and grab the
+> next local). So `committed` is a **tighter lower bound**, not the full truth — a *fully* committed
+> sim (re-decide at every leg as the delay reveals itself) would be a per-leg forward simulation and
+> is the remaining upgrade. The whole-journey clairvoyant lower bound stays available
+> (`RAPTOR_MC_COMMITTED=0`) as the route-resilience read.
 
-Knobs (env): `RAPTOR_MC` (1), `RAPTOR_MC_DRAWS` (24), `RAPTOR_MC_ALT_DRAWS` (4), `RAPTOR_MC_SHAPE`
-(2.0), `RAPTOR_MC_MU_{BUS,METRO,CABLE,BART,CALTRAIN}` (70/45/40/25/40 s initial delay mean).
+Knobs (env): `RAPTOR_MC` (1), `RAPTOR_MC_COMMITTED` (1 = committed-plan; 0 = clairvoyant lower bound),
+`RAPTOR_MC_DRAWS` (24), `RAPTOR_MC_ALT_DRAWS` (4), `RAPTOR_MC_SHAPE` (2.0),
+`RAPTOR_MC_MU_{BUS,METRO,CABLE,BART,CALTRAIN}` (70/45/40/25/40 s initial delay mean).
 
 ## Phase B: hill-aware R5-free walk router + walk-speed toggle (`USE_WALK_GRAPH=1`) — DROPS THE JVM
 Replaces R5's last runtime job (the per-workplace walk matrix) with a custom **slope-aware**

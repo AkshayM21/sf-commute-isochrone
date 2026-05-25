@@ -257,7 +257,7 @@ function bdHTML(d){
     `<div class="legs">${chips.join('<span class="arr">▸</span>')}</div>`+
     altline+
     `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
-    `<div class="foot">best-case = perfect timing (~0 wait); typical adds service noise</div></div>`;}
+    `<div class="foot">best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait</div></div>`;}
 let bdTimer;
 function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){setHTML("—");return;}
   if(!EXACT){   // map still on the fast estimate — show the SAME value (no contradicting exact breakdown yet)

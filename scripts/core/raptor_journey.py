@@ -133,6 +133,62 @@ class JourneyTree:
             return None
         return self._format(out, total_min)
 
+    # -- committed-plan MC: per-cell committed FIRST leg (departure + first board) ---------
+    def committed_first_legs(self):
+        """Per-cell committed plan extracted from THIS (unperturbed) arrive-by tree, for the
+        committed-plan Monte-Carlo: you choose your departure and first train from the published
+        schedule with no foreknowledge of delays. Returns cell-aligned int arrays:
+
+          commit_home   int64  committed home departure (sec); NEG if unreachable
+          commit_kind   int8   0 unreachable, 1 deterministic (walk-only / no transit), 2 transit
+          commit_walk0  int64  walk seconds home -> first BOARD stop (access + any leading footpaths)
+          commit_pi     int32  first committed transit pattern (-1 if not transit)
+          commit_bpos   int32  board position within that pattern
+          commit_apos   int32  committed alight position (a LATER position) within that pattern
+          commit_as     int32  committed alight stop gid (you re-optimize the TAIL from here)
+
+        The forward sim (raptor_numba.montecarlo_committed) then, per delayed draw, boards the next
+        available trip on ``commit_pi`` at ``commit_bpos`` (the same line you planned; a late earlier
+        trip you can also catch), rides to ``commit_apos``, and re-optimizes from ``commit_as`` at the
+        ACTUAL (late) arrival — so a first-leg delay that blows the transfer costs a real headway."""
+        n = self.n_cells
+        out = dict(
+            commit_home=np.full(n, NEG, np.int64), commit_kind=np.zeros(n, np.int8),
+            commit_walk0=np.zeros(n, np.int64), commit_pi=np.full(n, -1, np.int32),
+            commit_bpos=np.full(n, -1, np.int32), commit_apos=np.full(n, -1, np.int32),
+            commit_as=np.full(n, -1, np.int32))
+        d = self.d
+        pat_stop_off = d["pat_stop_off"]; pat_stops = d["pat_stops"]
+        tr_off = d["tr_off"]; tr_to = d["tr_to"]; tr_time = d["tr_time"]
+        par = self.par
+        par_kind = par["par_kind"]; par_pat = par["par_pat"]
+        par_board = par["par_board"]; par_alight = par["par_alight"]; par_from = par["par_from"]
+        for ci in range(n):
+            s_star, aw, latest_home, is_walk = self._select(ci)
+            if is_walk:                                  # pure-walk wins: deterministic, no service noise
+                if self.purewalk[ci] < 0:
+                    continue                             # unreachable (kind stays 0)
+                out["commit_kind"][ci] = 1; out["commit_home"][ci] = latest_home
+                continue
+            if s_star < 0:
+                continue
+            out["commit_home"][ci] = latest_home
+            s = s_star; walk0 = int(aw)
+            for _ in range(64):                          # walk the parent chain to the FIRST transit board
+                k = int(par_kind[s])
+                if k == 1:                               # transit board at s -> ride to par_alight
+                    pi = int(par_pat[s]); sbase = int(pat_stop_off[pi]); apos = int(par_alight[s])
+                    out["commit_kind"][ci] = 2; out["commit_pi"][ci] = pi
+                    out["commit_bpos"][ci] = int(par_board[s]); out["commit_apos"][ci] = apos
+                    out["commit_as"][ci] = int(pat_stops[sbase + apos]); out["commit_walk0"][ci] = walk0
+                    break
+                elif k == 2:                             # leading footpath toward W -> accumulate walk
+                    j = int(par_from[s]); walk0 += _footpath_sec(tr_off, tr_to, tr_time, s, j); s = j
+                else:                                    # egress seed before any transit -> all-walk, deterministic
+                    out["commit_kind"][ci] = 1
+                    break
+        return out
+
     # -- public: per-cell commute minutes + dominant line (map + color-by-line) -----------
     def commute_and_dominant(self):
         commute = np.full(self.n_cells, -1, dtype=np.int32)

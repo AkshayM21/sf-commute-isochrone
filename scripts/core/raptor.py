@@ -427,6 +427,85 @@ def montecarlo_commute(data, egress_g, egress_w, deadlines, access_off, access_t
                               board_slack, max_rounds)
 
 
+def montecarlo_commute_committed(data, egress_g, egress_w, deadlines, legs, perfect, max_min,
+                                 delta0_all, slope_all, board_slack=60, max_rounds=8, kernel=None):
+    """COMMITTED-PLAN commute_all[n_cells, R] in float minutes. ``legs`` is the per-cell committed
+    first leg from ``raptor_journey.JourneyTree.committed_first_legs`` (departure + first board fixed
+    from the unperturbed plan). Each draw perturbs the schedule, then per transit cell: board the
+    next trip on the committed line, ride to the committed alight, and re-optimize the tail from the
+    ACTUAL late arrival. Higher/more honest than the clairvoyant ``montecarlo_commute``. Numba when
+    available; the parallel kernel is serialized (workqueue not threadsafe)."""
+    if kernel is None:
+        kernel = _select_kernel()
+    if kernel == "numba":
+        from . import raptor_numba
+        with _MC_KERNEL_LOCK:                          # serialize the non-threadsafe parallel kernel
+            return raptor_numba.montecarlo_committed(
+                np.int64(data["n_stops"]),
+                data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
+                data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64),
+                pat_trip_off(data),
+                data["pat_stops"].astype(np.int64), data["pat_dep"].astype(np.int64),
+                data["pat_arr"].astype(np.int64),
+                data["ras_off"].astype(np.int64), data["ras_pat"].astype(np.int64),
+                data["ras_pos"].astype(np.int64),
+                data["tr_off"].astype(np.int64), data["tr_to"].astype(np.int64),
+                data["tr_time"].astype(np.int64),
+                np.asarray(egress_g, np.int64), np.asarray(egress_w, np.int64),
+                np.asarray(deadlines, np.int64), np.int64(board_slack), np.int64(max_rounds),
+                np.asarray(legs["commit_home"], np.int64), np.asarray(legs["commit_kind"], np.int64),
+                np.asarray(legs["commit_walk0"], np.int64), np.asarray(legs["commit_pi"], np.int64),
+                np.asarray(legs["commit_bpos"], np.int64), np.asarray(legs["commit_apos"], np.int64),
+                np.asarray(legs["commit_as"], np.int64), np.asarray(perfect, np.int64),
+                np.int64(max_min),
+                np.ascontiguousarray(delta0_all, np.float64),
+                np.ascontiguousarray(slope_all, np.float64))
+    return _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perfect,
+                                        max_min, delta0_all, slope_all, board_slack, max_rounds)
+
+
+def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perfect, max_min,
+                                 delta0_all, slope_all, board_slack, max_rounds):
+    """Slow pure-numpy reference for ``montecarlo_commute_committed`` (test/no-numba path)."""
+    off = pat_trip_off(data)
+    deadlines = np.asarray(deadlines, np.int64)
+    nd = len(deadlines)
+    home = np.asarray(legs["commit_home"]); kind = np.asarray(legs["commit_kind"])
+    walk0 = np.asarray(legs["commit_walk0"]); pic = np.asarray(legs["commit_pi"])
+    bpos = np.asarray(legs["commit_bpos"]); apos = np.asarray(legs["commit_apos"])
+    as_ = np.asarray(legs["commit_as"]); perfect = np.asarray(perfect)
+    pat_nstops = data["pat_nstops"]; pat_ntrips = data["pat_ntrips"]; pat_mat_off = data["pat_mat_off"]
+    n_cells = len(home)
+    Rn = delta0_all.shape[0]
+    cm = np.empty((n_cells, Rn), dtype=np.float64)
+    capf = float(max_min)
+    for r in range(Rn):
+        dep, arr = apply_delays(data, delta0_all[r], slope_all[r], off)
+        pdata = dict(data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
+        latest = reverse_profile(pdata, egress_g, egress_w, deadlines,
+                                 board_slack=board_slack, max_rounds=max_rounds, kernel="python")
+        for ci in range(n_cells):
+            k = int(kind[ci])
+            if k != 2:
+                p = int(perfect[ci])
+                cm[ci, r] = capf if (k == 0 or p < 0) else min(float(p), capf)
+                continue
+            pi = int(pic[ci]); ns = int(pat_nstops[pi]); nt = int(pat_ntrips[pi])
+            mb = int(pat_mat_off[pi]); bp = int(bpos[ci]); ap = int(apos[ci])
+            key = int(home[ci]) + int(walk0[ci]) + board_slack
+            depcol = dep[mb + bp: mb + nt * ns: ns]
+            lo = int(np.searchsorted(depcol, key, side="left"))
+            if lo >= nt:
+                cm[ci, r] = capf; continue
+            arr_as = int(arr[mb + lo * ns + ap])
+            lo2 = int(np.searchsorted(latest[int(as_[ci])], arr_as, side="left"))
+            if lo2 >= nd:
+                cm[ci, r] = capf; continue
+            tt = (int(deadlines[lo2]) - int(home[ci])) / 60.0
+            cm[ci, r] = min(max(tt, 0.0), capf)
+    return cm
+
+
 def _montecarlo_python(data, egress_g, egress_w, deadlines, access_off, access_to, access_w,
                        purewalk, d_med, max_min, delta0_all, slope_all, off,
                        board_slack, max_rounds):
