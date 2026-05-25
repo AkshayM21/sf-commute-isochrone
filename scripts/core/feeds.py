@@ -6,7 +6,20 @@ import io
 import zipfile
 import datetime as dt
 from pathlib import Path
-import pandas as pd
+
+# pandas is imported LAZILY (it's ~44 MB): the JVM-free server precomputes this module's outputs
+# (line shapes + service date) into a static artifact and never calls these functions at runtime,
+# so importing `feeds` must not pull pandas. Call _pd() at the top of any function that needs it.
+pd = None
+
+
+def _pd():
+    global pd
+    if pd is None:
+        import pandas as _p
+        pd = _p
+    return pd
+
 
 # route_type -> overlay mode bucket (Caltrain is route_type 2 = rail, drawn as "bart")
 _MODE = {"0": "metro", "1": "bart", "2": "bart", "5": "cable", "3": "bus"}
@@ -15,6 +28,7 @@ _MODE = {"0": "metro", "1": "bart", "2": "bart", "5": "cable", "3": "bus"}
 def load_routes(gtfs_paths):
     """{feed_stem: {route_id: name}} so colliding ids across feeds (Muni '8' vs
     BART '8'=Red-N) resolve correctly via the leg's own feed."""
+    _pd()
     m = {}
     for p in gtfs_paths:
         d = {}
@@ -31,7 +45,7 @@ def load_routes(gtfs_paths):
 def route_name(route_id, feed, routes):
     """Feed-aware route name. `routes` is the map from load_routes(). Normalizes the
     float-ish ids r5py hands back ('8.0' -> '8') and returns None for missing ids."""
-    if pd.isna(route_id):
+    if route_id is None or (isinstance(route_id, float) and route_id != route_id):  # None / NaN
         return None
     try:
         key = str(int(float(route_id)))
@@ -43,6 +57,7 @@ def route_name(route_id, feed, routes):
 def route_shapes(gtfs_paths):
     """One representative (longest) shape per route, classified by mode, as a GeoJSON
     FeatureCollection — used for the transit-line overlay."""
+    _pd()
     feats = []
     for p in gtfs_paths:
         with zipfile.ZipFile(p) as z:
@@ -74,6 +89,7 @@ def route_shapes(gtfs_paths):
 
 def _feed_has_trips(path, date):
     """True if feed `path` actually runs trips on YYYYMMDD `date`."""
+    _pd()
     wd = dt.datetime.strptime(date, "%Y%m%d").strftime("%A").lower()
     with zipfile.ZipFile(path) as z:
         names = z.namelist()
@@ -98,6 +114,7 @@ def pick_service_date(gtfs_paths):
     GTFS validity windows are short (Muni's are ~4-week signups), so a hardcoded date
     silently yields no service after a data repull. This walks the common calendar window
     and verifies trips per feed instead."""
+    _pd()
     starts, ends = [], []
     for p in gtfs_paths:
         with zipfile.ZipFile(p) as z:

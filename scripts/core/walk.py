@@ -34,15 +34,14 @@ class WalkGraph:
         self.w_flat = z["w_flat"].astype(np.float64) if "w_flat" in z else self.w_ref
         self.ref_kmh = float(z["walk_ref_kmh"]) if "walk_ref_kmh" in z else config.WALK_KMH
         self.speed_mps = self.ref_kmh * 1000.0 / 3600.0
-        n = len(self.lon)
-        self._csr = csr_matrix((self.w_ref, self.indices, self.indptr), shape=(n, n))
-        self._csr_flat = csr_matrix((self.w_flat, self.indices, self.indptr), shape=(n, n))
-        # Transposed graphs: a Dijkstra from X on the transpose gives, per node, the cost
-        # NODE->X in the original graph. Walking is DIRECTIONAL (uphill != downhill), so the
-        # egress (alight stop -> work) and pure-walk (home -> work) legs, which we root at the
-        # workplace W, must route on the transpose to get the true stop->W / cell->W uphill cost.
-        self._csrT = self._csr.T.tocsr()
-        self._csr_flatT = self._csr_flat.T.tocsr()
+        self._n = len(self.lon)
+        # CSR graphs are built LAZILY per (flat, reverse) combo — at server runtime (arrive-by) only
+        # the transposed grade-aware graph is ever used, so we materialize just that one (~1/4 the
+        # RAM of building all four). Transposed: a Dijkstra from X on the transpose gives, per node,
+        # the cost NODE->X in the original graph. Walking is DIRECTIONAL (uphill != downhill), so the
+        # egress (alight stop -> work) + pure-walk (home -> work) legs, rooted at W, route on the
+        # transpose to get the true stop->W / cell->W uphill cost.
+        self._graphs = {}                            # (flat, reverse) -> csr_matrix
         # local equirectangular metres (matches build_walk_graph + raptor_build._footpaths)
         self.lat0 = float(self.lat.mean())
         self.mlat = 111320.0
@@ -55,9 +54,14 @@ class WalkGraph:
         return cls(path)
 
     def _graph(self, flat, reverse=False):
-        if reverse:
-            return self._csr_flatT if flat else self._csrT
-        return self._csr_flat if flat else self._csr
+        key = (flat, reverse)
+        g = self._graphs.get(key)
+        if g is None:
+            w = self.w_flat if flat else self.w_ref
+            base = csr_matrix((w, self.indices, self.indptr), shape=(self._n, self._n))
+            g = base.T.tocsr() if reverse else base
+            self._graphs[key] = g
+        return g
 
     K_SNAP = 4              # connect each endpoint to its K nearest nodes (nearest-EDGE approx:
     #                        a mid-block point reaches the graph via whichever node is best by

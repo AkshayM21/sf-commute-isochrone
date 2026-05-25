@@ -26,13 +26,14 @@ from collections import OrderedDict
 os.environ.setdefault("NUMBA_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-import pandas as pd, geopandas as gpd, shapely
-from shapely.geometry import Point
 from flask import Flask, request, jsonify
 from flask_limiter import Limiter
 
-from core import config, feeds, grid, geo        # JVM-free core (no r5py)
+from core import config, feeds, geo              # lightweight JVM-free core (no r5py/pandas/geopandas)
 config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the geocoder
+# pandas / geopandas / shapely / Point / core.grid are imported LAZILY in the boot BUILD path only
+# (below): the lean JVM-free boot loads a precomputed static bundle and never pulls the ~70 MB
+# geo/pandas stack. They become module globals there, used by the R5 branches (unreachable lean).
 
 # ---- Flags (parsed EARLY: they decide whether the in-process JVM starts at all) --------
 # THE DEFAULT IS NOW THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + arrive-by-09:00 + the
@@ -74,47 +75,86 @@ GRID_M = int(os.environ.get("GRID_M", str(config.GRID_M)))
 
 # ---- Boot: feeds, model date, grid, warm R5 network (all once) -------------------------
 GTFS = config.gtfs_paths()
-LINES = feeds.route_shapes(GTFS)                  # GTFS line geometries for the overlay
-# Auto-pick a weekday with trips in ALL feeds, so a future data repull (whose feed window
-# may not cover a hardcoded date) keeps working instead of silently returning no service.
-_SVC_DATE = feeds.pick_service_date(GTFS)
-DEP = config.departure(_SVC_DATE)
-print(f"[boot] modeling weekday {_SVC_DATE} @ {DEP:%-I:%M%p}".lower())
 
-print(f"[boot] building grid @ {GRID_M}m"
-      + (" + loading R5 network (once)..." if _NEED_R5 else " (JVM-free: RAPTOR + walk graph)..."))
-NEIGH = grid.load_neighborhoods()
-GRID = grid.build_grid(NEIGH, GRID_M)[["id", "geometry"]]
-ORIGIN_LL = {r.id: (r.geometry.y, r.geometry.x) for r in GRID.itertuples()}
+# ---- Static page data: cells (GeoJSON), origin coords, line shapes, service date --------
+# These are workplace-INDEPENDENT (only the feeds + neighborhoods determine them). We cache them to
+# data/server_static.json so the JVM-free server boots WITHOUT geopandas/shapely/pandas (~70 MB).
+# The R5 path — and the first JVM-free boot, or after a GTFS repull (fingerprint mismatch) — builds
+# them via the geo stack and writes the bundle; subsequent JVM-free boots load it with json only.
+_STATIC = config.DATA / "server_static.json"
 
-# cell squares (sent to the browser once) + neighborhood label per cell
-_cells = gpd.GeoDataFrame({"id": GRID["id"].values},
-                          geometry=grid.square_cells(GRID, GRID_M).values, crs=config.WGS)
-_cells = grid.attach_neighborhoods(_cells, NEIGH)
-CELLS_GEOJSON = json.loads(_cells.to_json())
-for f in CELLS_GEOJSON["features"]:
-    f["properties"] = {"id": f["properties"]["id"], "n": f["properties"].get("name")}
 
-# R5 network + the snapped grid are ONLY built when R5 is needed (see _NEED_R5). In the fully
-# JVM-free mode (RAPTOR arrive-by + walk graph) we never start the JVM: the map, hover, and walk
-# all come from the engine + walk router; cell coordinates come from ORIGIN_LL (JVM-free grid).
-if _NEED_R5:
-    NET = network.build_network(GTFS)
-    # Pre-snap the grid to the street network ONCE so every /compute can route a single tree
-    # FROM the workplace TO every grid cell (the fast reverse approximation) without re-snapping.
-    SNAPPED_GRID = GRID.copy()
-    SNAPPED_GRID["geometry"] = NET.snap_to_network(GRID.geometry)
-    SNAPPED_GRID = SNAPPED_GRID[SNAPPED_GRID.geometry != shapely.Point()].reset_index(drop=True)
-    _EXACT_IDS = list(SNAPPED_GRID.id)
-    _EXACT_GEOMS = list(SNAPPED_GRID.geometry)
-    # The TransitLayer materialises a recorded path's transit legs (route names, stops).
-    _TRANSIT_LAYER = NET._transport_network.transitLayer
-    print(f"[boot] ready: {len(GRID)} origins ({len(SNAPPED_GRID)} on-network). "
-          f"Open http://127.0.0.1:8000")
-else:
+def _gtfs_fp():
+    import hashlib
+    h = hashlib.sha256()
+    for p in GTFS:
+        st = Path(p).stat()
+        h.update(f"{Path(p).name}:{st.st_size}:{int(st.st_mtime)}".encode())
+    return h.hexdigest()[:16]
+
+
+_fp = _gtfs_fp()
+_bundle = None
+if not _NEED_R5 and _STATIC.exists():
+    try:
+        _b = json.loads(_STATIC.read_text())
+        if _b.get("gtfs_fp") == _fp:
+            _bundle = _b
+    except Exception:
+        _bundle = None
+
+if _bundle is not None:                          # LEAN boot — json only, no geopandas/shapely/pandas
+    CELLS_GEOJSON = _bundle["cells"]; LINES = _bundle["lines"]
+    ORIGIN_LL = {k: tuple(v) for k, v in _bundle["origin_ll"].items()}
+    _SVC_DATE = dt.datetime.strptime(_bundle["svc_date"], "%Y%m%d").date()
+    DEP = config.departure(_SVC_DATE)
     NET = SNAPPED_GRID = _TRANSIT_LAYER = None
     _EXACT_IDS, _EXACT_GEOMS = [], []
-    print(f"[boot] ready: {len(GRID)} origins (JVM-free). Open http://127.0.0.1:8000")
+    print(f"[boot] modeling weekday {_SVC_DATE} @ {DEP:%-I:%M%p}".lower())
+    print(f"[boot] ready: {len(ORIGIN_LL)} origins (JVM-free, lean static bundle — no geopandas). "
+          f"Open http://127.0.0.1:8000")
+else:                                            # BUILD path — needs the geo/pandas stack (one-time)
+    import pandas as pd, geopandas as gpd, shapely      # noqa: F401 (module globals for R5 branches)
+    from shapely.geometry import Point                  # noqa: F401
+    from core import grid
+    LINES = feeds.route_shapes(GTFS)             # GTFS line geometries for the overlay
+    # Auto-pick a weekday with trips in ALL feeds (a hardcoded date silently breaks after a repull).
+    _SVC_DATE = feeds.pick_service_date(GTFS)
+    DEP = config.departure(_SVC_DATE)
+    print(f"[boot] modeling weekday {_SVC_DATE} @ {DEP:%-I:%M%p}".lower())
+    print(f"[boot] building grid @ {GRID_M}m" + (" + loading R5 network (once)..." if _NEED_R5
+          else " (one-time geo build; caching static bundle for lean reboots)..."))
+    NEIGH = grid.load_neighborhoods()
+    GRID = grid.build_grid(NEIGH, GRID_M)[["id", "geometry"]]
+    ORIGIN_LL = {r.id: (r.geometry.y, r.geometry.x) for r in GRID.itertuples()}
+    _cells = gpd.GeoDataFrame({"id": GRID["id"].values},
+                              geometry=grid.square_cells(GRID, GRID_M).values, crs=config.WGS)
+    _cells = grid.attach_neighborhoods(_cells, NEIGH)
+    CELLS_GEOJSON = json.loads(_cells.to_json())
+    for f in CELLS_GEOJSON["features"]:
+        f["properties"] = {"id": f["properties"]["id"], "n": f["properties"].get("name")}
+    try:                                         # cache the bundle so the next JVM-free boot is lean
+        _STATIC.write_text(json.dumps({
+            "gtfs_fp": _fp, "svc_date": _SVC_DATE.strftime("%Y%m%d"),
+            "origin_ll": {k: [v[0], v[1]] for k, v in ORIGIN_LL.items()},
+            "cells": CELLS_GEOJSON, "lines": LINES}))
+    except Exception as _e:
+        print(f"[boot] (could not cache static bundle: {_e})")
+    if _NEED_R5:
+        NET = network.build_network(GTFS)
+        SNAPPED_GRID = GRID.copy()
+        SNAPPED_GRID["geometry"] = NET.snap_to_network(GRID.geometry)
+        SNAPPED_GRID = SNAPPED_GRID[SNAPPED_GRID.geometry != shapely.Point()].reset_index(drop=True)
+        _EXACT_IDS = list(SNAPPED_GRID.id)
+        _EXACT_GEOMS = list(SNAPPED_GRID.geometry)
+        _TRANSIT_LAYER = NET._transport_network.transitLayer
+        print(f"[boot] ready: {len(GRID)} origins ({len(SNAPPED_GRID)} on-network). "
+              f"Open http://127.0.0.1:8000")
+    else:
+        NET = SNAPPED_GRID = _TRANSIT_LAYER = None
+        _EXACT_IDS, _EXACT_GEOMS = [], []
+        print(f"[boot] ready: {len(GRID)} origins (JVM-free; bundle cached). "
+              f"Open http://127.0.0.1:8000")
 
 # Thread pool for the EXACT recompute. R5 routing is read-only against the shared warm
 # network and each task clones its own Java RegionalTask, so per-origin routing parallelises
@@ -156,9 +196,13 @@ if USE_RAPTOR:
         _gids = [g for g in range(_RAPTOR.data["n_stops"]) if not _np.isnan(_gl[g])]
         # id="S<gid>" so stop ids stay DISJOINT from cell ids ("0".."N") and the origin "w"
         # (R5's matrix returns 0 travel time when an origin id string == a destination id).
-        _RAPTOR_STOPS = gpd.GeoDataFrame(
-            {"id": ["S" + str(g) for g in _gids]},
-            geometry=[Point(_go[g], _gl[g]) for g in _gids], crs=config.WGS)
+        # _RAPTOR_STOPS (a GeoDataFrame) is only used by the R5 egress walk matrix; in the lean
+        # JVM-free path the walk router snaps stop coords from numpy below, so skip it (gpd/Point
+        # aren't even imported in lean mode).
+        if _NEED_R5:
+            _RAPTOR_STOPS = gpd.GeoDataFrame(
+                {"id": ["S" + str(g) for g in _gids]},
+                geometry=[Point(_go[g], _gl[g]) for g in _gids], crs=config.WGS)
         # align purewalk to the engine's cell order (server grid == engine grid by id)
         _RAPTOR_CELL_POS = {c: i for i, c in enumerate(_RAPTOR.cell_ids)}
         if USE_WALK_GRAPH:
@@ -446,7 +490,7 @@ def _raptor_egress_purewalk(lat, lon):
         res = (egress_g, egress_w, purewalk)
         with _RAPTOR_EGRESS_LOCK:
             _RAPTOR_EGRESS_CACHE[ckey] = res
-            while len(_RAPTOR_EGRESS_CACHE) > 64:
+            while len(_RAPTOR_EGRESS_CACHE) > 24:
                 _RAPTOR_EGRESS_CACHE.popitem(last=False)
         return res
     W = gpd.GeoDataFrame({"id": ["w"]}, geometry=[Point(lon, lat)], crs=config.WGS)
@@ -479,7 +523,7 @@ def _raptor_egress_purewalk(lat, lon):
     res = (egress_g, egress_w, purewalk)
     with _RAPTOR_EGRESS_LOCK:
         _RAPTOR_EGRESS_CACHE[ckey] = res
-        while len(_RAPTOR_EGRESS_CACHE) > 64:
+        while len(_RAPTOR_EGRESS_CACHE) > 24:
             _RAPTOR_EGRESS_CACHE.popitem(last=False)
     return res
 
@@ -509,7 +553,7 @@ def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
     entry = {"tree": tree, "cells": cells, "dom": domd}
     with _RAPTOR_TREE_LOCK:
         _RAPTOR_TREE_CACHE[key] = entry
-        while len(_RAPTOR_TREE_CACHE) > 16:
+        while len(_RAPTOR_TREE_CACHE) > 8:
             _RAPTOR_TREE_CACHE.popitem(last=False)
     return entry
 
@@ -598,7 +642,7 @@ def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
     out = {"realistic": realistic, "variance": variance}
     with _RAPTOR_MC_LOCK:
         _RAPTOR_MC_CACHE[key] = out
-        while len(_RAPTOR_MC_CACHE) > 16:
+        while len(_RAPTOR_MC_CACHE) > 8:
             _RAPTOR_MC_CACHE.popitem(last=False)
     return out
 

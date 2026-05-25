@@ -35,9 +35,20 @@ import datetime as dt
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 from . import config, feeds
+
+# pandas (~44 MB) is used ONLY by build() (GTFS parse), which runs on a cache MISS. On the normal
+# cache-hit boot we never touch it, so import it lazily — keeps the JVM-free server's RSS down.
+pd = None
+
+
+def _pd():
+    global pd
+    if pd is None:
+        import pandas as _p
+        pd = _p
+    return pd
 
 BUILD_VERSION = 2            # bump when the struct schema changes (v2: + pat_feed/line/mode);
                              # a cached pkl with a different version is rebuilt in place (the
@@ -65,6 +76,7 @@ def _hms_to_sec(s):
 
 def _active_service_ids(z, names, date):
     """service_ids running on YYYYMMDD ``date`` per calendar.txt + calendar_dates.txt."""
+    _pd()
     wd = dt.datetime.strptime(date, "%Y%m%d").strftime("%A").lower()
     sids = set()
     if "calendar.txt" in names:
@@ -103,6 +115,7 @@ def _split_fifo(dep, arr):
 def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPATH_M):
     """Parse feeds into flat RAPTOR arrays for ``date_str`` (YYYYMMDD), trips intersecting
     [band_start_sec, band_end_sec]. Returns a dict of numpy arrays (see module docstring)."""
+    _pd()
     stop_key_to_gid = {}
     stop_lat, stop_lon = [], []
 
