@@ -89,7 +89,7 @@ class JourneyTree:
                 alight_stop = int(pat_stops[sbase + apos])
                 dep_sec = int(pat_dep[mbase + trip * ns + bpos])
                 arr_sec = int(pat_arr[mbase + trip * ns + apos])
-                legs.append(("ride", pi, dep_sec, arr_sec))
+                legs.append(("ride", pi, dep_sec, arr_sec, bpos, trip))
                 s = alight_stop
             elif k == 2:                        # footpath s -> par_from (toward W)
                 j = int(par_from[s])
@@ -110,7 +110,7 @@ class JourneyTree:
             if leg[0] in ("access", "walk_t", "egress", "walk"):
                 w = leg[1]; t += w; _push_walk(out, w)
             else:                                        # ride
-                _, pi, dep_sec, arr_sec = leg
+                pi, dep_sec, arr_sec = leg[1], leg[2], leg[3]
                 wait = max(0, dep_sec - t)
                 ride = arr_sec - dep_sec
                 if ride < _TINY_HOP_MIN * 60:            # fold a fluke 1-stop hop into walk
@@ -180,7 +180,8 @@ class JourneyTree:
             return "walk only"
         # longest ride wins; tie-break by (route name, feed, route_id) for run-to-run stability
         best = None; best_key = None
-        for _, pi, dep_sec, arr_sec in rides:
+        for r in rides:
+            pi, dep_sec, arr_sec = r[1], r[2], r[3]
             feed, rid, name, _mode = self.line_table[int(self.pat_line[pi])]
             key = (-(arr_sec - dep_sec), name, feed, rid)
             if best_key is None or key < best_key:
