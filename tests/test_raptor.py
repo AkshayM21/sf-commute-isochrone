@@ -162,20 +162,21 @@ def test_color_by_line_deterministic(engine):
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
-def test_mc_clairvoyant_invariant(engine):
-    """Clairvoyant service-noise MC (``committed=False``): ``realistic`` (p50 over delay draws)
-    NEVER beats the perfect-timing best-case map (the hard invariant), sits modestly ABOVE R5's
-    schedule-perfect p50 (delays only add time, but the whole journey re-optimizes with
-    foreknowledge so it stays a tight LOWER bound), and produces a non-trivial fragility tail."""
+def test_mc_committed_invariant(engine):
+    """Committed-plan MC (the ``realistic`` overlay): fixes the first leg from the published plan
+    and re-optimizes the tail from the actual late arrival. It must (a) never beat perfect-timing,
+    and (b) read meaningfully higher than R5's schedule-perfect p50 with a real bad-day fragility
+    tail. R5 p50 has NO delays, so committed sitting well above it is correct, not an error (no true
+    delayed-commute ground truth exists)."""
     pos = {c: i for i, c in enumerate(engine.cell_ids)}
-    all_err, all_signed, viol, fragmax = [], [], 0, 0
+    all_signed, viol, fragmax = [], 0, 0
     for f in _oracles():
         z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
         pw = _purewalk_aligned(engine, z)
         perfect, _ = engine.journey_tree(z["egress_g"], z["egress_w"], pw).commute_and_dominant()
         perfect = np.asarray(perfect, np.int32)
         mc = engine.montecarlo(z["egress_g"], z["egress_w"], pw, perfect=perfect,
-                               seed=7, alt_draws=0, committed=False)
+                               seed=7, alt_draws=0)
         real = mc["realistic"]; reach = perfect >= 0
         viol += int(np.sum(real[reach] < perfect[reach]))
         fragmax = max(fragmax, int(mc["frag"][reach].max()))
@@ -186,56 +187,11 @@ def test_mc_clairvoyant_invariant(engine):
             r5 = int(z["p50"][k])
             if r5 < 0:
                 continue
-            all_err.append(abs(int(real[i]) - r5)); all_signed.append(int(real[i]) - r5)
-    err = np.array(all_err); signed = np.array(all_signed)
-    print(f"\n[mc clairvoyant] vs R5 p50: MAE={err.mean():.2f} bias={signed.mean():+.2f} "
-          f"perfect>realistic={viol} fragmax={fragmax}")
-    assert viol == 0, f"realistic beat perfect-timing in {viol} cells"
-    assert err.mean() <= 2.5, f"realistic vs R5 p50 MAE {err.mean():.2f} > 2.5"
-    assert 0.0 <= signed.mean() <= 2.0, f"realistic bias {signed.mean():+.2f} outside [0, 2]"
-    assert fragmax > 0, "no fragile cells — MC produced no service variance"
-
-
-@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
-def test_mc_committed_invariant(engine):
-    """Committed-plan MC (the DEFAULT ``realistic``): fixes the first leg from the published plan
-    and re-optimizes the tail from the actual late arrival. It must (a) never beat perfect-timing,
-    (b) sit ABOVE the clairvoyant lower bound at the SAME seed (committing the first leg can only
-    add missed-transfer pain), and (c) read meaningfully higher than R5's schedule-perfect p50 with
-    a real bad-day fragility tail. R5 p50 has NO delays, so committed sitting well above it is
-    correct, not an error (no true delayed-commute ground truth exists)."""
-    pos = {c: i for i, c in enumerate(engine.cell_ids)}
-    all_signed, viol, fragmax = [], 0, 0
-    comm_sum = clair_sum = ncells = 0
-    for f in _oracles():
-        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
-        pw = _purewalk_aligned(engine, z)
-        perfect, _ = engine.journey_tree(z["egress_g"], z["egress_w"], pw).commute_and_dominant()
-        perfect = np.asarray(perfect, np.int32)
-        comm = engine.montecarlo(z["egress_g"], z["egress_w"], pw, perfect=perfect,
-                                 seed=7, alt_draws=0, committed=True)
-        clair = engine.montecarlo(z["egress_g"], z["egress_w"], pw, perfect=perfect,
-                                  seed=7, alt_draws=0, committed=False)
-        real = comm["realistic"]; reach = perfect >= 0
-        viol += int(np.sum(real[reach] < perfect[reach]))
-        fragmax = max(fragmax, int(comm["frag"][reach].max()))
-        comm_sum += int(real[reach].sum()); clair_sum += int(clair["realistic"][reach].sum())
-        ncells += int(reach.sum())
-        for k, cid in enumerate(z["cell_ids"].astype(str)):
-            i = pos.get(cid)
-            if i is None or perfect[i] < 0:
-                continue
-            r5 = int(z["p50"][k])
-            if r5 < 0:
-                continue
             all_signed.append(int(real[i]) - r5)
     signed = np.array(all_signed)
-    comm_mean, clair_mean = comm_sum / ncells, clair_sum / ncells
     print(f"\n[mc committed] vs R5 p50 bias={signed.mean():+.2f} perfect>realistic={viol} "
-          f"fragmax={fragmax} committed_mean={comm_mean:.2f} clairvoyant_mean={clair_mean:.2f}")
+          f"fragmax={fragmax}")
     assert viol == 0, f"committed realistic beat perfect-timing in {viol} cells"
-    assert comm_mean >= clair_mean, \
-        f"committed mean {comm_mean:.2f} below clairvoyant {clair_mean:.2f} (should be >=)"
     assert 0.0 < signed.mean() <= 8.0, f"committed bias {signed.mean():+.2f} outside (0, 8]"
     assert fragmax > 0, "committed MC produced no fragility tail"
 
@@ -276,7 +232,7 @@ def test_mc_committed_numba_matches_python(engine):
 def test_mc_concurrent_safe(engine):
     """Concurrent montecarlo() from multiple threads must NOT crash the process. numba's
     workqueue threading layer isn't threadsafe, so the parallel MC kernel is serialized by a lock
-    (core/raptor.montecarlo_commute). Regression guard for the /variance multi-user crash."""
+    (core/raptor._MC_KERNEL_LOCK). Regression guard for the /variance multi-user crash."""
     import concurrent.futures as cf
     z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
     pw = _purewalk_aligned(engine, z)
@@ -286,9 +242,7 @@ def test_mc_concurrent_safe(engine):
     eg = np.asarray(z["egress_g"]); ew = np.asarray(z["egress_w"])
 
     def run(seed):
-        # alternate committed (default) and clairvoyant so BOTH parallel kernels are hit concurrently
-        return engine.montecarlo(eg, ew, pw, n_draws=8, alt_draws=0,
-                                 seed=seed, committed=bool(seed % 2))
+        return engine.montecarlo(eg, ew, pw, n_draws=8, alt_draws=0, seed=seed)
 
     with cf.ThreadPoolExecutor(max_workers=3) as ex:
         results = [f.result() for f in [ex.submit(run, s) for s in (1, 2, 3, 4, 5)]]

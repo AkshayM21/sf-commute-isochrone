@@ -598,8 +598,8 @@ def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_S
 # cached. Keyed like the other heavy caches (coarse bucket + transfer cap), bounded LRU.
 _RAPTOR_MC_CACHE = OrderedDict()             # (coarse_key, max_rides) -> {realistic, variance}
 _RAPTOR_MC_LOCK = threading.Lock()           # guards the cache dict
-# (The parallel MC kernel itself is serialized inside core/raptor.montecarlo_commute — numba's
-# workqueue threading layer isn't threadsafe — so concurrent /variance is safe.)
+# (The parallel MC kernel itself is serialized inside core/raptor.montecarlo_commute_committed —
+# numba's workqueue threading layer isn't threadsafe — so concurrent /variance is safe.)
 
 
 def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):

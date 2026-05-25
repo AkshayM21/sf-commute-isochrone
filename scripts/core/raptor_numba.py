@@ -321,8 +321,8 @@ def _draw_profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pa
                   pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
                   egress_g, egress_w, deadlines, board_slack, max_rounds, delta0, slope):
     """One Monte-Carlo draw: perturb the schedule then run the reverse profile. Returns
-    (latest[n_stops, nd], dep_r, arr_r) — the shared per-draw work both MC kernels read off
-    (clairvoyant uses latest; committed also needs the perturbed dep/arr to ride the fixed leg)."""
+    (latest[n_stops, nd], dep_r, arr_r) — the committed kernel reads the latest profile for the
+    re-optimized tail and the perturbed dep/arr to ride the fixed first leg."""
     np_len = pat_dep.shape[0]
     dep_r = np.empty(np_len, dtype=np.int64)
     arr_r = np.empty(np_len, dtype=np.int64)
@@ -350,55 +350,13 @@ def _first_ge(row, n, key):
     return lo
 
 
-@njit(parallel=True, nogil=True, cache=True)
-def montecarlo(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
-               pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
-               egress_g, egress_w, deadlines, board_slack, max_rounds,
-               access_off, access_to, access_w, purewalk, d_med, max_min,
-               delta0_all, slope_all):
-    """For R draws (rows of delta0_all/slope_all), perturb -> reverse sweep -> per-cell commute
-    at the single median departure ``d_med``. Returns commute_all[n_cells, R] in float minutes,
-    capped at max_min (unreachable -> max_min, so it counts as 'stuck'). Cross-draw spread is
-    pure SERVICE noise (the departure is fixed), which is exactly the variance we want."""
-    R = delta0_all.shape[0]
-    n_cells = access_off.shape[0] - 1
-    nd = deadlines.shape[0]
-    commute_all = np.empty((n_cells, R), dtype=np.float64)
-    capf = np.float64(max_min)
-    for r in prange(R):
-        latest, _dep_r, _arr_r = _draw_profile(
-            n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
-            pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
-            egress_g, egress_w, deadlines, board_slack, max_rounds, delta0_all[r], slope_all[r])
-        for ci in range(n_cells):
-            best = INF
-            for a in range(access_off[ci], access_off[ci + 1]):
-                s = access_to[a]
-                lo = _first_ge(latest[s], nd, d_med + access_w[a])   # earliest deadline you still make
-                if lo < nd:
-                    tt = deadlines[lo] - d_med
-                    if tt < best:
-                        best = tt
-            pw = purewalk[ci]
-            ttv = best
-            if pw >= 0 and pw < ttv:
-                ttv = pw
-            m = ttv / 60.0 if ttv < INF else 1e18
-            if m > capf:
-                m = capf
-            commute_all[ci, r] = m
-    return commute_all
-
-
 # ----------------------------------------------- committed-plan Monte-Carlo (forward sim)
-# The clairvoyant `montecarlo` above re-optimizes the WHOLE journey per draw (it dodges a
-# missed transfer by picking a different first train, knowing the delays in advance) -> it is a
-# LOWER bound on real variance. This kernel commits the FIRST leg from the unperturbed plan
-# (departure + line + board stop, no foreknowledge), then per draw: board the next available trip
-# on the committed line, ride to the committed alight, and re-optimize the TAIL from the ACTUAL
-# (late) arrival via the perturbed reverse profile. So a late first leg that blows the transfer
-# eats a real headway -> a higher, more honest realistic + fragility. Tail stays clairvoyant
-# (you have real-time info en route), so it remains a TIGHTER lower bound, not the full truth.
+# You commit the FIRST leg from the unperturbed plan (departure + line + board stop, no
+# foreknowledge of delays), then per draw: board the next available trip on the committed line,
+# ride to the committed alight, and re-optimize the TAIL from the ACTUAL (late) arrival via the
+# perturbed reverse profile. So a late first leg that blows the transfer eats a real headway ->
+# the honest realistic + fragility. The tail still re-optimizes with the perturbed schedule (you
+# have real-time info en route), so it's a tight lower bound on the fully-committed truth.
 
 @njit(parallel=True, nogil=True, cache=True)
 def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,

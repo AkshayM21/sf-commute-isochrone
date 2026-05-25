@@ -417,40 +417,14 @@ def _mc_flat_args(data):
             data["tr_time"].astype(np.int64))
 
 
-def montecarlo_commute(data, egress_g, egress_w, deadlines, access_off, access_to, access_w,
-                       purewalk, d_med, max_min, delta0_all, slope_all,
-                       board_slack=60, max_rounds=8, kernel=None):
-    """commute_all[n_cells, R] in float minutes (capped at max_min; unreachable -> max_min)
-    for R service-noise draws (rows of delta0_all/slope_all, per global trip). Each draw
-    perturbs the schedule, re-runs the reverse sweep, and reads the door-to-door commute at the
-    single median departure ``d_med`` (so spread = pure service noise). Numba when available."""
-    if kernel is None:
-        kernel = _select_kernel()
-    if kernel == "numba":
-        from . import raptor_numba
-        with _MC_KERNEL_LOCK:                      # serialize the non-threadsafe parallel kernel
-            return raptor_numba.montecarlo(
-                *_mc_flat_args(data),
-                np.asarray(egress_g, np.int64), np.asarray(egress_w, np.int64),
-                np.asarray(deadlines, np.int64), np.int64(board_slack), np.int64(max_rounds),
-                np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
-                np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
-                np.int64(d_med), np.int64(max_min),
-                np.ascontiguousarray(delta0_all, np.float64),
-                np.ascontiguousarray(slope_all, np.float64))
-    return _montecarlo_python(data, egress_g, egress_w, deadlines, access_off, access_to,
-                              access_w, purewalk, d_med, max_min, delta0_all, slope_all,
-                              pat_trip_off(data), board_slack, max_rounds)
-
-
 def montecarlo_commute_committed(data, egress_g, egress_w, deadlines, legs, perfect, max_min,
                                  delta0_all, slope_all, board_slack=60, max_rounds=8, kernel=None):
     """COMMITTED-PLAN commute_all[n_cells, R] in float minutes. ``legs`` is the per-cell committed
     first leg from ``raptor_journey.JourneyTree.committed_first_legs`` (departure + first board fixed
     from the unperturbed plan). Each draw perturbs the schedule, then per transit cell: board the
     next trip on the committed line, ride to the committed alight, and re-optimize the tail from the
-    ACTUAL late arrival. Higher/more honest than the clairvoyant ``montecarlo_commute``. Numba when
-    available; the parallel kernel is serialized (workqueue not threadsafe)."""
+    ACTUAL late arrival (so a missed transfer eats a real headway). Numba when available; the
+    parallel kernel is serialized (workqueue not threadsafe)."""
     if kernel is None:
         kernel = _select_kernel()
     if kernel == "numba":
@@ -509,35 +483,4 @@ def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perf
                 cm[ci, r] = capf; continue
             tt = (int(deadlines[lo2]) - int(home[ci])) / 60.0
             cm[ci, r] = min(max(tt, 0.0), capf)
-    return cm
-
-
-def _montecarlo_python(data, egress_g, egress_w, deadlines, access_off, access_to, access_w,
-                       purewalk, d_med, max_min, delta0_all, slope_all, off,
-                       board_slack, max_rounds):
-    """Slow pure-numpy reference for ``montecarlo_commute`` (test/no-numba path)."""
-    deadlines = np.asarray(deadlines, np.int64)
-    n_cells = len(access_off) - 1
-    Rn = delta0_all.shape[0]
-    cm = np.empty((n_cells, Rn), dtype=np.float64)
-    for r in range(Rn):
-        pdata, _dep, _arr = perturbed_data(data, delta0_all[r], slope_all[r], off)
-        latest = reverse_profile(pdata, egress_g, egress_w, deadlines,
-                                 board_slack=board_slack, max_rounds=max_rounds, kernel="python")
-        for ci in range(n_cells):
-            a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
-            best = INF
-            for a in range(a0, a1):
-                s = int(access_to[a]); board = d_med + int(access_w[a])
-                lo = int(np.searchsorted(latest[s], board, side="left"))
-                if lo < len(deadlines):
-                    tt = int(deadlines[lo]) - d_med
-                    if tt < best:
-                        best = tt
-            pw = int(purewalk[ci])
-            ttv = best
-            if pw >= 0 and pw < ttv:
-                ttv = pw
-            m = ttv / 60.0 if ttv < INF else 1e18
-            cm[ci, r] = min(m, float(max_min))
     return cm
