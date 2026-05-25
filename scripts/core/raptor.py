@@ -95,6 +95,105 @@ def reverse_raptor(data, egress_g, egress_t, max_rounds=8, board_slack=60):
     return best
 
 
+def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, board_slack=60):
+    """Single-deadline reverse RAPTOR that records BACK-POINTERS for journey reconstruction.
+
+    Same algorithm as ``reverse_raptor`` but, for each stop, remembers HOW its latest-departure
+    was achieved so a cell's journey can be traced cell -> access stop -> transit legs -> W (see
+    ``raptor_journey``). Used once per workplace (the path tree), not in the range sweep, so it
+    stays pure-python. Determinism (color-by-line stability): patterns are scanned in SORTED
+    order and a tie (`d == best[s]`) keeps the FIRST writer, so the chosen parent is reproducible
+    run-to-run (earlier rounds write first -> fewer-ride journeys preferred; a strictly-faster
+    later-round journey still wins). Returns a dict of parent arrays + ``best``.
+
+    Parent encoding per stop s (all sized n_stops):
+      par_kind   int8   -1 unreachable, 0 egress-seed (terminal), 1 transit board, 2 footpath
+      par_pat/par_trip/par_board/par_alight  int32  transit leg: board at par_board on par_pat/trip,
+                                                     forward-ALIGHT at par_alight (a LATER position)
+      par_from   int32  footpath: the stop you walk TO (toward W)
+      par_nxfer  int16  reverse round it was set in (= rides from here to W; tie-break + xfer count)
+      egress_sec int32  egress WALK seconds at seed stops (-1 otherwise)
+    """
+    n = data["n_stops"]
+    pat_nstops = data["pat_nstops"]; pat_ntrips = data["pat_ntrips"]
+    pat_stop_off = data["pat_stop_off"]; pat_mat_off = data["pat_mat_off"]
+    pat_stops = data["pat_stops"]; pat_dep = data["pat_dep"]; pat_arr = data["pat_arr"]
+    ras_off = data["ras_off"]; ras_pat = data["ras_pat"]; ras_pos = data["ras_pos"]
+    tr_off = data["tr_off"]; tr_to = data["tr_to"]; tr_time = data["tr_time"]
+
+    best = np.full(n, NEG, dtype=np.int64)
+    prev = np.full(n, NEG, dtype=np.int64)
+    par_kind = np.full(n, -1, dtype=np.int8)
+    par_pat = np.full(n, -1, dtype=np.int32); par_trip = np.full(n, -1, dtype=np.int32)
+    par_board = np.full(n, -1, dtype=np.int32); par_alight = np.full(n, -1, dtype=np.int32)
+    par_from = np.full(n, -1, dtype=np.int32); par_nxfer = np.zeros(n, dtype=np.int16)
+    egress_sec = np.full(n, -1, dtype=np.int32)
+
+    def set_transit(s, d, pi, trip, board_pos, alight_pos, rnd):
+        best[s] = d
+        par_kind[s] = 1; par_pat[s] = pi; par_trip[s] = trip
+        par_board[s] = board_pos; par_alight[s] = alight_pos; par_nxfer[s] = rnd
+        par_from[s] = -1
+
+    def set_foot(j, cand, frm, nxfer):
+        best[j] = cand; prev[j] = cand
+        par_kind[j] = 2; par_from[j] = frm; par_nxfer[j] = nxfer
+        par_pat[j] = par_trip[j] = par_board[j] = par_alight[j] = -1
+
+    marked = set()
+    for g, t, w in zip(egress_g, egress_t, egress_w):
+        g = int(g)
+        if t > best[g]:
+            best[g] = t; prev[g] = t; par_kind[g] = 0; egress_sec[g] = int(w); marked.add(g)
+    for g in sorted(marked):                     # initial one-hop footpaths from egress stops
+        for k in range(int(tr_off[g]), int(tr_off[g + 1])):
+            j = int(tr_to[k]); cand = best[g] - tr_time[k]
+            if cand > best[j]:
+                set_foot(j, cand, g, 0); marked.add(j)
+
+    for rnd in range(1, max_rounds + 1):
+        if not marked:
+            break
+        q = {}
+        for s in marked:
+            for k in range(int(ras_off[s]), int(ras_off[s + 1])):
+                pi = int(ras_pat[k]); pos = int(ras_pos[k])
+                if pi not in q or pos > q[pi]:
+                    q[pi] = pos
+        marked = set()
+        for pi in sorted(q):                     # deterministic pattern order
+            end_pos = q[pi]
+            ns = int(pat_nstops[pi]); nt = int(pat_ntrips[pi])
+            sbase = int(pat_stop_off[pi]); mbase = int(pat_mat_off[pi])
+            trip = -1; cur_alight = -1
+            for pos in range(end_pos, -1, -1):
+                s = int(pat_stops[sbase + pos])
+                if trip >= 0:
+                    d = int(pat_dep[mbase + trip * ns + pos])
+                    if d > best[s]:              # strict improvement; ties keep first writer
+                        set_transit(s, d, pi, trip, pos, cur_alight, rnd)
+                        marked.add(s)
+                pa = prev[s]
+                if pa > NEG:
+                    col = pat_arr[mbase + pos: mbase + pos + nt * ns: ns]
+                    idx = int(np.searchsorted(col, pa - board_slack, side="right")) - 1
+                    if idx >= 0 and (trip < 0 or idx > trip):
+                        trip = idx; cur_alight = pos
+        newly = list(marked)
+        for s in newly:
+            prev[s] = best[s]
+        tr_marked = set()
+        for s in sorted(newly):
+            for k in range(int(tr_off[s]), int(tr_off[s + 1])):
+                j = int(tr_to[k]); cand = best[s] - tr_time[k]
+                if cand > best[j]:
+                    set_foot(j, cand, s, int(par_nxfer[s])); tr_marked.add(j)
+        marked |= tr_marked
+    return dict(best=best, par_kind=par_kind, par_pat=par_pat, par_trip=par_trip,
+                par_board=par_board, par_alight=par_alight, par_from=par_from,
+                par_nxfer=par_nxfer, egress_sec=egress_sec)
+
+
 def reverse_profile(data, egress_g, egress_w, deadlines, board_slack=60, max_rounds=8,
                     kernel=None):
     """Run reverse RAPTOR for each arrival deadline in ``deadlines`` (seconds).

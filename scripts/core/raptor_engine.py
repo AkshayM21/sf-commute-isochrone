@@ -16,7 +16,7 @@ The hot reverse sweep runs in the numba kernel automatically when available; ass
 import os
 import numpy as np
 
-from . import config, raptor_build, raptor as R
+from . import config, raptor_build, raptor as R, raptor_journey
 
 ACCESS_CAP_MIN = int(os.environ.get("RAPTOR_ACCESS_CAP", "25"))  # 25 cleared the worst access-starved periphery (max err 15->7, mism 20->5) vs 20
 DEADLINE_STEP = int(os.environ.get("RAPTOR_DEADLINE_STEP", "180"))
@@ -132,6 +132,21 @@ class RaptorEngine:
                                         self.max_min, np.asarray(percentiles, np.float64))
         return {c: [int(out[i, k]) if out[i, k] >= 0 else None
                     for k in range(out.shape[1])] for i, c in enumerate(self.cell_ids)}
+
+
+    # -- Phase 2: traced arrive-by tree -> journey breakdown + color-by-line ---------------
+    def journey_tree(self, egress_g, egress_w, purewalk, target_sec=None, max_rounds=MAX_ROUNDS):
+        """A JourneyTree for the single arrive-by deadline: serves the per-cell breakdown
+        (hover), color-by-line, AND the arrive-by map value (actual commute = arrival - latest
+        home departure), all from ONE traced reverse tree so hover == map by construction."""
+        target = self.target_sec if target_sec is None else int(target_sec)
+        egress_g = np.asarray(egress_g, np.int32)
+        egress_w = np.asarray(egress_w, np.int64)
+        par = R.reverse_raptor_traced(self.data, egress_g, target - egress_w, egress_w,
+                                      max_rounds=max_rounds, board_slack=BOARD_SLACK)
+        return raptor_journey.JourneyTree(self.data, par, self.access_off, self.access_to,
+                                          self.access_w, np.asarray(purewalk, np.int64),
+                                          target, self.max_min)
 
 
 def _assemble_arriveby_window(access_off, access_to, access_w, purewalk, latest, deadlines,

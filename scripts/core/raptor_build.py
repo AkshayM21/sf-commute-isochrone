@@ -39,6 +39,9 @@ import pandas as pd
 
 from . import config, feeds
 
+BUILD_VERSION = 2            # bump when the struct schema changes (v2: + pat_feed/line/mode);
+                             # a cached pkl with a different version is rebuilt in place (the
+                             # filename is unchanged, so the gid-keyed access table stays valid).
 FOOTPATH_M = float(os.environ.get("RAPTOR_FOOTPATH_M", "250"))  # synthesized-transfer radius (m)
 BAND_START_H = 5.0           # keep trips active from 05:00 ...
 # ... to the latest arrival deadline we will ever sweep: the arrive-by target plus the
@@ -112,19 +115,31 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
             stop_lat.append(lat); stop_lon.append(lon)
         return g
 
-    # group trips by identical (feed, stop-sequence); each group -> >=1 FIFO pattern
-    seqs = {}                  # (feed, gids tuple) -> list[(dep array, arr array)]
+    # group trips by (feed, route_id, stop-sequence) -> >=1 FIFO pattern. Keying on route_id
+    # keeps a pattern intrinsically single-route (so it can be named feed-aware in Phase 2) and
+    # fixes a latent merge of two routes that happen to share an identical stop list.
+    seqs = {}                  # (feed_idx, route_id, gids tuple) -> list[(dep, arr)]
+    feeds_list = [Path(p).stem for p in gtfs_paths]
+    route_name = {}            # (feed_idx, route_id) -> display name
+    route_mode = {}            # (feed_idx, route_id) -> overlay mode bucket ("bus"/"bart"/...)
     feed_trip_counts = {}
-    for p in gtfs_paths:
-        feed = Path(p).stem
+    for fi, p in enumerate(gtfs_paths):
+        feed = feeds_list[fi]
         with zipfile.ZipFile(p) as z:
             names = z.namelist()
             sids = _active_service_ids(z, names, date_str)
             sdf = pd.read_csv(io.BytesIO(z.read("stops.txt")), dtype=str)
             slat = dict(zip(sdf.stop_id, pd.to_numeric(sdf.stop_lat, errors="coerce")))
             slon = dict(zip(sdf.stop_id, pd.to_numeric(sdf.stop_lon, errors="coerce")))
+            rdf = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
+            for _, r in rdf.iterrows():
+                rid = str(r["route_id"])
+                nm = (r.get("route_short_name") or r.get("route_long_name") or rid)
+                route_name[(fi, rid)] = str(nm).strip()
+                route_mode[(fi, rid)] = feeds._MODE.get(str(r.get("route_type", "3")), "bus")
             trips = pd.read_csv(io.BytesIO(z.read("trips.txt")), dtype=str)
             trips = trips[trips.service_id.isin(sids)]
+            trip_route = dict(zip(trips.trip_id, trips.route_id))
             active = set(trips.trip_id)
             st = pd.read_csv(io.BytesIO(z.read("stop_times.txt")), dtype=str)
             st = st[st.trip_id.isin(active)].copy()
@@ -140,7 +155,8 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
                 deps = g["dep"].to_numpy(); arrs = g["arr"].to_numpy()
                 if deps[0] > band_end_sec or arrs[-1] < band_start_sec:
                     continue                              # outside the morning band
-                seqs.setdefault((feed, gids), []).append((deps, arrs))
+                rid = str(trip_route.get(tid, ""))
+                seqs.setdefault((fi, rid, gids), []).append((deps, arrs))
                 kept += 1
             feed_trip_counts[feed] = kept
             _log(f"  {feed}: {len(sids)} services, {kept} trips in band")
@@ -149,10 +165,18 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
     stop_lat = np.asarray(stop_lat, dtype=np.float64)
     stop_lon = np.asarray(stop_lon, dtype=np.float64)
 
-    # ---- finalize patterns (FIFO-split), then flatten to CSR arrays
+    # ---- finalize patterns (FIFO-split), then flatten to CSR arrays.
+    # Intern (feed_idx, route_id) -> line_idx; line_table rows = (feed_stem, route_id, name, mode).
+    # Iterate seqs in sorted key order so pattern + line indices are DETERMINISTIC run-to-run
+    # (Phase 2 color-by-line stability depends on this).
     P_stops, P_dep, P_arr = [], [], []        # ragged, per pattern
+    pat_feed_l, pat_line_l, pat_mode_l = [], [], []
+    line_index = {}                           # (feed_idx, route_id) -> line_idx
+    line_table = []                           # [(feed_stem, route_id, name, mode)]
+    _MODE_CODE = {"metro": 0, "bart": 1, "cable": 2, "bus": 3}
     n_split = 0
-    for (feed, gids), trips in seqs.items():
+    for (fi, rid, gids) in sorted(seqs.keys()):
+        trips = seqs[(fi, rid, gids)]
         dep = np.array([t[0] for t in trips], dtype=np.int64)
         arr = np.array([t[1] for t in trips], dtype=np.int64)
         order = np.argsort(dep[:, 0], kind="stable")
@@ -160,10 +184,22 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
         subs = _split_fifo(dep, arr)
         if len(subs) > 1:
             n_split += len(subs) - 1
+        key = (fi, rid)
+        li = line_index.get(key)
+        if li is None:
+            li = len(line_table)
+            line_index[key] = li
+            line_table.append((feeds_list[fi], rid, route_name.get(key, rid),
+                               route_mode.get(key, "bus")))
+        mode_code = _MODE_CODE.get(route_mode.get(key, "bus"), 3)
         garr = np.asarray(gids, dtype=np.int32)
         for dsub, asub in subs:
             P_stops.append(garr); P_dep.append(dsub); P_arr.append(asub)
+            pat_feed_l.append(fi); pat_line_l.append(li); pat_mode_l.append(mode_code)
     n_pat = len(P_stops)
+    pat_feed = np.asarray(pat_feed_l, dtype=np.int16)
+    pat_line = np.asarray(pat_line_l, dtype=np.int32)
+    pat_mode = np.asarray(pat_mode_l, dtype=np.int8)
     if n_split:
         _log(f"  overtaking: split into {n_split} extra FIFO sub-patterns")
 
@@ -198,12 +234,16 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
     # transfers: synthesized footpaths within footpath_m, bidirectional, all feeds
     tr_off, tr_to, tr_time = _footpaths(stop_lat, stop_lon, footpath_m)
 
-    _log(f"stops {n_stops}  patterns {n_pat}  ras {len(ras_pat)}  footpaths {len(tr_to)}")
+    _log(f"stops {n_stops}  patterns {n_pat}  lines {len(line_table)}  "
+         f"ras {len(ras_pat)}  footpaths {len(tr_to)}")
     return dict(
+        build_version=BUILD_VERSION,
         n_stops=n_stops, stop_lat=stop_lat, stop_lon=stop_lon,
         pat_nstops=pat_nstops, pat_ntrips=pat_ntrips,
         pat_stop_off=pat_stop_off, pat_mat_off=pat_mat_off,
         pat_stops=pat_stops, pat_dep=pat_dep, pat_arr=pat_arr,
+        pat_feed=pat_feed, pat_line=pat_line, pat_mode=pat_mode,
+        feeds=feeds_list, line_table=line_table,            # pat_line -> (feed, route_id, name, mode)
         ras_off=ras_off, ras_pat=ras_pat, ras_pos=ras_pos,
         tr_off=tr_off, tr_to=tr_to, tr_time=tr_time,
         feed_trip_counts=feed_trip_counts, date=date_str,
@@ -281,10 +321,15 @@ def load_or_build(gtfs_paths=None, service_date=None, footpath_m=FOOTPATH_M, ver
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache = CACHE_DIR / f"raptor_{date_str}_{fp}.pkl"
     if cache.exists():
-        if verbose:
-            _log(f"[raptor] loading cached structures {cache.name}")
         with open(cache, "rb") as f:
-            return pickle.load(f)
+            data = pickle.load(f)
+        if data.get("build_version") == BUILD_VERSION:
+            if verbose:
+                _log(f"[raptor] loading cached structures {cache.name}")
+            return data
+        if verbose:
+            _log(f"[raptor] cache {cache.name} is build v{data.get('build_version')} "
+                 f"!= v{BUILD_VERSION}; rebuilding")
     if verbose:
         _log(f"[raptor] building structures for {date_str} band {band} ...")
     t = time.time()
