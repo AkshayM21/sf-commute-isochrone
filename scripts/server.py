@@ -93,6 +93,39 @@ _N_PHYS = os.cpu_count() or 8
 EXACT_THREADS = int(os.environ.get("EXACT_THREADS", str(max(2, _N_PHYS - 2))))
 _EXACT_POOL = ThreadPoolExecutor(max_workers=EXACT_THREADS, thread_name_prefix="r5-exact")
 
+# ---- RAPTOR engine (flag-gated grid travel-times) -------------------------------------
+# USE_RAPTOR=1 swaps the grid coloring from the R5 reverse-approx + per-cell exact refine to
+# the self-built reverse range-RAPTOR (near-exact vs R5: MAE ~0.75, max ~7; ~0.05-0.14s/req,
+# no heavy per-visitor R5 pass). R5 stays in-process ONLY for the on-demand hover breakdown
+# (/itinerary) + color-by-line (/attribution) — Phase 2 moves those to RAPTOR too. Default
+# OFF: the live app is byte-identical until the flag is flipped. RAPTOR_SEMANTIC selects
+# 'departafter' (matches today's depart-8:35 model + the R5 hover, so map~=hover within RAPTOR
+# error) or 'arriveby' (the arrive-by-09:00 product semantic, surfaced for review).
+USE_RAPTOR = os.environ.get("USE_RAPTOR", "").lower() in ("1", "true", "yes", "on")
+RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "departafter").lower()
+_RAPTOR = None
+_RAPTOR_STOPS = None             # GeoDataFrame of stop coords keyed by gid (egress destinations)
+_RAPTOR_EGRESS_CACHE = OrderedDict()   # coarse_key -> (egress_g, egress_w, purewalk)
+_RAPTOR_EGRESS_LOCK = threading.Lock()
+if USE_RAPTOR:
+    try:
+        from core import raptor_engine
+        _RAPTOR = raptor_engine.RaptorEngine(GTFS, _SVC_DATE, verbose=True)
+        import numpy as _np
+        _gl, _go = _RAPTOR.data["stop_lat"], _RAPTOR.data["stop_lon"]
+        _gids = [g for g in range(_RAPTOR.data["n_stops"]) if not _np.isnan(_gl[g])]
+        # id="S<gid>" so stop ids stay DISJOINT from cell ids ("0".."N") and the origin "w"
+        # (R5's matrix returns 0 travel time when an origin id string == a destination id).
+        _RAPTOR_STOPS = gpd.GeoDataFrame(
+            {"id": ["S" + str(g) for g in _gids]},
+            geometry=[Point(_go[g], _gl[g]) for g in _gids], crs=config.WGS)
+        # align purewalk to the engine's cell order (server grid == engine grid by id)
+        _RAPTOR_CELL_POS = {c: i for i, c in enumerate(_RAPTOR.cell_ids)}
+        print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); R5 kept for hover only")
+    except Exception as _e:                     # missing access table etc. -> degrade to OFF
+        print(f"[boot] USE_RAPTOR requested but engine init failed ({_e}); using R5 path")
+        USE_RAPTOR = False
+
 # ---- Generation / cancel token --------------------------------------------------------
 # Each new workplace (/compute) bumps _GENERATION. The long all-cores jobs (compute_exact,
 # the lazy attribution prewarm) read the generation they started under and, between origin
@@ -302,6 +335,66 @@ def _client_ip():
 limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
 
 
+# ---- RAPTOR grid travel-times (flag-gated) --------------------------------------------
+def _raptor_egress_purewalk(lat, lon):
+    """Per-workplace inputs for the RAPTOR engine, via ONE-origin R5 WALK matrices:
+      egress_g/egress_w — W->stop walk seconds (gid-keyed), capped at the access cap;
+      purewalk          — W->cell walk seconds (cell order), capped at MAX_MIN.
+    The only R5 use on the RAPTOR map path (one light walk tree, not the heavy per-cell pass).
+    Cached per ~110m workplace bucket."""
+    import numpy as _np
+    ckey = _coarse_key(lat, lon)
+    cached = None
+    with _RAPTOR_EGRESS_LOCK:
+        if ckey in _RAPTOR_EGRESS_CACHE:
+            _RAPTOR_EGRESS_CACHE.move_to_end(ckey)
+            cached = _RAPTOR_EGRESS_CACHE[ckey]
+    if cached is not None:
+        return cached
+    W = gpd.GeoDataFrame({"id": ["w"]}, geometry=[Point(lon, lat)], crs=config.WGS)
+    cap = _RAPTOR.access_cap_min
+    # egress: W -> stops (walk), gid-keyed
+    e = pd.DataFrame(network.walk_time_matrix(NET, W, _RAPTOR_STOPS, DEP, cap))
+    ec = "travel_time" if "travel_time" in e.columns else \
+        [c for c in e.columns if c.startswith("travel_time")][0]
+    egr = {}
+    for to, v in zip(e["to_id"].astype(str), e[ec]):
+        if pd.isna(v):
+            continue
+        g = int(to[1:])                       # strip the "S" prefix -> gid
+        sec = int(round(float(v) * 60))
+        if g not in egr or sec < egr[g]:
+            egr[g] = sec
+    egress_g = _np.array(sorted(egr), dtype=_np.int32)
+    egress_w = _np.array([egr[g] for g in egress_g], dtype=_np.int64)
+    # pure walk: W -> cells, aligned to the engine's cell order
+    pw_ttm = pd.DataFrame(network.walk_time_matrix(NET, W, SNAPPED_GRID, DEP, config.MAX_MIN))
+    pc = "travel_time" if "travel_time" in pw_ttm.columns else \
+        [c for c in pw_ttm.columns if c.startswith("travel_time")][0]
+    purewalk = _np.full(len(_RAPTOR.cell_ids), -1, dtype=_np.int64)
+    for to, v in zip(pw_ttm["to_id"].astype(str), pw_ttm[pc]):
+        if pd.isna(v):
+            continue
+        i = _RAPTOR_CELL_POS.get(to)
+        if i is not None:
+            purewalk[i] = int(round(float(v) * 60))
+    res = (egress_g, egress_w, purewalk)
+    with _RAPTOR_EGRESS_LOCK:
+        _RAPTOR_EGRESS_CACHE[ckey] = res
+        while len(_RAPTOR_EGRESS_CACHE) > 64:
+            _RAPTOR_EGRESS_CACHE.popitem(last=False)
+    return res
+
+
+def compute_raptor(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+    """Grid travel-times via the RAPTOR engine -> {id: [best, real]} (same shape as compute).
+    ``max_rides`` (rides = transfers + 1) caps RAPTOR rounds, matching the Max-transfers UI."""
+    egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
+    fn = _RAPTOR.arriveby if RAPTOR_SEMANTIC == "arriveby" else _RAPTOR.departafter
+    res = fn(egress_g, egress_w, purewalk, max_rounds=int(max_rides))   # {cell_id: [p5, p50]}
+    return {cid: [pair[0], pair[1]] for cid, pair in res.items()}
+
+
 # ---- Map TIME: fast reverse approximation + exact forward refine ----------------------
 def compute(lat, lon, max_rides=DEFAULT_MAX_RIDES):
     """Door-to-door times from every grid cell TO (lat, lon), as {id: [best, real]}.
@@ -380,9 +473,10 @@ def _compute():
     else:
         gen = _current_generation()
     t0 = dt.datetime.now()
-    cells = compute(lat, lon, max_rides)
+    cells = compute_raptor(lat, lon, max_rides) if USE_RAPTOR else compute(lat, lon, max_rides)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[compute] ({lat:.4f},{lon:.4f}) rides={max_rides} {ms:.0f}ms gen={gen}")
+    tag = "raptor" if USE_RAPTOR else "approx"
+    print(f"[compute:{tag}] ({lat:.4f},{lon:.4f}) rides={max_rides} {ms:.0f}ms gen={gen}")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -391,6 +485,12 @@ def _compute():
 def _compute_exact():
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
     max_rides = _req_max_rides()
+    # With RAPTOR ON, /compute already returned the near-exact answer; the "exact refine" is
+    # the SAME engine, so return it instantly (no heavy per-cell R5 pass). map == refine, so
+    # the old fast-vs-exact contradiction disappears entirely.
+    if USE_RAPTOR:
+        cells = compute_raptor(lat, lon, max_rides)
+        return jsonify({"dest": [lat, lon], "cells": cells, "ms": 0})
     ckey = _coarse_key(lat, lon, max_rides)
     # CACHE HIT (~110m): return the same result instantly — no R5 work, no lock, and the
     # generation/supersede dance is irrelevant since there's nothing to cancel.

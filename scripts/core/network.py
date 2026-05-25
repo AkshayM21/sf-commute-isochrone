@@ -41,6 +41,16 @@ def travel_time_matrix(net, origins, destinations, dep, *, snap_to_network=True,
                             snap_to_network=snap_to_network, **_common(dep, max_rides))
 
 
+def walk_time_matrix(net, origins, destinations, dep, max_min, *, snap_to_network=True):
+    """WALK-only door-to-door matrix (minutes) — used to derive the RAPTOR engine's
+    per-workplace egress (W->stops) and pure-walk (W->cells) at the canonical walk speed."""
+    return TravelTimeMatrix(net, origins=origins, destinations=destinations,
+                            departure=dep, transport_modes=[TransportMode.WALK],
+                            speed_walking=config.WALK_KMH,
+                            max_time=dt.timedelta(minutes=max_min),
+                            snap_to_network=snap_to_network)
+
+
 def routing_template(net, dest, dep, *, paths=False, n_paths=8,
                      max_rides=DEFAULT_MAX_RIDES):
     """A reusable RegionalTask routing TO `dest` (callers set .origin per request, then
