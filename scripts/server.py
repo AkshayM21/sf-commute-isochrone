@@ -30,15 +30,23 @@ from core import config, feeds, grid, geo        # JVM-free core (no r5py)
 config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the geocoder
 
 # ---- Flags (parsed EARLY: they decide whether the in-process JVM starts at all) --------
-# USE_RAPTOR=1 swaps the grid coloring to the self-built reverse range-RAPTOR. RAPTOR_SEMANTIC
-# 'departafter' (R5-validated map + R5 hover) or 'arriveby' (arrive-by-09:00 product + RAPTOR
-# hover/color-by-line). RAPTOR_MC=1 adds the service-noise realistic+fragility overlay (/variance).
-# USE_WALK_GRAPH=1 replaces R5's last runtime job (the walk matrix) with the JVM-free hill-aware
-# walk router. Default: all OFF -> the live app is byte-identical (R5 path).
-USE_RAPTOR = os.environ.get("USE_RAPTOR", "").lower() in ("1", "true", "yes", "on")
+# THE DEFAULT IS NOW THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + arrive-by-09:00 + the
+# service-noise overlay. R5/the JVM is no longer loaded by default. Opt back into the legacy R5
+# path with USE_RAPTOR=0 (and/or USE_WALK_GRAPH=0 for the R5 walk matrix, RAPTOR_SEMANTIC=departafter).
+USE_RAPTOR = os.environ.get("USE_RAPTOR", "1").lower() in ("1", "true", "yes", "on")
 RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "arriveby").lower()
 RAPTOR_MC = os.environ.get("RAPTOR_MC", "1").lower() in ("1", "true", "yes", "on")
-USE_WALK_GRAPH = os.environ.get("USE_WALK_GRAPH", "").lower() in ("1", "true", "yes", "on")
+USE_WALK_GRAPH = os.environ.get("USE_WALK_GRAPH", "1").lower() in ("1", "true", "yes", "on")
+# Safety net: the JVM-free walk stack needs its one-time bakes (walk graph + access_walk table).
+# If they're absent (fresh checkout), fall back to the R5 walk matrix (re-enables the JVM) with a
+# clear message instead of crashing. Bake them to go fully JVM-free (see below / setup.sh).
+if USE_WALK_GRAPH and not (
+        (config.DATA / "walk_graph.npz").exists()
+        and any((config.DATA / "raptor_cache").glob("access_walk_*m_*.npz"))):
+    print("[boot] USE_WALK_GRAPH on but the walk graph / access_walk table isn't baked — falling "
+          "back to R5 walk (JVM). Bake the JVM-free stack: scripts/fetch_dem.sh && "
+          "scripts/build_walk_graph.py && scripts/bake_walk_access.py")
+    USE_WALK_GRAPH = False
 # FULLY JVM-free when the map, breakdown, AND walk all come from RAPTOR arrive-by + the walk graph.
 # Otherwise R5 is still needed (fast approx / depart-after / R5 hover+color-by-line / R5 walk).
 _NEED_R5 = not (USE_RAPTOR and USE_WALK_GRAPH and RAPTOR_SEMANTIC == "arriveby")
@@ -1033,7 +1041,15 @@ def _autocomplete():
 def _build_page():
     html = (HERE / "templates" / "index.html").read_text()
     viz = (HERE / "assets" / "viz.js").read_text()
+    # Tell the page which semantic it's serving so it can drop the (now meaningless) R5 "refine"
+    # affordance and frame everything as an arrive-by-09:00 estimate. arrive-by => map == the
+    # engine result, there is no separate exact pass to refine to.
+    _arriveby = USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby"
+    cfg = {"raptor": USE_RAPTOR, "arriveby": _arriveby,
+           "timephrase": ("arriving by ~9:00am" if _arriveby
+                          else f"leaving ~{DEP:%-I:%M%p}".lower())}
     return (html.replace("/*__VIZ__*/", viz)
+                .replace("__CFG__", json.dumps(cfg))
                 .replace("__CELLS__", json.dumps(CELLS_GEOJSON))
                 .replace("__LINES__", json.dumps(LINES)))
 

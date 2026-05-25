@@ -125,8 +125,9 @@
     <div class="addr"><div class="acwrap"><input id="addr" placeholder="e.g. 1 Market St" autocomplete="off"
       role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="ac"><div id="ac" role="listbox"></div></div><button id="go">Set</button></div>
     <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div>
-    <button id="refine" class="btn sec" style="margin-top:9px" disabled>Refine — exact (~30s)</button>
+    <div id="refinebox"><button id="refine" class="btn sec" style="margin-top:9px" disabled>Refine — exact (~30s)</button>
     <div class="note">Fast map (±~2 min) auto-sharpens to exact times. Use <b>Refine</b> to re-run the exact pass.</div></div>
+    <div id="estnote" class="note" style="display:none">Door-to-door <b>estimates</b>, <span id="estphrase"></span> by walk + transit.</div></div>
   <div class="ctl"><div class="lab">Time estimate</div>
     <div class="seg" id="metric"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
   <div class="ctl"><div class="lab">Color by</div>
@@ -149,8 +150,8 @@
   <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods <span id="nbcount" style="color:var(--mut);text-transform:none;letter-spacing:0;font-weight:400"></span></div></div>
   <div id="list"></div>
   <div class="export"><button id="copylist">Copy list</button><button id="dlcsv">Download CSV</button></div>
-  <div class="credit">R5/r5py · Muni (511) + BART + Caltrain · network kept warm; only the matrix recomputes.
-    Live map is a fast reverse-routing approximation (~±2 min); <b>scripts/isochrone.py</b> is the exact build.
+  <div class="credit">Walk + Muni (511) + BART + Caltrain · self-built RAPTOR transit router + hill-aware
+    walking. Door-to-door <b>estimates</b> (<span id="creditphrase"></span>).
     Geocoding © <a href="https://www.geoapify.com/" target="_blank" style="color:#5c6470">Geoapify</a>, © OpenStreetMap.</div>
 </div>
 <div id="legend"><b id="legtitle">Realistic door-to-door (min)</b><div class="bar"></div>
@@ -159,14 +160,17 @@
 <div id="howmodal"><div class="card">
   <span class="x" id="howx" role="button" aria-label="Close">&times;</span>
   <h2>How it works</h2>
-  <div>Door-to-door times by <b>walking + public transit only</b> (Muni / BART / Caltrain) —
-  no driving or biking — on real schedules leaving ~8:35am on a weekday.
-  The fast map is an estimate (±~2 min) that auto-sharpens to exact times (Refine re-runs it).
-  <b>Hover or tap</b> any area for the route behind the number.</div>
+  <div>Door-to-door <b>estimates</b> by <b>walking + public transit only</b> (Muni / BART / Caltrain) —
+  no driving or biking — on real weekday schedules, <b><span id="howtime"></span></b>.
+  Walking is <b>hill-aware</b> (uphill is slower than downhill). <b>Hover or tap</b> any area for the
+  route behind the number; the <b>Realistic</b> view adds typical service delays, <b>Best-case</b>
+  assumes perfect timing.</div>
 </div></div>
 <script>
 /*__VIZ__*/
-const CELLS=__CELLS__, LINES=__LINES__;
+const CELLS=__CELLS__, LINES=__LINES__, CFG=__CFG__;
+// CFG.raptor: the map IS the engine result (no separate exact pass) -> drop the R5 "Refine"
+// affordance. CFG.arriveby: frame everything as an arrive-by-09:00 estimate (CFG.timephrase).
 let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
 let REAL={}, VAR={};   // service-noise overlay (RAPTOR arrive-by): REAL[id]=realistic(MC p50) min; VAR[id]={frag,std,stuck,alt}. Populated by /variance after the map paints; survives the exact-refine overwrite of TT.
 let EXACT=false;   // true once the exact refine has replaced the fast map (so hover==map, not a contradicting exact number on a fast cell)
@@ -308,27 +312,28 @@ async function setWorkplace(lat,lon,label){
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   document.getElementById("prompt").style.display="none";
   DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};REAL={};VAR={};
-  document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
+  if(!CFG.raptor)document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
   if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
   map.setView([lat,lon],12.6);
   try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
   busy("estimating…");
   try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}${speedParam()}`);const d=await r.json();
     if(myGen!==GEN)return;                            // a newer address took over → drop this
-    TT=d.cells;EXACT=false;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
+    // RAPTOR: the map IS the engine result (exact-by-construction) -> breakdown is shown
+    // immediately (no "refining…" placeholder). Legacy R5: stays the fast approx until refine().
+    TT=d.cells;EXACT=CFG.raptor;DESTLL=d.dest;
+    document.getElementById("dest").textContent=(label||"")+(CFG.raptor?"":`  ·  fast ~${d.ms}ms`);
     aggregate();redraw();
   }catch(e){if(myGen===GEN){busy(false);alert("compute failed: "+e);}return;}
   if(myGen!==GEN)return;
   busy(false);
-  document.getElementById("refine").disabled=false;  // also re-refinable on demand via the button
+  if(!CFG.raptor)document.getElementById("refine").disabled=false;  // re-refinable via the button (R5 only)
   syncHash();
   if(cmode=="line")loadAttribution();
   loadVariance();   // layer realistic + fragility + alt-lines once the perfect map is up (no-op off RAPTOR)
-  // Auto-sharpen the fast approximation to the EXACT map so the colors/filter match the hover
-  // breakdown (which is always exact). Safe under load: refine() is 503-aware and silently keeps
-  // the fast map when the server is busy; its own generation guard drops this if the address
-  // changes again before the exact pass returns.
-  if(myGen===GEN)refine();
+  // Legacy R5 only: auto-sharpen the fast approximation to the EXACT map. With RAPTOR the map is
+  // already exact (== the engine), so there is nothing to refine to.
+  if(myGen===GEN && !CFG.raptor)refine();
 }
 // ---- exact refine: auto-run after every address (above) AND re-runnable via the button.
 //      503-aware with one retry; keeps the fast approximation if exact is unavailable/busy. ----
@@ -510,6 +515,17 @@ function applyHash(o){applyingHash=true;
       setWorkplace(lat,lon,label);return true;}}
   return false;}
 
+// Apply CFG: with the RAPTOR stack the map IS the engine result, so drop the R5 "Refine" button
+// and frame the panel as arrive-by-09:00 estimates (CFG.timephrase).
+(function applyCfg(){
+  document.getElementById("howtime").textContent=CFG.timephrase;
+  document.getElementById("creditphrase").textContent=CFG.timephrase;
+  document.getElementById("estphrase").textContent=CFG.timephrase;
+  if(CFG.raptor){
+    document.getElementById("refinebox").style.display="none";
+    document.getElementById("estnote").style.display="block";
+  }
+})();
 legend();   // draw the legend; map stays blank until you set an address
 // Boot: hash takes precedence over localStorage (Feature 4).
 (function boot(){
