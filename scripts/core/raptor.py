@@ -347,3 +347,105 @@ def _reverse_profile_numba(data, egress_g, egress_w, deadlines, board_slack, max
     from . import raptor_numba
     return raptor_numba.reverse_profile(data, egress_g, egress_w, deadlines,
                                         board_slack, max_rounds)
+
+
+# --------------------------------------------------------------- service-noise Monte-Carlo
+def pat_trip_off(data):
+    """CSR-style base into a per-(global)-trip array: trip g of pattern pi = off[pi] + trip."""
+    off = np.zeros(len(data["pat_ntrips"]) + 1, dtype=np.int64)
+    off[1:] = np.cumsum(np.asarray(data["pat_ntrips"], dtype=np.int64))
+    return off
+
+
+def apply_delays(data, delta0, slope, off=None):
+    """Perturb the schedule by per-trip delay delta(pos)=delta0[g]+slope[g]*scheduled_elapsed(pos)
+    (applied to BOTH dep & arr so dwell is preserved), then a per-pattern FIFO cumulative-max
+    clamp per position across trips. Vectorized reference; MUST match raptor_numba._perturb.
+    delta0/slope are per global trip (see ``pat_trip_off``). Returns (dep, arr) int32."""
+    if off is None:
+        off = pat_trip_off(data)
+    pat_nstops = data["pat_nstops"]; pat_ntrips = data["pat_ntrips"]; pat_mat_off = data["pat_mat_off"]
+    dep = np.asarray(data["pat_dep"], dtype=np.int64).copy()
+    arr = np.asarray(data["pat_arr"], dtype=np.int64).copy()
+    for pi in range(len(pat_nstops)):
+        ns = int(pat_nstops[pi]); nt = int(pat_ntrips[pi]); mb = int(pat_mat_off[pi])
+        if nt == 0 or ns == 0:
+            continue
+        D = dep[mb:mb + nt * ns].reshape(nt, ns)
+        A = arr[mb:mb + nt * ns].reshape(nt, ns)
+        tb = int(off[pi])
+        d0 = delta0[tb:tb + nt][:, None]
+        sl = slope[tb:tb + nt][:, None]
+        elapsed = np.maximum(D - D[:, :1], 0)
+        inc = (d0 + sl * elapsed).astype(np.int64)
+        D = D + inc; A = A + inc
+        np.maximum.accumulate(D, axis=0, out=D)        # no overtaking on dep ...
+        np.maximum.accumulate(A, axis=0, out=A)        # ... or arr (keeps the arr column sorted)
+        dep[mb:mb + nt * ns] = D.ravel(); arr[mb:mb + nt * ns] = A.ravel()
+    return dep.astype(np.int32), arr.astype(np.int32)
+
+
+def montecarlo_commute(data, egress_g, egress_w, deadlines, access_off, access_to, access_w,
+                       purewalk, d_med, max_min, delta0_all, slope_all,
+                       board_slack=60, max_rounds=8, kernel=None):
+    """commute_all[n_cells, R] in float minutes (capped at max_min; unreachable -> max_min)
+    for R service-noise draws (rows of delta0_all/slope_all, per global trip). Each draw
+    perturbs the schedule, re-runs the reverse sweep, and reads the door-to-door commute at the
+    single median departure ``d_med`` (so spread = pure service noise). Numba when available."""
+    off = pat_trip_off(data)
+    if kernel is None:
+        kernel = _select_kernel()
+    if kernel == "numba":
+        from . import raptor_numba
+        return raptor_numba.montecarlo(
+            np.int64(data["n_stops"]),
+            data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
+            data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64), off,
+            data["pat_stops"].astype(np.int64), data["pat_dep"].astype(np.int64),
+            data["pat_arr"].astype(np.int64),
+            data["ras_off"].astype(np.int64), data["ras_pat"].astype(np.int64),
+            data["ras_pos"].astype(np.int64),
+            data["tr_off"].astype(np.int64), data["tr_to"].astype(np.int64),
+            data["tr_time"].astype(np.int64),
+            np.asarray(egress_g, np.int64), np.asarray(egress_w, np.int64),
+            np.asarray(deadlines, np.int64), np.int64(board_slack), np.int64(max_rounds),
+            np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
+            np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
+            np.int64(d_med), np.int64(max_min),
+            np.ascontiguousarray(delta0_all, np.float64),
+            np.ascontiguousarray(slope_all, np.float64))
+    return _montecarlo_python(data, egress_g, egress_w, deadlines, access_off, access_to,
+                              access_w, purewalk, d_med, max_min, delta0_all, slope_all, off,
+                              board_slack, max_rounds)
+
+
+def _montecarlo_python(data, egress_g, egress_w, deadlines, access_off, access_to, access_w,
+                       purewalk, d_med, max_min, delta0_all, slope_all, off,
+                       board_slack, max_rounds):
+    """Slow pure-numpy reference for ``montecarlo_commute`` (test/no-numba path)."""
+    deadlines = np.asarray(deadlines, np.int64)
+    n_cells = len(access_off) - 1
+    Rn = delta0_all.shape[0]
+    cm = np.empty((n_cells, Rn), dtype=np.float64)
+    for r in range(Rn):
+        dep, arr = apply_delays(data, delta0_all[r], slope_all[r], off)
+        pdata = dict(data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
+        latest = reverse_profile(pdata, egress_g, egress_w, deadlines,
+                                 board_slack=board_slack, max_rounds=max_rounds, kernel="python")
+        for ci in range(n_cells):
+            a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
+            best = INF
+            for a in range(a0, a1):
+                s = int(access_to[a]); board = d_med + int(access_w[a])
+                lo = int(np.searchsorted(latest[s], board, side="left"))
+                if lo < len(deadlines):
+                    tt = int(deadlines[lo]) - d_med
+                    if tt < best:
+                        best = tt
+            pw = int(purewalk[ci])
+            ttv = best
+            if pw >= 0 and pw < ttv:
+                ttv = pw
+            m = ttv / 60.0 if ttv < INF else 1e18
+            cm[ci, r] = min(m, float(max_min))
+    return cm

@@ -166,6 +166,7 @@
 /*__VIZ__*/
 const CELLS=__CELLS__, LINES=__LINES__;
 let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
+let REAL={}, VAR={};   // service-noise overlay (RAPTOR arrive-by): REAL[id]=realistic(MC p50) min; VAR[id]={frag,std,stuck,alt}. Populated by /variance after the map paints; survives the exact-refine overwrite of TT.
 let EXACT=false;   // true once the exact refine has replaced the fast map (so hover==map, not a contradicting exact number on a fast cell)
 let maxxfers="any";   // "0"/"1"/"2" transfers, or "any" (the R5 default 8-ride cap)
 // UI transfers -> R5 ride cap (rides = transfers + 1). "any" stays unset so the URL and
@@ -191,7 +192,11 @@ function legend(){const sc=document.querySelector("#legend .sc"),bar=document.qu
   bar.style.background="linear-gradient(90deg,"+S.map(s=>rgb(s[1])+" "+Math.round(s[0]/hi*100)+"%").join(",")+")";
   sc.innerHTML=`<span>0</span><span>${ideal} (ideal)</span><span>${hi}+</span>`;
   document.getElementById("legtitle").textContent=(metric=="r"?"Realistic":"Best-case")+" door-to-door (min)";}
-function val(id){const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
+function val(id){
+  // Realistic prefers the MC overlay (REAL) when loaded; else falls back to TT[1] (= the
+  // depart-after p50, or the perfect map until /variance lands). Best-case is always TT[0].
+  if(metric=="r"){const rv=REAL[id];if(rv!=null)return rv;}
+  const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
 function style(f){const id=f.properties.id,v=val(id);
   if(v==null||v>thr)return{fillOpacity:0,opacity:0,weight:0};
   if(cmode=="line"){const ln=ATTR[id];return ln?{fillColor:LINECOLOR[ln]||"#888",fillOpacity:.76,weight:0}:{fillColor:"#888",fillOpacity:.06,weight:0};}
@@ -205,6 +210,15 @@ function lineColor(line){  // match the overlay legend colors
   if(/^[JKLMNT]$/.test(line)||line==="KLM")return MODECOLOR.metro;
   return MODECOLOR.bus;
 }
+// fragility chip: a one-word read on SERVICE risk (miss-a-connection re-route + last-train).
+// frag = p90-p50 bad-day delta (min); stuck = fraction of MC draws that hit the cap.
+function fragChip(frag,stuck){
+  let label,c;
+  if((stuck||0)>=0.15){label="fragile";c="#ff6b6b";}
+  else if(frag<=2){label="robust";c="#5cd65c";}
+  else if(frag<=6){label="some risk";c="#f6a04d";}
+  else{label="fragile";c="#ff6b6b";}
+  return `<span style="font-size:10px;padding:1px 6px;border-radius:6px;background:${c}22;color:${c};border:1px solid ${c}55">${label}</span>`;}
 function bdHTML(d){
   if(d.error)return `<div class="bd"><span style="color:#9aa3af">No transit route within ~75 min.</span></div>`;
   const chips=[];
@@ -214,21 +228,40 @@ function bdHTML(d){
     const c=lineColor(g.line);
     chips.push(`<span class="leg" style="background:${c}26;color:${c};border:1px solid ${c}55">${g.line} · ${g.min}m</span>`);
   });
-  return `<div class="bd"><div class="h"><b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"}</div>`+
+  // realistic + fragility line (when the /variance overlay is loaded for this cell)
+  let vline="";
+  if(d.real!=null){
+    const frag=d.var?d.var.frag:0;
+    vline=`<div style="margin:-3px 0 8px;color:#9aa3af;font-size:11.5px">typical `+
+      `<b style="color:#e8eaed">~${d.real} min</b>`+
+      (frag>0?` · bad-day <b style="color:#e8eaed">+${frag}</b>`:``)+
+      ` ${fragChip(frag,d.var?d.var.stuck:0)}</div>`;
+  }
+  // alternative lines that serve this commute under delays (re-routes), excluding the normal line
+  let altline="";
+  if(d.var&&d.var.alt&&Object.keys(d.var.alt).length){
+    const ls=Object.keys(d.var.alt).slice(0,4).map(l=>{const c=lineColor(l);
+      return `<span class="leg" style="background:${c}1f;color:${c};border:1px solid ${c}44">${l}</span>`;}).join(" ");
+    altline=`<div style="margin-top:8px;font-size:11px;color:#9aa3af">also serves: ${ls}</div>`;
+  }
+  return `<div class="bd"><div class="h"><b>${d.name||""}</b> · ${d.total} min · ${d.xfers} transfer${d.xfers==1?"":"s"} <span style="color:#5c6470;font-size:10px">best-case</span></div>`+
+    vline+
     `<div class="legs">${chips.join('<span class="arr">▸</span>')}</div>`+
+    altline+
     `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
-    `<div class="foot">typical fastest trip (~8:35am)</div></div>`;}
+    `<div class="foot">best-case = perfect timing (~0 wait); typical adds service noise</div></div>`;}
 let bdTimer;
 function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){setHTML("—");return;}
   if(!EXACT){   // map still on the fast estimate — show the SAME value (no contradicting exact breakdown yet)
     setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ~${v} min <span style="color:#9aa3af;font-weight:400">estimate</span></div><div style="color:#9aa3af">refining to exact times + route…</div></div>`);
     return;}
-  if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n});setHTML(bdHTML(d));return;}
+  if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n,real:REAL[id],var:VAR[id]});setHTML(bdHTML(d));return;}
   setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
   bdTimer=setTimeout(async()=>{try{
     const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}`);
-    const d=await r.json();if(my!==bdToken)return;if(!d.error)BDCACHE[id]=d;d.name=f.properties.n;setHTML(bdHTML(d));
+    const d=await r.json();if(my!==bdToken)return;if(!d.error)BDCACHE[id]=d;
+    d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];setHTML(bdHTML(d));
   }catch(e){if(my===bdToken)setHTML("error");}},150);}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
   // Desktop: hover shows the sticky breakdown tooltip. Touch has no hover, so we skip it
@@ -270,7 +303,7 @@ function busy(t){const b=document.getElementById("busy");if(t){b.textContent=t;b
 async function setWorkplace(lat,lon,label){
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   document.getElementById("prompt").style.display="none";
-  DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};
+  DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};REAL={};VAR={};
   document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
   if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
   map.setView([lat,lon],12.6);
@@ -286,6 +319,7 @@ async function setWorkplace(lat,lon,label){
   document.getElementById("refine").disabled=false;  // also re-refinable on demand via the button
   syncHash();
   if(cmode=="line")loadAttribution();
+  loadVariance();   // layer realistic + fragility + alt-lines once the perfect map is up (no-op off RAPTOR)
   // Auto-sharpen the fast approximation to the EXACT map so the colors/filter match the hover
   // breakdown (which is always exact). Safe under load: refine() is 503-aware and silently keeps
   // the fast map when the server is busy; its own generation guard drops this if the address
@@ -329,6 +363,15 @@ async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping
     if(r.ok){const a=await r.json();if(myGen!==GEN)return;ATTR=a;buildLineColors();redraw();}
     else{document.getElementById("legtitle").textContent="line map unavailable yet";}
   }catch(e){}finally{if(myGen===GEN)busy(false);}}
+// ---- service-noise overlay: realistic (MC p50) + fragility + alt-lines ------------------
+//      Progressive (fetched AFTER /compute paints the perfect map), gen-guarded, best-effort.
+//      Returns {} when the server isn't in RAPTOR arrive-by + MC mode -> we keep the perfect map.
+async function loadVariance(){if(!DESTLL)return;const myGen=GEN;
+  try{const r=await fetch(`/variance?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}`);
+    if(!r.ok)return;const d=await r.json();if(myGen!==GEN)return;
+    if(d.realistic&&Object.keys(d.realistic).length){
+      REAL=d.realistic;VAR=d.variance||{};aggregate();redraw();}   // realistic now drives metric="r"
+  }catch(e){}}
 // ---- small shared utils for busy handling + toasts --------------------------------------
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function retryAfter(r){const h=r.headers.get("Retry-After");const s=h?parseFloat(h):NaN;

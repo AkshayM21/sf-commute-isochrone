@@ -103,6 +103,10 @@ _EXACT_POOL = ThreadPoolExecutor(max_workers=EXACT_THREADS, thread_name_prefix="
 # error) or 'arriveby' (the arrive-by-09:00 product semantic, surfaced for review).
 USE_RAPTOR = os.environ.get("USE_RAPTOR", "").lower() in ("1", "true", "yes", "on")
 RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "arriveby").lower()
+# RAPTOR_MC=1 (default ON under arrive-by): the service-noise Monte-Carlo "realistic + fragility
+# + alt-lines" layer, served by /variance (lazy, cached, ~1s once per workplace, off the hover
+# path). The perfect-timing map (/compute) is unchanged; realistic is a refinement overlay.
+RAPTOR_MC = os.environ.get("RAPTOR_MC", "1").lower() in ("1", "true", "yes", "on")
 _RAPTOR = None
 _RAPTOR_STOPS = None             # GeoDataFrame of stop coords keyed by gid (egress destinations)
 _RAPTOR_EGRESS_CACHE = OrderedDict()   # coarse_key -> (egress_g, egress_w, purewalk)
@@ -447,6 +451,56 @@ def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES):
         _, dom = entry["tree"].commute_and_dominant()
         entry["dom"] = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
     return entry["dom"]
+
+
+# Per-workplace service-noise Monte-Carlo (realistic + fragility + alt-lines), JVM-free, lazy +
+# cached. Keyed like the other heavy caches (coarse bucket + transfer cap), bounded LRU.
+_RAPTOR_MC_CACHE = OrderedDict()             # (coarse_key, max_rides) -> {realistic, variance}
+_RAPTOR_MC_LOCK = threading.Lock()
+
+
+def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES):
+    """{"realistic": {id: min}, "variance": {id: {frag, std, stuck, alt}}} for this workplace.
+    realistic = MC p50 (clamped >= perfect); frag = p90-p50 bad-day delta; stuck = fraction of
+    draws hitting the cap; alt = lines that become dominant under delays (EXCLUDING the cell's
+    normal line). Reachability follows the perfect map (unreachable cells are omitted)."""
+    import numpy as _np
+    import hashlib as _hl
+    key = _coarse_key(dlat, dlon, max_rides)
+    with _RAPTOR_MC_LOCK:
+        if key in _RAPTOR_MC_CACHE:
+            _RAPTOR_MC_CACHE.move_to_end(key)
+            return _RAPTOR_MC_CACHE[key]
+    entry = _raptor_tree(dlat, dlon, max_rides)         # perfect map + dominant lines (cached)
+    cells = entry["cells"]; dom = entry["dom"] or {}
+    ids = _RAPTOR.cell_ids
+    perfect = _np.array([(cells[c][0] if cells[c][0] is not None else -1) for c in ids], _np.int32)
+    egress_g, egress_w, purewalk = _raptor_egress_purewalk(dlat, dlon)
+    # deterministic per-workplace seed -> the realistic numbers are stable across reboots/reloads
+    seed = int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)}"
+                          .encode()).hexdigest()[:8], 16)
+    mc = _RAPTOR.montecarlo(egress_g, egress_w, purewalk, perfect=perfect, seed=seed)
+    realistic, variance = {}, {}
+    alt_all = mc["alt"]
+    for i, c in enumerate(ids):
+        if perfect[i] < 0:                              # follow the perfect map's reachability
+            continue
+        realistic[c] = int(mc["realistic"][i])
+        v = {"frag": int(mc["frag"][i]), "std": int(mc["std"][i]),
+             "stuck": round(float(mc["stuck"][i]), 2)}
+        a = alt_all[i] if alt_all else None
+        if a:
+            domc = dom.get(c)
+            a = {k: vv for k, vv in a.items() if k != domc}   # only OTHER lines (not the normal one)
+            if a:
+                v["alt"] = dict(list(a.items())[:4])
+        variance[c] = v
+    out = {"realistic": realistic, "variance": variance}
+    with _RAPTOR_MC_LOCK:
+        _RAPTOR_MC_CACHE[key] = out
+        while len(_RAPTOR_MC_CACHE) > 16:
+            _RAPTOR_MC_CACHE.popitem(last=False)
+    return out
 
 
 # ---- Map TIME: fast reverse approximation + exact forward refine ----------------------
@@ -828,6 +882,25 @@ def _attribution():
     print(f"[attr] ({dlat:.4f},{dlon:.4f}) {ms:.0f}ms -> {len(attr)} cells"
           f"{' (cached)' if cached else ''}")
     return jsonify(attr)
+
+
+@app.route("/variance")
+@limiter.limit("20/minute")
+def _variance():
+    """Service-noise overlay (RAPTOR arrive-by only): realistic (MC p50) + per-cell fragility +
+    alternative lines. Lazy + cached; fetched by the frontend AFTER /compute paints the perfect
+    map (progressive refinement, like /compute_exact). Empty when the flag/semantic is off so the
+    frontend simply keeps the perfect map."""
+    if not (USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby" and RAPTOR_MC):
+        return jsonify({"realistic": {}, "variance": {}})
+    dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
+    max_rides = _req_max_rides()
+    t0 = dt.datetime.now()
+    out = _raptor_mc(dlat, dlon, max_rides)
+    ms = (dt.datetime.now() - t0).total_seconds() * 1000
+    print(f"[variance:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} {ms:.0f}ms "
+          f"-> {len(out['realistic'])} cells")
+    return jsonify({"dest": [dlat, dlon], **out, "ms": round(ms)})
 
 
 @app.route("/geocode")

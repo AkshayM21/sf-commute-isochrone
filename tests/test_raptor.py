@@ -162,6 +162,64 @@ def test_color_by_line_deterministic(engine):
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_realistic_invariant(engine):
+    """Phase A service-noise Monte-Carlo: ``realistic`` (p50 over delay draws) NEVER beats the
+    perfect-timing best-case map (the hard invariant), sits modestly ABOVE R5's schedule-perfect
+    p50 (delays only add time), and produces a non-trivial fragility tail."""
+    pos = {c: i for i, c in enumerate(engine.cell_ids)}
+    all_err, all_signed, viol, fragmax = [], [], 0, 0
+    for f in _oracles():
+        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
+        pw = _purewalk_aligned(engine, z)
+        perfect, _ = engine.journey_tree(z["egress_g"], z["egress_w"], pw).commute_and_dominant()
+        perfect = np.asarray(perfect, np.int32)
+        mc = engine.montecarlo(z["egress_g"], z["egress_w"], pw, perfect=perfect,
+                               seed=7, alt_draws=0)
+        real = mc["realistic"]; reach = perfect >= 0
+        viol += int(np.sum(real[reach] < perfect[reach]))
+        fragmax = max(fragmax, int(mc["frag"][reach].max()))
+        for k, cid in enumerate(z["cell_ids"].astype(str)):
+            i = pos.get(cid)
+            if i is None or perfect[i] < 0:
+                continue
+            r5 = int(z["p50"][k])
+            if r5 < 0:
+                continue
+            all_err.append(abs(int(real[i]) - r5)); all_signed.append(int(real[i]) - r5)
+    err = np.array(all_err); signed = np.array(all_signed)
+    print(f"\n[mc realistic] vs R5 p50: MAE={err.mean():.2f} bias={signed.mean():+.2f} "
+          f"perfect>realistic={viol} fragmax={fragmax}")
+    assert viol == 0, f"realistic beat perfect-timing in {viol} cells"
+    assert err.mean() <= 2.5, f"realistic vs R5 p50 MAE {err.mean():.2f} > 2.5"
+    assert 0.0 <= signed.mean() <= 2.0, f"realistic bias {signed.mean():+.2f} outside [0, 2]"
+    assert fragmax > 0, "no fragile cells — MC produced no service variance"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_fifo_clamp_sorted(engine):
+    """A perturbed schedule keeps every pattern's per-position arrival AND departure column
+    non-decreasing across trips (the FIFO cumulative-max clamp), so the per-position binary
+    search the reverse sweep relies on stays valid."""
+    from core import raptor as R
+    data = engine.data
+    off = R.pat_trip_off(data)
+    Tn = int(off[-1])
+    rng = np.random.default_rng(1)
+    dep, arr = R.apply_delays(data, rng.gamma(2.0, 40.0, size=Tn),
+                              rng.gamma(2.0, 0.03, size=Tn), off)
+    bad = 0
+    for pi in range(len(data["pat_nstops"])):
+        ns = int(data["pat_nstops"][pi]); nt = int(data["pat_ntrips"][pi])
+        mb = int(data["pat_mat_off"][pi])
+        if nt < 2:
+            continue
+        A = arr[mb:mb + nt * ns].reshape(nt, ns); D = dep[mb:mb + nt * ns].reshape(nt, ns)
+        if (np.diff(A, axis=0) < 0).any() or (np.diff(D, axis=0) < 0).any():
+            bad += 1
+    assert bad == 0, f"{bad} patterns broke FIFO order after perturbation"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_numba_matches_python(engine):
     """The compiled kernel (production) and the pure-python reference are equivalent: both
     drive the FULL engine path to the same per-cell p50 within <= 2 min (the order-dependent

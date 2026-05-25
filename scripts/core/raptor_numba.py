@@ -10,7 +10,7 @@ Falls back is unnecessary: ``raptor.reverse_profile`` selects this kernel only w
 imports cleanly, else uses the pure-python path (kept as the reference + test oracle).
 """
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 NEG = -(1 << 60)
 
@@ -268,3 +268,104 @@ def reverse_profile(data, egress_g, egress_w, deadlines, board_slack, max_rounds
         np.asarray(egress_g, dtype=np.int64), np.asarray(egress_w, dtype=np.int64),
         np.asarray(deadlines, dtype=np.int64),
         np.int64(board_slack), np.int64(max_rounds))
+
+
+# ============================================================== service-noise Monte-Carlo
+# Perturb the schedule (per-trip cumulative delay) and re-run the SAME validated reverse sweep
+# per draw, streaming each draw's per-cell median-departure commute into an accumulator. This
+# re-routes OPTIMALLY per scenario (miss an express -> the min over patterns lands on the next
+# local), which a naive same-line headway score cannot do. The cell loop's cost is folded into
+# the per-draw work; draws run in `prange` across cores (nogil), each thread holding only ONE
+# perturbed schedule + ONE latest profile at a time (never R x n_stops).
+
+@njit(cache=True, nogil=True)
+def _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
+             delta0, slope, dep_out, arr_out):
+    """Apply a per-trip delay delta(pos) = delta0[trip] + slope[trip]*scheduled_elapsed(pos)
+    to dep & arr (preserving dwell), then a per-pattern, per-position FIFO cumulative-max clamp
+    across trips so the arrival column stays sorted (the per-position binary search in _profile
+    requires it). delta0 / slope are indexed by GLOBAL trip id (pat_trip_off[pi] + trip)."""
+    n_pat = pat_nstops.shape[0]
+    for pi in range(n_pat):
+        ns = pat_nstops[pi]
+        nt = pat_ntrips[pi]
+        mbase = pat_mat_off[pi]
+        tbase = pat_trip_off[pi]
+        for trip in range(nt):
+            g = tbase + trip
+            d0 = delta0[g]
+            sl = slope[g]
+            base = mbase + trip * ns
+            dep0 = pat_dep[base]
+            for pos in range(ns):
+                off = base + pos
+                elapsed = pat_dep[off] - dep0
+                if elapsed < 0:
+                    elapsed = 0
+                inc = np.int64(d0 + sl * elapsed)
+                dep_out[off] = pat_dep[off] + inc
+                arr_out[off] = pat_arr[off] + inc
+        # FIFO cumulative-max clamp per position across trips (no overtaking on dep or arr)
+        for pos in range(ns):
+            for trip in range(1, nt):
+                a = mbase + trip * ns + pos
+                b = mbase + (trip - 1) * ns + pos
+                if dep_out[a] < dep_out[b]:
+                    dep_out[a] = dep_out[b]
+                if arr_out[a] < arr_out[b]:
+                    arr_out[a] = arr_out[b]
+
+
+@njit(parallel=True, nogil=True, cache=True)
+def montecarlo(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
+               pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
+               egress_g, egress_w, deadlines, board_slack, max_rounds,
+               access_off, access_to, access_w, purewalk, d_med, max_min,
+               delta0_all, slope_all):
+    """For R draws (rows of delta0_all/slope_all), perturb -> reverse sweep -> per-cell commute
+    at the single median departure ``d_med``. Returns commute_all[n_cells, R] in float minutes,
+    capped at max_min (unreachable -> max_min, so it counts as 'stuck'). Cross-draw spread is
+    pure SERVICE noise (the departure is fixed), which is exactly the variance we want."""
+    R = delta0_all.shape[0]
+    n_cells = access_off.shape[0] - 1
+    nd = deadlines.shape[0]
+    np_len = pat_dep.shape[0]
+    commute_all = np.empty((n_cells, R), dtype=np.float64)
+    capf = np.float64(max_min)
+    for r in prange(R):
+        dep_r = np.empty(np_len, dtype=np.int64)
+        arr_r = np.empty(np_len, dtype=np.int64)
+        _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
+                 delta0_all[r], slope_all[r], dep_r, arr_r)
+        latest = _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
+                          pat_stops, dep_r, arr_r, ras_off, ras_pat, ras_pos,
+                          tr_off, tr_to, tr_time, egress_g, egress_w, deadlines,
+                          board_slack, max_rounds)
+        for ci in range(n_cells):
+            a0 = access_off[ci]
+            a1 = access_off[ci + 1]
+            best = INF
+            for a in range(a0, a1):
+                s = access_to[a]
+                board = d_med + access_w[a]
+                lo = 0
+                hi = nd
+                while lo < hi:                        # first deadline T with latest[s,T] >= board
+                    mid = (lo + hi) >> 1
+                    if latest[s, mid] < board:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                if lo < nd:
+                    tt = deadlines[lo] - d_med
+                    if tt < best:
+                        best = tt
+            pw = purewalk[ci]
+            ttv = best
+            if pw >= 0 and pw < ttv:
+                ttv = pw
+            m = ttv / 60.0 if ttv < INF else 1e18
+            if m > capf:
+                m = capf
+            commute_all[ci, r] = m
+    return commute_all

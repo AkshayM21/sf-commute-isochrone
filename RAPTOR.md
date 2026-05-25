@@ -116,3 +116,47 @@ egress/pure-walk walk matrix (`_raptor_egress_purewalk`). Fully removing r5py ne
 pedestrian router for W→stops/cells (e.g. snap W to the nearest baked grid cell, or a pandana/OSM
 walk graph) — the last ~140 ms R5 dependency. Until then R5 is loaded but does **no** heavy
 per-cell pass and **no** recorded-path breakdowns (those are RAPTOR in `arriveby`).
+
+## Phase A: service-noise Monte-Carlo — realistic + fragility + alt-lines (`RAPTOR_MC=1`, default ON)
+The arrive-by map is the **perfect-timing best case** (you leave home to the second and catch every
+vehicle with ~0 wait). Departure timing is the user's control, so we keep perfect as the BASE and
+add a **realistic** number + a **fragility** score from a Monte-Carlo over *service* noise — the
+part you can't control. Each draw perturbs the schedule and **re-runs the same validated reverse
+sweep**, which **re-optimizes per scenario** (miss the express → the min over patterns lands on the
+next local), so the spread captures missed-transfer **re-routing**, not a naive same-line headway.
+
+- **Perturbation** (`raptor.apply_delays` / `raptor_numba._perturb`): per trip, delay
+  `δ(pos)=δ₀+slope·scheduled_elapsed(pos)` applied to dep & arr (dwell preserved); `δ₀,slope ~
+  Gamma` with means by mode/operator (bus noisiest, rail steadiest; keyed on `pat_mode`+`pat_feed`).
+  A per-pattern **FIFO cumulative-max clamp** (no overtaking on the arr OR dep column) keeps the
+  per-position binary search valid (tested).
+- **Hot path** (`raptor_numba.montecarlo`, `parallel=True` nogil): draws run in `prange`, each
+  thread holding ONE perturbed schedule + ONE latest profile, **streaming** each draw's per-cell
+  median-departure commute into `commute_all[n_cells, R]` (never R×n_stops). ~**0.1 s** for 24
+  draws (full grid). Per-cell outputs: `realistic = p50` (clamped ≥ perfect), `frag = p90−p50`
+  (the "bad-day +Y" headline), `std`, `stuck` (fraction of draws hitting the cap = last-train/
+  peak risk).
+- **Alt-lines** (`RaptorEngine._mc_alt_lines`): the dominant line across ~4 *traced* perturbed
+  arrive-by trees (reuses `JourneyTree`), so a delayed express lets the next local show up. Pricier
+  (pure-python trace, ~0.7 s for 4 draws), env-tunable (`RAPTOR_MC_ALT_DRAWS`), excludes the cell's
+  normal line.
+- **Serving:** lazy `/variance` endpoint (`server._raptor_mc`, cached per workplace, deterministic
+  per-workplace seed), fetched by the frontend AFTER `/compute` paints the perfect map (progressive
+  refinement, like `/compute_exact`). NEVER on the hover path. The hover stays the single
+  perfect-timing journey (hover == perfect-map exact); realistic/fragility/alt are header
+  annotations. The `Realistic`/`Best-case` `#metric` toggle now switches MC-p50 ↔ perfect.
+
+**Validation** (`scripts/raptor_validate_mc.py`, `tests/test_raptor.py::test_mc_*`): realistic vs
+R5's *schedule-perfect* p50 — MAE **2.19**, bias **+1.14** (mildly positive: delays only add time;
+larger in fragile peripheral workplaces like bayview +2.4), **0** `perfect ≤ realistic` violations,
+FIFO-clamp sortedness. There is no true R5 ground truth for a *delayed* commute, so this bounds
+realistic's drift from schedule-perfect rather than measuring error.
+
+> **Caveat (documented limit):** the MC re-routes **clairvoyantly** (it knows the perturbed schedule
+> at home), so `realistic` is a **lower bound** on real "committed-plan" variance — it answers "is
+> there a good alternative under bad conditions" (route *resilience*), not "I'm on the platform and
+> just missed it." A committed-plan MC (fix departure + first leg, re-optimize the tail) is the more
+> expensive future upgrade.
+
+Knobs (env): `RAPTOR_MC` (1), `RAPTOR_MC_DRAWS` (24), `RAPTOR_MC_ALT_DRAWS` (4), `RAPTOR_MC_SHAPE`
+(2.0), `RAPTOR_MC_MU_{BUS,METRO,CABLE,BART,CALTRAIN}` (70/45/40/25/40 s initial delay mean).

@@ -25,6 +25,21 @@ BOARD_SLACK = int(os.environ.get("RAPTOR_BOARD_SLACK", "60"))
 MAX_ROUNDS = 8                                    # rides = transfers + 1 (R5 default cap)
 ARRIVE_BY_HM = (9, 0)                             # product target: arrive by 09:00
 
+# --- service-noise Monte-Carlo (realistic + fragility + alt-lines) --------------------
+MC_DRAWS = int(os.environ.get("RAPTOR_MC_DRAWS", "24"))       # draws for realistic/fragility
+MC_ALT_DRAWS = int(os.environ.get("RAPTOR_MC_ALT_DRAWS", "4"))  # traced draws for alt-lines (pricier)
+MC_SHAPE = float(os.environ.get("RAPTOR_MC_SHAPE", "2.0"))   # Gamma shape (spread); mean=shape*scale
+# mean INITIAL delay (sec) + fractional DRIFT slope, by mode/operator (env-overridable). Buses are
+# the noisiest, rail the steadiest; Caltrain/BART keyed on feed (BART=1, Caltrain=2).
+_MU = dict(bus=float(os.environ.get("RAPTOR_MC_MU_BUS", "70")),
+           metro=float(os.environ.get("RAPTOR_MC_MU_METRO", "45")),
+           cable=float(os.environ.get("RAPTOR_MC_MU_CABLE", "40")),
+           bart=float(os.environ.get("RAPTOR_MC_MU_BART", "25")),
+           caltrain=float(os.environ.get("RAPTOR_MC_MU_CALTRAIN", "40")))
+# fractional DRIFT (delay grows with time on the vehicle); the most uncertain knob, kept modest
+# so a long peripheral bus ride doesn't over-inflate the median (validated vs R5 p50 bias).
+_SLOPE = dict(bus=0.035, metro=0.025, cable=0.03, bart=0.012, caltrain=0.02)
+
 
 class RaptorEngine:
     def __init__(self, gtfs_paths=None, service_date=None, access_path=None,
@@ -147,6 +162,86 @@ class RaptorEngine:
         return raptor_journey.JourneyTree(self.data, par, self.access_off, self.access_to,
                                           self.access_w, np.asarray(purewalk, np.int64),
                                           target, self.max_min)
+
+    # -- Phase A: service-noise Monte-Carlo (realistic + fragility + alt-lines) ------------
+    def _mc_mode_params(self):
+        """Per-pattern (mean initial delay sec, fractional drift slope) from mode + operator."""
+        pf = np.asarray(self.data["pat_feed"]); pm = np.asarray(self.data["pat_mode"])
+        mu = np.full(len(pm), _MU["bus"], np.float64); sl = np.full(len(pm), _SLOPE["bus"], np.float64)
+        mu[pm == 0] = _MU["metro"]; sl[pm == 0] = _SLOPE["metro"]      # Muni Metro
+        mu[pm == 2] = _MU["cable"]; sl[pm == 2] = _SLOPE["cable"]      # cable/streetcar
+        mu[pf == 1] = _MU["bart"]; sl[pf == 1] = _SLOPE["bart"]        # BART (feed 1)
+        mu[pf == 2] = _MU["caltrain"]; sl[pf == 2] = _SLOPE["caltrain"]  # Caltrain (feed 2)
+        return mu, sl
+
+    def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
+                   seed=None, alt_draws=None):
+        """Service-noise MC for a workplace. Returns dict of cell-aligned arrays:
+          realistic int32  p50 door-to-door commute over draws (clamped >= ``perfect``)
+          frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number)
+          std       int32  commute std minutes (secondary)
+          stuck     float  fraction of draws where the cell hits the cap (last-train/peak risk)
+          alt       list[dict|None]  {line: votes} alternative lines that serve the cell under
+                                     delays (re-routes), from ``alt_draws`` traced perturbed trees
+        Each draw perturbs the schedule and re-optimizes, so the spread captures missed-transfer
+        RE-ROUTING (take the next local), not just same-line headway. Lazy + cached per workplace
+        by the caller; never on the hover path. ``seed`` makes it reproducible per workplace."""
+        nR = MC_DRAWS if n_draws is None else int(n_draws)
+        egress_g = np.asarray(egress_g, np.int32); egress_w = np.asarray(egress_w, np.int64)
+        purewalk = np.asarray(purewalk, np.int64)
+        mu_pat, slope_pat = self._mc_mode_params()
+        ntrips = np.asarray(self.data["pat_ntrips"])
+        mu_trip = np.repeat(mu_pat, ntrips); slope_trip = np.repeat(slope_pat, ntrips)
+        rng = np.random.default_rng(seed)
+        k = MC_SHAPE
+        T = mu_trip.shape[0]
+        delta0_all = rng.gamma(k, mu_trip / k, size=(nR, T))
+        slope_all = rng.gamma(k, np.maximum(slope_trip, 1e-9) / k, size=(nR, T))
+        d_med = self.dep_sec + self.win_sec // 2
+        cm = R.montecarlo_commute(self.data, egress_g, egress_w, self.Tgrid,
+                                  self.access_off, self.access_to, self.access_w, purewalk,
+                                  np.int64(d_med), self.max_min, delta0_all, slope_all,
+                                  board_slack=BOARD_SLACK, max_rounds=MAX_ROUNDS)
+        p50 = np.percentile(cm, 50, axis=1)
+        p90 = np.percentile(cm, 90, axis=1)
+        realistic = np.ceil(p50).astype(np.int32)
+        frag = np.maximum(0, np.round(p90 - p50)).astype(np.int32)
+        std = np.round(np.std(cm, axis=1)).astype(np.int32)
+        stuck = np.mean(cm >= self.max_min - 1e-9, axis=1)
+        if perfect is not None:
+            perfect = np.asarray(perfect)
+            m = perfect >= 0
+            realistic[m] = np.maximum(realistic[m], perfect[m].astype(np.int32))
+        alt = self._mc_alt_lines(egress_g, egress_w, purewalk, delta0_all, slope_all,
+                                 MC_ALT_DRAWS if alt_draws is None else int(alt_draws))
+        return dict(realistic=realistic, frag=frag, std=std, stuck=stuck, alt=alt)
+
+    def _mc_alt_lines(self, egress_g, egress_w, purewalk, delta0_all, slope_all, K):
+        """{line: votes} per cell: dominant line across ``K`` perturbed arrive-by traced trees
+        (so a delayed express lets the next local show up as an alternative). Reuses the validated
+        JourneyTree; pricier than the numpy MC, so K is small + env-tunable."""
+        if K <= 0:
+            return None
+        off = R.pat_trip_off(self.data)
+        target = self.target_sec
+        n = len(self.cell_ids)
+        votes = [None] * n
+        K = min(K, delta0_all.shape[0])
+        for kk in range(K):
+            dep, arr = R.apply_delays(self.data, delta0_all[kk], slope_all[kk], off)
+            pdata = dict(self.data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
+            par = R.reverse_raptor_traced(pdata, egress_g, target - egress_w, egress_w,
+                                          max_rounds=MAX_ROUNDS, board_slack=BOARD_SLACK)
+            tree = raptor_journey.JourneyTree(pdata, par, self.access_off, self.access_to,
+                                              self.access_w, purewalk, target, self.max_min)
+            _, dom = tree.commute_and_dominant()
+            for ci, line in enumerate(dom):
+                if line and line != "walk only":
+                    d = votes[ci]
+                    if d is None:
+                        d = votes[ci] = {}
+                    d[line] = d.get(line, 0) + 1
+        return [None if not d else dict(sorted(d.items(), key=lambda kv: -kv[1])) for d in votes]
 
 
 def _assemble_arriveby_window(access_off, access_to, access_w, purewalk, latest, deadlines,
