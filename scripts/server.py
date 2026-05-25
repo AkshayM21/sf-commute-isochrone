@@ -386,13 +386,67 @@ def _raptor_egress_purewalk(lat, lon):
     return res
 
 
-def compute_raptor(lat, lon, max_rides=DEFAULT_MAX_RIDES):
-    """Grid travel-times via the RAPTOR engine -> {id: [best, real]} (same shape as compute).
-    ``max_rides`` (rides = transfers + 1) caps RAPTOR rounds, matching the Max-transfers UI."""
+# Per-workplace traced tree (Phase 2): one arrive-by tree serves the MAP (actual commute),
+# the hover breakdown, AND color-by-line — so they are guaranteed consistent (hover == map).
+_RAPTOR_TREE_CACHE = OrderedDict()           # (coarse_key, max_rides) -> {tree, cells, dom}
+_RAPTOR_TREE_LOCK = threading.Lock()
+
+
+def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+    """Build (or fetch) the cached arrive-by JourneyTree + per-cell map values + dominant lines
+    for this workplace. Tracing every cell is ~0.14s, done once per workplace bucket."""
+    key = _coarse_key(lat, lon, max_rides)
+    with _RAPTOR_TREE_LOCK:
+        if key in _RAPTOR_TREE_CACHE:
+            _RAPTOR_TREE_CACHE.move_to_end(key)
+            return _RAPTOR_TREE_CACHE[key]
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
-    fn = _RAPTOR.arriveby if RAPTOR_SEMANTIC == "arriveby" else _RAPTOR.departafter
-    res = fn(egress_g, egress_w, purewalk, max_rounds=int(max_rides))   # {cell_id: [p5, p50]}
-    return {cid: [pair[0], pair[1]] for cid, pair in res.items()}
+    if RAPTOR_SEMANTIC == "arriveby":
+        tree = _RAPTOR.journey_tree(egress_g, egress_w, purewalk, max_rounds=int(max_rides))
+        commute, dom = tree.commute_and_dominant()
+        cells = {c: [int(commute[i]) if commute[i] >= 0 else None,
+                     int(commute[i]) if commute[i] >= 0 else None]
+                 for i, c in enumerate(_RAPTOR.cell_ids)}
+        domd = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
+    else:                                    # depart-after map keeps the vectorized p5/p50
+        res = _RAPTOR.departafter(egress_g, egress_w, purewalk, max_rounds=int(max_rides))
+        cells = {c: [p[0], p[1]] for c, p in res.items()}
+        tree = _RAPTOR.journey_tree(egress_g, egress_w, purewalk, max_rounds=int(max_rides))
+        domd = None                          # built lazily by /attribution if needed
+    entry = {"tree": tree, "cells": cells, "dom": domd}
+    with _RAPTOR_TREE_LOCK:
+        _RAPTOR_TREE_CACHE[key] = entry
+        while len(_RAPTOR_TREE_CACHE) > 16:
+            _RAPTOR_TREE_CACHE.popitem(last=False)
+    return entry
+
+
+def compute_raptor(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+    """Grid travel-times via the RAPTOR engine -> {id: [best, real]} (same shape as compute)."""
+    return _raptor_tree(lat, lon, max_rides)["cells"]
+
+
+def _nearest_raptor_cell(olat, olon):
+    """Index of the nearest on-grid cell to an off-grid hover point (RAPTOR can only trace grid
+    cells, since the access table is per-cell). Good enough for the occasional off-grid hover."""
+    best_i, best_d = None, 1e30
+    for i, cid in enumerate(_RAPTOR.cell_ids):
+        la, lo = ORIGIN_LL.get(cid, (None, None))
+        if la is None:
+            continue
+        d = (la - olat) ** 2 + (lo - olon) ** 2
+        if d < best_d:
+            best_d = d; best_i = i
+    return best_i
+
+
+def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES):
+    """{cellId: dominant line} from the cached arrive-by tree (color-by-line, no R5)."""
+    entry = _raptor_tree(dlat, dlon, max_rides)
+    if entry["dom"] is None:                  # depart-after map -> derive dominant on demand
+        _, dom = entry["tree"].commute_and_dominant()
+        entry["dom"] = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
+    return entry["dom"]
 
 
 # ---- Map TIME: fast reverse approximation + exact forward refine ----------------------
@@ -701,6 +755,16 @@ def _itinerary():
     # Same transfer cap the map used, so the breakdown total matches the cell's colored time
     # (and so it hits the SAME _dest_key-bucketed cache as the matching /compute).
     max_rides = _req_max_rides()
+    # RAPTOR path: trace the cell's journey from the cached arrive-by tree -> breakdown total
+    # EQUALS the cell's map value by construction (no R5). Off-grid points snap to nearest cell.
+    if USE_RAPTOR:
+        ci = _RAPTOR.cell_index.get(cid) if cid is not None else None
+        if ci is None:
+            ci = _nearest_raptor_cell(olat, olon)
+        res = _raptor_tree(dlat, dlon, max_rides)["tree"].itinerary(ci) if ci is not None else None
+        res = dict(res) if res else {"error": "no route"}
+        res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
+        return jsonify(res)
     dkey = _dest_key(dlat, dlon, max_rides)
     res = None
     # FAST PATH 1: the full-grid cache (present once color-by-line has been triggered).
@@ -733,6 +797,12 @@ def _attribution():
     de-duped, so /itinerary also benefits once it has run."""
     dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
     max_rides = _req_max_rides()
+    # RAPTOR path: dominant line per cell from the same traced tree as the map (no R5, ~0.14s,
+    # no _HEAVY_LOCK / fan spike). Deterministic across reboots.
+    if USE_RAPTOR:
+        attr = _raptor_attribution(dlat, dlon, max_rides)
+        print(f"[attr:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} -> {len(attr)} cells")
+        return jsonify(attr)
     ckey = _coarse_key(dlat, dlon, max_rides)
     # CACHE HIT (~110m): return the same attribution dict instantly — no R5 work, no lock.
     cached_res = _result_cache_get(_ATTR_RESULT_CACHE, ckey)
