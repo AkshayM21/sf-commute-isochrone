@@ -18,6 +18,8 @@ Public API:
 """
 import json
 import os
+import time
+import threading
 import urllib.request
 import urllib.parse
 from collections import OrderedDict
@@ -97,6 +99,29 @@ def _lru_put(key, value):
 def _clear_lru():
     """Test/maintenance hook: drop the in-memory cache."""
     _LRU.clear()
+
+
+# ---- Global upstream rate-limit (ban protection) ---------------------------------------
+# The LRU stops REPEAT lookups, and Flask-Limiter caps per-IP, but neither bounds the rate of
+# UNIQUE queries hitting the provider across all visitors — which is how a public deploy gets the
+# server IP banned (Nominatim's usage policy is a hard 1 req/s + identifying UA; Photon asks for
+# fair use; Geoapify is metered by the key). A tiny global min-interval throttle keeps us polite.
+# It only engages on an LRU MISS, so cached keystrokes/popular queries are never delayed.
+_MIN_INTERVAL = {"nominatim": 1.0, "photon": 0.25, "geoapify": 0.0}   # seconds between upstream calls
+_throttle_lock = threading.Lock()
+_last_upstream = 0.0
+
+
+def _throttle(provider):
+    global _last_upstream
+    iv = _MIN_INTERVAL.get(provider, 0.5)
+    if iv <= 0:
+        return
+    with _throttle_lock:                       # serialize upstream calls to <= the provider's rate
+        wait = _last_upstream + iv - time.monotonic()
+        if wait > 0:
+            time.sleep(min(wait, iv))          # cap the wait at one interval (clock-jump safe)
+        _last_upstream = time.monotonic()
 
 
 # ---- HTTP ------------------------------------------------------------------------------
@@ -203,6 +228,7 @@ def _provider_results(q, limit, *, kind="search"):
     """Dispatch a raw upstream query for the active provider -> list of result dicts.
     `kind` is 'search' or 'autocomplete' (only Geoapify has distinct endpoints)."""
     p = _provider()
+    _throttle(p)                               # polite global rate-limit (LRU miss only)
     if p == "geoapify":
         return _geoapify_results(q, limit, path=("autocomplete" if kind == "autocomplete" else "search"))
     if p == "nominatim":
@@ -216,7 +242,7 @@ def autocomplete(q, limit=6):
     best match first. Blank/whitespace input -> []. Backed by the in-memory LRU so repeated
     keystrokes/popular queries don't hit the upstream. Network/parse errors propagate."""
     norm = _norm(q)
-    if not norm:
+    if len(norm) < 3:                          # too short to be useful; don't hit the upstream
         return []
     limit = max(1, int(limit))
     key = ("auto", _provider(), norm, limit)
