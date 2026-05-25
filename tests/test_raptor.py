@@ -130,6 +130,38 @@ def test_perf_single_core(engine):
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_hover_equals_map_invariant(engine):
+    """Phase 2: every cell's traced breakdown legs sum EXACTLY to its arrive-by map value
+    (the whole point of building hover + map from one engine)."""
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    tree = engine.journey_tree(z["egress_g"], z["egress_w"], pw)
+    commute, _dom = tree.commute_and_dominant()
+    viol = checked = 0
+    for ci in range(len(engine.cell_ids)):
+        if commute[ci] < 0:
+            continue
+        it = tree.itinerary(ci)
+        checked += 1
+        legsum = sum(l["min"] for l in it["legs"]) + sum(l.get("wait", 0) for l in it["legs"])
+        if not (legsum == it["total"] == int(commute[ci])):
+            viol += 1
+    assert checked > 1000
+    assert viol == 0, f"hover==map violated in {viol}/{checked} cells"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_color_by_line_deterministic(engine):
+    """Phase 2: the dominant line per cell is identical across two independent traces (R5's
+    color-by-line flipped ~1057 cells per JVM boot; RAPTOR must be 0)."""
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    _, d1 = engine.journey_tree(z["egress_g"], z["egress_w"], pw).commute_and_dominant()
+    _, d2 = engine.journey_tree(z["egress_g"], z["egress_w"], pw).commute_and_dominant()
+    assert d1 == d2, "color-by-line is not deterministic across runs"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_numba_matches_python(engine):
     """The compiled kernel (production) and the pure-python reference are equivalent: both
     drive the FULL engine path to the same per-cell p50 within <= 2 min (the order-dependent
