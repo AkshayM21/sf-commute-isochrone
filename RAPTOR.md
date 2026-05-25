@@ -111,11 +111,11 @@ reconstruction** (run forward RAPTOR from each cell's chosen departure to recove
 fastest journey) — a clear next step. Validate: `scripts/raptor_validate_paths.py` (vs R5 dominant),
 `scripts/raptor_check_anchor.py` (same-departure check).
 
-**JVM not yet dropped.** Even in `arriveby`, the runtime still calls R5 once per workplace for the
-egress/pure-walk walk matrix (`_raptor_egress_purewalk`). Fully removing r5py needs an R5-free
-pedestrian router for W→stops/cells (e.g. snap W to the nearest baked grid cell, or a pandana/OSM
-walk graph) — the last ~140 ms R5 dependency. Until then R5 is loaded but does **no** heavy
-per-cell pass and **no** recorded-path breakdowns (those are RAPTOR in `arriveby`).
+**JVM drop:** done in **Phase B** (below) via `USE_WALK_GRAPH=1` — the per-workplace
+egress/pure-walk walk matrix (`_raptor_egress_purewalk`) is replaced by a JVM-free hill-aware
+pedestrian router, and the boot skips the R5 network entirely. With `USE_RAPTOR=1 USE_WALK_GRAPH=1`
++ arrive-by, **r5py is never imported** (verified: 0 libjvm handles in-process, RSS ~333 MB vs
+~1.6 GB+ with the JVM).
 
 ## Phase A: service-noise Monte-Carlo — realistic + fragility + alt-lines (`RAPTOR_MC=1`, default ON)
 The arrive-by map is the **perfect-timing best case** (you leave home to the second and catch every
@@ -160,3 +160,45 @@ realistic's drift from schedule-perfect rather than measuring error.
 
 Knobs (env): `RAPTOR_MC` (1), `RAPTOR_MC_DRAWS` (24), `RAPTOR_MC_ALT_DRAWS` (4), `RAPTOR_MC_SHAPE`
 (2.0), `RAPTOR_MC_MU_{BUS,METRO,CABLE,BART,CALTRAIN}` (70/45/40/25/40 s initial delay mean).
+
+## Phase B: hill-aware R5-free walk router + walk-speed toggle (`USE_WALK_GRAPH=1`) — DROPS THE JVM
+Replaces R5's last runtime job (the per-workplace walk matrix) with a custom **slope-aware**
+pedestrian router. SF is steep and R5 ignores grade, so this is **more accurate**, not just a swap.
+
+- **Build** (`scripts/build_walk_graph.py`, offline, ~10 s): parse `data/osm_sf.pbf` with
+  **`esy-osm-pbf`** (pure-Python; two-pass: ways→node-refs, then node coords); sample a USGS 3DEP
+  DEM (`scripts/fetch_dem.sh` → `data/dem_sf.tif`, ~10 m, free) per node; weight each **directed**
+  half-edge by **Tobler's hiking function** `exp(3.5·(|S+0.05|−0.05))` (gentle downhill fastest,
+  uphill/steep-descent slower) × stairs penalty, as REFERENCE seconds @4.8 km/h; keep the giant
+  connected component → `data/walk_graph.npz` (215 k nodes, 8 MB). A grade-agnostic `w_flat` is
+  stored too, for R5-parity validation.
+- **Runtime** (`core/walk.py`, JVM-free numpy+scipy): cKDTree **k-nearest snapping**
+  (nearest-edge approx), scipy one-to-many **Dijkstra**. Walking is **directional** — egress
+  (alight→work) + pure-walk (home→work) route on the **transposed** graph so uphill≠downhill (on a
+  real 16% block: uphill 126 s vs downhill 89 s). `scripts/bake_walk_access.py` rebakes the
+  cell→stop access table from the router (same CSR format the engine consumes).
+- **Speed toggle** (slow 4.0 / **med 4.8** / fast 5.6 km/h): a `walk_scalar = 4.8/pace` threaded
+  through `engine.{departafter,arriveby,journey_tree,montecarlo}` (`_scale_walk` multiplies every
+  walk reference-second) + the server (`?speed=`, in the cache keys) + the frontend (`#speed`
+  control, `&sp=` hash). The access table + egress stay reference seconds, cached once.
+- **JVM drop:** with `USE_RAPTOR=1 USE_WALK_GRAPH=1` + arrive-by, the server parses flags up top and
+  skips the r5py/`com.conveyal` import + the `NET` build (`_NEED_R5=False`); cell coords come from
+  the JVM-free grid (`ORIGIN_LL`). Verified: 0 libjvm handles in-process, **RSS ~333 MB** (was
+  ~1.6 GB+), CPU-bound → fits a free tier.
+
+**Validation:** `scripts/raptor_validate_walk.py` (W→stops vs R5: flat MAE **24.7 s**/+12 s bias =
+mechanics OK; steep >8% grade **100% ours ≥ R5** = the intended hill divergence). Door-to-door via
+the walk-baked access table (`bake_walk_access.py`): flat MAE **1.38**, hill **1.67** vs R5 (hill
+reads longer on steep cells — more accurate, not an R5 match). Tests: `tests/test_walk.py` (graph
+sanity, **directionality**, flat==R5, hill≥flat).
+
+## Run it JVM-free (the full new stack)
+```bash
+# one-time bakes (the only JVM step is the R5 oracle/access for TESTS; the walk path is JVM-free):
+scripts/fetch_dem.sh && .venv/bin/python scripts/build_walk_graph.py   # walk graph (+ DEM)
+.venv/bin/python scripts/bake_walk_access.py                           # cell->stop access (JVM-free)
+# run the server with the whole stack on, NO JVM:
+USE_RAPTOR=1 RAPTOR_SEMANTIC=arriveby USE_WALK_GRAPH=1 .venv/bin/python scripts/server.py
+```
+Knobs (env): `USE_WALK_GRAPH`, `?speed=slow|med|fast`, `WALK_STAIRS_MULT` (2.5).
+Validate: `raptor_validate_walk.py`, `bake_walk_access.py`; tests `pytest tests/test_walk.py`.
