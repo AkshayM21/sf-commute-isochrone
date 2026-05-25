@@ -133,6 +133,8 @@
     <div class="seg" id="cmode"><button data-v="time" class="on">Time</button><button data-v="line">Primary line</button></div></div>
   <div class="ctl"><div class="lab">Max transfers</div>
     <div class="seg" id="maxrides"><button data-v="0">0</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="any" class="on">Any</button></div></div>
+  <div class="ctl"><div class="lab">Walk speed</div>
+    <div class="seg" id="speed"><button data-v="slow">Slow</button><button data-v="med" class="on">Medium</button><button data-v="fast">Fast</button></div></div>
   <div class="ctl"><div class="lab">Sweet spot — green ≤ <span class="val" id="idval">25</span> min (recolors)</div>
     <input type="range" id="ideal" min="10" max="45" value="25"></div>
   <div class="ctl"><div class="lab">Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</div>
@@ -174,6 +176,8 @@ let maxxfers="any";   // "0"/"1"/"2" transfers, or "any" (the R5 default 8-ride 
 function ridesParam(){
   if(maxxfers==="any")return "";
   const n=+maxxfers;return Number.isFinite(n)?`&maxrides=${n+1}`:"";}
+let walkspeed="med";                              // walk pace toggle (slow|med|fast); RAPTOR only
+function speedParam(){return walkspeed==="med"?"":`&speed=${walkspeed}`;}
 let CURLABEL="";                                  // current workplace label (for permalink + dest line)
 const TOUCH = ("ontouchstart" in window) || (navigator.maxTouchPoints>0) || window.matchMedia("(max-width:719px)").matches;
 let SCALE=ramp(ideal).S;                          // current time->color scale (recomputed in redraw)
@@ -259,7 +263,7 @@ function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){set
   setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
   bdTimer=setTimeout(async()=>{try{
-    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}`);
+    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
     const d=await r.json();if(my!==bdToken)return;if(!d.error)BDCACHE[id]=d;
     d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];setHTML(bdHTML(d));
   }catch(e){if(my===bdToken)setHTML("error");}},150);}
@@ -309,7 +313,7 @@ async function setWorkplace(lat,lon,label){
   map.setView([lat,lon],12.6);
   try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
   busy("estimating…");
-  try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}`);const d=await r.json();
+  try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}${speedParam()}`);const d=await r.json();
     if(myGen!==GEN)return;                            // a newer address took over → drop this
     TT=d.cells;EXACT=false;DESTLL=d.dest;document.getElementById("dest").textContent=(label||"")+`  ·  fast ~${d.ms}ms`;
     aggregate();redraw();
@@ -331,7 +335,7 @@ async function setWorkplace(lat,lon,label){
 async function refine(){
   if(!DESTLL)return;const myGen=GEN;const [lat,lon]=DESTLL;const label=CURLABEL;
   const btn=document.getElementById("refine");btn.disabled=true;busy("refining (exact)…");
-  const doFetch=()=>fetch(`/compute_exact?lat=${lat}&lon=${lon}${ridesParam()}`);
+  const doFetch=()=>fetch(`/compute_exact?lat=${lat}&lon=${lon}${ridesParam()}${speedParam()}`);
   try{
     let r=await doFetch();
     if(myGen!==GEN)return;
@@ -350,7 +354,7 @@ async function refine(){
   finally{if(myGen===GEN){busy(false);btn.disabled=false;}}
 }
 async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping lines…");
-  const doFetch=()=>fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}`);
+  const doFetch=()=>fetch(`/attribution?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
   try{let r=await doFetch();
     if(myGen!==GEN)return;
     if(r.status===503){                               // busy — retry once after Retry-After
@@ -367,7 +371,7 @@ async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping
 //      Progressive (fetched AFTER /compute paints the perfect map), gen-guarded, best-effort.
 //      Returns {} when the server isn't in RAPTOR arrive-by + MC mode -> we keep the perfect map.
 async function loadVariance(){if(!DESTLL)return;const myGen=GEN;
-  try{const r=await fetch(`/variance?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}`);
+  try{const r=await fetch(`/variance?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
     if(!r.ok)return;const d=await r.json();if(myGen!==GEN)return;
     if(d.realistic&&Object.keys(d.realistic).length){
       REAL=d.realistic;VAR=d.variance||{};aggregate();redraw();}   // realistic now drives metric="r"
@@ -395,6 +399,15 @@ document.querySelectorAll("#maxrides button").forEach(b=>b.onclick=()=>{
   BDCACHE={};                                             // breakdowns were for the old cap
   syncHash();
   if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL);   // recompute + auto-refine the map
+});
+// Walk speed: like Max transfers, a new pace changes the colored TIMES -> recompute the map.
+document.querySelectorAll("#speed button").forEach(b=>b.onclick=()=>{
+  if(b.dataset.v===walkspeed)return;
+  document.querySelectorAll("#speed button").forEach(x=>x.classList.remove("on"));
+  b.classList.add("on");walkspeed=b.dataset.v;
+  BDCACHE={};                                             // breakdowns were for the old pace
+  syncHash();
+  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL);
 });
 document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();syncHash();};
 document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();syncHash();};
@@ -472,7 +485,7 @@ function syncHash(){if(applyingHash)return;clearTimeout(hashTimer);
   hashTimer=setTimeout(()=>{
     const parts=[];
     if(DESTLL)parts.push(`wp=${DESTLL[0].toFixed(6)},${DESTLL[1].toFixed(6)},${encodeURIComponent(CURLABEL)}`);
-    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`,`mt=${maxxfers}`);
+    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`,`mt=${maxxfers}`,`sp=${walkspeed}`);
     const h="#"+parts.join("&");
     if(("#"+location.hash.replace(/^#/,""))!==h){history.replaceState(null,"",h);}
   },300);}
@@ -488,6 +501,7 @@ function applyHash(o){applyingHash=true;
   if(o.metric==="r"||o.metric==="b"){metric=o.metric;setSeg("metric",metric);}
   if(o.cmode==="time"||o.cmode==="line"){cmode=o.cmode;setSeg("cmode",cmode);}
   if(["0","1","2","any"].includes(o.mt)){maxxfers=o.mt;setSeg("maxrides",maxxfers);}
+  if(["slow","med","fast"].includes(o.sp)){walkspeed=o.sp;setSeg("speed",walkspeed);}
   applyingHash=false;
   if(o.wp){const wseg=o.wp.split(",");const lat=+wseg[0],lon=+wseg[1];
     const label=decodeURIComponent(wseg.slice(2).join(","));

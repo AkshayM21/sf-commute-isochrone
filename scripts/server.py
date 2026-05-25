@@ -107,15 +107,33 @@ RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "arriveby").lower()
 # + alt-lines" layer, served by /variance (lazy, cached, ~1s once per workplace, off the hover
 # path). The perfect-timing map (/compute) is unchanged; realistic is a refinement overlay.
 RAPTOR_MC = os.environ.get("RAPTOR_MC", "1").lower() in ("1", "true", "yes", "on")
+# USE_WALK_GRAPH=1: replace R5's last runtime job (the per-workplace walk matrix) with the
+# JVM-free hill-aware pedestrian router (core/walk.py + data/walk_graph.npz) and load the
+# walk-baked access table. Map walk-times then come entirely from the walk graph (no r5py on the
+# RAPTOR path). Requires the walk graph + access_walk_*.npz to be baked. Default OFF.
+USE_WALK_GRAPH = os.environ.get("USE_WALK_GRAPH", "").lower() in ("1", "true", "yes", "on")
 _RAPTOR = None
 _RAPTOR_STOPS = None             # GeoDataFrame of stop coords keyed by gid (egress destinations)
+_WG = None                       # WalkGraph (JVM-free) when USE_WALK_GRAPH
+_WG_STOP_NODES = _WG_STOP_CONN = _WG_CELL_NODES = _WG_CELL_CONN = None
+_WG_STOP_GIDS = None             # gids aligned to _WG_STOP_NODES rows
 _RAPTOR_EGRESS_CACHE = OrderedDict()   # coarse_key -> (egress_g, egress_w, purewalk)
 _RAPTOR_EGRESS_LOCK = threading.Lock()
 if USE_RAPTOR:
     try:
         from core import raptor_engine
-        _RAPTOR = raptor_engine.RaptorEngine(GTFS, _SVC_DATE, verbose=True)
         import numpy as _np
+        _acc_path = None
+        if USE_WALK_GRAPH:                       # prefer the walk-baked (slope-aware) access table
+            import core.raptor_build as _rb
+            _fp = _rb._fingerprint(GTFS, _SVC_DATE.strftime("%Y%m%d"),
+                                   _rb.band_seconds(), _rb.FOOTPATH_M)
+            _cands = sorted((config.DATA / "raptor_cache").glob(f"access_walk_*m_{_fp}.npz"))
+            if not _cands:
+                raise FileNotFoundError("USE_WALK_GRAPH set but no access_walk_*.npz "
+                                        "(run scripts/build_walk_graph.py + bake_walk_access.py)")
+            _acc_path = _cands[0]
+        _RAPTOR = raptor_engine.RaptorEngine(GTFS, _SVC_DATE, access_path=_acc_path, verbose=True)
         _gl, _go = _RAPTOR.data["stop_lat"], _RAPTOR.data["stop_lon"]
         _gids = [g for g in range(_RAPTOR.data["n_stops"]) if not _np.isnan(_gl[g])]
         # id="S<gid>" so stop ids stay DISJOINT from cell ids ("0".."N") and the origin "w"
@@ -125,10 +143,22 @@ if USE_RAPTOR:
             geometry=[Point(_go[g], _gl[g]) for g in _gids], crs=config.WGS)
         # align purewalk to the engine's cell order (server grid == engine grid by id)
         _RAPTOR_CELL_POS = {c: i for i, c in enumerate(_RAPTOR.cell_ids)}
-        print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); R5 kept for hover only")
+        if USE_WALK_GRAPH:
+            from core import walk as _walkmod
+            _WG = _walkmod.WalkGraph.load()
+            _WG_STOP_GIDS = _np.asarray(_gids, dtype=_np.int32)
+            _WG_STOP_NODES, _WG_STOP_CONN = _WG.snap(
+                _np.column_stack(([_go[g] for g in _gids], [_gl[g] for g in _gids])))
+            _cll = _np.array([[ORIGIN_LL[c][1], ORIGIN_LL[c][0]] for c in _RAPTOR.cell_ids])
+            _WG_CELL_NODES, _WG_CELL_CONN = _WG.snap(_cll)
+            print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); WALK GRAPH ON "
+                  f"(JVM-free walk: {_acc_path.name}) — R5 walk not used")
+        else:
+            print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); R5 kept for hover only")
     except Exception as _e:                     # missing access table etc. -> degrade to OFF
         print(f"[boot] USE_RAPTOR requested but engine init failed ({_e}); using R5 path")
         USE_RAPTOR = False
+        USE_WALK_GRAPH = False
 
 # ---- Generation / cancel token --------------------------------------------------------
 # Each new workplace (/compute) bumps _GENERATION. The long all-cores jobs (compute_exact,
@@ -175,14 +205,19 @@ _CELL_CACHE_LOCK = threading.Lock()
 _LAST_DEST_KEY = None            # workplace of the last /compute; a CHANGE clears the caches above
 
 
-def _dest_key(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+def _dest_key(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=None):
     """Per-workplace cache key for the breakdown caches (_ITIN_CACHE/_CELL_CACHE/
     _ITIN_INFLIGHT) and the _LAST_DEST_KEY change-detector. A capped result is a DIFFERENT
     journey than the uncapped one, so the cap is part of the key — otherwise a maxrides=1
-    breakdown would poison the uncapped cell (and vice-versa). At the R5 default the key is
-    the same 2-tuple as before, so the baseline (and existing key callers) is unchanged."""
+    breakdown would poison the uncapped cell (and vice-versa). The walk SPEED likewise changes
+    the journey, so it's keyed too. At the R5 default + medium speed the key is the same 2-tuple
+    as before, so the baseline (and existing key callers) is unchanged."""
     base = (round(float(lat), 5), round(float(lon), 5))
-    return base if max_rides == DEFAULT_MAX_RIDES else base + (int(max_rides),)
+    if max_rides != DEFAULT_MAX_RIDES:
+        base = base + (int(max_rides),)
+    if speed and speed != DEFAULT_SPEED:
+        base = base + (speed,)
+    return base
 
 
 def _reset_caches():
@@ -280,13 +315,19 @@ _ATTR_RESULT_CACHE = OrderedDict()        # coarse_key -> {cellId: dominantLine}
 _RESULT_CACHE_LOCK = threading.Lock()
 
 
-def _coarse_key(lat, lon, max_rides=DEFAULT_MAX_RIDES):
-    """~110m bucket for the heavy-result cache (_EXACT_RESULT_CACHE/_ATTR_RESULT_CACHE).
-    Like _dest_key, the transfer cap is part of the key so a capped result can't be served
-    for an uncapped request. At the R5 default the key is the same 2-tuple as before, so the
-    baseline cache behavior (and existing callers) is unchanged."""
+def _coarse_key(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=None):
+    """~110m bucket for the heavy-result caches (_EXACT/_ATTR/_RAPTOR_TREE/_RAPTOR_MC). Like
+    _dest_key, the transfer cap AND the walk speed are part of the key so a capped/slow result
+    can't be served for an uncapped/medium request. At the R5 default + medium speed the key is
+    the same 2-tuple as before, so the baseline cache behavior (and existing callers) is
+    unchanged. (The egress/pure-walk cache stays speed-free: it's reference seconds, the engine
+    applies the speed scalar.)"""
     base = (round(float(lat), 3), round(float(lon), 3))
-    return base if max_rides == DEFAULT_MAX_RIDES else base + (int(max_rides),)
+    if max_rides != DEFAULT_MAX_RIDES:
+        base = base + (int(max_rides),)
+    if speed and speed != DEFAULT_SPEED:
+        base = base + (speed,)
+    return base
 
 
 def _req_max_rides():
@@ -302,6 +343,21 @@ def _req_max_rides():
     except (TypeError, ValueError):
         return DEFAULT_MAX_RIDES
     return max(1, min(DEFAULT_MAX_RIDES, v))
+
+
+# Walk-speed toggle (RAPTOR only): scalar = 4.8 / pace. The engine multiplies every WALK
+# reference-second (access/egress/pure-walk, baked @4.8) by it. Default medium (the user is a
+# fast walker but most aren't); the access table / egress stay reference seconds + cached once.
+WALK_SPEEDS = {"slow": 4.0, "med": config.WALK_KMH, "fast": 5.6}
+DEFAULT_SPEED = "med"
+
+
+def _req_speed():
+    """(speed_name, walk_scalar) from ?speed=slow|med|fast; default medium (scalar 1.0)."""
+    s = (request.args.get("speed") or "").lower()
+    if s not in WALK_SPEEDS:
+        return DEFAULT_SPEED, 1.0
+    return s, config.WALK_KMH / WALK_SPEEDS[s]
 
 
 def _result_cache_get(store, key):
@@ -355,6 +411,23 @@ def _raptor_egress_purewalk(lat, lon):
             cached = _RAPTOR_EGRESS_CACHE[ckey]
     if cached is not None:
         return cached
+    if USE_WALK_GRAPH:                              # JVM-free hill-aware walk router (no R5)
+        Wll = (lon, lat)
+        ecap = _RAPTOR.access_cap_min * 60          # reference seconds (engine applies speed scalar)
+        # egress = stop -> W (alight->work) and pure-walk = cell -> W (home->work): both rooted at
+        # W on the TRANSPOSED graph so uphill/downhill is correct for the actual walk direction.
+        eg = _WG.one_to_many(Wll, _WG_STOP_NODES, _WG_STOP_CONN, ecap, reverse=True)
+        fin = _np.isfinite(eg)
+        egress_g = _WG_STOP_GIDS[fin].astype(_np.int32)
+        egress_w = _np.rint(eg[fin]).astype(_np.int64)
+        pw = _WG.one_to_many(Wll, _WG_CELL_NODES, _WG_CELL_CONN, config.MAX_MIN * 60, reverse=True)
+        purewalk = _np.where(_np.isfinite(pw), _np.rint(pw), -1).astype(_np.int64)
+        res = (egress_g, egress_w, purewalk)
+        with _RAPTOR_EGRESS_LOCK:
+            _RAPTOR_EGRESS_CACHE[ckey] = res
+            while len(_RAPTOR_EGRESS_CACHE) > 64:
+                _RAPTOR_EGRESS_CACHE.popitem(last=False)
+        return res
     W = gpd.GeoDataFrame({"id": ["w"]}, geometry=[Point(lon, lat)], crs=config.WGS)
     cap = _RAPTOR.access_cap_min
     # egress: W -> stops (walk), gid-keyed
@@ -396,17 +469,18 @@ _RAPTOR_TREE_CACHE = OrderedDict()           # (coarse_key, max_rides) -> {tree,
 _RAPTOR_TREE_LOCK = threading.Lock()
 
 
-def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):
     """Build (or fetch) the cached arrive-by JourneyTree + per-cell map values (actual commute)
     + dominant lines for this workplace (the Phase-2 path layer). Tracing every cell is ~0.14s,
-    done once per workplace bucket."""
-    key = _coarse_key(lat, lon, max_rides)
+    done once per workplace bucket (keyed by transfer cap + walk speed)."""
+    key = _coarse_key(lat, lon, max_rides, speed)
     with _RAPTOR_TREE_LOCK:
         if key in _RAPTOR_TREE_CACHE:
             _RAPTOR_TREE_CACHE.move_to_end(key)
             return _RAPTOR_TREE_CACHE[key]
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
-    tree = _RAPTOR.journey_tree(egress_g, egress_w, purewalk, max_rounds=int(max_rides))
+    tree = _RAPTOR.journey_tree(egress_g, egress_w, purewalk, max_rounds=int(max_rides),
+                                walk_scalar=walk_scalar)
     commute, dom = tree.commute_and_dominant()
     cells = {c: ([int(commute[i]), int(commute[i])] if commute[i] >= 0 else [None, None])
              for i, c in enumerate(_RAPTOR.cell_ids)}
@@ -419,14 +493,15 @@ def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES):
     return entry
 
 
-def compute_raptor(lat, lon, max_rides=DEFAULT_MAX_RIDES):
+def compute_raptor(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):
     """Grid travel-times via the RAPTOR engine -> {id: [best, real]} (same shape as compute).
     arrive-by uses the traced tree (actual commute, pairs with the RAPTOR breakdown so hover==map);
     depart-after uses the R5-VALIDATED vectorized p5/p50 (Phase 1; pairs with the R5 breakdown)."""
     if RAPTOR_SEMANTIC == "arriveby":
-        return _raptor_tree(lat, lon, max_rides)["cells"]
+        return _raptor_tree(lat, lon, max_rides, speed, walk_scalar)["cells"]
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
-    res = _RAPTOR.departafter(egress_g, egress_w, purewalk, max_rounds=int(max_rides))
+    res = _RAPTOR.departafter(egress_g, egress_w, purewalk, max_rounds=int(max_rides),
+                              walk_scalar=walk_scalar)
     return {cid: [p[0], p[1]] for cid, p in res.items()}
 
 
@@ -444,9 +519,10 @@ def _nearest_raptor_cell(olat, olon):
     return best_i
 
 
-def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES):
+def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED,
+                        walk_scalar=1.0):
     """{cellId: dominant line} from the cached arrive-by tree (color-by-line, no R5)."""
-    entry = _raptor_tree(dlat, dlon, max_rides)
+    entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)
     if entry["dom"] is None:                  # depart-after map -> derive dominant on demand
         _, dom = entry["tree"].commute_and_dominant()
         entry["dom"] = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
@@ -459,27 +535,28 @@ _RAPTOR_MC_CACHE = OrderedDict()             # (coarse_key, max_rides) -> {reali
 _RAPTOR_MC_LOCK = threading.Lock()
 
 
-def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES):
+def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):
     """{"realistic": {id: min}, "variance": {id: {frag, std, stuck, alt}}} for this workplace.
     realistic = MC p50 (clamped >= perfect); frag = p90-p50 bad-day delta; stuck = fraction of
     draws hitting the cap; alt = lines that become dominant under delays (EXCLUDING the cell's
     normal line). Reachability follows the perfect map (unreachable cells are omitted)."""
     import numpy as _np
     import hashlib as _hl
-    key = _coarse_key(dlat, dlon, max_rides)
+    key = _coarse_key(dlat, dlon, max_rides, speed)
     with _RAPTOR_MC_LOCK:
         if key in _RAPTOR_MC_CACHE:
             _RAPTOR_MC_CACHE.move_to_end(key)
             return _RAPTOR_MC_CACHE[key]
-    entry = _raptor_tree(dlat, dlon, max_rides)         # perfect map + dominant lines (cached)
+    entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)   # perfect map + dom (cached)
     cells = entry["cells"]; dom = entry["dom"] or {}
     ids = _RAPTOR.cell_ids
     perfect = _np.array([(cells[c][0] if cells[c][0] is not None else -1) for c in ids], _np.int32)
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(dlat, dlon)
     # deterministic per-workplace seed -> the realistic numbers are stable across reboots/reloads
-    seed = int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)}"
+    seed = int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)},{speed}"
                           .encode()).hexdigest()[:8], 16)
-    mc = _RAPTOR.montecarlo(egress_g, egress_w, purewalk, perfect=perfect, seed=seed)
+    mc = _RAPTOR.montecarlo(egress_g, egress_w, purewalk, perfect=perfect, seed=seed,
+                            walk_scalar=walk_scalar)
     realistic, variance = {}, {}
     alt_all = mc["alt"]
     for i, c in enumerate(ids):
@@ -569,22 +646,25 @@ def _compute():
     global _LAST_DEST_KEY
     lat = float(request.args["lat"]); lon = float(request.args["lon"])
     max_rides = _req_max_rides()
-    key = _dest_key(lat, lon, max_rides)
+    speed, walk_scalar = _req_speed()
+    key = _dest_key(lat, lon, max_rides, speed)
     if key != _LAST_DEST_KEY:
-        # Genuinely new workplace (or a changed transfer cap — different colored times, so
-        # treat it as new): bump the generation (cancels any in-flight exact/attribution job
-        # for the PREVIOUS key between waves) and drop its breakdown caches. Re-submitting the
-        # same address + cap (e.g. the localStorage auto-restore on refresh) keeps the caches.
+        # Genuinely new workplace (or a changed transfer cap / walk speed — different colored
+        # times, so treat it as new): bump the generation (cancels any in-flight exact/attribution
+        # job for the PREVIOUS key between waves) and drop its breakdown caches. Re-submitting the
+        # same address + cap + speed (e.g. the localStorage auto-restore on refresh) keeps caches.
         _LAST_DEST_KEY = key
         gen = _bump_generation()
         _reset_caches()
     else:
         gen = _current_generation()
     t0 = dt.datetime.now()
-    cells = compute_raptor(lat, lon, max_rides) if USE_RAPTOR else compute(lat, lon, max_rides)
+    cells = (compute_raptor(lat, lon, max_rides, speed, walk_scalar) if USE_RAPTOR
+             else compute(lat, lon, max_rides))
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     tag = "raptor" if USE_RAPTOR else "approx"
-    print(f"[compute:{tag}] ({lat:.4f},{lon:.4f}) rides={max_rides} {ms:.0f}ms gen={gen}")
+    print(f"[compute:{tag}] ({lat:.4f},{lon:.4f}) rides={max_rides} speed={speed} "
+          f"{ms:.0f}ms gen={gen}")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -597,7 +677,8 @@ def _compute_exact():
     # the SAME engine, so return it instantly (no heavy per-cell R5 pass). map == refine, so
     # the old fast-vs-exact contradiction disappears entirely.
     if USE_RAPTOR:
-        cells = compute_raptor(lat, lon, max_rides)
+        speed, walk_scalar = _req_speed()
+        cells = compute_raptor(lat, lon, max_rides, speed, walk_scalar)
         return jsonify({"dest": [lat, lon], "cells": cells, "ms": 0})
     ckey = _coarse_key(lat, lon, max_rides)
     # CACHE HIT (~110m): return the same result instantly — no R5 work, no lock, and the
@@ -809,6 +890,7 @@ def _itinerary():
     # Same transfer cap the map used, so the breakdown total matches the cell's colored time
     # (and so it hits the SAME _dest_key-bucketed cache as the matching /compute).
     max_rides = _req_max_rides()
+    speed, walk_scalar = _req_speed()
     # RAPTOR path (Phase 2, arrive-by only): trace the cell's journey from the cached tree ->
     # breakdown total EQUALS the cell's map value by construction (no R5). depart-after keeps the
     # R5-validated breakdown below. Off-grid points snap to nearest cell.
@@ -816,7 +898,8 @@ def _itinerary():
         ci = _RAPTOR.cell_index.get(cid) if cid is not None else None
         if ci is None:
             ci = _nearest_raptor_cell(olat, olon)
-        res = _raptor_tree(dlat, dlon, max_rides)["tree"].itinerary(ci) if ci is not None else None
+        res = (_raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)["tree"].itinerary(ci)
+               if ci is not None else None)
         res = dict(res) if res else {"error": "no route"}
         res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
         return jsonify(res)
@@ -852,12 +935,14 @@ def _attribution():
     de-duped, so /itinerary also benefits once it has run."""
     dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
     max_rides = _req_max_rides()
+    speed, walk_scalar = _req_speed()
     # RAPTOR path (Phase 2, arrive-by only): dominant line per cell from the same traced tree as
     # the map (no R5, ~0.14s, no _HEAVY_LOCK / fan spike, deterministic). depart-after keeps the
     # R5 color-by-line below.
     if USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby":
-        attr = _raptor_attribution(dlat, dlon, max_rides)
-        print(f"[attr:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} -> {len(attr)} cells")
+        attr = _raptor_attribution(dlat, dlon, max_rides, speed, walk_scalar)
+        print(f"[attr:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} speed={speed} "
+              f"-> {len(attr)} cells")
         return jsonify(attr)
     ckey = _coarse_key(dlat, dlon, max_rides)
     # CACHE HIT (~110m): return the same attribution dict instantly — no R5 work, no lock.
@@ -895,10 +980,11 @@ def _variance():
         return jsonify({"realistic": {}, "variance": {}})
     dlat = float(request.args["dlat"]); dlon = float(request.args["dlon"])
     max_rides = _req_max_rides()
+    speed, walk_scalar = _req_speed()
     t0 = dt.datetime.now()
-    out = _raptor_mc(dlat, dlon, max_rides)
+    out = _raptor_mc(dlat, dlon, max_rides, speed, walk_scalar)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[variance:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} {ms:.0f}ms "
+    print(f"[variance:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} speed={speed} {ms:.0f}ms "
           f"-> {len(out['realistic'])} cells")
     return jsonify({"dest": [dlat, dlon], **out, "ms": round(ms)})
 

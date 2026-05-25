@@ -113,55 +113,69 @@ class RaptorEngine:
         except Exception:
             pass
 
+    # -- walk-speed scalar ----------------------------------------------------------------
+    def _scale_walk(self, egress_w, purewalk, walk_scalar):
+        """Scale all WALK reference-seconds (access/egress/pure-walk, baked at 4.8 km/h) to the
+        user's pace: walk_scalar = 4.8/v (slow 1.20, med 1.00, fast 0.857). Returns
+        (egress_w, purewalk, access_w) as int64 at the user's pace."""
+        ew = np.asarray(egress_w, np.int64); pw = np.asarray(purewalk, np.int64)
+        aw = self.access_w
+        if walk_scalar != 1.0:
+            ew = np.rint(ew.astype(np.float64) * walk_scalar).astype(np.int64)
+            pw = pw.copy(); m = pw >= 0
+            pw[m] = np.rint(pw[m].astype(np.float64) * walk_scalar).astype(np.int64)
+            aw = np.rint(self.access_w.astype(np.float64) * walk_scalar).astype(np.int64)
+        return ew, pw, aw
+
     # -- compute -------------------------------------------------------------------------
     def _reverse(self, egress_g, egress_w, deadlines, max_rounds=MAX_ROUNDS):
         return R.reverse_profile(self.data, egress_g, egress_w, deadlines,
                                  board_slack=BOARD_SLACK, max_rounds=max_rounds)
 
     def departafter(self, egress_g, egress_w, purewalk, percentiles=(5, 50),
-                    max_rounds=MAX_ROUNDS):
+                    max_rounds=MAX_ROUNDS, walk_scalar=1.0):
         """{cell_id: [p5, p50]} minutes, depart-after window (R5-comparable). ``purewalk`` is
         cell->W walk seconds aligned to self.cell_ids (-1 if > cap). ``max_rounds`` caps
-        public-transport rides (rides = transfers + 1)."""
-        latest = self._reverse(egress_g, egress_w, self.Tgrid, max_rounds)
+        public-transport rides (rides = transfers + 1). ``walk_scalar`` sets the walk pace."""
+        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
+        latest = self._reverse(egress_g, ew, self.Tgrid, max_rounds)
         arrivalW = R.stop_arrival_profile(latest, self.Tgrid, self.dep_grid)
-        out = R.assemble_departafter(self.access_off, self.access_to, self.access_w,
-                                     np.asarray(purewalk, np.int64), arrivalW,
+        out = R.assemble_departafter(self.access_off, self.access_to, aw, pw, arrivalW,
                                      self.dep_grid, self.cell_deps, self.max_min,
                                      percentiles=percentiles)
         return {c: [int(out[i, k]) if out[i, k] >= 0 else None
                     for k in range(out.shape[1])] for i, c in enumerate(self.cell_ids)}
 
     def arriveby(self, egress_g, egress_w, purewalk, target_sec=None, window_sec=None,
-                 percentiles=(5, 50), max_rounds=MAX_ROUNDS):
+                 percentiles=(5, 50), max_rounds=MAX_ROUNDS, walk_scalar=1.0):
         """{cell_id: [p5, p50]} minutes, arrive-by an arrival window ending at ``target_sec``
         (default 09:00). ``window_sec`` None -> use config.window(); 0 -> single deadline.
         ``max_rounds`` caps public-transport rides (rides = transfers + 1)."""
+        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
         target = self.target_sec if target_sec is None else int(target_sec)
         win = int(config.window().total_seconds()) if window_sec is None else int(window_sec)
         deadlines = (np.array([target], np.int64) if win <= 0
                      else np.arange(target - win, target + 1, DEP_STEP, dtype=np.int64))
-        latest = self._reverse(egress_g, egress_w, deadlines, max_rounds)
-        out = _assemble_arriveby_window(self.access_off, self.access_to, self.access_w,
-                                        np.asarray(purewalk, np.int64), latest, deadlines,
+        latest = self._reverse(egress_g, ew, deadlines, max_rounds)
+        out = _assemble_arriveby_window(self.access_off, self.access_to, aw, pw, latest, deadlines,
                                         self.max_min, np.asarray(percentiles, np.float64))
         return {c: [int(out[i, k]) if out[i, k] >= 0 else None
                     for k in range(out.shape[1])] for i, c in enumerate(self.cell_ids)}
 
 
     # -- Phase 2: traced arrive-by tree -> journey breakdown + color-by-line ---------------
-    def journey_tree(self, egress_g, egress_w, purewalk, target_sec=None, max_rounds=MAX_ROUNDS):
+    def journey_tree(self, egress_g, egress_w, purewalk, target_sec=None, max_rounds=MAX_ROUNDS,
+                     walk_scalar=1.0):
         """A JourneyTree for the single arrive-by deadline: serves the per-cell breakdown
         (hover), color-by-line, AND the arrive-by map value (actual commute = arrival - latest
         home departure), all from ONE traced reverse tree so hover == map by construction."""
         target = self.target_sec if target_sec is None else int(target_sec)
         egress_g = np.asarray(egress_g, np.int32)
-        egress_w = np.asarray(egress_w, np.int64)
-        par = R.reverse_raptor_traced(self.data, egress_g, target - egress_w, egress_w,
+        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
+        par = R.reverse_raptor_traced(self.data, egress_g, target - ew, ew,
                                       max_rounds=max_rounds, board_slack=BOARD_SLACK)
         return raptor_journey.JourneyTree(self.data, par, self.access_off, self.access_to,
-                                          self.access_w, np.asarray(purewalk, np.int64),
-                                          target, self.max_min)
+                                          aw, pw, target, self.max_min)
 
     # -- Phase A: service-noise Monte-Carlo (realistic + fragility + alt-lines) ------------
     def _mc_mode_params(self):
@@ -175,7 +189,7 @@ class RaptorEngine:
         return mu, sl
 
     def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
-                   seed=None, alt_draws=None):
+                   seed=None, alt_draws=None, walk_scalar=1.0):
         """Service-noise MC for a workplace. Returns dict of cell-aligned arrays:
           realistic int32  p50 door-to-door commute over draws (clamped >= ``perfect``)
           frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number)
@@ -187,8 +201,8 @@ class RaptorEngine:
         RE-ROUTING (take the next local), not just same-line headway. Lazy + cached per workplace
         by the caller; never on the hover path. ``seed`` makes it reproducible per workplace."""
         nR = MC_DRAWS if n_draws is None else int(n_draws)
-        egress_g = np.asarray(egress_g, np.int32); egress_w = np.asarray(egress_w, np.int64)
-        purewalk = np.asarray(purewalk, np.int64)
+        egress_g = np.asarray(egress_g, np.int32)
+        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
         mu_pat, slope_pat = self._mc_mode_params()
         ntrips = np.asarray(self.data["pat_ntrips"])
         mu_trip = np.repeat(mu_pat, ntrips); slope_trip = np.repeat(slope_pat, ntrips)
@@ -198,8 +212,8 @@ class RaptorEngine:
         delta0_all = rng.gamma(k, mu_trip / k, size=(nR, T))
         slope_all = rng.gamma(k, np.maximum(slope_trip, 1e-9) / k, size=(nR, T))
         d_med = self.dep_sec + self.win_sec // 2
-        cm = R.montecarlo_commute(self.data, egress_g, egress_w, self.Tgrid,
-                                  self.access_off, self.access_to, self.access_w, purewalk,
+        cm = R.montecarlo_commute(self.data, egress_g, ew, self.Tgrid,
+                                  self.access_off, self.access_to, aw, pw,
                                   np.int64(d_med), self.max_min, delta0_all, slope_all,
                                   board_slack=BOARD_SLACK, max_rounds=MAX_ROUNDS)
         p50 = np.percentile(cm, 50, axis=1)
@@ -212,11 +226,11 @@ class RaptorEngine:
             perfect = np.asarray(perfect)
             m = perfect >= 0
             realistic[m] = np.maximum(realistic[m], perfect[m].astype(np.int32))
-        alt = self._mc_alt_lines(egress_g, egress_w, purewalk, delta0_all, slope_all,
+        alt = self._mc_alt_lines(egress_g, ew, pw, aw, delta0_all, slope_all,
                                  MC_ALT_DRAWS if alt_draws is None else int(alt_draws))
         return dict(realistic=realistic, frag=frag, std=std, stuck=stuck, alt=alt)
 
-    def _mc_alt_lines(self, egress_g, egress_w, purewalk, delta0_all, slope_all, K):
+    def _mc_alt_lines(self, egress_g, egress_w, purewalk, access_w, delta0_all, slope_all, K):
         """{line: votes} per cell: dominant line across ``K`` perturbed arrive-by traced trees
         (so a delayed express lets the next local show up as an alternative). Reuses the validated
         JourneyTree; pricier than the numpy MC, so K is small + env-tunable."""
@@ -233,7 +247,7 @@ class RaptorEngine:
             par = R.reverse_raptor_traced(pdata, egress_g, target - egress_w, egress_w,
                                           max_rounds=MAX_ROUNDS, board_slack=BOARD_SLACK)
             tree = raptor_journey.JourneyTree(pdata, par, self.access_off, self.access_to,
-                                              self.access_w, purewalk, target, self.max_min)
+                                              access_w, purewalk, target, self.max_min)
             _, dom = tree.commute_and_dominant()
             for ci, line in enumerate(dom):
                 if line and line != "walk only":
