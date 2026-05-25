@@ -82,8 +82,37 @@ Knobs (env): `USE_RAPTOR`, `RAPTOR_SEMANTIC` (departafter|arriveby), `RAPTOR_ACC
 `RAPTOR_DEADLINE_STEP` (180), `RAPTOR_BOARD_SLACK` (60), `RAPTOR_FOOTPATH_M` (250).
 Tests: `pytest tests/test_raptor.py` (JVM-free).
 
-## Phase 2 (next): journey reconstruction → drop the JVM
-Design in `prototypes/spike_raptor/PHASE2_DESIGN.md`. Add back-pointers to the reverse search to
-reconstruct the leg breakdown + color-by-line dominant route from RAPTOR itself (built on the
-arrive-by single-deadline tree so hover == map by construction), replacing the R5 `/itinerary`
-and `/attribution`, after which r5py is dev/test-only and the runtime is JVM-free.
+## Two semantics (RAPTOR_SEMANTIC), and what each ships
+- **`departafter`** — map = depart-after p5/p50 (the R5-validated MAE 0.75 above); breakdown +
+  color-by-line stay on R5 recorded paths. **This is the validated, R5-consistent Phase-1 ship.**
+- **`arriveby`** (default, per review) — map = the *actual commute* of the latest-feasible journey
+  arriving by 09:00, AND the breakdown + color-by-line come from the same RAPTOR traced tree
+  (Phase 2). Internally consistent (hover == map exact) and deterministic, but see the route
+  caveat below.
+
+## Phase 2: journey reconstruction from RAPTOR — status
+Design: `prototypes/spike_raptor/PHASE2_DESIGN.md`. Implemented: `raptor.reverse_raptor_traced`
+(back-pointers), `raptor_journey.JourneyTree` (leg breakdown + dominant line from the GTFS times
+we load), `raptor_build` v2 (feed-aware names: Muni 8 vs BART Red-N). Wired into `/itinerary` +
+`/attribution` behind `arriveby`.
+
+**Works:** hover == map EXACTLY (0/2997 violations — the breakdown legs sum to the cell's map
+minutes by construction), feed-aware names, color-by-line in ~5 ms and **deterministic across
+reboots** (R5's flipped ~1057 cells per boot). No R5 recorded-path compute, no `_HEAVY_LOCK`/fan.
+
+**Open wall (measured):** RAPTOR's reconstructed routes match R5's dominant line only **~46%**
+(59% corridor-collapsed; **18% even at the same departure minute**). Root cause: (1) the reverse
+**latest-departure** objective produces valid-but-different journeys than R5's **earliest-arrival**;
+(2) the arrive-by anchor is optimistic (commute ~3–6 min under the depart-after p50); (3) the
+Market-St Metro tunnel (K/L/M/N/J/T) and the BART downtown trunk (Yellow/Red/Blue/Green) are
+**interchangeable** — R5's own dominant-line pick there is per-boot arbitrary, so exact match to it
+is ill-defined. So this is not a clean R5-match; closing to ≥90% needs a **forward earliest-arrival
+reconstruction** (run forward RAPTOR from each cell's chosen departure to recover R5's actual
+fastest journey) — a clear next step. Validate: `scripts/raptor_validate_paths.py` (vs R5 dominant),
+`scripts/raptor_check_anchor.py` (same-departure check).
+
+**JVM not yet dropped.** Even in `arriveby`, the runtime still calls R5 once per workplace for the
+egress/pure-walk walk matrix (`_raptor_egress_purewalk`). Fully removing r5py needs an R5-free
+pedestrian router for W→stops/cells (e.g. snap W to the nearest baked grid cell, or a pandana/OSM
+walk graph) — the last ~140 ms R5 dependency. Until then R5 is loaded but does **no** heavy
+per-cell pass and **no** recorded-path breakdowns (those are RAPTOR in `arriveby`).
