@@ -392,6 +392,23 @@ def apply_delays(data, delta0, slope, off=None):
     return dep.astype(np.int32), arr.astype(np.int32)
 
 
+def _mc_flat_args(data):
+    """The schedule CSR as the int64 tuple BOTH MC kernels take positionally: n_stops, the pattern
+    arrays (incl. ``pat_trip_off`` for per-trip delay indexing), the routes-at-stop CSR, and the
+    footpath CSR. One source of truth for the kernels' flat-arg contract (kept in sync with
+    ``raptor_numba.montecarlo`` / ``montecarlo_committed`` parameter order)."""
+    return (np.int64(data["n_stops"]),
+            data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
+            data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64),
+            pat_trip_off(data),
+            data["pat_stops"].astype(np.int64), data["pat_dep"].astype(np.int64),
+            data["pat_arr"].astype(np.int64),
+            data["ras_off"].astype(np.int64), data["ras_pat"].astype(np.int64),
+            data["ras_pos"].astype(np.int64),
+            data["tr_off"].astype(np.int64), data["tr_to"].astype(np.int64),
+            data["tr_time"].astype(np.int64))
+
+
 def montecarlo_commute(data, egress_g, egress_w, deadlines, access_off, access_to, access_w,
                        purewalk, d_med, max_min, delta0_all, slope_all,
                        board_slack=60, max_rounds=8, kernel=None):
@@ -399,32 +416,23 @@ def montecarlo_commute(data, egress_g, egress_w, deadlines, access_off, access_t
     for R service-noise draws (rows of delta0_all/slope_all, per global trip). Each draw
     perturbs the schedule, re-runs the reverse sweep, and reads the door-to-door commute at the
     single median departure ``d_med`` (so spread = pure service noise). Numba when available."""
-    off = pat_trip_off(data)
     if kernel is None:
         kernel = _select_kernel()
     if kernel == "numba":
         from . import raptor_numba
         with _MC_KERNEL_LOCK:                      # serialize the non-threadsafe parallel kernel
             return raptor_numba.montecarlo(
-                np.int64(data["n_stops"]),
-            data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
-            data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64), off,
-            data["pat_stops"].astype(np.int64), data["pat_dep"].astype(np.int64),
-            data["pat_arr"].astype(np.int64),
-            data["ras_off"].astype(np.int64), data["ras_pat"].astype(np.int64),
-            data["ras_pos"].astype(np.int64),
-            data["tr_off"].astype(np.int64), data["tr_to"].astype(np.int64),
-            data["tr_time"].astype(np.int64),
-            np.asarray(egress_g, np.int64), np.asarray(egress_w, np.int64),
-            np.asarray(deadlines, np.int64), np.int64(board_slack), np.int64(max_rounds),
-            np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
-            np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
-            np.int64(d_med), np.int64(max_min),
-            np.ascontiguousarray(delta0_all, np.float64),
-            np.ascontiguousarray(slope_all, np.float64))
+                *_mc_flat_args(data),
+                np.asarray(egress_g, np.int64), np.asarray(egress_w, np.int64),
+                np.asarray(deadlines, np.int64), np.int64(board_slack), np.int64(max_rounds),
+                np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
+                np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
+                np.int64(d_med), np.int64(max_min),
+                np.ascontiguousarray(delta0_all, np.float64),
+                np.ascontiguousarray(slope_all, np.float64))
     return _montecarlo_python(data, egress_g, egress_w, deadlines, access_off, access_to,
-                              access_w, purewalk, d_med, max_min, delta0_all, slope_all, off,
-                              board_slack, max_rounds)
+                              access_w, purewalk, d_med, max_min, delta0_all, slope_all,
+                              pat_trip_off(data), board_slack, max_rounds)
 
 
 def montecarlo_commute_committed(data, egress_g, egress_w, deadlines, legs, perfect, max_min,
@@ -441,16 +449,7 @@ def montecarlo_commute_committed(data, egress_g, egress_w, deadlines, legs, perf
         from . import raptor_numba
         with _MC_KERNEL_LOCK:                          # serialize the non-threadsafe parallel kernel
             return raptor_numba.montecarlo_committed(
-                np.int64(data["n_stops"]),
-                data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
-                data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64),
-                pat_trip_off(data),
-                data["pat_stops"].astype(np.int64), data["pat_dep"].astype(np.int64),
-                data["pat_arr"].astype(np.int64),
-                data["ras_off"].astype(np.int64), data["ras_pat"].astype(np.int64),
-                data["ras_pos"].astype(np.int64),
-                data["tr_off"].astype(np.int64), data["tr_to"].astype(np.int64),
-                data["tr_time"].astype(np.int64),
+                *_mc_flat_args(data),
                 np.asarray(egress_g, np.int64), np.asarray(egress_w, np.int64),
                 np.asarray(deadlines, np.int64), np.int64(board_slack), np.int64(max_rounds),
                 np.asarray(legs["commit_home"], np.int64), np.asarray(legs["commit_kind"], np.int64),

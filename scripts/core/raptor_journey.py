@@ -56,9 +56,11 @@ class JourneyTree:
 
     # -- raw forward legs (exact seconds) -------------------------------------------------
     def _trace(self, ci):
-        """Return (legs_raw, latest_home) in FORWARD order, or None if unreachable. legs_raw is
-        a list of tuples: ("access",sec) ("ride",pi,dep_sec,arr_sec) ("walk_t",sec) ("egress",sec)
-        or, for a walk-only journey, [("walk",sec)]."""
+        """Return (legs_raw, latest_home) in FORWARD order, or None if unreachable. legs_raw is a
+        list of tuples: ("access",sec) ("ride",pi,dep_sec,arr_sec,board_pos,alight_pos,alight_stop)
+        ("walk_t",sec) ("egress",sec), or, for a walk-only journey, [("walk",sec)]. The ride's board/
+        alight positions + alight stop feed the committed-plan MC (``committed_first_legs``); the
+        clock/dominant readers use only pi/dep/arr."""
         s_star, aw, latest_home, is_walk = self._select(ci)
         if is_walk:
             if self.purewalk[ci] < 0:
@@ -89,7 +91,7 @@ class JourneyTree:
                 alight_stop = int(pat_stops[sbase + apos])
                 dep_sec = int(pat_dep[mbase + trip * ns + bpos])
                 arr_sec = int(pat_arr[mbase + trip * ns + apos])
-                legs.append(("ride", pi, dep_sec, arr_sec, bpos, trip))
+                legs.append(("ride", pi, dep_sec, arr_sec, bpos, apos, alight_stop))
                 s = alight_stop
             elif k == 2:                        # footpath s -> par_from (toward W)
                 j = int(par_from[s])
@@ -150,43 +152,33 @@ class JourneyTree:
         The forward sim (raptor_numba.montecarlo_committed) then, per delayed draw, boards the next
         available trip on ``commit_pi`` at ``commit_bpos`` (the same line you planned; a late earlier
         trip you can also catch), rides to ``commit_apos``, and re-optimizes from ``commit_as`` at the
-        ACTUAL (late) arrival — so a first-leg delay that blows the transfer costs a real headway."""
+        ACTUAL (late) arrival — so a first-leg delay that blows the transfer costs a real headway.
+
+        Reuses ``_trace`` (the same per-cell journey the map/hover show) and just reads the FIRST ride
+        + the walk leading up to it, so the committed plan is the displayed plan by construction."""
         n = self.n_cells
         out = dict(
             commit_home=np.full(n, NEG, np.int64), commit_kind=np.zeros(n, np.int8),
             commit_walk0=np.zeros(n, np.int64), commit_pi=np.full(n, -1, np.int32),
             commit_bpos=np.full(n, -1, np.int32), commit_apos=np.full(n, -1, np.int32),
             commit_as=np.full(n, -1, np.int32))
-        d = self.d
-        pat_stop_off = d["pat_stop_off"]; pat_stops = d["pat_stops"]
-        tr_off = d["tr_off"]; tr_to = d["tr_to"]; tr_time = d["tr_time"]
-        par = self.par
-        par_kind = par["par_kind"]; par_pat = par["par_pat"]
-        par_board = par["par_board"]; par_alight = par["par_alight"]; par_from = par["par_from"]
         for ci in range(n):
-            s_star, aw, latest_home, is_walk = self._select(ci)
-            if is_walk:                                  # pure-walk wins: deterministic, no service noise
-                if self.purewalk[ci] < 0:
-                    continue                             # unreachable (kind stays 0)
-                out["commit_kind"][ci] = 1; out["commit_home"][ci] = latest_home
-                continue
-            if s_star < 0:
-                continue
+            tr = self._trace(ci)
+            if tr is None:
+                continue                                 # unreachable (kind stays 0)
+            legs_raw, latest_home = tr
             out["commit_home"][ci] = latest_home
-            s = s_star; walk0 = int(aw)
-            for _ in range(64):                          # walk the parent chain to the FIRST transit board
-                k = int(par_kind[s])
-                if k == 1:                               # transit board at s -> ride to par_alight
-                    pi = int(par_pat[s]); sbase = int(pat_stop_off[pi]); apos = int(par_alight[s])
-                    out["commit_kind"][ci] = 2; out["commit_pi"][ci] = pi
-                    out["commit_bpos"][ci] = int(par_board[s]); out["commit_apos"][ci] = apos
-                    out["commit_as"][ci] = int(pat_stops[sbase + apos]); out["commit_walk0"][ci] = walk0
-                    break
-                elif k == 2:                             # leading footpath toward W -> accumulate walk
-                    j = int(par_from[s]); walk0 += _footpath_sec(tr_off, tr_to, tr_time, s, j); s = j
-                else:                                    # egress seed before any transit -> all-walk, deterministic
-                    out["commit_kind"][ci] = 1
-                    break
+            walk0, ride = 0, None
+            for leg in legs_raw:
+                if leg[0] == "ride":
+                    ride = leg; break
+                walk0 += leg[1]                          # access / leading footpath seconds before the first ride
+            if ride is None:                             # walk-only / no-transit -> deterministic, no service noise
+                out["commit_kind"][ci] = 1
+                continue
+            _, pi, _dep, _arr, bpos, apos, alight_stop = ride
+            out["commit_kind"][ci] = 2; out["commit_pi"][ci] = pi; out["commit_walk0"][ci] = walk0
+            out["commit_bpos"][ci] = bpos; out["commit_apos"][ci] = apos; out["commit_as"][ci] = alight_stop
         return out
 
     # -- public: per-cell commute minutes + dominant line (map + color-by-line) -----------
