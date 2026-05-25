@@ -22,5 +22,9 @@ tests/**/__pycache__/
 # precompute prototype build artifacts
 prototypes/**/artifacts/
 prototypes/**/*.npz
+prototypes/**/*.pkl
 prototypes/**/*.log
 prototypes/**/__pycache__/
+
+# agent worktrees / local Claude state
+.claude/

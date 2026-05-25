@@ -24,6 +24,7 @@ from core import config
 REALTOR = "https://data.sfgov.org/resource/2kjj-ysvr.geojson?$limit=2000"   # field: nbrhood
 FIND117 = "https://data.sfgov.org/resource/gfpk-269f.geojson?$limit=300"    # field: name (tight Chinatown/Japantown)
 GRAFT = ["Chinatown", "Japantown"]
+RENAME = {"Financial District/Barbary Coast": "FiDi"}   # colloquial display names
 
 
 def main():
@@ -42,6 +43,7 @@ def main():
 
     merged = gpd.GeoDataFrame(pd.concat([realtor, graft], ignore_index=True),
                               geometry="geometry", crs=config.WGS)
+    merged["name"] = merged["name"].replace(RENAME)
     out = config.neigh_path()
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
