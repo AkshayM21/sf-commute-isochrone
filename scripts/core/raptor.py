@@ -126,6 +126,9 @@ def stop_arrival_profile(latest, deadlines, dep_grid):
     Returns arrivalW : int64[n_stops, len(dep_grid)] (INF where never feasible)."""
     deadlines = np.asarray(deadlines, dtype=np.int64)
     dep_grid = np.asarray(dep_grid, dtype=np.int64)
+    if _select_kernel() == "numba":
+        from . import raptor_numba
+        return raptor_numba.stop_arrival_profile(latest, deadlines, dep_grid)
     n = latest.shape[0]
     arrivalW = np.full((n, len(dep_grid)), INF, dtype=np.int64)
     nT = len(deadlines)
@@ -152,9 +155,15 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, de
     (-1 where that percentile is unreachable)."""
     n_cells = len(access_off) - 1
     pct = np.asarray(percentiles, dtype=np.float64)
-    out = np.full((n_cells, len(pct)), -1, dtype=np.int32)
     dep_grid = np.asarray(dep_grid, dtype=np.int64)
     cell_deps = np.asarray(cell_deps, dtype=np.int64)
+    if _select_kernel() == "numba":
+        from . import raptor_numba
+        return raptor_numba.assemble_departafter(
+            np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
+            np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
+            arrivalW, dep_grid, cell_deps, np.int64(max_min), pct)
+    out = np.full((n_cells, len(pct)), -1, dtype=np.int32)
     nd = len(cell_deps)
     ndg = len(dep_grid)
     for ci in range(n_cells):

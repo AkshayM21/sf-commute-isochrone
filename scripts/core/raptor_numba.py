@@ -142,6 +142,117 @@ def _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
     return latest
 
 
+INF = 1 << 60
+
+
+@njit(cache=True, nogil=True)
+def stop_arrival_profile(latest, deadlines, dep_grid):
+    """Invert latest-departure profiles -> arrival-at-workplace profiles (see raptor.py)."""
+    n = latest.shape[0]
+    nT = deadlines.shape[0]
+    ndg = dep_grid.shape[0]
+    out = np.full((n, ndg), INF, dtype=np.int64)
+    for s in range(n):
+        if latest[s, nT - 1] < dep_grid[0]:
+            continue
+        for k in range(ndg):
+            D = dep_grid[k]
+            lo = 0
+            hi = nT
+            while lo < hi:                       # searchsorted(latest[s], D, 'left')
+                mid = (lo + hi) >> 1
+                if latest[s, mid] < D:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo < nT:
+                out[s, k] = deadlines[lo]
+    return out
+
+
+@njit(cache=True, nogil=True)
+def _pct_lower(srt, p):
+    return srt[int(np.floor((srt.shape[0] - 1) * p / 100.0))]
+
+
+@njit(cache=True, nogil=True)
+def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW,
+                         dep_grid, cell_deps, max_min, pct):
+    n_cells = access_off.shape[0] - 1
+    ndg = dep_grid.shape[0]
+    nd = cell_deps.shape[0]
+    npct = pct.shape[0]
+    out = np.full((n_cells, npct), -1, dtype=np.int32)
+    ttm = np.empty(nd, dtype=np.float64)
+    for ci in range(n_cells):
+        a0 = access_off[ci]
+        a1 = access_off[ci + 1]
+        pw = purewalk[ci]
+        for di in range(nd):
+            D = cell_deps[di]
+            best = INF
+            for a in range(a0, a1):
+                board = D + access_w[a]
+                lo = 0
+                hi = ndg
+                while lo < hi:                   # searchsorted(dep_grid, board, 'left')
+                    mid = (lo + hi) >> 1
+                    if dep_grid[mid] < board:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                if lo < ndg:
+                    v = arrivalW[access_to[a], lo]
+                    if v < INF and v < best:
+                        best = v
+            tt = (best - D) / 60.0 if best < INF else 1e18
+            if pw >= 0 and pw / 60.0 < tt:
+                tt = pw / 60.0
+            if tt > max_min:
+                tt = max_min
+            ttm[di] = np.ceil(tt)
+        srt = np.sort(ttm)
+        for p in range(npct):
+            v = _pct_lower(srt, pct[p])
+            out[ci, p] = -1 if v >= max_min else np.int32(v)
+    return out
+
+
+@njit(cache=True, nogil=True)
+def assemble_arriveby(access_off, access_to, access_w, purewalk, latest, deadlines,
+                      max_min, pct):
+    n_cells = access_off.shape[0] - 1
+    nd = deadlines.shape[0]
+    npct = pct.shape[0]
+    out = np.full((n_cells, npct), -1, dtype=np.int32)
+    ttm = np.empty(nd, dtype=np.float64)
+    NEGH = -(1 << 60) // 2
+    for ci in range(n_cells):
+        a0 = access_off[ci]
+        a1 = access_off[ci + 1]
+        pw = purewalk[ci]
+        for di in range(nd):
+            T = deadlines[di]
+            home = -(1 << 60)
+            for a in range(a0, a1):
+                h = latest[access_to[a], di] - access_w[a]
+                if h > home:
+                    home = h
+            tt = (T - home) / 60.0 if home > NEGH else 1e18
+            if pw >= 0 and (T - pw) >= 0 and pw / 60.0 < tt:
+                tt = pw / 60.0
+            if tt < 0:
+                tt = 0.0
+            if tt > max_min:
+                tt = max_min
+            ttm[di] = np.ceil(tt)
+        srt = np.sort(ttm)
+        for p in range(npct):
+            v = _pct_lower(srt, pct[p])
+            out[ci, p] = -1 if v >= max_min else np.int32(v)
+    return out
+
+
 def reverse_profile(data, egress_g, egress_w, deadlines, board_slack, max_rounds):
     """latest[n_stops, n_deadlines] via the compiled kernel."""
     return _profile(

@@ -137,8 +137,14 @@ def _assemble_arriveby_window(access_off, access_to, access_w, purewalk, latest,
     then percentile over the arrival window. Returns int32[n_cells, n_pct] (-1 unreachable)."""
     n_cells = len(access_off) - 1
     nd = len(deadlines)
-    out = np.full((n_cells, len(percentiles)), -1, dtype=np.int32)
     deadlines = np.asarray(deadlines, np.int64)
+    if R._select_kernel() == "numba":
+        from . import raptor_numba
+        return raptor_numba.assemble_arriveby(
+            np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
+            np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
+            latest, deadlines, np.int64(max_min), np.asarray(percentiles, np.float64))
+    out = np.full((n_cells, len(percentiles)), -1, dtype=np.int32)
     for ci in range(n_cells):
         a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
         gids = access_to[a0:a1]
