@@ -196,6 +196,24 @@ def test_mc_realistic_invariant(engine):
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_concurrent_safe(engine):
+    """Concurrent montecarlo() from multiple threads must NOT crash the process. numba's
+    workqueue threading layer isn't threadsafe, so the parallel MC kernel is serialized by a lock
+    (core/raptor.montecarlo_commute). Regression guard for the /variance multi-user crash."""
+    import concurrent.futures as cf
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+
+    def run(seed):
+        return engine.montecarlo(z["egress_g"], z["egress_w"], pw, n_draws=8, alt_draws=0, seed=seed)
+
+    with cf.ThreadPoolExecutor(max_workers=3) as ex:
+        results = [f.result() for f in [ex.submit(run, s) for s in (1, 2, 3, 4, 5)]]
+    assert len(results) == 5
+    assert all(r["realistic"].shape[0] == len(engine.cell_ids) for r in results)
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_mc_fifo_clamp_sorted(engine):
     """A perturbed schedule keeps every pattern's per-position arrival AND departure column
     non-decreasing across trips (the FIFO cumulative-max clamp), so the per-position binary

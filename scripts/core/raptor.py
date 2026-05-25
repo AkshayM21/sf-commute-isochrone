@@ -23,10 +23,17 @@ The hot ``reverse_raptor`` is a tight loop over contiguous int arrays with no Py
 in the inner body, so it can be JIT-compiled (numba) or ported (Rust) unchanged; an optional
 numba kernel is used automatically when available (see ``_NUMBA``).
 """
+import threading
+
 import numpy as np
 
 INF = np.int64(1 << 60)
 NEG = np.int64(-(1 << 60))
+
+# numba's `workqueue` threading layer (the only one available in many envs — TBB/OMP absent) is
+# NOT threadsafe: two `parallel=True` kernels running on different Python threads abort the whole
+# process. Serialize the one parallel kernel we have (the MC) so concurrent callers are safe.
+_MC_KERNEL_LOCK = threading.Lock()
 
 
 def reverse_raptor(data, egress_g, egress_t, max_rounds=8, board_slack=60):
@@ -397,8 +404,9 @@ def montecarlo_commute(data, egress_g, egress_w, deadlines, access_off, access_t
         kernel = _select_kernel()
     if kernel == "numba":
         from . import raptor_numba
-        return raptor_numba.montecarlo(
-            np.int64(data["n_stops"]),
+        with _MC_KERNEL_LOCK:                      # serialize the non-threadsafe parallel kernel
+            return raptor_numba.montecarlo(
+                np.int64(data["n_stops"]),
             data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
             data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64), off,
             data["pat_stops"].astype(np.int64), data["pat_dep"].astype(np.int64),

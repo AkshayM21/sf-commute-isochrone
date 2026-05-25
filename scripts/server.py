@@ -19,6 +19,11 @@ persists it. Two distinct computations power the map (see CLAUDE.md/Issues.md):
 """
 import os, sys, json, copy, threading, datetime as dt
 from collections import OrderedDict
+# Cap numba's thread pool BEFORE numba is imported (via core.raptor_*). Bounds the parallel MC
+# kernel's worker threads — fewer idle threads (lower RSS) and no oversubscription on a small box.
+# Overridable via NUMBA_NUM_THREADS. (The MC kernel is also serialized below: numba's workqueue
+# threading layer is NOT threadsafe, so two concurrent parallel kernels would abort the process.)
+os.environ.setdefault("NUMBA_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd, geopandas as gpd, shapely
@@ -548,7 +553,9 @@ def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_S
 # Per-workplace service-noise Monte-Carlo (realistic + fragility + alt-lines), JVM-free, lazy +
 # cached. Keyed like the other heavy caches (coarse bucket + transfer cap), bounded LRU.
 _RAPTOR_MC_CACHE = OrderedDict()             # (coarse_key, max_rides) -> {realistic, variance}
-_RAPTOR_MC_LOCK = threading.Lock()
+_RAPTOR_MC_LOCK = threading.Lock()           # guards the cache dict
+# (The parallel MC kernel itself is serialized inside core/raptor.montecarlo_commute — numba's
+# workqueue threading layer isn't threadsafe — so concurrent /variance is safe.)
 
 
 def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):
