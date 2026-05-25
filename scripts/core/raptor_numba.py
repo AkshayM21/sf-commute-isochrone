@@ -316,6 +316,40 @@ def _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr
                     arr_out[a] = arr_out[b]
 
 
+@njit(nogil=True, cache=True)
+def _draw_profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
+                  pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
+                  egress_g, egress_w, deadlines, board_slack, max_rounds, delta0, slope):
+    """One Monte-Carlo draw: perturb the schedule then run the reverse profile. Returns
+    (latest[n_stops, nd], dep_r, arr_r) — the shared per-draw work both MC kernels read off
+    (clairvoyant uses latest; committed also needs the perturbed dep/arr to ride the fixed leg)."""
+    np_len = pat_dep.shape[0]
+    dep_r = np.empty(np_len, dtype=np.int64)
+    arr_r = np.empty(np_len, dtype=np.int64)
+    _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
+             delta0, slope, dep_r, arr_r)
+    latest = _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
+                      pat_stops, dep_r, arr_r, ras_off, ras_pat, ras_pos,
+                      tr_off, tr_to, tr_time, egress_g, egress_w, deadlines,
+                      board_slack, max_rounds)
+    return latest, dep_r, arr_r
+
+
+@njit(nogil=True, cache=True)
+def _first_ge(row, n, key):
+    """Index of the first entry in row[0:n] that is >= key (n if none). Binary search on a
+    non-decreasing row — the per-cell readout both MC kernels share."""
+    lo = 0
+    hi = n
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        if row[mid] < key:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
 @njit(parallel=True, nogil=True, cache=True)
 def montecarlo(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
                pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
@@ -329,33 +363,18 @@ def montecarlo(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_t
     R = delta0_all.shape[0]
     n_cells = access_off.shape[0] - 1
     nd = deadlines.shape[0]
-    np_len = pat_dep.shape[0]
     commute_all = np.empty((n_cells, R), dtype=np.float64)
     capf = np.float64(max_min)
     for r in prange(R):
-        dep_r = np.empty(np_len, dtype=np.int64)
-        arr_r = np.empty(np_len, dtype=np.int64)
-        _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
-                 delta0_all[r], slope_all[r], dep_r, arr_r)
-        latest = _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
-                          pat_stops, dep_r, arr_r, ras_off, ras_pat, ras_pos,
-                          tr_off, tr_to, tr_time, egress_g, egress_w, deadlines,
-                          board_slack, max_rounds)
+        latest, _dep_r, _arr_r = _draw_profile(
+            n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
+            pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
+            egress_g, egress_w, deadlines, board_slack, max_rounds, delta0_all[r], slope_all[r])
         for ci in range(n_cells):
-            a0 = access_off[ci]
-            a1 = access_off[ci + 1]
             best = INF
-            for a in range(a0, a1):
+            for a in range(access_off[ci], access_off[ci + 1]):
                 s = access_to[a]
-                board = d_med + access_w[a]
-                lo = 0
-                hi = nd
-                while lo < hi:                        # first deadline T with latest[s,T] >= board
-                    mid = (lo + hi) >> 1
-                    if latest[s, mid] < board:
-                        lo = mid + 1
-                    else:
-                        hi = mid
+                lo = _first_ge(latest[s], nd, d_med + access_w[a])   # earliest deadline you still make
                 if lo < nd:
                     tt = deadlines[lo] - d_med
                     if tt < best:
@@ -396,18 +415,13 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
     R = delta0_all.shape[0]
     n_cells = commit_home.shape[0]
     nd = deadlines.shape[0]
-    np_len = pat_dep.shape[0]
     commute_all = np.empty((n_cells, R), dtype=np.float64)
     capf = np.float64(max_min)
     for r in prange(R):
-        dep_r = np.empty(np_len, dtype=np.int64)
-        arr_r = np.empty(np_len, dtype=np.int64)
-        _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
-                 delta0_all[r], slope_all[r], dep_r, arr_r)
-        latest = _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
-                          pat_stops, dep_r, arr_r, ras_off, ras_pat, ras_pos,
-                          tr_off, tr_to, tr_time, egress_g, egress_w, deadlines,
-                          board_slack, max_rounds)
+        latest, dep_r, arr_r = _draw_profile(
+            n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
+            pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
+            egress_g, egress_w, deadlines, board_slack, max_rounds, delta0_all[r], slope_all[r])
         for ci in range(n_cells):
             k = commit_kind[ci]
             if k != 2:                                   # unreachable (0) or deterministic walk (1)
@@ -423,7 +437,8 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
             mbase = pat_mat_off[pi]
             bpos = commit_bpos[ci]
             apos = commit_apos[ci]
-            # arrive at the committed board stop, then catch the next available trip on the line
+            # arrive at the committed board stop, catch the next trip on the line. The dep column at
+            # bpos is FIFO-sorted but STRIDED by ns across trips, so search it in place (not _first_ge).
             key = commit_home[ci] + commit_walk0[ci] + board_slack
             lo = 0
             hi = nt
@@ -437,19 +452,11 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
                 commute_all[ci, r] = capf
                 continue
             arr_as = arr_r[mbase + lo * ns + apos]       # ACTUAL (late) arrival at the transfer stop
-            s = commit_as[ci]
-            lo2 = 0                                      # earliest deadline reachable from there now
-            hi2 = nd
-            while lo2 < hi2:
-                mid = (lo2 + hi2) >> 1
-                if latest[s, mid] < arr_as:
-                    lo2 = mid + 1
-                else:
-                    hi2 = mid
-            if lo2 >= nd:                                # can't reach work within the horizon
+            d = _first_ge(latest[commit_as[ci]], nd, arr_as)    # earliest deadline reachable from there now
+            if d >= nd:                                  # can't reach work within the horizon
                 commute_all[ci, r] = capf
                 continue
-            tt = (deadlines[lo2] - commit_home[ci]) / 60.0
+            tt = (deadlines[d] - commit_home[ci]) / 60.0
             if tt < 0.0:
                 tt = 0.0
             if tt > capf:

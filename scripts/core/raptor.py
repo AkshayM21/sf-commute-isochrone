@@ -392,6 +392,14 @@ def apply_delays(data, delta0, slope, off=None):
     return dep.astype(np.int32), arr.astype(np.int32)
 
 
+def perturbed_data(data, delta0, slope, off=None):
+    """A shallow copy of ``data`` with pat_dep/pat_arr replaced by one perturbed draw (the MC
+    python-reference + alt-lines build-block). Returns (pdata, dep, arr)."""
+    dep, arr = apply_delays(data, delta0, slope, off)
+    pdata = dict(data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
+    return pdata, dep, arr
+
+
 def _mc_flat_args(data):
     """The schedule CSR as the int64 tuple BOTH MC kernels take positionally: n_stops, the pattern
     arrays (incl. ``pat_trip_off`` for per-trip delay indexing), the routes-at-stop CSR, and the
@@ -479,8 +487,7 @@ def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perf
     cm = np.empty((n_cells, Rn), dtype=np.float64)
     capf = float(max_min)
     for r in range(Rn):
-        dep, arr = apply_delays(data, delta0_all[r], slope_all[r], off)
-        pdata = dict(data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
+        pdata, dep, arr = perturbed_data(data, delta0_all[r], slope_all[r], off)
         latest = reverse_profile(pdata, egress_g, egress_w, deadlines,
                                  board_slack=board_slack, max_rounds=max_rounds, kernel="python")
         for ci in range(n_cells):
@@ -514,8 +521,7 @@ def _montecarlo_python(data, egress_g, egress_w, deadlines, access_off, access_t
     Rn = delta0_all.shape[0]
     cm = np.empty((n_cells, Rn), dtype=np.float64)
     for r in range(Rn):
-        dep, arr = apply_delays(data, delta0_all[r], slope_all[r], off)
-        pdata = dict(data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
+        pdata, _dep, _arr = perturbed_data(data, delta0_all[r], slope_all[r], off)
         latest = reverse_profile(pdata, egress_g, egress_w, deadlines,
                                  board_slack=board_slack, max_rounds=max_rounds, kernel="python")
         for ci in range(n_cells):

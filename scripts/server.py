@@ -623,7 +623,8 @@ def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
     seed = int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)},{speed}"
                           .encode()).hexdigest()[:8], 16)
     mc = _RAPTOR.montecarlo(egress_g, egress_w, purewalk, perfect=perfect, seed=seed,
-                            walk_scalar=walk_scalar, max_rounds=int(max_rides))
+                            walk_scalar=walk_scalar, max_rounds=int(max_rides),
+                            tree=entry.get("tree"))   # reuse the cached arrive-by trace (no re-trace)
     realistic, variance = {}, {}
     alt_all = mc["alt"]
     for i, c in enumerate(ids):

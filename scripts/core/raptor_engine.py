@@ -195,7 +195,7 @@ class RaptorEngine:
 
     def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
                    seed=None, alt_draws=None, walk_scalar=1.0, committed=None,
-                   max_rounds=MAX_ROUNDS):
+                   max_rounds=MAX_ROUNDS, tree=None):
         """Service-noise MC for a workplace. Returns dict of cell-aligned arrays:
           realistic int32  p50 door-to-door commute over draws (clamped >= ``perfect``)
           frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number)
@@ -221,9 +221,11 @@ class RaptorEngine:
         delta0_all = rng.gamma(k, mu_trip / k, size=(nR, T))
         slope_all = rng.gamma(k, np.maximum(slope_trip, 1e-9) / k, size=(nR, T))
         if committed:
-            # the committed plan + perfect map come from the SAME unperturbed arrive-by tree
-            tree = self.journey_tree(egress_g, egress_w, purewalk, max_rounds=max_rounds,
-                                     walk_scalar=walk_scalar)
+            # the committed plan + perfect map come from the SAME unperturbed arrive-by tree; the
+            # caller can pass an already-built one (server reuses its cached tree -> no re-trace)
+            if tree is None:
+                tree = self.journey_tree(egress_g, egress_w, purewalk, max_rounds=max_rounds,
+                                         walk_scalar=walk_scalar)
             legs = tree.committed_first_legs()
             if perfect is None:
                 perfect, _ = tree.commute_and_dominant()
@@ -264,8 +266,7 @@ class RaptorEngine:
         votes = [None] * n
         K = min(K, delta0_all.shape[0])
         for kk in range(K):
-            dep, arr = R.apply_delays(self.data, delta0_all[kk], slope_all[kk], off)
-            pdata = dict(self.data); pdata["pat_dep"] = dep; pdata["pat_arr"] = arr
+            pdata, _dep, _arr = R.perturbed_data(self.data, delta0_all[kk], slope_all[kk], off)
             par = R.reverse_raptor_traced(pdata, egress_g, target - egress_w, egress_w,
                                           max_rounds=max_rounds, board_slack=BOARD_SLACK)
             tree = raptor_journey.JourneyTree(pdata, par, self.access_off, self.access_to,
