@@ -26,19 +26,35 @@ from shapely.geometry import Point
 from flask import Flask, request, jsonify
 from flask_limiter import Limiter
 
-# Cap the JVM heap BEFORE r5py starts the JVM (imported via core.network below). r5py
-# defaults -Xmx to 80% of TOTAL system RAM — fine locally, but on a small hosting box that
-# over-reserves and risks OOM. Set R5_MAX_MEMORY (e.g. "1200M" or "70%") to cap it; unset
-# keeps r5py's default. r5py reads this from its --max-memory option.
-_r5_mem = os.environ.get("R5_MAX_MEMORY")
-if _r5_mem and "--max-memory" not in sys.argv and "-m" not in sys.argv:
-    sys.argv += ["--max-memory", _r5_mem]
-
-from core import config, feeds, grid, network, geo
-from core.network import MAX_INT32, DEFAULT_MAX_RIDES
-import com.conveyal.r5            # JVM already started by core.network's r5py import
-
+from core import config, feeds, grid, geo        # JVM-free core (no r5py)
 config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the geocoder
+
+# ---- Flags (parsed EARLY: they decide whether the in-process JVM starts at all) --------
+# USE_RAPTOR=1 swaps the grid coloring to the self-built reverse range-RAPTOR. RAPTOR_SEMANTIC
+# 'departafter' (R5-validated map + R5 hover) or 'arriveby' (arrive-by-09:00 product + RAPTOR
+# hover/color-by-line). RAPTOR_MC=1 adds the service-noise realistic+fragility overlay (/variance).
+# USE_WALK_GRAPH=1 replaces R5's last runtime job (the walk matrix) with the JVM-free hill-aware
+# walk router. Default: all OFF -> the live app is byte-identical (R5 path).
+USE_RAPTOR = os.environ.get("USE_RAPTOR", "").lower() in ("1", "true", "yes", "on")
+RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "arriveby").lower()
+RAPTOR_MC = os.environ.get("RAPTOR_MC", "1").lower() in ("1", "true", "yes", "on")
+USE_WALK_GRAPH = os.environ.get("USE_WALK_GRAPH", "").lower() in ("1", "true", "yes", "on")
+# FULLY JVM-free when the map, breakdown, AND walk all come from RAPTOR arrive-by + the walk graph.
+# Otherwise R5 is still needed (fast approx / depart-after / R5 hover+color-by-line / R5 walk).
+_NEED_R5 = not (USE_RAPTOR and USE_WALK_GRAPH and RAPTOR_SEMANTIC == "arriveby")
+
+network = None
+MAX_INT32 = (2 ** 31) - 1                         # R5's "unreachable" sentinel (JVM-free fallback)
+DEFAULT_MAX_RIDES = 8                             # R5's ride cap (rides = transfers + 1)
+if _NEED_R5:
+    # Cap the JVM heap BEFORE r5py starts it (small hosting box; over-reserve risks OOM). r5py
+    # reads --max-memory; unset keeps its default (80% of RAM). Local rule: do NOT set it.
+    _r5_mem = os.environ.get("R5_MAX_MEMORY")
+    if _r5_mem and "--max-memory" not in sys.argv and "-m" not in sys.argv:
+        sys.argv += ["--max-memory", _r5_mem]
+    from core import network                      # imports r5py -> starts the in-process JVM
+    from core.network import MAX_INT32, DEFAULT_MAX_RIDES
+    import com.conveyal.r5
 
 HERE = Path(__file__).resolve().parent
 GRID_M = int(os.environ.get("GRID_M", str(config.GRID_M)))
@@ -52,7 +68,8 @@ _SVC_DATE = feeds.pick_service_date(GTFS)
 DEP = config.departure(_SVC_DATE)
 print(f"[boot] modeling weekday {_SVC_DATE} @ {DEP:%-I:%M%p}".lower())
 
-print(f"[boot] building grid @ {GRID_M}m + loading R5 network (once)...")
+print(f"[boot] building grid @ {GRID_M}m"
+      + (" + loading R5 network (once)..." if _NEED_R5 else " (JVM-free: RAPTOR + walk graph)..."))
 NEIGH = grid.load_neighborhoods()
 GRID = grid.build_grid(NEIGH, GRID_M)[["id", "geometry"]]
 ORIGIN_LL = {r.id: (r.geometry.y, r.geometry.x) for r in GRID.itertuples()}
@@ -65,23 +82,26 @@ CELLS_GEOJSON = json.loads(_cells.to_json())
 for f in CELLS_GEOJSON["features"]:
     f["properties"] = {"id": f["properties"]["id"], "n": f["properties"].get("name")}
 
-NET = network.build_network(GTFS)
-
-# Pre-snap the grid to the street network ONCE so every /compute can route a single tree
-# FROM the workplace TO every grid cell (the fast reverse approximation) without re-snapping
-# thousands of points per request.
-SNAPPED_GRID = GRID.copy()
-SNAPPED_GRID["geometry"] = NET.snap_to_network(GRID.geometry)
-SNAPPED_GRID = SNAPPED_GRID[SNAPPED_GRID.geometry != shapely.Point()].reset_index(drop=True)
-print(f"[boot] ready: {len(GRID)} origins ({len(SNAPPED_GRID)} on-network). "
-      f"Open http://127.0.0.1:8000")
-
-# Pre-extract origin ids/geometries once (used by the threaded exact router below).
-_EXACT_IDS = list(SNAPPED_GRID.id)
-_EXACT_GEOMS = list(SNAPPED_GRID.geometry)
-# The TransitLayer materialises a recorded path's transit legs (route names, stops). It's
-# read-only and shared across threads like the rest of NET.
-_TRANSIT_LAYER = NET._transport_network.transitLayer
+# R5 network + the snapped grid are ONLY built when R5 is needed (see _NEED_R5). In the fully
+# JVM-free mode (RAPTOR arrive-by + walk graph) we never start the JVM: the map, hover, and walk
+# all come from the engine + walk router; cell coordinates come from ORIGIN_LL (JVM-free grid).
+if _NEED_R5:
+    NET = network.build_network(GTFS)
+    # Pre-snap the grid to the street network ONCE so every /compute can route a single tree
+    # FROM the workplace TO every grid cell (the fast reverse approximation) without re-snapping.
+    SNAPPED_GRID = GRID.copy()
+    SNAPPED_GRID["geometry"] = NET.snap_to_network(GRID.geometry)
+    SNAPPED_GRID = SNAPPED_GRID[SNAPPED_GRID.geometry != shapely.Point()].reset_index(drop=True)
+    _EXACT_IDS = list(SNAPPED_GRID.id)
+    _EXACT_GEOMS = list(SNAPPED_GRID.geometry)
+    # The TransitLayer materialises a recorded path's transit legs (route names, stops).
+    _TRANSIT_LAYER = NET._transport_network.transitLayer
+    print(f"[boot] ready: {len(GRID)} origins ({len(SNAPPED_GRID)} on-network). "
+          f"Open http://127.0.0.1:8000")
+else:
+    NET = SNAPPED_GRID = _TRANSIT_LAYER = None
+    _EXACT_IDS, _EXACT_GEOMS = [], []
+    print(f"[boot] ready: {len(GRID)} origins (JVM-free). Open http://127.0.0.1:8000")
 
 # Thread pool for the EXACT recompute. R5 routing is read-only against the shared warm
 # network and each task clones its own Java RegionalTask, so per-origin routing parallelises
@@ -93,25 +113,10 @@ _N_PHYS = os.cpu_count() or 8
 EXACT_THREADS = int(os.environ.get("EXACT_THREADS", str(max(2, _N_PHYS - 2))))
 _EXACT_POOL = ThreadPoolExecutor(max_workers=EXACT_THREADS, thread_name_prefix="r5-exact")
 
-# ---- RAPTOR engine (flag-gated grid travel-times) -------------------------------------
-# USE_RAPTOR=1 swaps the grid coloring from the R5 reverse-approx + per-cell exact refine to
-# the self-built reverse range-RAPTOR (near-exact vs R5: MAE ~0.75, max ~7; ~0.05-0.14s/req,
-# no heavy per-visitor R5 pass). R5 stays in-process ONLY for the on-demand hover breakdown
-# (/itinerary) + color-by-line (/attribution) — Phase 2 moves those to RAPTOR too. Default
-# OFF: the live app is byte-identical until the flag is flipped. RAPTOR_SEMANTIC selects
-# 'departafter' (matches today's depart-8:35 model + the R5 hover, so map~=hover within RAPTOR
-# error) or 'arriveby' (the arrive-by-09:00 product semantic, surfaced for review).
-USE_RAPTOR = os.environ.get("USE_RAPTOR", "").lower() in ("1", "true", "yes", "on")
-RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "arriveby").lower()
-# RAPTOR_MC=1 (default ON under arrive-by): the service-noise Monte-Carlo "realistic + fragility
-# + alt-lines" layer, served by /variance (lazy, cached, ~1s once per workplace, off the hover
-# path). The perfect-timing map (/compute) is unchanged; realistic is a refinement overlay.
-RAPTOR_MC = os.environ.get("RAPTOR_MC", "1").lower() in ("1", "true", "yes", "on")
-# USE_WALK_GRAPH=1: replace R5's last runtime job (the per-workplace walk matrix) with the
-# JVM-free hill-aware pedestrian router (core/walk.py + data/walk_graph.npz) and load the
-# walk-baked access table. Map walk-times then come entirely from the walk graph (no r5py on the
-# RAPTOR path). Requires the walk graph + access_walk_*.npz to be baked. Default OFF.
-USE_WALK_GRAPH = os.environ.get("USE_WALK_GRAPH", "").lower() in ("1", "true", "yes", "on")
+# ---- RAPTOR engine (flag-gated grid travel-times; flags parsed up top) ----------------
+# When USE_WALK_GRAPH the walk-baked (slope-aware) access table + the JVM-free walk router serve
+# the whole map path; otherwise R5 stays in-process for the walk matrix (and, under departafter,
+# the R5 hover/color-by-line).
 _RAPTOR = None
 _RAPTOR_STOPS = None             # GeoDataFrame of stop coords keyed by gid (egress destinations)
 _WG = None                       # WalkGraph (JVM-free) when USE_WALK_GRAPH
@@ -155,7 +160,10 @@ if USE_RAPTOR:
                   f"(JVM-free walk: {_acc_path.name}) — R5 walk not used")
         else:
             print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); R5 kept for hover only")
-    except Exception as _e:                     # missing access table etc. -> degrade to OFF
+    except Exception as _e:                     # missing access table etc.
+        if not _NEED_R5:
+            # JVM-free mode: R5 was never imported, so there is NO fallback — fail loudly.
+            raise RuntimeError(f"USE_WALK_GRAPH engine init failed and R5 is not loaded: {_e}")
         print(f"[boot] USE_RAPTOR requested but engine init failed ({_e}); using R5 path")
         USE_RAPTOR = False
         USE_WALK_GRAPH = False
