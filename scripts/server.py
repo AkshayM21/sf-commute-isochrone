@@ -102,7 +102,7 @@ _EXACT_POOL = ThreadPoolExecutor(max_workers=EXACT_THREADS, thread_name_prefix="
 # 'departafter' (matches today's depart-8:35 model + the R5 hover, so map~=hover within RAPTOR
 # error) or 'arriveby' (the arrive-by-09:00 product semantic, surfaced for review).
 USE_RAPTOR = os.environ.get("USE_RAPTOR", "").lower() in ("1", "true", "yes", "on")
-RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "departafter").lower()
+RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "arriveby").lower()
 _RAPTOR = None
 _RAPTOR_STOPS = None             # GeoDataFrame of stop coords keyed by gid (egress destinations)
 _RAPTOR_EGRESS_CACHE = OrderedDict()   # coarse_key -> (egress_g, egress_w, purewalk)
