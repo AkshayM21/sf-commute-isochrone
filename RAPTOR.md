@@ -136,9 +136,14 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   unperturbed arrive-by tree — no foreknowledge of delays). Per draw it boards the **next available
   trip on that committed line** (a late earlier train you can also catch), rides to the committed
   alight, then re-optimizes the **tail** from the *actual* (late) arrival via the perturbed reverse
-  profile. So a late first leg that blows a transfer **eats a real headway**. Sits **+2.94 above**
-  R5's schedule-perfect p50 (agg 44.0 over 5 workplaces), much more on tight-transfer cells
-  (downtown `frag90` 20 vs westportal 18). `perfect ≤ committed` holds by construction (asserted).
+  profile. So a late first leg that blows a transfer **eats a real headway**. It tracks R5's
+  depart-window p50 closely (agg **41.1**, bias ≈ **0** over 5 workplaces — committed = best
+  departure + small service delay, which is what R5's window median already measures), with a modest
+  fragility tail (`frag90` 3–6 min; SF transit is frequent). `perfect ≤ committed` holds (clamped +
+  asserted). **GOTCHA:** the boarding key is `commit_home + walk0` with NO extra board_slack —
+  `commit_home` already places you at the stop exactly at your committed trip's departure (the
+  perfect-timing arrive-by assumption), so adding slack would skip your own trip to the next one and
+  eat a full headway on every cell (the board-slack bug, see Issues 2026-05-25).
 - **Hot path:** draws run in `prange`, each thread holding ONE perturbed schedule + ONE latest
   profile (`_draw_profile`), **streaming** each draw's per-cell commute into `commute_all[n_cells, R]`
   (never R×n_stops). ~**0.1–0.2 s** for 24 draws (full grid). Per-cell outputs: `realistic = p50`
@@ -157,9 +162,10 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
 
 **Validation** (`scripts/raptor_validate_mc.py`, `tests/test_raptor.py::test_mc_*`): committed vs R5's
 *schedule-perfect* p50 (NOT ground truth for a delayed commute — committed should sit ABOVE it).
-Aggregate over 5 workplaces **44.0**, bias vs R5 **+2.94**; **0** `perfect ≤ committed` violations,
-FIFO-clamp sortedness, and numba==python (the committed kernel agrees with the pure-python reference
-within ≤2 min at the served p50, the same transfer-relaxation tolerance as the depart-after kernel).
+Aggregate over 5 workplaces **41.1**, bias vs R5 **≈0** (per-workplace −1.1…+2.3); **0** `perfect ≤
+committed` violations, the zero-perturbation guard (committed == perfect ± grid rounding, the
+board-slack regression test), FIFO-clamp sortedness, and numba==python (the committed kernel agrees
+with the pure-python reference within ≤2 min at the served p50, the depart-after relaxation tolerance).
 
 > **Caveat:** the committed model fixes only the FIRST leg; the **tail** still re-optimizes
 > clairvoyantly (you have real-time info en route, e.g. you check the app and grab the next local). So

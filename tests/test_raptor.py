@@ -164,10 +164,11 @@ def test_color_by_line_deterministic(engine):
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_mc_committed_invariant(engine):
     """Committed-plan MC (the ``realistic`` overlay): fixes the first leg from the published plan
-    and re-optimizes the tail from the actual late arrival. It must (a) never beat perfect-timing,
-    and (b) read meaningfully higher than R5's schedule-perfect p50 with a real bad-day fragility
-    tail. R5 p50 has NO delays, so committed sitting well above it is correct, not an error (no true
-    delayed-commute ground truth exists)."""
+    and re-optimizes the tail from the actual late arrival. It must (a) never beat perfect-timing
+    (the hard invariant — guards the board-slack regression where committed skipped its own trip and
+    ate a headway), (b) track R5's window p50 closely (committed = best departure + small service
+    delay ≈ R5's depart-window median, so |bias| is small either sign), and (c) show a real, modest
+    fragility tail. R5 p50 is NOT ground truth for a delayed commute, hence a band, not an error."""
     pos = {c: i for i, c in enumerate(engine.cell_ids)}
     all_signed, viol, fragmax = [], 0, 0
     for f in _oracles():
@@ -192,8 +193,40 @@ def test_mc_committed_invariant(engine):
     print(f"\n[mc committed] vs R5 p50 bias={signed.mean():+.2f} perfect>realistic={viol} "
           f"fragmax={fragmax}")
     assert viol == 0, f"committed realistic beat perfect-timing in {viol} cells"
-    assert 0.0 < signed.mean() <= 8.0, f"committed bias {signed.mean():+.2f} outside (0, 8]"
+    assert -3.0 <= signed.mean() <= 4.0, f"committed bias {signed.mean():+.2f} outside [-3, 4]"
     assert fragmax > 0, "committed MC produced no fragility tail"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_committed_zero_perturbation_equals_perfect(engine):
+    """With NO delays, the committed forward-sim must reproduce the perfect arrive-by commute on
+    every transit cell (you catch your own planned trip and ride it). Only the 180s deadline-grid
+    rounding may lift it (<= one step). Regression guard for the board-slack bug where the boarding
+    key was commit_home+walk0+board_slack -> it skipped the committed trip and ate a full headway
+    (committed sat ~+16 min above perfect at zero perturbation)."""
+    from core import raptor as R
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"], np.int32)
+    ew, _, _ = engine._scale_walk(z["egress_w"], pw, 1.0)
+    tree = engine.journey_tree(eg, z["egress_w"], pw)
+    legs = tree.committed_first_legs()
+    perfect, _ = tree.commute_and_dominant(); perfect = np.asarray(perfect, np.int32)
+    Tn = int(R.pat_trip_off(engine.data)[-1])
+    zero = np.zeros((2, Tn))
+    cm = R.montecarlo_commute_committed(engine.data, eg, ew, engine.Tgrid, legs, perfect,
+                                        engine.max_min, zero, zero)
+    committed = np.ceil(cm[:, 0]).astype(np.int32)
+    transit = (perfect >= 0) & (np.asarray(legs["commit_kind"]) == 2)
+    diff = committed[transit] - perfect[transit]
+    print(f"\n[mc committed zero-pert] committed-perfect mean={diff.mean():+.2f} "
+          f"min={int(diff.min())} max={int(diff.max())}")
+    # With no delays committed ≈ perfect; the only spread is the 180s deadline grid + the
+    # traced-tree-vs-sweep relaxation diff (both small, two-sided; production clamps any negative to
+    # perfect). The bug made this +15.85 one-sided — so the guard is "no systematic inflation".
+    assert abs(diff.mean()) <= 1.5, \
+        f"committed {diff.mean():+.2f} vs perfect at zero perturbation (board-slack headway regression?)"
+    assert diff.max() <= 4, f"committed +{int(diff.max())} over perfect at zero perturbation (> one grid step)"
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")

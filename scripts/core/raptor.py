@@ -472,7 +472,7 @@ def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perf
                 continue
             pi = int(pic[ci]); ns = int(pat_nstops[pi]); nt = int(pat_ntrips[pi])
             mb = int(pat_mat_off[pi]); bp = int(bpos[ci]); ap = int(apos[ci])
-            key = int(home[ci]) + int(walk0[ci]) + board_slack
+            key = int(home[ci]) + int(walk0[ci])      # = your committed trip's departure (no extra slack)
             depcol = dep[mb + bp: mb + nt * ns: ns]
             lo = int(np.searchsorted(depcol, key, side="left"))
             if lo >= nt:

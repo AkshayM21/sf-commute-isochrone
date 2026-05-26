@@ -395,9 +395,11 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
             mbase = pat_mat_off[pi]
             bpos = commit_bpos[ci]
             apos = commit_apos[ci]
-            # arrive at the committed board stop, catch the next trip on the line. The dep column at
-            # bpos is FIFO-sorted but STRIDED by ns across trips, so search it in place (not _first_ge).
-            key = commit_home[ci] + commit_walk0[ci] + board_slack
+            # You arrive at the committed board stop at commit_home + walk0, which is EXACTLY your
+            # committed trip's departure (the perfect-timing plan), so board the first trip departing
+            # at/after that (no extra slack — adding board_slack would skip your own planned trip).
+            # The dep column at bpos is FIFO-sorted but STRIDED by ns across trips -> search in place.
+            key = commit_home[ci] + commit_walk0[ci]
             lo = 0
             hi = nt
             while lo < hi:                               # first trip with perturbed dep >= key

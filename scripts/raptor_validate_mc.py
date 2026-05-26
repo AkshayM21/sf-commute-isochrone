@@ -85,10 +85,11 @@ def main():
     bias = float(signed.mean())
     comm_mean = comm_sum / ncell
     print(f"\n{'AGGREGATE':<12}{ncell:>5}{comm_mean:>8.1f}{bias:>+8.2f}{tot_viol:>8}")
-    # No true R5 ground truth for a DELAYED commute (R5 here is schedule-perfect), so this bounds
-    # committed's drift from schedule-perfect, not error: it should sit ABOVE R5 p50.
-    print(f"\nSanity: bias>0 (above schedule-perfect)  perfect<=committed violations=0")
-    ok = (bias > 0.0 and tot_viol == 0)
+    # Committed = best (arrive-by) departure + small service delay, so it tracks R5's depart-window
+    # p50 closely (|bias| small, either sign — R5 p50 already includes typical wait). The hard
+    # invariant is perfect <= committed (0 violations); R5 p50 is a ballpark, not ground truth.
+    print(f"\nSanity: |bias vs R5 p50| <= 3  perfect<=committed violations=0")
+    ok = (abs(bias) <= 3.0 and tot_viol == 0)
     print("RESULT:", "PASS" if ok else "REVIEW",
           f"(committed={comm_mean:.2f}, biasR5={bias:+.2f}, perfect>committed={tot_viol})")
 
