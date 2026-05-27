@@ -460,6 +460,17 @@ def _client_ip():
 limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
 
 
+@app.after_request
+def _no_cache(resp):
+    """Force fresh fetches on every page navigation and API call. Without an explicit header
+    browsers apply heuristic caching (and back/forward bf-cache) to GETs, which silently hides
+    server-side fixes ("still seeing the old result after a restart") AND can serve a stale
+    /itinerary response after a workplace/speed change. The bundle is ~120 KB inlined and the API
+    responses are small, so the latency cost is dwarfed by the safety benefit."""
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 # ---- RAPTOR grid travel-times (flag-gated) --------------------------------------------
 def _raptor_egress_purewalk(lat, lon):
     """Per-workplace inputs for the RAPTOR engine, via ONE-origin R5 WALK matrices:

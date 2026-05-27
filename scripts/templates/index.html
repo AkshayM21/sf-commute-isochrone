@@ -356,8 +356,12 @@ async function setWorkplace(lat,lon,label,opts){
   DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};REAL={};VAR={};
   closeOpenInfo();                                   // workplace changed -> any open tooltip is stale
   if(!CFG.raptor)document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
-  if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
-  map.setView([lat,lon],12.6);
+  // Pan/zoom to the workplace ONLY when it's a NEW one. On atomic param tweaks (speed/transfers)
+  // the workplace is unchanged, so don't yank the map back from wherever the user has scrolled.
+  if(!atomic){
+    if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
+    map.setView([lat,lon],12.6);
+  }
   try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
   busy(atomic?"updating estimates…":"estimating…");
   try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}${speedParam()}`);const d=await r.json();
@@ -417,7 +421,7 @@ async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping
       if(r.status===503){toast("Server busy, try the line map again in a moment.");
         document.getElementById("legtitle").textContent="line map unavailable yet";return;}
     }
-    if(r.ok){const a=await r.json();if(myGen!==GEN)return;ATTR=a;buildLineColors();redraw();}
+    if(r.ok){const a=await r.json();if(myGen!==GEN)return;ATTR=a;buildLineColors();redraw();refreshOpenInfo();}   // open tooltip's leg-chip colors come from LINECOLOR -> refresh after attribution arrives
     else{document.getElementById("legtitle").textContent="line map unavailable yet";}
   }catch(e){}finally{if(myGen===GEN)busy(false);}}
 // ---- service-noise overlay: realistic (MC p50) + fragility + alt-lines ------------------
