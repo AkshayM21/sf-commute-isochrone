@@ -33,7 +33,7 @@
   .leaflet-popup-content-wrapper{background:#11141a;color:var(--ink);border:1px solid var(--line);border-radius:10px}
   .leaflet-popup-tip{background:#11141a}
   .bd{width:238px;padding:11px 13px;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
-  .bd .h{font-size:13px;margin-bottom:8px}
+  .bd .h{font-size:13px;margin-bottom:3px}
   .bd .legs{display:flex;flex-wrap:wrap;gap:5px 5px;align-items:center}
   .bd .leg{padding:1px 7px;border-radius:7px;white-space:nowrap;font-size:11.5px;font-weight:600}
   .bd .walk{background:#262b33;color:#b6bdc8;font-weight:500}
@@ -229,6 +229,8 @@ function fragChip(frag,stuck){
   return `<span style="font-size:10px;padding:1px 6px;border-radius:6px;background:${c}22;color:${c};border:1px solid ${c}55;white-space:nowrap">${label}</span>`;}
 function bdHTML(d){
   if(d.error)return `<div class="bd"><span style="color:#9aa3af">No transit route within ~75 min.</span></div>`;
+  // legs: build chip list, then pair each subsequent chip with its leading arrow as a nowrap
+  // unit so the arrow can't orphan to the start of the next line when the row wraps.
   const chips=[];
   d.legs.forEach(g=>{
     if(!g.line){chips.push(`<span class="leg walk">walk ${g.min}m</span>`);return;}
@@ -236,22 +238,25 @@ function bdHTML(d){
     const c=lineColor(g.line);
     chips.push(`<span class="leg" style="background:${c}26;color:${c};border:1px solid ${c}55">${g.line} · ${g.min}m</span>`);
   });
-  // Headline matches the metric toggle (Realistic ↔ Best-case); secondary inline shows the other.
-  // bad-day +Y + the fragility chip get their own line so the chip can't wrap mid-label.
+  const legsHTML = chips.map((c,i)=> i===0 ? c :
+    `<span style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap"><span class="arr">▸</span>${c}</span>`
+  ).join("");
+  // One line per group, consistent across cells:
+  //   headBig   the metric-matched headline number (typical OR best-case)
+  //   ctxLine   "N transfers · {other-metric Xm}" — context, never the prominent number
+  //   vline     "bad-day +Y · {chip}" — only when there's signal (skipped for fully robust cells)
   const real=d.real, frag=d.var?d.var.frag:0, stuck=d.var?d.var.stuck:0;
   const showR=(metric=="r" && real!=null);
   const head=showR?real:d.total, headLab=showR?"typical":"best-case";
   const otherVal=showR?d.total:real, otherLab=showR?"best-case":"typical", otherTilde=showR?"":"~";
-  const subhead=`<div style="margin:-4px 0 6px;font-size:12px">`+
-    `<b style="font-size:14px;color:#e8eaed">${showR?"~":""}${head} min</b>`+
-    ` <span style="color:#9aa3af">${headLab}</span>`+
-    ` · ${d.xfers} transfer${d.xfers==1?"":"s"}`+
-    (otherVal!=null && otherVal!=head
-      ? ` <span style="color:#6b7280">· ${otherLab} ${otherTilde}${otherVal}m</span>` : ``)+
-    `</div>`;
+  const headBig=`<div style="margin:0 0 4px"><b style="font-size:14px">${showR?"~":""}${head} min</b>`+
+    ` <span style="color:#9aa3af;font-size:12px">${headLab}</span></div>`;
+  const otherTxt=(otherVal!=null && otherVal!=head) ? ` · ${otherLab} ${otherTilde}${otherVal}m` : ``;
+  const ctxLine=`<div style="margin:0 0 6px;color:#9aa3af;font-size:11.5px">`+
+    `${d.xfers} transfer${d.xfers==1?"":"s"}${otherTxt}</div>`;
   let vline="";
-  if(real!=null){
-    vline=`<div style="margin:-2px 0 8px;color:#9aa3af;font-size:11.5px;white-space:nowrap">`+
+  if(real!=null && (frag>0 || (stuck||0)>=0.05)){
+    vline=`<div style="margin:0 0 8px;color:#9aa3af;font-size:11.5px;white-space:nowrap">`+
       (frag>0?`bad-day <b style="color:#e8eaed">+${frag}</b> · `:``)+
       fragChip(frag,stuck)+`</div>`;
   }
@@ -263,8 +268,8 @@ function bdHTML(d){
     altline=`<div style="margin-top:8px;font-size:11px;color:#9aa3af">also serves: ${ls}</div>`;
   }
   return `<div class="bd"><div class="h"><b>${d.name||""}</b></div>`+
-    subhead+vline+
-    `<div class="legs">${chips.join('<span class="arr">▸</span>')}</div>`+
+    headBig+ctxLine+vline+
+    `<div class="legs">${legsHTML}</div>`+
     altline+
     `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
     `<div class="foot">best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait</div></div>`;}
