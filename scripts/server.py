@@ -460,14 +460,20 @@ def _client_ip():
 limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
 
 
+# Dynamic-data endpoints whose response depends on workplace/speed/transfer params. Geocode and
+# autocomplete are pure functions of the query string -> let the browser cache them. The page
+# bundle (GET /) is workplace-agnostic and shipped once at boot -> stays cacheable + bfcache-
+# eligible so back-navigation doesn't refetch the network and rerun /compute + /variance.
+_NO_STORE_PATHS = frozenset({"/compute", "/compute_exact", "/itinerary", "/attribution", "/variance"})
+
+
 @app.after_request
 def _no_cache(resp):
-    """Force fresh fetches on every page navigation and API call. Without an explicit header
-    browsers apply heuristic caching (and back/forward bf-cache) to GETs, which silently hides
-    server-side fixes ("still seeing the old result after a restart") AND can serve a stale
-    /itinerary response after a workplace/speed change. The bundle is ~120 KB inlined and the API
-    responses are small, so the latency cost is dwarfed by the safety benefit."""
-    resp.headers["Cache-Control"] = "no-store"
+    """Disable browser/bf-cache for the dynamic API endpoints only. Without no-store, a heuristic
+    cache hit on /itinerary or /variance (URL identical across runs) would silently hide a
+    server-side fix and could serve a stale response after a workplace/speed change."""
+    if request.path in _NO_STORE_PATHS:
+        resp.headers["Cache-Control"] = "no-store"
     return resp
 
 

@@ -307,21 +307,27 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
 // next hover refetches with the new params. refreshOpenInfo re-renders an open card in place from
 // the already-cached breakdown — for changes that only affect how the data is DISPLAYED (metric,
 // cmode toggle, /variance arriving), where the underlying journey is unchanged.
+// Leaflet's getTooltip/getPopup return the bound object even when CLOSED — gating on isOpen()
+// matters because tooltips/popups are bound on first hover/click and stay bound for the life of
+// the cell, so a "getTooltip()" check would visit every cell ever hovered (thousands).
 function closeOpenInfo(){
   bdToken++; clearTimeout(bdTimer);
   if(typeof layer==="undefined"||!layer)return;
-  layer.eachLayer(l=>{if(l.getTooltip&&l.getTooltip())l.closeTooltip();
-    if(l.getPopup&&l.getPopup())l.closePopup();});
+  layer.eachLayer(l=>{if(l.isTooltipOpen&&l.isTooltipOpen())l.closeTooltip();
+    if(l.isPopupOpen&&l.isPopupOpen())l.closePopup();});
 }
 function refreshOpenInfo(){
   if(typeof layer==="undefined"||!layer)return;
-  layer.eachLayer(l=>{const f=l.feature;if(!f)return;const id=f.properties.id;
+  layer.eachLayer(l=>{
+    const tipOpen=l.isTooltipOpen&&l.isTooltipOpen(), popOpen=l.isPopupOpen&&l.isPopupOpen();
+    if(!tipOpen && !popOpen)return;
+    const f=l.feature;if(!f)return;const id=f.properties.id;
     const cached=BDCACHE[id];if(!cached)return;
-    const open=(l.getTooltip&&l.getTooltip())||(l.getPopup&&l.getPopup());if(!open)return;
     const d=Object.assign({},cached,{name:f.properties.n,real:REAL[id],var:VAR[id]});
     const html=bdHTML(d);
-    if(l.getTooltip&&l.getTooltip())l.setTooltipContent(html);
-    if(l.getPopup&&l.getPopup())l.setPopupContent(html);});
+    if(tipOpen)l.setTooltipContent(html);
+    if(popOpen)l.setPopupContent(html);
+  });
 }
 // transit-line overlays (off by default; non-interactive so cells stay hoverable)
 const LINESTYLE={bus:{color:MODECOLOR.bus,weight:1.3,opacity:.5},metro:{color:MODECOLOR.metro,weight:2.4,opacity:.85},
@@ -354,6 +360,7 @@ async function setWorkplace(lat,lon,label,opts){
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   document.getElementById("prompt").style.display="none";
   DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};REAL={};VAR={};
+  if(!atomic)TT={};                                  // new workplace -> drop OLD times so a hover before /compute lands doesn't show last workplace's commute under the new name
   closeOpenInfo();                                   // workplace changed -> any open tooltip is stale
   if(!CFG.raptor)document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
   // Pan/zoom to the workplace ONLY when it's a NEW one. On atomic param tweaks (speed/transfers)

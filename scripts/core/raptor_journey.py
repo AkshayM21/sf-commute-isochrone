@@ -168,16 +168,24 @@ class JourneyTree:
                 continue                                 # unreachable (kind stays 0)
             legs_raw, latest_home = tr
             out["commit_home"][ci] = latest_home
-            walk0, ride = 0, None
+            # Find the first SIGNIFICANT ride (mirroring _clock's _TINY_HOP_MIN fold), so the plan
+            # the MC scores is the plan the breakdown DISPLAYS. A sub-2-min hop is shown as walk in
+            # the hover; treating it as transit here would attach delay-variance to a chip the user
+            # can't see — and on cells whose displayed first ride is a LATER, real leg, it would
+            # attribute fragility to the wrong line entirely.
+            ride = None
             for leg in legs_raw:
-                if leg[0] == "ride":
+                if leg[0] == "ride" and (leg[3] - leg[2]) >= _TINY_HOP_MIN * 60:
                     ride = leg; break
-                walk0 += leg[1]                          # access / leading footpath seconds before the first ride
-            if ride is None:                             # walk-only / no-transit -> deterministic, no service noise
+            if ride is None:                             # walk-only (incl. all-tiny-rides) -> deterministic
                 out["commit_kind"][ci] = 1
                 continue
-            _, pi, _dep, _arr, bpos, apos, alight_stop = ride
-            out["commit_kind"][ci] = 2; out["commit_pi"][ci] = pi; out["commit_walk0"][ci] = walk0
+            _, pi, dep_sec, _arr, bpos, apos, alight_stop = ride
+            # walk0 = total seconds from home to the board stop on the unperturbed plan, which is
+            # exactly dep_sec - latest_home (the perfect plan boards with 0 slack). Naturally
+            # absorbs leading walks AND any tiny rides folded by the loop above — no manual sum.
+            out["commit_kind"][ci] = 2; out["commit_pi"][ci] = pi
+            out["commit_walk0"][ci] = int(dep_sec) - int(latest_home)
             out["commit_bpos"][ci] = bpos; out["commit_apos"][ci] = apos; out["commit_as"][ci] = alight_stop
         return out
 
