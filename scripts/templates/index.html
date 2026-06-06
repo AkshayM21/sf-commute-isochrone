@@ -353,23 +353,30 @@ function aggregate(){const acc={};CELLS.features.forEach(f=>{const v=val(f.prope
   for(const n in acc){acc[n].sort((a,b)=>a-b);NB[n]=acc[n][Math.floor(acc[n].length/2)];}}
 function busy(t){const b=document.getElementById("busy");if(t){b.textContent=t;b.style.display="block";}else b.style.display="none";}
 async function setWorkplace(lat,lon,label,opts){
-  // opts.atomic=true (set by speed/maxrides handlers in RAPTOR mode): wait for /variance and paint
-  // ONCE so a param tweak doesn't flash perfect (more green) -> realistic (less green). On the
-  // initial address-set we want the progressive paint (something appears as soon as /compute lands).
-  opts=opts||{}; const atomic=!!opts.atomic;
+  // Three independent opts (default behaviour = "fresh address"):
+  //   atomic   true  -> wait for /variance then paint once (no expand→contract on param tweaks).
+  //                    RAPTOR-only; non-raptor mode lacks the overlay, so the param handlers leave
+  //                    this off and the legacy R5 refine() handles the second paint.
+  //   recenter true  -> pan/zoom the map to the workplace. Param tweaks pass false so the user's
+  //                    scroll position is preserved regardless of RAPTOR/R5 mode.
+  //   persist  true  -> store the workplace in localStorage. Hash-applied permalinks pass false so
+  //                    a one-time deep link can't silently clobber the user's saved workplace.
+  opts=opts||{};
+  const atomic=!!opts.atomic;
+  const recenter=opts.recenter!==false;
+  const persist=opts.persist!==false;
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   document.getElementById("prompt").style.display="none";
   DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};REAL={};VAR={};
-  if(!atomic)TT={};                                  // new workplace -> drop OLD times so a hover before /compute lands doesn't show last workplace's commute under the new name
+  if(recenter)TT={};                                 // new workplace -> drop OLD times so a hover before /compute lands doesn't show last workplace's commute under the new name (param tweaks keep TT visible during the load window — same workplace, just new speed)
   closeOpenInfo();                                   // workplace changed -> any open tooltip is stale
   if(!CFG.raptor)document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
-  // Pan/zoom to the workplace ONLY when it's a NEW one. On atomic param tweaks (speed/transfers)
-  // the workplace is unchanged, so don't yank the map back from wherever the user has scrolled.
-  if(!atomic){
+  // Pan/zoom to the workplace ONLY when it's a NEW one (param tweaks keep the user's scroll).
+  if(recenter){
     if(pin)pin.setLatLng([lat,lon]);else pin=L.marker([lat,lon]).addTo(map);
     map.setView([lat,lon],12.6);
   }
-  try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}   // survives refresh
+  if(persist){try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}}
   busy(atomic?"updating estimates…":"estimating…");
   try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}${speedParam()}`);const d=await r.json();
     if(myGen!==GEN)return;                            // a newer address took over → drop this
@@ -411,8 +418,8 @@ async function refine(){
     }
     if(r.ok){const d2=await r.json();if(myGen!==GEN)return;TT=d2.cells;EXACT=true;
       document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
-      aggregate();redraw();
-      if(cmode=="line")loadAttribution();             // re-derive lines off the exact result
+      aggregate();redraw();refreshOpenInfo();           // any "refining…" placeholder tooltips now upgrade in place
+      if(cmode=="line")loadAttribution();               // re-derive lines off the exact result
     }
   }catch(e){/* keep the fast approximation if exact isn't available */}
   finally{if(myGen===GEN){busy(false);btn.disabled=false;}}
@@ -435,7 +442,14 @@ async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping
 //      Progressive (fetched AFTER /compute paints the perfect map), gen-guarded, best-effort.
 //      Returns {} when the server isn't in RAPTOR arrive-by + MC mode -> we keep the perfect map.
 async function loadVariance(){if(!DESTLL)return;const myGen=GEN;
-  try{const r=await fetch(`/variance?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
+  const doFetch=()=>fetch(`/variance?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
+  try{let r=await doFetch();
+    if(myGen!==GEN)return;
+    if(r.status===503){                                 // rate-limited or busy — one retry like /attribution
+      const wait=retryAfter(r);await sleep(wait);if(myGen!==GEN)return;
+      r=await doFetch();if(myGen!==GEN)return;
+      if(r.status===503){toast("Realistic times unavailable — try again in a moment.");return;}
+    }
     if(!r.ok)return;const d=await r.json();if(myGen!==GEN)return;
     if(d.realistic&&Object.keys(d.realistic).length){
       REAL=d.realistic;VAR=d.variance||{};aggregate();redraw();refreshOpenInfo();}   // realistic now drives metric="r"; refresh any open tooltip to add the bad-day line
@@ -464,8 +478,9 @@ document.querySelectorAll("#maxrides button").forEach(b=>b.onclick=()=>{
   BDCACHE={};                                             // breakdowns were for the old cap
   closeOpenInfo();                                        // close stale tooltip; next hover fetches with new cap
   syncHash();
-  // atomic in RAPTOR mode -> the map waits for /variance and repaints ONCE (no expand-then-contract).
-  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor});
+  // Param tweak (same workplace, new param): atomic in RAPTOR (no flicker), and recenter:false ALWAYS
+  // so the user's pan/zoom is preserved even in legacy R5 mode where atomic isn't set.
+  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor,recenter:false});
 });
 // Walk speed: like Max transfers, a new pace changes the colored TIMES -> recompute the map.
 document.querySelectorAll("#speed button").forEach(b=>b.onclick=()=>{
@@ -475,7 +490,7 @@ document.querySelectorAll("#speed button").forEach(b=>b.onclick=()=>{
   BDCACHE={};                                             // breakdowns were for the old pace
   closeOpenInfo();                                        // close stale tooltip; next hover fetches with new pace
   syncHash();
-  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor});
+  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor,recenter:false});
 });
 document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();syncHash();};
 document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();syncHash();};
@@ -575,7 +590,7 @@ function applyHash(o){applyingHash=true;
     const label=decodeURIComponent(wseg.slice(2).join(","));
     if(Number.isFinite(lat)&&Number.isFinite(lon)){
       document.getElementById("addr").value=label||"";
-      setWorkplace(lat,lon,label);return true;}}
+      setWorkplace(lat,lon,label,{persist:false});return true;}}   // a one-time deep link must not clobber the user's saved workplace
   return false;}
 
 // Apply CFG: with the RAPTOR stack the map IS the engine result, so drop the R5 "Refine" button

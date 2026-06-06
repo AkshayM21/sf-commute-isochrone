@@ -559,7 +559,7 @@ def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
     with _RAPTOR_TREE_LOCK:
         if key in _RAPTOR_TREE_CACHE:
             _RAPTOR_TREE_CACHE.move_to_end(key)
-            return _RAPTOR_TREE_CACHE[key]
+            return dict(_RAPTOR_TREE_CACHE[key])    # shallow copy: callers can't reassign cache keys
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
     tree = _RAPTOR.journey_tree(egress_g, egress_w, purewalk, max_rounds=int(max_rides),
                                 walk_scalar=walk_scalar)
@@ -603,12 +603,11 @@ def _nearest_raptor_cell(olat, olon):
 
 def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED,
                         walk_scalar=1.0):
-    """{cellId: dominant line} from the cached arrive-by tree (color-by-line, no R5)."""
-    entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)
-    if entry["dom"] is None:                  # depart-after map -> derive dominant on demand
-        _, dom = entry["tree"].commute_and_dominant()
-        entry["dom"] = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
-    return entry["dom"]
+    """{cellId: dominant line} from the cached arrive-by tree (color-by-line, no R5).
+    ``_raptor_tree`` always populates ``dom`` (dict of cell_id -> line) at build time, so we just
+    read it. (The old lazy-fill-on-None branch was dead code AND a tripwire — it mutated the cached
+    entry without holding _RAPTOR_TREE_LOCK; activating it later means adding the lock back.)"""
+    return _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)["dom"]
 
 
 # Per-workplace service-noise Monte-Carlo (realistic + fragility + alt-lines), JVM-free, lazy +
@@ -630,7 +629,7 @@ def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
     with _RAPTOR_MC_LOCK:
         if key in _RAPTOR_MC_CACHE:
             _RAPTOR_MC_CACHE.move_to_end(key)
-            return _RAPTOR_MC_CACHE[key]
+            return dict(_RAPTOR_MC_CACHE[key])   # shallow copy: callers can't reassign cache keys
     entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)   # perfect map + dom (cached)
     cells = entry["cells"]; dom = entry["dom"] or {}
     ids = _RAPTOR.cell_ids
@@ -733,12 +732,18 @@ def _compute():
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
     key = _dest_key(lat, lon, max_rides, speed)
-    if key != _LAST_DEST_KEY:
+    # Compare-and-set under _GEN_LOCK: without it, two concurrent first-time /computes for
+    # different workplaces could both see _LAST_DEST_KEY = None, both bump generation, both reset
+    # caches, and a third request for the displaced workplace would re-fire the reset path.
+    with _GEN_LOCK:
+        changed = (key != _LAST_DEST_KEY)
+        if changed:
+            _LAST_DEST_KEY = key
+    if changed:
         # Genuinely new workplace (or a changed transfer cap / walk speed — different colored
         # times, so treat it as new): bump the generation (cancels any in-flight exact/attribution
         # job for the PREVIOUS key between waves) and drop its breakdown caches. Re-submitting the
         # same address + cap + speed (e.g. the localStorage auto-restore on refresh) keeps caches.
-        _LAST_DEST_KEY = key
         gen = _bump_generation()
         _reset_caches()
     else:
