@@ -307,19 +307,24 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
 // next hover refetches with the new params. refreshOpenInfo re-renders an open card in place from
 // the already-cached breakdown — for changes that only affect how the data is DISPLAYED (metric,
 // cmode toggle, /variance arriving), where the underlying journey is unchanged.
-// Leaflet's getTooltip/getPopup return the bound object even when CLOSED — gating on isOpen()
-// matters because tooltips/popups are bound on first hover/click and stay bound for the life of
-// the cell, so a "getTooltip()" check would visit every cell ever hovered (thousands).
+// Leaflet's getTooltip/getPopup return undefined when unbound -> safe with optional chaining;
+// we still gate on isOpen() so we skip cells that were hovered earlier but aren't open anymore.
+// (DO NOT use layer.isTooltipOpen() — its implementation is `this._tooltip.isOpen()`, which throws
+// "Cannot read properties of undefined" on any layer without a tooltip bound. The method exists on
+// every layer via inheritance, so `l.isTooltipOpen && l.isTooltipOpen()` doesn't guard.)
 function closeOpenInfo(){
   bdToken++; clearTimeout(bdTimer);
   if(typeof layer==="undefined"||!layer)return;
-  layer.eachLayer(l=>{if(l.isTooltipOpen&&l.isTooltipOpen())l.closeTooltip();
-    if(l.isPopupOpen&&l.isPopupOpen())l.closePopup();});
+  layer.eachLayer(l=>{
+    const tip=l.getTooltip&&l.getTooltip(); if(tip&&tip.isOpen())l.closeTooltip();
+    const pop=l.getPopup&&l.getPopup(); if(pop&&pop.isOpen())l.closePopup();
+  });
 }
 function refreshOpenInfo(){
   if(typeof layer==="undefined"||!layer)return;
   layer.eachLayer(l=>{
-    const tipOpen=l.isTooltipOpen&&l.isTooltipOpen(), popOpen=l.isPopupOpen&&l.isPopupOpen();
+    const tip=l.getTooltip&&l.getTooltip(), pop=l.getPopup&&l.getPopup();
+    const tipOpen=tip&&tip.isOpen(), popOpen=pop&&pop.isOpen();
     if(!tipOpen && !popOpen)return;
     const f=l.feature;if(!f)return;const id=f.properties.id;
     const cached=BDCACHE[id];if(!cached)return;
