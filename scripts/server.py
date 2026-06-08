@@ -477,6 +477,13 @@ def _no_cache(resp):
     return resp
 
 
+@app.errorhandler(429)
+def _ratelimit_json(e):
+    """Flask-Limiter's default 429 page is HTML, so the frontend's r.json() throws and the user
+    just sees 'error' in the tooltip. Return JSON so callers can handle it (retry / show toast)."""
+    return jsonify({"error": "rate_limited", "detail": str(getattr(e, "description", e))}), 429
+
+
 # ---- RAPTOR grid travel-times (flag-gated) --------------------------------------------
 def _raptor_egress_purewalk(lat, lon):
     """Per-workplace inputs for the RAPTOR engine, via ONE-origin R5 WALK matrices:

@@ -281,11 +281,22 @@ function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){set
   if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n,real:REAL[id],var:VAR[id]});setHTML(bdHTML(d));return;}
   setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
-  bdTimer=setTimeout(async()=>{try{
-    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
-    const d=await r.json();if(my!==bdToken)return;if(!d.error)BDCACHE[id]=d;
-    d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];setHTML(bdHTML(d));
-  }catch(e){if(my===bdToken)setHTML("error");}},150);}
+  bdTimer=setTimeout(async()=>{
+    const doFetch=()=>fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
+    const fail=msg=>{if(my===bdToken)setHTML(`<div class="bd"><span style="color:#9aa3af">${msg}</span></div>`);};
+    try{
+      let r=await doFetch();
+      if(r.status===429){                              // hit /itinerary's 120/min rate limit -> one polite retry
+        const wait=retryAfter(r);await sleep(wait);if(my!==bdToken)return;
+        r=await doFetch();if(my!==bdToken)return;
+        if(r.status===429){fail("Too many hovers — slow down a sec.");return;}
+      }
+      if(!r.ok){fail(`Route lookup failed (${r.status}).`);return;}
+      const d=await r.json();if(my!==bdToken)return;
+      if(!d.error)BDCACHE[id]=d;
+      d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];setHTML(bdHTML(d));
+    }catch(e){console.error("loadBreak",e);fail("Couldn't load route — try again in a moment.");}
+  },150);}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
   // Desktop: hover shows the sticky breakdown tooltip. Touch has no hover, so we skip it
   // (a leftover sticky tooltip on tap is confusing) and rely on click/tap -> popup below.
