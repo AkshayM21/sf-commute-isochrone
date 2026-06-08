@@ -1,0 +1,9 @@
+[Unit]
+Description=sfci anti-reclamation CPU burst (keeps Oracle Always Free instance from being reclaimed)
+ConditionPathExists=/usr/bin/stress-ng
+
+[Service]
+Type=oneshot
+ExecStart=/opt/sfci/deploy/sfci-keepalive.sh
+Nice=19
+IOSchedulingClass=idle

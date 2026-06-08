@@ -1,0 +1,49 @@
+# Caddy v2 reverse-proxy in front of the Flask app on localhost:8000.
+#
+# Uses a Cloudflare Origin CA certificate so the origin can run on port 443 with end-to-end TLS
+# without exposing port 80 to Let's Encrypt's HTTP-01 challenge. With this in place + the
+# cloudflare-ufw timer, ports 80/443 can be locked down to CF IPs only.
+#
+# If you'd rather use Let's Encrypt: delete the `tls` line below and ensure port 80 is reachable
+# from the public internet (not the CF allowlist).
+
+{
+	admin off
+}
+
+sfcommutemap.com, www.sfcommutemap.com {
+	tls /etc/caddy/origin-cert.pem /etc/caddy/origin-key.pem
+
+	encode zstd gzip
+
+	# www -> apex (consistent canonical URL behind the CF cache key)
+	@www host www.sfcommutemap.com
+	redir @www https://sfcommutemap.com{uri} 308
+
+	# pass the real client IP through to Flask (set by Cloudflare; trustable because ufw drops
+	# anything not coming from a CF edge IP).
+	reverse_proxy localhost:8000 {
+		header_up X-Real-IP {http.request.header.CF-Connecting-IP}
+		header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}
+		header_up X-Forwarded-Proto https
+	}
+
+	# Tiny set of defensive response headers (Cloudflare adds a few too — these don't duplicate).
+	header {
+		# We embed Leaflet from unpkg + Cloudflare tile maps -- so unsafe-inline for style and
+		# script-src is intentional. Tighten if you ever move assets fully on-origin.
+		-Server
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Permissions-Policy "geolocation=(), camera=(), microphone=()"
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+		format json
+	}
+}

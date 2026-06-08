@@ -78,27 +78,33 @@ def _norm(q):
 # ---- Bounded in-memory LRU (shared by geocode + autocomplete) --------------------------
 # Keyed by (kind, provider, normalized-query, limit) so a geocode hit and an autocomplete
 # hit for the same text don't collide, and switching GEOCODER at runtime stays correct.
+# The lock makes move_to_end + popitem safe under concurrent Flask request threads (without
+# it, a get racing with an eviction can KeyError on the `return _LRU[key]` after move_to_end).
 _LRU_MAX = 512
 _LRU = OrderedDict()
+_LRU_LOCK = threading.Lock()
 
 
 def _lru_get(key):
-    if key in _LRU:
-        _LRU.move_to_end(key)
-        return _LRU[key]
+    with _LRU_LOCK:
+        if key in _LRU:
+            _LRU.move_to_end(key)
+            return _LRU[key]
     return None
 
 
 def _lru_put(key, value):
-    _LRU[key] = value
-    _LRU.move_to_end(key)
-    while len(_LRU) > _LRU_MAX:
-        _LRU.popitem(last=False)
+    with _LRU_LOCK:
+        _LRU[key] = value
+        _LRU.move_to_end(key)
+        while len(_LRU) > _LRU_MAX:
+            _LRU.popitem(last=False)
 
 
 def _clear_lru():
     """Test/maintenance hook: drop the in-memory cache."""
-    _LRU.clear()
+    with _LRU_LOCK:
+        _LRU.clear()
 
 
 # ---- Global upstream rate-limit (ban protection) ---------------------------------------

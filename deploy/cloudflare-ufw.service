@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh Cloudflare IP allowlist in ufw
+After=network-online.target ufw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/sfci/deploy/cloudflare-ufw.sh

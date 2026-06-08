@@ -1,0 +1,13 @@
+[Unit]
+Description=Run sfci-keepalive every hour
+
+[Timer]
+# First burst 10 min after boot (give the app time to settle); then every hour, jittered by
+# up to 5 min so all the AlwaysFree boxes on a host don't fire simultaneously.
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

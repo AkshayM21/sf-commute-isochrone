@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly refresh of Cloudflare IP allowlist in ufw
+
+[Timer]
+# First refresh 2 min after boot (so a freshly-deployed box gets locked down quickly),
+# then weekly thereafter to track any CF IP rotation.
+OnBootSec=2min
+OnUnitActiveSec=1w
+Persistent=true
+
+[Install]
+WantedBy=timers.target

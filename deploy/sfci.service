@@ -1,0 +1,59 @@
+[Unit]
+Description=SF Commute Isochrone (RAPTOR map server)
+After=network.target
+Documentation=https://github.com/akshaymanglik/sf-commute-isochrone
+
+[Service]
+Type=simple
+User=sfci
+Group=sfci
+WorkingDirectory=/opt/sfci
+EnvironmentFile=/etc/sfci.env
+# Numba's @njit(cache=True) writes .nbc files next to the source by default. With our
+# ProtectSystem=strict, /opt/sfci is read-only -> the cache silently fails to persist and we
+# re-JIT (~10s for the parallel MC kernel) on every restart. Point it at a systemd-managed
+# CacheDirectory so the warmup pays off across restarts.
+Environment=NUMBA_CACHE_DIR=/var/cache/sfci/numba
+# Flask is behind Caddy + Cloudflare -- tell _client_ip it can also fall back to X-Forwarded-For.
+Environment=TRUST_PROXY=1
+# Don't buffer print() output (so journalctl -f shows logs live).
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/sfci/.venv/bin/python scripts/server.py
+
+# Crash-loop strategy: restart on any exit, but stop trying after 5 fast crashes so a real
+# alarm fires (or you `journalctl -u sfci -n 50` to see why) instead of consuming the box.
+Restart=always
+RestartSec=10s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Give the in-flight MC kernel (~0.5s) a moment to finish before SIGKILL.
+TimeoutStopSec=15s
+
+# Logs go to journal (journalctl -u sfci -f). Caddy logs separately.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sfci
+
+# Hardening -- Flask only needs the repo + tmp + the numba cache writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sfci/data /tmp
+CacheDirectory=sfci
+CacheDirectoryMode=0750
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+# Memory ceiling -- A1.Flex 1 OCPU / 6 GB. App warm RSS ~245 MB, peak ~500 MB during /variance
+# bursts. 1 GB cap leaves 5+ GB for OS / Caddy / page cache. MemoryHigh applies soft pressure first.
+MemoryMax=1G
+MemoryHigh=800M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

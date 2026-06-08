@@ -17,7 +17,7 @@ persists it. Two distinct computations power the map (see CLAUDE.md/Issues.md):
   * route LEGS — /itinerary + /attribution use R5 recorded paths; hover computes one cell
                 on demand, color-by-line builds the whole grid lazily on first toggle.
 """
-import os, sys, json, copy, threading, datetime as dt
+import os, sys, json, copy, math, time, threading, datetime as dt
 from collections import OrderedDict
 # Cap numba's thread pool BEFORE numba is imported (via core.raptor_*). Bounds the parallel MC
 # kernel's worker threads — fewer idle threads (lower RSS) and no oversubscription on a small box.
@@ -445,16 +445,49 @@ app = Flask(__name__)
 
 # ---- Rate limiting (Flask-Limiter, in-memory) -----------------------------------------
 # Single-process app, so the default in-memory store is correct (no Redis needed). Per-IP
-# limits are applied per endpoint below via @limiter.limit. The key func prefers the FIRST
-# hop in X-Forwarded-For (the real client when behind a proxy) and falls back to the socket
-# peer when the header is absent/blank — so it's safe both behind a proxy and run directly.
+# limits are applied per endpoint below via @limiter.limit. Choosing the right IP source is
+# load-bearing for the limits to be real:
+#   - Behind Cloudflare (the production deploy), `CF-Connecting-IP` is the canonical real-client
+#     header. It's set by CF, not echoed from the request, so it's the only header an attacker
+#     can't forge. Caddy → Flask passes it through untouched.
+#   - X-Forwarded-For is only trustworthy if we know we're behind a proxy that owns it. Gate it
+#     on TRUST_PROXY=1 so a direct-to-Flask request (no proxy) can't spoof a per-IP key.
+#   - Without either, fall back to the socket peer (correct for localhost dev / direct hits).
 def _client_ip():
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd:
-        first = fwd.split(",")[0].strip()
-        if first:
-            return first
+    cf = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf:
+        return cf
+    if os.environ.get("TRUST_PROXY", "").lower() in ("1", "true", "yes"):
+        fwd = request.headers.get("X-Forwarded-For", "")
+        if fwd:
+            first = fwd.split(",")[0].strip()
+            if first:
+                return first
     return request.remote_addr or "127.0.0.1"
+
+
+def _parse_ll(lat_raw, lon_raw):
+    """Parse + validate lat/lon from query args. Rejects NaN/inf/giants with a friendly 400
+    instead of letting an OverflowError bubble to a 500 deep in the routing code. SF-clamped
+    so a coordinate the engine can't sensibly serve doesn't burn cycles."""
+    try:
+        lat = float(lat_raw); lon = float(lon_raw)
+    except (TypeError, ValueError):
+        raise _BadRequest("lat/lon must be numeric")
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        raise _BadRequest("lat/lon must be finite")
+    if not (37.3 <= lat <= 38.1 and -123.1 <= lon <= -122.0):
+        raise _BadRequest(f"lat/lon outside SF region: {lat:.4f},{lon:.4f}")
+    return lat, lon
+
+
+class _BadRequest(Exception):
+    pass
+
+
+@app.errorhandler(_BadRequest)
+def _bad_request(e):
+    return jsonify({"error": "bad_request", "detail": str(e)}), 400
 
 
 limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
@@ -1147,6 +1180,7 @@ def _build_page():
 
 
 PAGE_HTML = _build_page()
+_BOOT_TS = time.time()
 
 
 @app.route("/")
@@ -1154,9 +1188,31 @@ def _index():
     return PAGE_HTML
 
 
+@app.route("/healthz")
+def _healthz():
+    """Cheap, non-rate-limited liveness/readiness probe. Returns the engine + walk router state
+    + the modeled service date, so a monitor can alarm on (a) the engine never initializing or
+    (b) the GTFS feed having drifted past its validity window (svc_date won't update until the
+    server restarts after a feed re-pull)."""
+    return jsonify({
+        "ok": _RAPTOR is not None or USE_RAPTOR is False,
+        "engine": "raptor" if USE_RAPTOR else "r5",
+        "semantic": RAPTOR_SEMANTIC,
+        "walk": "graph" if USE_WALK_GRAPH else "r5",
+        "svc_date": _SVC_DATE.isoformat() if _SVC_DATE else None,
+        "uptime_s": int(time.time() - _BOOT_TS),
+    })
+
+
 if __name__ == "__main__":
-    # threaded=True so a slow /compute_exact or /attribution can't freeze hover (/itinerary)
-    # or /compute. R5 routing is thread-safe (read-only shared network; per-task Java request
-    # clones) and jpype auto-attaches Python threads to the JVM; heavy jobs are additionally
-    # serialised by _HEAVY_LOCK while the light single-OD /itinerary never takes it.
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "8000")), threaded=True)
+    # In production, prefer waitress (waitress-serve) over Flask's dev server: clean SIGTERM,
+    # no "WARNING: development server" noise, no surprise per-request thread spawn. Falls back
+    # to Flask's threaded dev server if waitress isn't installed (so local dev still works).
+    PORT = int(os.environ.get("PORT", "8000"))
+    try:
+        from waitress import serve
+        print(f"[boot] waitress serving on 127.0.0.1:{PORT}")
+        serve(app, host="127.0.0.1", port=PORT, threads=8, _quiet=False, channel_timeout=120)
+    except ImportError:
+        print(f"[boot] waitress not installed — falling back to Flask dev server on 127.0.0.1:{PORT}")
+        app.run(host="127.0.0.1", port=PORT, threaded=True)
