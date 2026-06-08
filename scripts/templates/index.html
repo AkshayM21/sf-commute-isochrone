@@ -615,10 +615,12 @@ legend();   // draw the legend; map stays blank until you set an address
   const o=parseHash();
   if(o&&o.wp){applyHash(o);return;}
   if(o){applyHash(o);}                                 // restore sliders/metric/cmode even without wp
-  try{const wp=JSON.parse(localStorage.getItem("wp_v1")||"null");   // restore last workplace
-    if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){
-      document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);}
-  }catch(e){}
+  let wp=null;
+  try{wp=JSON.parse(localStorage.getItem("wp_v1")||"null");}catch(e){}        // previously-typed workplace wins
+  if(!(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon))) wp=CFG.default_wp;   // else fall back to .env DEFAULT_ADDRESS
+  if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){
+    document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);
+  }
   redraw();
 })();
 </script></body></html>

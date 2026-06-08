@@ -1122,6 +1122,17 @@ def _build_page():
     cfg = {"raptor": USE_RAPTOR, "arriveby": _arriveby,
            "timephrase": ("arriving by ~9:00am" if _arriveby
                           else f"leaving ~{DEP:%-I:%M%p}".lower())}
+    # Default workplace (resolved from .env DEFAULT_ADDRESS or DEST_LAT/LON via destination.py),
+    # injected so a fresh visit / new browser shows the configured location without the user
+    # having to type. Frontend boot() uses this ONLY as a fallback when localStorage is empty —
+    # a previously-typed workplace still wins. Best-effort: if resolution fails we ship null and
+    # the page falls through to its usual "type an address" prompt.
+    try:
+        import destination as _dest
+        _lat, _lon, _label = _dest._resolve()
+        cfg["default_wp"] = {"lat": _lat, "lon": _lon, "label": _label}
+    except Exception:
+        cfg["default_wp"] = None
     return (html.replace("/*__VIZ__*/", viz)
                 .replace("__CFG__", json.dumps(cfg))
                 .replace("__CELLS__", json.dumps(CELLS_GEOJSON))
