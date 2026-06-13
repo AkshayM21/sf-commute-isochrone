@@ -25,6 +25,19 @@ def _pd():
 _MODE = {"0": "metro", "1": "bart", "2": "bart", "5": "cable", "3": "bus"}
 
 
+def _route_display_name(short, long_, rid):
+    """short -> long -> id, the ONE naming policy (load_routes + route_shapes).
+    Treats None/NaN/blank as missing: pandas leaves blank cells as float NaN even
+    under dtype=str, and NaN is TRUTHY, so a bare or-chain would name a route "nan"."""
+    for v in (short, long_):
+        if v is None or (isinstance(v, float) and v != v):  # None / NaN
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return str(rid)
+
+
 def load_routes(gtfs_paths):
     """{feed_stem: {route_id: name}} so colliding ids across feeds (Muni '8' vs
     BART '8'=Red-N) resolve correctly via the leg's own feed."""
@@ -35,9 +48,9 @@ def load_routes(gtfs_paths):
         with zipfile.ZipFile(p) as z:
             r = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
             for _, row in r.iterrows():
-                name = (row.get("route_short_name") or row.get("route_long_name")
-                        or row.get("route_id"))
-                d[str(row["route_id"])] = str(name).strip()
+                rid = str(row["route_id"])
+                d[rid] = _route_display_name(row.get("route_short_name"),
+                                             row.get("route_long_name"), rid)
         m[Path(p).stem] = d
     return m
 
@@ -68,8 +81,13 @@ def route_shapes(gtfs_paths):
             trips = pd.read_csv(io.BytesIO(z.read("trips.txt")), dtype=str).dropna(subset=["shape_id"])
             routes = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
             rtype = dict(zip(routes.route_id, routes.route_type))
-            rname = dict(zip(routes.route_id,
-                             routes.get("route_short_name", routes["route_id"]).fillna(routes["route_id"])))
+            # Missing columns fall through as None (NOT route_id) so a long-names-only
+            # feed still gets its long names via _route_display_name.
+            n = len(routes)
+            short = routes["route_short_name"] if "route_short_name" in routes.columns else [None] * n
+            long_ = routes["route_long_name"] if "route_long_name" in routes.columns else [None] * n
+            rname = {rid: _route_display_name(s, l, rid)
+                     for rid, s, l in zip(routes["route_id"], short, long_)}
             cnt = shapes.groupby("shape_id").size()
             best = {}
             for sid, rid in zip(trips.shape_id, trips.route_id):
@@ -87,21 +105,30 @@ def route_shapes(gtfs_paths):
     return {"type": "FeatureCollection", "features": feats}
 
 
+def active_service_ids(z, names, date):
+    """service_ids running on YYYYMMDD ``date`` per calendar.txt + calendar_dates.txt.
+
+    ``z`` is an open ZipFile, ``names`` its namelist(). The ONE place this GTFS calendar
+    logic lives — used by _feed_has_trips here and by raptor_build.build()."""
+    _pd()
+    wd = dt.datetime.strptime(date, "%Y%m%d").strftime("%A").lower()
+    sids = set()
+    if "calendar.txt" in names:
+        cal = pd.read_csv(io.BytesIO(z.read("calendar.txt")), dtype=str)
+        m = cal[(cal[wd] == "1") & (cal["start_date"] <= date) & (cal["end_date"] >= date)]
+        sids = set(m["service_id"])
+    if "calendar_dates.txt" in names:
+        cd = pd.read_csv(io.BytesIO(z.read("calendar_dates.txt")), dtype=str)
+        sids |= set(cd[(cd["date"] == date) & (cd["exception_type"] == "1")]["service_id"])
+        sids -= set(cd[(cd["date"] == date) & (cd["exception_type"] == "2")]["service_id"])
+    return sids
+
+
 def _feed_has_trips(path, date):
     """True if feed `path` actually runs trips on YYYYMMDD `date`."""
     _pd()
-    wd = dt.datetime.strptime(date, "%Y%m%d").strftime("%A").lower()
     with zipfile.ZipFile(path) as z:
-        names = z.namelist()
-        sids = set()
-        if "calendar.txt" in names:
-            cal = pd.read_csv(io.BytesIO(z.read("calendar.txt")), dtype=str)
-            m = cal[(cal[wd] == "1") & (cal["start_date"] <= date) & (cal["end_date"] >= date)]
-            sids = set(m["service_id"])
-        if "calendar_dates.txt" in names:
-            cd = pd.read_csv(io.BytesIO(z.read("calendar_dates.txt")), dtype=str)
-            sids |= set(cd[(cd["date"] == date) & (cd["exception_type"] == "1")]["service_id"])
-            sids -= set(cd[(cd["date"] == date) & (cd["exception_type"] == "2")]["service_id"])
+        sids = active_service_ids(z, z.namelist(), date)
         if not sids:
             return False
         trips = pd.read_csv(io.BytesIO(z.read("trips.txt")), dtype=str)
@@ -118,11 +145,16 @@ def pick_service_date(gtfs_paths):
     starts, ends = [], []
     for p in gtfs_paths:
         with zipfile.ZipFile(p) as z:
+            if "calendar.txt" not in z.namelist():
+                continue  # calendar_dates-only feed: still verified per-date by _feed_has_trips
             cal = pd.read_csv(io.BytesIO(z.read("calendar.txt")), dtype=str)
             w = cal[cal["wednesday"] == "1"]
             if len(w):
                 starts.append(int(w["start_date"].min()))
                 ends.append(int(w["end_date"].max()))
+    if not starts:
+        raise RuntimeError("no feed contributes Wednesday calendar.txt rows: "
+                           + ", ".join(Path(p).name for p in gtfs_paths))
     lo = dt.datetime.strptime(str(max(starts)), "%Y%m%d").date()
     hi = dt.datetime.strptime(str(min(ends)), "%Y%m%d").date()
     d = lo + dt.timedelta(days=7)              # a week in, past signup-boundary swaps
@@ -133,4 +165,5 @@ def pick_service_date(gtfs_paths):
         if all(_feed_has_trips(p, ds) for p in gtfs_paths):
             return d
         d += dt.timedelta(days=7)
-    raise SystemExit("No common service Wednesday found across feeds")
+    raise RuntimeError("No common service Wednesday found across feeds "
+                       "(window %s..%s)" % (lo, hi))

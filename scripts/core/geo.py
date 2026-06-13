@@ -1,8 +1,9 @@
 """Geocoding for destination.py and the server's /geocode + /autocomplete endpoints.
 
-Default provider is **Photon** (https://photon.komoot.io/api) — free, no API key, biased
-to San Francisco, and fast enough for type-ahead autocomplete. The provider is swappable
-via the GEOCODER env var ("photon" default, "nominatim" fallback).
+Default provider is **Geoapify** when a GEOAPIFY_KEY is set (metered, has a real
+type-ahead endpoint), else **Photon** (https://photon.komoot.io/api — free, no API key);
+all SF-biased. An explicit GEOCODER env var ("geoapify"/"photon"/"nominatim") overrides
+the default; a keyless "geoapify" demotes to Photon.
 
 Two layers of caching, deliberately kept separate:
   * an in-memory bounded LRU (~512 entries, keyed by normalized query) wraps BOTH geocode
@@ -18,6 +19,7 @@ Public API:
 """
 import json
 import os
+import pathlib
 import time
 import threading
 import urllib.request
@@ -29,11 +31,33 @@ from . import config
 _UA = "SF Commute Explorer (https://sfcommutemap.com)"
 
 # Persistent destination cache (destination.py only). The in-memory LRU below never touches it.
-_CACHE = config.ROOT / ".dest_cache.json"
+# Path is env-overridable (DEST_CACHE_FILE) so a hardened systemd deploy where the repo dir is
+# read-only (ProtectSystem=strict) can point this at a writable CacheDirectory like /var/cache/sfci.
+# DEST_CACHE_FILE is bound at import, so load .env FIRST — both consumers (destination.py,
+# server.py) import geo before calling load_dotenv(); without this a DEST_CACHE_FILE set in .env
+# was silently ignored. load_dotenv uses setdefault, so real process env (systemd Environment=)
+# still wins and the call is idempotent.
+config.load_dotenv()
+_CACHE = pathlib.Path(os.environ.get("DEST_CACHE_FILE") or (config.ROOT / ".dest_cache.json"))
+_STORE_LOCK = threading.Lock()   # serializes the read-modify-write in geocode(cache=True)
 
-# San Francisco geographic bias + bounding box, shared by both providers.
+
+def _load_store():
+    """Read the persistent dest cache as a dict. A missing/corrupt/unreadable file is
+    treated as empty with a warning — the cache must never be load-bearing (a truncated
+    write would otherwise crash every geocode(cache=True), including the boot-time
+    DEFAULT_ADDRESS resolution in destination.py, until someone deletes the file)."""
+    try:
+        return json.loads(_CACHE.read_text()) if _CACHE.exists() else {}
+    except (OSError, ValueError) as e:
+        print(f"[geo] WARN: ignoring unreadable dest cache {_CACHE}: {e}", flush=True)
+        return {}
+
+# San Francisco geographic bias + bounding box, shared by both providers. The box is the
+# canonical tight one from core.config (rendered to the "minLon,minLat,maxLon,maxLat"
+# string Photon's bbox= and Geoapify's rect: filter both expect).
 _SF_LAT, _SF_LON = 37.773, -122.42
-_SF_BBOX = "-122.55,37.70,-122.34,37.84"   # minLon,minLat,maxLon,maxLat
+_SF_BBOX = ",".join(str(v) for v in config.SF_BBOX)
 
 
 def _geoapify_key():
@@ -41,9 +65,11 @@ def _geoapify_key():
 
 
 def _provider():
-    """Effective provider, lowercased: 'geoapify' (only if selected AND a key is present),
-    else 'photon' (default) or 'nominatim'."""
-    p = (os.environ.get("GEOCODER") or "photon").strip().lower()
+    """Effective provider, lowercased. GEOCODER env wins when set; otherwise the default
+    is 'geoapify' when a GEOAPIFY_KEY is present, else 'photon'. A 'geoapify' selection
+    without a key demotes to 'photon' (the request would just 401)."""
+    p = (os.environ.get("GEOCODER")
+         or ("geoapify" if _geoapify_key() else "photon")).strip().lower()
     if p == "geoapify" and not _geoapify_key():
         return "photon"
     return p
@@ -271,8 +297,8 @@ def geocode(addr, *, cache=True):
     server's /geocode) returns the provider's human label and never touches that file. Both
     paths share the bounded in-memory LRU so repeated lookups skip the upstream."""
     addr = str(addr)
-    if cache and _CACHE.exists():
-        store = json.loads(_CACHE.read_text())
+    if cache:
+        store = _load_store()
         if addr in store:
             return tuple(store[addr])
 
@@ -291,8 +317,21 @@ def geocode(addr, *, cache=True):
     if cache:
         # Preserve the historical round-trip contract: persisted label IS the input address.
         res = (lat, lon, addr)
-        store = json.loads(_CACHE.read_text()) if _CACHE.exists() else {}
-        store[addr] = list(res)
-        _CACHE.write_text(json.dumps(store, indent=2))
+        with _STORE_LOCK:                      # one read-modify-write at a time in-process
+            store = _load_store()
+            store[addr] = list(res)
+            try:
+                # Atomic replace: a crash/OOM-kill mid-write can never leave a truncated
+                # _CACHE behind (plain write_text truncates first — a corrupt file used to
+                # crash every later geocode(cache=True), incl. the boot DEFAULT_ADDRESS).
+                tmp = _CACHE.with_name(_CACHE.name + ".tmp")
+                tmp.write_text(json.dumps(store, indent=2))
+                os.replace(tmp, _CACHE)
+            except OSError as e:
+                # Read-only filesystem (e.g. systemd ProtectSystem=strict without DEST_CACHE_FILE
+                # pointing at a writable path). Returning the resolved tuple is still correct;
+                # callers just won't get a persisted hit next boot. Warn once and continue.
+                print(f"[geo] WARN: could not persist dest cache to {_CACHE}: {e} "
+                      f"(set DEST_CACHE_FILE to a writable path to silence this)", flush=True)
         return res
     return (lat, lon, label)

@@ -1,5 +1,9 @@
 # SF Commute Isochrone
 
+**Live at [sfcommutemap.com](https://sfcommutemap.com).** Free, no signup, opens to a
+configurable workplace; hover/tap any neighborhood to see the route behind the number.
+Hosted on Oracle Always Free ($0/mo) behind Cloudflare. Self-host instructions in `deploy/`.
+
 Find **where in San Francisco you can live and still reach a workplace you
 choose within N minutes** by **walking + Muni + BART + Caltrain**, arriving on a
 weekday morning — rendered as an interactive map.

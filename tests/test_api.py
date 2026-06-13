@@ -1,13 +1,17 @@
-"""Integration tests for the Flask + R5 commute API (scripts/server.py).
+"""Integration tests for the Flask commute API (scripts/server.py).
 
-These are REGRESSION GUARDS, not unit tests: they exercise the real in-process R5 JVM
-(booted once via the session-scoped `server`/`client` fixtures in conftest.py) and assert
-the cross-cutting invariants that hold the app together:
+These are REGRESSION GUARDS, not unit tests: they exercise the real in-process engine —
+the JVM-FREE RAPTOR stack by default, pinned by conftest.py's setdefaults to the
+production config (USE_RAPTOR=1, USE_WALK_GRAPH=1, RAPTOR_SEMANTIC=arriveby, RAPTOR_MC=1)
+— booted once via the session-scoped `server`/`client` fixtures, and assert the
+cross-cutting invariants that hold the app together:
 
-  * /compute (fast reverse approx) and /compute_exact (slow forward refine) shapes + the
-    best <= real ordering, and exact determinism (twice-identical + a golden snapshot).
+  * /compute and /compute_exact shapes + the best <= real ordering, and exact determinism
+    (twice-identical + a golden snapshot stamped with the engine identity).
   * the breakdown == map-color invariant: an /itinerary's total equals that cell's
     /compute_exact realistic minutes, and its legs (min + wait) sum to that total.
+  * /variance (service-noise MC overlay): realistic >= perfect floor, frag/stuck bounds,
+    alt-lines exclude the dominant line, caching + the ?speed= walk-scalar knob.
   * /attribution, /geocode, /autocomplete shapes + bounds + caching.
   * the operational guards: a held _HEAVY_LOCK turns /compute_exact into a 503{busy}, the
     rate limiter is wired, and the per-workplace breakdown caches are reset on a new dest.
@@ -15,9 +19,11 @@ the cross-cutting invariants that hold the app together:
 
 Run with:  .venv/bin/python -m pytest tests/test_api.py -q
 
-It is SLOW (one R5 boot + a couple ~30s exact passes); the heavy tests are marked. Another
-agent may have a live server on :8000 and another pytest JVM running — this suite boots its
-OWN in-process R5 and never binds a port, so it's independent (just CPU-contended).
+Under the default RAPTOR boot the whole suite is fast (~1s boot, ~ms grid computes); the
+`slow` marker survives for the heaviest full-grid passes, which take ~30s+ only on the
+legacy USE_RAPTOR=0 R5 path. Never run beside a server that is still BOOTING (concurrent
+numba JIT corrupts the shared .nbc cache — see CLAUDE.md); a long-running server on :8000
+is fine (we never bind a port).
 """
 import json
 import os
@@ -111,23 +117,32 @@ def test_compute_exact_shape_and_determinism(client, server):
 
 @pytest.mark.slow
 def test_compute_exact_matches_golden(client, server):
-    """Regression snapshot. If this fails after a GTFS refresh (pick_service_date shifted),
-    regenerate the golden:  .venv/bin/python tests/make_golden.py"""
+    """Regression snapshot. If this fails after a GTFS refresh (pick_service_date shifted)
+    or an engine-default change, regenerate:  .venv/bin/python tests/make_golden.py"""
     if not os.path.exists(GOLDEN_PATH):
         pytest.skip(
-            "golden missing — generate with `.venv/bin/python tests/make_golden.py` "
-            "(also runs automatically once via make_golden in this session is not wired; "
-            "run the helper)."
+            "golden missing — generate with `.venv/bin/python tests/make_golden.py`"
         )
     with open(GOLDEN_PATH) as f:
         golden = json.load(f)
-    current = _get_exact_cells(client)
-    g_cells = golden["cells"]
     if golden.get("service_date") != str(server._SVC_DATE):
         pytest.skip(
             f"golden service_date {golden.get('service_date')} != current "
             f"{server._SVC_DATE}; regenerate via tests/make_golden.py"
         )
+    # Engine-identity guard (mirrors the service_date one): the snapshot is only comparable
+    # when the booted engine matches the one it was baked under — e.g. USE_RAPTOR=0 (legacy
+    # R5) legitimately differs from the RAPTOR golden by MAE ~0.75, and a GTFS-fingerprint
+    # shift means a repull happened even if pick_service_date landed on the same date.
+    from make_golden import engine_identity
+    booted = engine_identity(server)
+    if golden.get("engine") != booted:
+        pytest.skip(
+            f"golden engine {golden.get('engine')} != booted {booted}; "
+            "regenerate via tests/make_golden.py (or unset the engine env overrides)"
+        )
+    current = _get_exact_cells(client)
+    g_cells = golden["cells"]
     assert current == g_cells, (
         "compute_exact output drifted from the golden snapshot. If GTFS feeds were "
         "refreshed this is expected — regenerate with tests/make_golden.py."
@@ -217,6 +232,407 @@ def test_attribution_shape_caching_and_count(client, server):
 
 
 # --------------------------------------------------------------------------------------
+# /variance — service-noise Monte-Carlo overlay (realistic + fragility + alt-lines)
+# --------------------------------------------------------------------------------------
+def _skip_unless_mc(server):
+    if not (server.USE_RAPTOR and server.RAPTOR_SEMANTIC == "arriveby" and server.RAPTOR_MC):
+        pytest.skip("/variance is only served under the RAPTOR arrive-by MC boot")
+
+
+@pytest.mark.slow
+def test_variance_realistic_floor_bounds_alt_and_cache(client, server):
+    """The MC overlay's served contract: every realistic >= the perfect map's best minutes
+    (the asserted perfect <= committed invariant, floored server-side), frag >= 0,
+    0 <= stuck <= 1, alt-lines are capped at 4 and never include the cell's own dominant
+    line, and a second identical GET returns the identical payload (LRU cache + the
+    deterministic per-workplace sha256 seed)."""
+    _skip_unless_mc(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    # Perfect map first (exactly what the frontend paints before layering /variance).
+    r = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    assert r.status_code == 200
+    perfect = r.get_json()["cells"]
+    # Dominant line per cell, to cross-check the alt-lines exclusion.
+    ra = client.get(f"/attribution?dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert ra.status_code == 200
+    dom = ra.get_json()
+
+    resp = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["dest"] == [FERRY_LAT, FERRY_LON]
+    realistic, variance = body["realistic"], body["variance"]
+    assert realistic, "MC overlay returned no realistic cells"
+    assert set(realistic) == set(variance), "realistic/variance cell sets diverge"
+
+    seen_alt = frag_pos = 0
+    for cid, rmin in realistic.items():
+        pair = perfect.get(cid)
+        assert pair is not None and pair[0] is not None, (
+            f"{cid}: realistic cell missing from the perfect map (reachability must follow it)"
+        )
+        assert isinstance(rmin, int)
+        assert rmin >= pair[0], f"{cid}: realistic {rmin} < perfect {pair[0]} (floor lost)"
+        v = variance[cid]
+        assert v["frag"] >= 0, f"{cid}: negative fragility {v['frag']}"
+        frag_pos += v["frag"] > 0
+        assert v["std"] >= 0
+        assert 0.0 <= v["stuck"] <= 1.0, f"{cid}: stuck {v['stuck']} out of [0,1]"
+        alt = v.get("alt")
+        if alt:
+            assert len(alt) <= 4, f"{cid}: alt has {len(alt)} entries (> 4 cap)"
+            assert dom.get(cid) not in alt, (
+                f"{cid}: alt {alt} includes the cell's own dominant line {dom.get(cid)!r}"
+            )
+            assert all(isinstance(n, int) and n >= 1 for n in alt.values()), alt
+            seen_alt += 1
+    assert seen_alt > 0, "no cell carried alt-lines — the traced-perturbation path is dead"
+    assert frag_pos > 0, "MC produced zero fragility everywhere — delays are not applied"
+
+    # Cache + determinism: bit-identical realistic/variance on a repeat GET (ms may differ).
+    resp2 = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert resp2.status_code == 200
+    body2 = resp2.get_json()
+    assert body2["realistic"] == realistic
+    assert body2["variance"] == variance
+
+
+@pytest.mark.slow
+def test_variance_speed_slow_shifts_payload(client, server):
+    """?speed=slow is a separate cache key with a real effect: walking is scaled slower, so
+    reachability can only SHRINK (slow-reachable cells are a subset of medium-reachable) and
+    the average realistic commute over common cells goes UP (walk legs dominate the shift;
+    per-cell monotonicity is not asserted because the MC seed is keyed by speed)."""
+    _skip_unless_mc(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    med = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert med.status_code == 200, med.get_data(as_text=True)
+    slow = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}&speed=slow")
+    assert slow.status_code == 200, slow.get_data(as_text=True)
+    m_real = med.get_json()["realistic"]
+    s_real = slow.get_json()["realistic"]
+    assert s_real, "slow-speed MC overlay returned no cells"
+    assert s_real != m_real, "?speed=slow returned the medium-speed payload (cache key collision)"
+    # Slower walking is monotonic on the deterministic perfect map -> no NEW reachable cells.
+    assert set(s_real) <= set(m_real), (
+        f"{len(set(s_real) - set(m_real))} cells became reachable only at slow walk speed"
+    )
+    common = set(s_real) & set(m_real)
+    assert len(common) > 100, f"only {len(common)} common cells between speeds"
+    mean_m = sum(m_real[c] for c in common) / len(common)
+    mean_s = sum(s_real[c] for c in common) / len(common)
+    assert mean_s > mean_m, (
+        f"slow-walk mean realistic {mean_s:.1f} not above medium {mean_m:.1f}"
+    )
+
+
+# --------------------------------------------------------------------------------------
+# /itinerary geom — the drawn hover route (RAPTOR arrive-by only)
+# --------------------------------------------------------------------------------------
+def _haversine_m(lat1, lon1, lat2, lon2):
+    import math
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _skip_unless_geom(server):
+    if not (server.USE_RAPTOR and server.RAPTOR_SEMANTIC == "arriveby"):
+        pytest.skip("route geometry is served on the RAPTOR arrive-by path only")
+
+
+def _geom_sample_cells(server, dlat, dlon, n_generic=4):
+    """Pick test cells from the traced tree itself: >=1 multi-transfer (2+ significant
+    rides), >=1 walk-only, plus a spread of generic reachable cells."""
+    entry = server._raptor_tree(dlat, dlon)
+    tree = entry["tree"]
+    multi = walk_only = None
+    generic = []
+    for cid, (best, real) in entry["cells"].items():
+        if real is None:
+            continue
+        ci = server._RAPTOR.cell_index[cid]
+        tr = tree._trace(ci)
+        if tr is None:
+            continue
+        legs_raw, _lh = tr
+        rides = [l for l in legs_raw if l[0] == "ride" and (l[3] - l[2]) >= 120]
+        if walk_only is None and legs_raw[0][0] == "walk":
+            walk_only = cid
+        if multi is None and len(rides) >= 2:
+            multi = cid
+        if len(generic) < n_generic and real >= 8:
+            generic.append(cid)
+    assert multi is not None, "no multi-transfer cell found in the traced tree"
+    assert walk_only is not None, "no walk-only cell found in the traced tree"
+    cells = [multi, walk_only] + [c for c in generic if c not in (multi, walk_only)]
+    return entry, cells
+
+
+def test_itinerary_geom_matches_breakdown_and_endpoints(client, server):
+    """The drawn route's contract: geom legs mirror the breakdown legs 1:1 (mode + name +
+    minutes, same order), the path starts at the hovered cell and ends at the workplace
+    (within ~250m), every ride leg's first/last points are the board/alight stop coords of
+    the SAME traced journey, and the minutes are consistent with the cell's map value."""
+    _skip_unless_geom(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    r = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    assert r.status_code == 200
+    map_cells = r.get_json()["cells"]
+    entry, sample = _geom_sample_cells(server, FERRY_LAT, FERRY_LON)
+    tree = entry["tree"]
+    data = server._RAPTOR.data
+
+    saw_transit = saw_walk_only = 0
+    for cid in sample:
+        resp = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        body = resp.get_json()
+        assert "error" not in body, f"{cid}: {body}"
+        assert "geom" in body, f"{cid}: /itinerary has no geom field"
+        geom, legs = body["geom"], body["legs"]
+
+        # 1:1 with the displayed breakdown: same count, mode, line name, minutes, order.
+        assert len(geom) == len(legs), f"{cid}: geom {len(geom)} legs vs breakdown {len(legs)}"
+        for g, l in zip(geom, legs):
+            assert g["mode"] == l["mode"], f"{cid}: {g['mode']} != {l['mode']}"
+            assert (g.get("name") or None) == (l.get("line") or None), f"{cid}: {g} vs {l}"
+            assert g["min"] == l["min"], f"{cid}: geom min {g['min']} != leg min {l['min']}"
+            if g["mode"] == "transit":
+                assert g.get("tmode") in ("bart", "metro", "bus", "cable"), g
+                assert g.get("feed"), g
+            assert isinstance(g["pts"], list)
+            for p in g["pts"]:
+                assert SF_LAT_MIN - 0.2 <= p[0] <= SF_LAT_MAX + 0.2, f"{cid}: bad lat {p}"
+                assert SF_LON_MIN - 0.2 <= p[1] <= SF_LON_MAX + 0.2, f"{cid}: bad lon {p}"
+
+        # Endpoints: starts at the hovered cell's center, ends at the workplace (~250m).
+        olat, olon = server.ORIGIN_LL[cid]
+        first_pts, last_pts = geom[0]["pts"], geom[-1]["pts"]
+        assert first_pts and last_pts, f"{cid}: empty endpoint geometry"
+        assert _haversine_m(first_pts[0][0], first_pts[0][1], olat, olon) <= 250, (
+            f"{cid}: route starts {first_pts[0]} far from cell center ({olat},{olon})"
+        )
+        assert _haversine_m(last_pts[-1][0], last_pts[-1][1], FERRY_LAT, FERRY_LON) <= 250, (
+            f"{cid}: route ends {last_pts[-1]} far from the workplace"
+        )
+
+        # Ride legs' endpoints == the traced journey's board/alight stop coords (the
+        # hover==map invariant extended to the drawn geometry: same trace, same stops).
+        ci = server._RAPTOR.cell_index[cid]
+        legs_raw, _lh = tree._trace(ci)
+        rides = [l for l in legs_raw
+                 if l[0] == "ride" and (l[3] - l[2]) >= 120]   # significant (un-folded) rides
+        transit_geoms = [g for g in geom if g["mode"] == "transit"]
+        assert len(transit_geoms) == len(rides), (
+            f"{cid}: {len(transit_geoms)} transit geom legs vs {len(rides)} traced rides"
+        )
+        for g, ride in zip(transit_geoms, rides):
+            pi, bpos, apos = ride[1], ride[4], ride[5]
+            sbase = int(data["pat_stop_off"][pi])
+            bstop = int(data["pat_stops"][sbase + bpos])
+            astop = int(data["pat_stops"][sbase + apos])
+            for stop, pt in ((bstop, g["pts"][0]), (astop, g["pts"][-1])):
+                sla, slo = float(data["stop_lat"][stop]), float(data["stop_lon"][stop])
+                if sla != sla or slo != slo:                   # NaN coords: skipped in pts
+                    continue
+                assert abs(pt[0] - sla) < 1e-4 and abs(pt[1] - slo) < 1e-4, (
+                    f"{cid}: ride endpoint {pt} != stop {stop} ({sla},{slo})"
+                )
+            saw_transit += 1
+        if not rides and len(legs) == 1 and legs[0]["mode"] == "walk":
+            saw_walk_only += 1
+
+        # Minutes consistent with the map: total == the cell's served map value, and the
+        # geom legs' minutes (+waits) sum to it like the breakdown's do.
+        assert body["total"] == map_cells[cid][1], (
+            f"{cid}: itinerary total {body['total']} != map value {map_cells[cid][1]}"
+        )
+        gsum = sum(g["min"] for g in geom) + sum(g.get("wait", 0) for g in geom)
+        assert gsum == body["total"], f"{cid}: geom minutes {gsum} != total {body['total']}"
+
+    assert saw_transit > 0, "sample never exercised a transit ride's geometry"
+    assert saw_walk_only > 0, "sample never exercised a walk-only journey's geometry"
+
+
+def test_itinerary_geom_walk_paths_are_real_and_cached(client, server):
+    """Walk legs are real street paths when the walk graph is loaded (many nodes, not a
+    straight 2-point approx), and a repeat GET serves the identical cached payload."""
+    _skip_unless_geom(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    entry, sample = _geom_sample_cells(server, FERRY_LAT, FERRY_LON)
+    cid = sample[0]                                   # the multi-transfer cell
+    r1 = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert r1.status_code == 200
+    b1 = r1.get_json()
+    walk_geoms = [g for g in b1["geom"] if g["mode"] == "walk" and g["min"] >= 2]
+    if server.USE_WALK_GRAPH:
+        assert walk_geoms, "multi-transfer journey has no walk legs >= 2 min"
+        for g in walk_geoms:
+            assert not g.get("approx"), f"walk leg marked approx with the graph loaded: {g}"
+            assert len(g["pts"]) >= 4, (
+                f"walk leg of {g['min']} min has only {len(g['pts'])} pts — not a street path"
+            )
+    else:
+        for g in walk_geoms:
+            assert g.get("approx") is True, "graphless walk leg must be marked approx"
+    # cached: the per-cell geometry is assembled once per workplace tree (bit-identical).
+    r2 = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert r2.get_json() == b1
+
+
+# --------------------------------------------------------------------------------------
+# /itinerary alts — the drawn ALTERNATIVE routes (under-delays re-routes; RAPTOR MC only)
+# --------------------------------------------------------------------------------------
+def _cell_with_alt_chips(server, dlat, dlon):
+    """A reachable cell id whose MC overlay surfaced alt chips (so /itinerary can draw alts) +
+    its served alt-line set, peeking the built MC entry directly. None if no cell qualifies."""
+    mc = server._mc_peek(dlat, dlon, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    if not mc:
+        return None, None
+    for ci, lines in mc.get("alt_chips", {}).items():
+        if lines:
+            return server._RAPTOR.cell_ids[ci], list(lines)
+    return None, None
+
+
+@pytest.mark.slow
+def test_itinerary_alts_lines_subset_chips_and_geometry_contract(client, server):
+    """After /variance has built the MC, /itinerary for a cell with alt chips returns ``alts``
+    whose lines are a SUBSET of that cell's chip lines, and each alt's legs satisfy the SAME
+    geometry contract as the primary route: the first walk leg starts at the cell center and the
+    last ends at the workplace (within ~250m), and every ride leg's first/last points are the
+    board/alight stop coords. Determinism: a second identical request returns identical alts."""
+    _skip_unless_mc(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    # Paint the perfect map, then build the MC (the only path that captures the alt bundle).
+    client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    rv = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert rv.status_code == 200, rv.get_data(as_text=True)
+    cid, chips = _cell_with_alt_chips(server, FERRY_LAT, FERRY_LON)
+    assert cid is not None, "MC surfaced no alt chips on any cell — alt-route path can't be tested"
+
+    resp = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert "alts" in body, "/itinerary missing the alts field"
+    alts = body["alts"]
+    assert isinstance(alts, list) and alts, f"{cid}: expected drawn alts, got {alts!r}"
+    assert len(alts) <= 4, f"{cid}: {len(alts)} alts (> 4 cap)"
+
+    data = server._RAPTOR.data
+    olat, olon = server.ORIGIN_LL[cid]
+    chip_set = set(chips)
+    seen_ride = 0
+    for alt in alts:
+        # line ⊆ the cell's chip lines (the same exclusion + cap /variance applied).
+        assert alt["line"] in chip_set, f"{cid}: alt line {alt['line']!r} not in chips {chips}"
+        assert isinstance(alt["min"], int) and alt["min"] > 0, alt
+        legs = alt["legs"]
+        assert legs, f"{cid}: alt {alt['line']} has no legs"
+        # same geometry contract as the primary route ----------------------------------------
+        first_pts, last_pts = legs[0]["pts"], legs[-1]["pts"]
+        assert first_pts and last_pts, f"{cid}: empty endpoint geometry on alt {alt['line']}"
+        assert _haversine_m(first_pts[0][0], first_pts[0][1], olat, olon) <= 250, (
+            f"{cid}: alt {alt['line']} starts {first_pts[0]} far from cell ({olat},{olon})")
+        assert _haversine_m(last_pts[-1][0], last_pts[-1][1], FERRY_LAT, FERRY_LON) <= 250, (
+            f"{cid}: alt {alt['line']} ends {last_pts[-1]} far from the workplace")
+        # the alt's dominant transit line IS its label (longest ride carries the line name).
+        transit = [l for l in legs if l["mode"] == "transit"]
+        assert transit, f"{cid}: alt {alt['line']} has no transit leg"
+        assert alt["line"] in {l["name"] for l in transit}, (
+            f"{cid}: alt label {alt['line']} not among its transit legs {[l['name'] for l in transit]}")
+        for l in transit:
+            assert l.get("tmode") in ("bart", "metro", "bus", "cable"), l
+            assert l.get("feed"), l
+            # ride pts must start/end at REAL stop coords (within ~120m; snapped polyline ends).
+            for end in (l["pts"][0], l["pts"][-1]):
+                assert SF_LAT_MIN - 0.2 <= end[0] <= SF_LAT_MAX + 0.2, l
+                assert SF_LON_MIN - 0.2 <= end[1] <= SF_LON_MAX + 0.2, l
+            seen_ride += 1
+        # geom minutes (+waits) sum to the alt total, like the primary route.
+        gsum = sum(l["min"] for l in legs) + sum(l.get("wait", 0) for l in legs)
+        assert gsum == alt["min"], f"{cid}: alt {alt['line']} legs {gsum} != total {alt['min']}"
+    assert seen_ride > 0, "no alt exercised a transit ride's geometry"
+
+    # Cross-check ride endpoints against the captured draw's actual board/alight stops (the alt
+    # geometry is traced from the SAME perturbed journey the vote came from, not a recompute).
+    mc = server._mc_peek(FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    bundle = mc["alt_bundle"]
+    ci = server._RAPTOR.cell_index[cid]
+    for alt in alts:
+        di = next(d for d in range(len(bundle["draws"]))
+                  if bundle["draws"][d]["dom"][ci] == alt["line"])
+        tree = server._RAPTOR.alt_journey_tree(bundle, di)
+        legs_raw, _lh = tree._trace(ci)
+        rides = [l for l in legs_raw if l[0] == "ride" and (l[3] - l[2]) >= 120]
+        transit_geoms = [l for l in alt["legs"] if l["mode"] == "transit"]
+        assert len(transit_geoms) == len(rides), (
+            f"{cid}/{alt['line']}: {len(transit_geoms)} geom rides vs {len(rides)} traced rides")
+        for g, ride in zip(transit_geoms, rides):
+            pi, bpos, apos = ride[1], ride[4], ride[5]
+            sbase = int(data["pat_stop_off"][pi])
+            for pos, pt in ((bpos, g["pts"][0]), (apos, g["pts"][-1])):
+                stop = int(data["pat_stops"][sbase + pos])
+                sla, slo = float(data["stop_lat"][stop]), float(data["stop_lon"][stop])
+                if sla != sla or slo != slo:                  # NaN coords skipped in pts
+                    continue
+                assert abs(pt[0] - sla) < 1e-4 and abs(pt[1] - slo) < 1e-4, (
+                    f"{cid}/{alt['line']}: ride endpoint {pt} != stop {stop} ({sla},{slo})")
+
+    # Determinism: a second identical request reproduces the alts byte-for-byte.
+    resp2 = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert resp2.status_code == 200
+    assert resp2.get_json()["alts"] == alts, "alts differ across two identical requests"
+
+
+def test_itinerary_alts_empty_before_variance_built(client, server):
+    """A fresh workplace whose MC has NOT been requested yet returns ``alts: []`` — /itinerary
+    must NEVER trigger the ~1s MC build on the hover path (the frontend re-hovers after
+    /variance lands). We evict any stale MC entry for this coord first to guarantee the miss."""
+    _skip_unless_mc(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    lat, lon = TWIN_PEAKS_LAT, TWIN_PEAKS_LON
+    key = server._coarse_key(lat, lon, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    # Guarantee a clean MC state for this workplace (other tests / ordering may have built it).
+    server._RAPTOR_MC_CACHE.pop(key)
+    assert server._mc_peek(lat, lon, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED) is None
+    # Paint the map (builds the traced tree, NOT the MC) and hover a reachable cell.
+    rc = client.get(f"/compute?lat={lat}&lon={lon}")
+    assert rc.status_code == 200
+    cells = rc.get_json()["cells"]
+    cid = next(c for c, pair in cells.items() if pair[1] is not None)
+    resp = client.get(f"/itinerary?id={cid}&dlat={lat}&dlon={lon}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body.get("alts") == [], f"alts must be [] before /variance, got {body.get('alts')!r}"
+    # The hover must NOT have built the MC (no cost paid on the hover path).
+    assert server._mc_peek(lat, lon, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED) is None, (
+        "/itinerary triggered the MC build on the hover path (must stay lazy)")
+
+
+# --------------------------------------------------------------------------------------
 # /geocode
 # --------------------------------------------------------------------------------------
 def test_geocode_ferry_building(client):
@@ -254,13 +670,9 @@ def test_autocomplete_short_and_blank_are_empty(client):
         assert resp.get_json()["results"] == [], f"q={q!r} should yield no results"
 
 
-@pytest.mark.xfail(
-    reason="KNOWN BUG: /autocomplete (via geo.autocomplete) can return duplicate "
-    "results — Photon returns the same place twice and nothing de-dupes. Documented, "
-    "not hidden: this should pass once the geocoder de-dupes results.",
-    strict=False,
-)
 def test_autocomplete_dedups_results(client):
+    """Guards the server-side _dedup wiring in geo.autocomplete: whatever the upstream
+    returns, no two results may share the same (label, 5-decimal lat/lon) key."""
     resp = client.get("/autocomplete?q=ferry")
     assert resp.status_code == 200
     results = resp.get_json()["results"]
@@ -274,24 +686,34 @@ def test_autocomplete_dedups_results(client):
 # --------------------------------------------------------------------------------------
 # Non-blocking heavy lock -> 503 {busy}
 # --------------------------------------------------------------------------------------
-def test_heavy_lock_makes_compute_exact_503(client, server):
-    """Hold the real _HEAVY_LOCK ourselves; /compute_exact must NOT block — it returns 503
-    {busy:true} with a Retry-After header. After release it works again.
+def test_heavy_lock_compute_exact_contract(client, server):
+    """The _HEAVY_LOCK contract on /compute_exact, which INVERTS with the engine:
 
-    Use a fresh coarse coordinate so a cached result can't short-circuit the lock check
-    (the endpoint returns a cache hit BEFORE trying to acquire the lock)."""
-    # Coordinate guaranteed not to be in the coarse cache yet.
+    * RAPTOR (the pinned default): /compute_exact is the instant engine result (map ==
+      refine, ~ms) and bypasses _HEAVY_LOCK BY DESIGN — so it must stay responsive (200,
+      non-empty cells) even while a heavy job holds the lock.
+    * Legacy R5 (USE_RAPTOR=0): a held lock must turn it into a non-blocking 503
+      {busy:true} with a Retry-After header; after release it works again."""
+    # Coordinate guaranteed not to be in the coarse cache yet (the legacy endpoint returns
+    # a cache hit BEFORE trying to acquire the lock).
     lat, lon = 37.7611, -122.4350
-    with server._RESULT_CACHE_LOCK:
-        server._EXACT_RESULT_CACHE.pop(server._coarse_key(lat, lon), None)
 
     acquired = server._HEAVY_LOCK.acquire(blocking=False)
     assert acquired, "_HEAVY_LOCK was already held — another heavy job in this process?"
     try:
-        resp = client.get(f"/compute_exact?lat={lat}&lon={lon}")
-        assert resp.status_code == 503, resp.get_data(as_text=True)
-        assert resp.get_json() == {"busy": True}
-        assert resp.headers.get("Retry-After"), "503 should carry a Retry-After header"
+        if server.USE_RAPTOR:
+            resp = client.get(f"/compute_exact?lat={lat}&lon={lon}")
+            assert resp.status_code == 200, resp.get_data(as_text=True)
+            body = resp.get_json()
+            assert body["dest"] == [lat, lon]
+            assert body["cells"], "RAPTOR /compute_exact returned no cells under a held lock"
+        else:
+            with server._RESULT_CACHE_LOCK:
+                server._EXACT_RESULT_CACHE.pop(server._coarse_key(lat, lon), None)
+            resp = client.get(f"/compute_exact?lat={lat}&lon={lon}")
+            assert resp.status_code == 503, resp.get_data(as_text=True)
+            assert resp.get_json() == {"busy": True}
+            assert resp.headers.get("Retry-After"), "503 should carry a Retry-After header"
     finally:
         server._HEAVY_LOCK.release()
 
@@ -340,8 +762,14 @@ def test_rate_limit_is_enforced_or_wired(client, server):
 # --------------------------------------------------------------------------------------
 @pytest.mark.slow
 def test_cell_cache_warms_and_resets_on_new_dest(client, server):
-    """/compute warms _LAST_DEST_KEY; /itinerary for a cell warms _CELL_CACHE; repeating
-    the SAME coords keeps the cache; a DIFFERENT coord clears it (new _LAST_DEST_KEY)."""
+    """/compute warms _LAST_DEST_KEY; /itinerary for a cell warms the per-workplace
+    breakdown cache; repeating the SAME coords keeps it.
+
+    The cache LAYER differs by engine: under RAPTOR arrive-by (the pinned default)
+    breakdowns come from _RAPTOR_TREE_CACHE (a bounded LRU keyed by ~110m bucket + rides
+    + speed; new-dest hygiene is LRU eviction, not _reset_caches) and the legacy
+    _CELL_CACHE must stay EMPTY on that path. Under legacy R5 (USE_RAPTOR=0), /itinerary
+    warms _CELL_CACHE and a DIFFERENT coord clears it (new _LAST_DEST_KEY)."""
     fkey = server._dest_key(FERRY_LAT, FERRY_LON)
 
     # Reset the limiter so a prior test (e.g. the rate-limit test) that consumed this
@@ -350,6 +778,45 @@ def test_cell_cache_warms_and_resets_on_new_dest(client, server):
         server.limiter.reset()
     except Exception:
         pass
+
+    if server.USE_RAPTOR and server.RAPTOR_SEMANTIC == "arriveby":
+        # 1) /compute sets the current dest AND builds the traced tree -> tree cache warm.
+        r = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+        assert r.status_code == 200
+        assert server._LAST_DEST_KEY == fkey
+        tkey = server._coarse_key(FERRY_LAT, FERRY_LON,
+                                  server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+        entry = server._RAPTOR_TREE_CACHE.get(tkey)
+        assert entry is not None, "/compute did not warm _RAPTOR_TREE_CACHE (arrive-by)"
+        # 2) /itinerary serves from that tree; its total must equal the cell's map value
+        #    (hover == map) and the legacy R5 _CELL_CACHE must remain untouched.
+        cells = entry["cells"]
+        cid = next(c for c, (b, rl) in cells.items() if rl is not None)
+        r = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+        assert r.status_code == 200, r.get_data(as_text=True)
+        body = r.get_json()
+        assert "error" not in body, body
+        assert body["total"] == cells[cid][1], (
+            f"breakdown total {body['total']} != map value {cells[cid][1]} for cell {cid}"
+        )
+        assert fkey not in server._CELL_CACHE, (
+            "_CELL_CACHE was populated on the RAPTOR arrive-by path — legacy cache leak"
+        )
+        # 3) Same coords again: the tree entry survives (re-submit keeps caches).
+        client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+        assert server._LAST_DEST_KEY == fkey
+        assert server._RAPTOR_TREE_CACHE.get(tkey) is not None, (
+            "tree cache should survive a same-dest /compute"
+        )
+        # 4) A DIFFERENT coord moves _LAST_DEST_KEY (tree entries age out via LRU, not reset).
+        tpkey = server._dest_key(TWIN_PEAKS_LAT, TWIN_PEAKS_LON)
+        assert tpkey != fkey
+        r = client.get(f"/compute?lat={TWIN_PEAKS_LAT}&lon={TWIN_PEAKS_LON}")
+        assert r.status_code == 200
+        assert server._LAST_DEST_KEY == tpkey, "new dest did not update _LAST_DEST_KEY"
+        # Restore Ferry as the current dest so other tests start from a known state.
+        client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+        return
 
     # 1) /compute for Ferry: establishes this as the current dest.
     r = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
@@ -428,12 +895,41 @@ def test_index_page_is_clean_and_private(client, server):
     # private literal from the gitignored .env at runtime (NOT hardcoded in this test) and
     # assert its absence from the page, which is built once at boot from a generic template.
     #
+    # ONE deliberate exception (commit db727c0): _build_page injects cfg.default_wp — the
+    # resolved .env DEFAULT_ADDRESS — so a fresh browser shows the configured workplace
+    # without typing. We reconstruct that exact JSON fragment the way _build_page does,
+    # assert it appears AT MOST ONCE, strip it, and require the needles absent from
+    # EVERYTHING ELSE — i.e. the single documented injection is the only carrier.
+    # (Product note: on a PUBLIC deployment, setting DEFAULT_ADDRESS in /etc/sfci.env
+    # exposes that address to every visitor — by design of db727c0; leave it unset there
+    # if that matters.)
+    #
     # NB: we deliberately do NOT scrape .dest_cache.json — its keys are incidental geocoder
     # lookups (e.g. "1 Market St"), some of which legitimately appear as UI placeholder text
     # in the template and are not the user's private workplace. The privacy invariant is
     # specifically about the configured DEFAULT_ADDRESS / DEST_LABEL / DEST_LAT/LON.
+    frag = _injected_default_wp_fragment()
+    if frag:
+        assert html.count(frag) <= 1, "default_wp fragment injected more than once"
+        html = html.replace(frag, "", 1)
     for needle in _private_workplace_needles():
-        assert needle not in html, f"served page leaks private workplace value {needle!r}"
+        assert needle not in html, (
+            f"served page leaks private workplace value {needle!r} outside the single "
+            "deliberate cfg.default_wp injection"
+        )
+
+
+def _injected_default_wp_fragment():
+    """Reconstruct the exact default_wp JSON fragment server._build_page embeds in __CFG__
+    (same dict construction order + json.dumps defaults + the '<' hardening replace), so the
+    privacy assertion can whitelist precisely that one deliberate injection and nothing else.
+    Returns None when no default workplace is configured/resolvable (strict mode)."""
+    try:
+        import destination as _dest
+        lat, lon, label = _dest._resolve()
+    except Exception:
+        return None
+    return json.dumps({"lat": lat, "lon": lon, "label": label}).replace("<", "\\u003c")
 
 
 def _private_workplace_needles():

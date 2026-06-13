@@ -24,6 +24,26 @@ WINDOW_MIN = 30            # departure-time window (min) the percentiles span
 MAX_MIN = 75               # routing cap (min) — trips longer than this are unreachable
 PERCENTILES = [5, 50]      # 5th = best-case (you time it well), 50th = realistic (median)
 WALK_KMH = 4.8             # walking speed (r5py's 3.6 default is too slow)
+# Walk-speed toggle presets (the server's ?speed= param; the RAPTOR engine applies the
+# scalar WALK_KMH / WALK_SPEEDS[speed] to its reference-second walk tables). 'med' IS the
+# canonical WALK_KMH (scalar 1.0), so the baked access/egress tables need no rescaling at
+# the default.
+WALK_SPEEDS = {"slow": 4.0, "med": WALK_KMH, "fast": 5.6}   # km/h
+DEFAULT_SPEED = "med"
+
+# --- Geographic bounds (minLon, minLat, maxLon, maxLat) -------------------------------
+# Two DIFFERENT boxes — don't conflate them:
+#   SF_BBOX       — TIGHT box around San Francisco proper; biases/filters the geocoder
+#                   (core/geo.py) so providers agree on "SF". scripts/setup.sh (OSM clip)
+#                   and scripts/fetch_dem.sh (DEM extent) carry their own slightly
+#                   padded/clipped variants of this box — keep them roughly in sync if
+#                   this ever changes.
+#   SF_VALID_BBOX — LOOSE input-validation box (server _parse_ll): wide enough to accept
+#                   near-SF workplaces (Daly City, East Bay edge) the grid can still
+#                   route toward, while rejecting garbage coordinates that would burn a
+#                   full compute for an unusable result.
+SF_BBOX = (-122.55, 37.70, -122.34, 37.84)
+SF_VALID_BBOX = (-123.1, 37.3, -122.0, 38.1)
 
 # --- Data files -----------------------------------------------------------------------
 OSM_FILE = "osm_sf.pbf"

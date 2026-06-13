@@ -1,95 +1,204 @@
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SF Commute Explorer — set your own workplace</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* First-paint theming: set data-theme synchronously BEFORE any CSS applies so a
+   light-preference visitor never sees a flash of the dark default chrome. Precedence
+   matches the app (bootTheme/applyHash): hash th= (session-only) > saved pref > OS. */
+(function(){try{var m=location.hash.match(/(?:^#|&)th=(light|dark|auto)(?:&|$)/);var p=m?m[1]:null;if(!p){try{p=localStorage.getItem("theme_v1");}catch(e){}}var t=(p==="light"||p==="dark")?p:(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");document.documentElement.dataset.theme=t;}catch(e){}})();
+</script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <style>
-  :root{--panel:#171a21;--ink:#e8eaed;--mut:#9aa3af;--line:#272b34;--accent:#5ab0ff}
+  /* Theme tokens. All visible chrome reads through these vars so the only thing that
+     differs between light/dark is the palette block — no hardcoded hex past this point. */
+  :root{
+    --panel:#171a21;--ink:#e8eaed;--mut:#9aa3af;--line:#272b34;--accent:#5ab0ff;
+    --ink-on-accent:#06121f;
+    --bg-map:#0b0d10;--bg-input:#0e1116;--bg-hover:#1f2530;--bg-row-line:#1c2027;
+    --bg-button:#11141a;--bg-toast:#2a2f3a;--bg-handle:#3a414d;
+    --bg-walk:#262b33;--ink-walk:#b6bdc8;
+    --bg-wait-a:#1c2030;--bg-wait-b:#161a26;--ink-wait:#8089b3;
+    --ink-arr:#4b515c;--ink-foot:#5c6470;--ink-dim:#9aa3af;
+    --shadow:0 6px 20px rgba(0,0,0,.45);--shadow-strong:0 10px 34px rgba(0,0,0,.55);
+    --shadow-pop:0 14px 40px rgba(0,0,0,.6);--shadow-busy:0 2px 10px rgba(0,0,0,.4);
+    --shadow-ac:0 10px 28px rgba(0,0,0,.5);--shadow-toast:0 6px 20px rgba(0,0,0,.5);
+    --shadow-sheet:0 -8px 30px rgba(0,0,0,.55);
+    --panel-rgb:23 26 33;                 /* used by #legend's rgba() */
+    --modal-bg:rgba(4,6,9,.6);
+    --route-casing:#fff;                  /* white casing under every drawn route leg (dark theme) */
+  }
+  :root[data-theme="light"]{
+    --panel:#ffffff;--ink:#1a1d23;--mut:#6b7280;--line:#dde1e6;--accent:#1f6bd6;
+    --ink-on-accent:#ffffff;
+    --bg-map:#e9edf2;--bg-input:#f5f7fa;--bg-hover:#eef1f6;--bg-row-line:#eaedf1;
+    --bg-button:#f5f7fa;--bg-toast:#ffffff;--bg-handle:#b5bcc6;
+    --bg-walk:#eef1f6;--ink-walk:#4a5160;
+    --bg-wait-a:#e8ebf0;--bg-wait-b:#f3f5f8;--ink-wait:#5560a3;
+    --ink-arr:#aab2bf;--ink-foot:#6b7280;--ink-dim:#6b7280;
+    --shadow:0 6px 20px rgba(30,40,60,.10);--shadow-strong:0 10px 34px rgba(30,40,60,.16);
+    --shadow-pop:0 14px 40px rgba(30,40,60,.18);--shadow-busy:0 2px 10px rgba(30,40,60,.10);
+    --shadow-ac:0 10px 28px rgba(30,40,60,.12);--shadow-toast:0 6px 20px rgba(30,40,60,.12);
+    --shadow-sheet:0 -8px 30px rgba(30,40,60,.14);
+    --panel-rgb:255 255 255;
+    --modal-bg:rgba(40,50,70,.4);
+    /* On the light basemap pure white casing vanishes; a near-white with a faint cool tint
+       still reads as a halo against light tiles while keeping the colored stroke dominant. */
+    --route-casing:#ffffff;
+  }
   *{box-sizing:border-box} html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-  #map{position:absolute;inset:0;background:#0b0d10}.leaflet-container{background:#0b0d10}
+  #map{position:absolute;inset:0;background:var(--bg-map)}.leaflet-container{background:var(--bg-map)}
   #panel{position:absolute;top:0;right:0;width:330px;height:100%;background:var(--panel);color:var(--ink);
     z-index:1000;display:flex;flex-direction:column;overflow-y:auto;border-left:1px solid var(--line)}
   h1{font-size:15px;margin:0;padding:14px 16px 3px}.sub{color:var(--mut);font-size:12px;padding:0 16px 10px;line-height:1.45}
   .ctl{padding:9px 16px;border-top:1px solid var(--line)}
   .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-bottom:7px}
-  .addr{display:flex;gap:6px}.addr input{flex:1;background:#0e1116;border:1px solid var(--line);color:var(--ink);
-    padding:8px;border-radius:8px;font-size:13px}.addr button{background:var(--accent);color:#06121f;border:0;
+  .addr{display:flex;gap:6px}.addr input{flex:1;background:var(--bg-input);border:1px solid var(--line);color:var(--ink);
+    padding:8px;border-radius:8px;font-size:13px}.addr button{background:var(--accent);color:var(--ink-on-accent);border:0;
     padding:0 12px;border-radius:8px;font-weight:600;cursor:pointer}
-  .seg{display:flex;gap:6px}.seg button{flex:1;background:#11141a;color:var(--ink);border:1px solid var(--line);
-    padding:7px;border-radius:8px;font-size:12.5px;cursor:pointer}.seg button.on{background:var(--accent);color:#06121f;font-weight:600;border-color:var(--accent)}
+  .seg{display:flex;gap:6px}.seg button{flex:1;background:var(--bg-button);color:var(--ink);border:1px solid var(--line);
+    padding:7px;border-radius:8px;font-size:12.5px;cursor:pointer}.seg button.on{background:var(--accent);color:var(--ink-on-accent);font-weight:600;border-color:var(--accent)}
   input[type=range]{width:100%;accent-color:var(--accent)} .val{color:var(--accent);font-weight:600}
   #list{border-top:1px solid var(--line)}   /* flows; the whole #panel scrolls */
-  .nb{display:flex;justify-content:space-between;padding:7px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid #1c2027}
-  .nb:hover{background:#1f2530}.nb .t{font-variant-numeric:tabular-nums;font-weight:600}.nb small{color:var(--mut)}
-  #legend{position:absolute;left:14px;bottom:16px;z-index:1000;background:rgba(20,23,29,.92);color:var(--ink);
+  .nb{display:flex;justify-content:space-between;padding:7px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--bg-row-line)}
+  .nb:hover{background:var(--bg-hover)}.nb .t{font-variant-numeric:tabular-nums;font-weight:600}.nb small{color:var(--mut)}
+  #legend{position:absolute;left:14px;bottom:16px;z-index:1000;background:rgb(var(--panel-rgb) / .92);color:var(--ink);
     padding:11px 13px;border:1px solid var(--line);border-radius:10px;font-size:12px}
   #legend .bar{height:11px;width:240px;border-radius:3px;margin:7px 0 4px}
   #legend .sc{display:flex;justify-content:space-between;color:var(--mut);font-size:11px}
-  #busy{position:absolute;top:12px;left:12px;z-index:1100;background:var(--accent);color:#06121f;font-weight:600;
-    padding:7px 12px;border-radius:20px;font-size:12.5px;display:none;box-shadow:0 2px 10px rgba(0,0,0,.4)}
-  .leaflet-tooltip.tt{background:#11141a;border:1px solid var(--line);color:var(--ink);white-space:normal;padding:0;box-shadow:0 6px 20px rgba(0,0,0,.45)}
+  #busy{position:absolute;top:12px;left:12px;z-index:1100;background:var(--accent);color:var(--ink-on-accent);font-weight:600;
+    padding:7px 12px;border-radius:20px;font-size:12.5px;display:none;box-shadow:var(--shadow-busy)}
+  .leaflet-tooltip.tt{background:var(--bg-input);border:1px solid var(--line);color:var(--ink);white-space:normal;padding:0;box-shadow:var(--shadow)}
   .leaflet-tooltip.tt:before{border:none!important}
+  /* open-after-ready: the hover card is bound+opened on hover (so it exists for hit-testing) but
+     held INVISIBLE until its content + route + final direction are ready, then revealed IN PLACE.
+     visibility (not display) keeps its measured rect valid while hidden, so it reveals exactly
+     where it was placed — the card appears once, parked, and never visibly repositions. */
+  .leaflet-tooltip.tt.tt-pending{visibility:hidden}
   .leaflet-popup-content{margin:0;font-size:12.5px}
-  .leaflet-popup-content-wrapper{background:#11141a;color:var(--ink);border:1px solid var(--line);border-radius:10px}
-  .leaflet-popup-tip{background:#11141a}
+  .leaflet-popup-content-wrapper{background:var(--bg-input);color:var(--ink);border:1px solid var(--line);border-radius:10px}
+  .leaflet-popup-tip{background:var(--bg-input)}
   .bd{width:238px;padding:11px 13px;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
   .bd .h{font-size:15px;margin-bottom:3px;letter-spacing:.1px}
+  /* --- pinned route card: a fixed corner panel (replaces the on-map popup) so the pinned
+         breakdown never sits on top of the drawn route. Same .bd content, panel chrome. --- */
+  #pincard{position:absolute;top:78px;right:344px;z-index:1200;background:var(--panel);color:var(--ink);
+    border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-pop);display:none;
+    max-width:262px;animation:pincard-in .14s ease}
+  #pincard.open{display:block}
+  @keyframes pincard-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+  #pincard .pinx{position:absolute;top:6px;right:8px;cursor:pointer;color:var(--mut);font-size:18px;
+    line-height:1;width:20px;height:20px;display:flex;align-items:center;justify-content:center;
+    border-radius:6px;z-index:1}
+  #pincard .pinx:hover{color:var(--ink);background:var(--bg-hover)}
+  #pincard .bd{width:auto;min-width:200px;max-width:262px;padding-right:26px}
   .bd .legs{display:flex;flex-wrap:wrap;gap:5px 5px;align-items:center}
   .bd .leg{padding:1px 7px;border-radius:7px;white-space:nowrap;font-size:11.5px;font-weight:600}
-  .bd .walk{background:#262b33;color:#b6bdc8;font-weight:500}
-  .bd .wait{color:#8089b3;font-style:italic;font-weight:500;padding:1px 3px;background:repeating-linear-gradient(45deg,#1c2030,#1c2030 3px,#161a26 3px,#161a26 6px);border-radius:6px}
-  .bd .arr{color:#4b515c;font-size:10px}
-  .bd .gm{color:#5ab0ff;display:inline-block;margin-top:9px;font-weight:600;text-decoration:none}
+  .bd .walk{background:var(--bg-walk);color:var(--ink-walk);font-weight:500}
+  .bd .wait{color:var(--ink-wait);font-style:italic;font-weight:500;padding:1px 3px;background:repeating-linear-gradient(45deg,var(--bg-wait-a),var(--bg-wait-a) 3px,var(--bg-wait-b) 3px,var(--bg-wait-b) 6px);border-radius:6px}
+  .bd .arr{color:var(--ink-arr);font-size:10px}
+  .bd .gm{color:var(--accent);display:inline-block;margin-top:9px;font-weight:600;text-decoration:none}
   .bd .gm:hover{text-decoration:underline}
-  .bd .foot{color:#5c6470;margin-top:5px;font-size:10.5px}
-  .credit{padding:9px 16px;color:#5c6470;font-size:10.5px;border-top:1px solid var(--line)}
+  .bd .foot{color:var(--ink-foot);margin-top:5px;font-size:10.5px}
   /* --- added: refine button + fast-map note --- */
-  .btn{width:100%;background:var(--accent);color:#06121f;border:0;padding:9px;border-radius:8px;
+  .btn{width:100%;background:var(--accent);color:var(--ink-on-accent);border:0;padding:9px;border-radius:8px;
     font-weight:600;font-size:13px;cursor:pointer}.btn:disabled{opacity:.55;cursor:default}
-  .btn.sec{background:#11141a;color:var(--ink);border:1px solid var(--line);font-weight:600}
+  .btn.sec{background:var(--bg-button);color:var(--ink);border:1px solid var(--line);font-weight:600}
   .note{color:var(--mut);font-size:11px;margin-top:6px;line-height:1.4}
   /* --- added: autocomplete dropdown --- */
   .acwrap{position:relative;flex:1}.acwrap input{width:100%}
-  #ac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:1200;background:#0e1116;
-    border:1px solid var(--line);border-radius:8px;overflow:hidden;display:none;box-shadow:0 10px 28px rgba(0,0,0,.5)}
+  #ac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:1200;background:var(--bg-input);
+    border:1px solid var(--line);border-radius:8px;overflow:hidden;display:none;box-shadow:var(--shadow-ac)}
   #ac.open{display:block}
-  .ac-item{padding:8px 10px;font-size:12.5px;color:var(--ink);cursor:pointer;border-bottom:1px solid #1c2027;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .ac-item:last-child{border-bottom:0}.ac-item.hl,.ac-item:hover{background:#1f2530}
+  .ac-item{padding:8px 10px;font-size:12.5px;color:var(--ink);cursor:pointer;border-bottom:1px solid var(--bg-row-line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ac-item:last-child{border-bottom:0}.ac-item.hl,.ac-item:hover{background:var(--bg-hover)}
   /* --- added: export controls --- */
   .export{display:flex;gap:6px;padding:7px 16px 11px}
-  .export button{flex:1;background:#11141a;color:var(--ink);border:1px solid var(--line);
-    padding:7px;border-radius:8px;font-size:11.5px;cursor:pointer}.export button:hover{background:#1f2530}
+  .export button{flex:1;background:var(--bg-button);color:var(--ink);border:1px solid var(--line);
+    padding:7px;border-radius:8px;font-size:11.5px;cursor:pointer}.export button:hover{background:var(--bg-hover)}
   /* --- added: toast --- */
   #toast{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);z-index:1300;
-    background:#2a2f3a;color:var(--ink);border:1px solid var(--line);padding:9px 15px;border-radius:20px;
-    font-size:12.5px;display:none;box-shadow:0 6px 20px rgba(0,0,0,.5);max-width:84%;text-align:center}
+    background:var(--bg-toast);color:var(--ink);border:1px solid var(--line);padding:9px 15px;border-radius:20px;
+    font-size:12.5px;display:none;box-shadow:var(--shadow-toast);max-width:84%;text-align:center}
+  /* --- hover tooltip footer: actionable "click to compare … then hover each" hint --- */
+  .bd .altfoot{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);
+    font-size:11px;line-height:1.45;color:var(--mut)}
+  .bd .altfoot b{color:var(--accent)}
+  /* --- compare list (pinned card): one selectable strip per route (primary + alts) ----------
+         The strip ties to the SINGLE route drawn on the map: its color dot = the drawn line's
+         identity casing color, its leg sequence reuses the .leg chip formatting, total right-
+         aligned. The locked/previewed row is marked (● + highlighted bg). Only one route draws
+         at a time, so the dot is the only cross-reference needed. --- */
+  .cmp{margin-top:9px;border-top:1px solid var(--line);padding-top:8px}
+  .cmp .cmphdr{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-bottom:6px}
+  .cmp .strip{display:flex;align-items:flex-start;gap:8px;padding:7px 8px;border-radius:9px;cursor:pointer;
+    border:1px solid transparent;transition:background .1s,border-color .1s}
+  .cmp .strip:hover{background:var(--bg-hover)}
+  .cmp .strip.sel{background:var(--bg-hover);border-color:var(--line)}
+  .cmp .strip .mark{flex:0 0 auto;width:13px;text-align:center;font-size:12px;color:var(--mut);line-height:1.4;margin-top:1px}
+  .cmp .strip.sel .mark{color:var(--ink)}
+  .cmp .strip .dot{flex:0 0 auto;width:10px;height:10px;border-radius:50%;margin-top:4px;
+    border:1px solid rgba(0,0,0,.35);box-shadow:0 0 0 1px rgba(255,255,255,.18)}
+  .cmp .strip .seq{flex:1 1 auto;min-width:0;display:flex;flex-wrap:wrap;gap:4px 4px;align-items:center}
+  .cmp .strip .seq .leg{font-size:10.5px;padding:1px 6px}
+  .cmp .strip .seq .arr{color:var(--ink-arr);font-size:9px}
+  .cmp .strip .tot{flex:0 0 auto;font-variant-numeric:tabular-nums;font-weight:700;font-size:12px;
+    margin-top:1px;white-space:nowrap}
+  .cmp .cmploading{font-size:11px;color:var(--mut);padding:4px 2px}
   /* --- added: how-it-works link + modal --- */
   .info-link{color:var(--accent);font-size:11.5px;cursor:pointer;text-decoration:none;margin-left:6px}
   .info-link:hover{text-decoration:underline}
-  #howmodal{position:absolute;inset:0;z-index:1400;background:rgba(4,6,9,.6);display:none;
+  /* shared modal shell: How it works + About both use it (one source of overlay styling) */
+  .modal{position:absolute;inset:0;z-index:1400;background:var(--modal-bg);display:none;
     align-items:center;justify-content:center;padding:18px}
-  #howmodal.open{display:flex}
-  #howmodal .card{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:14px;
-    max-width:420px;padding:20px 22px;box-shadow:0 14px 40px rgba(0,0,0,.6);font-size:13.5px;line-height:1.55}
-  #howmodal .card h2{margin:0 0 10px;font-size:15px}
-  #howmodal .card .x{float:right;cursor:pointer;color:var(--mut);font-size:18px;line-height:1;margin:-4px -4px 0 0}
-  #howmodal .card .x:hover{color:var(--ink)}
+  .modal.open{display:flex}
+  .modal .card{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:14px;
+    max-width:440px;max-height:84vh;overflow-y:auto;padding:20px 22px;box-shadow:var(--shadow-pop);
+    font-size:13.5px;line-height:1.55}
+  .modal .card h2{margin:0 0 10px;font-size:15px}
+  .modal .card h3{margin:16px 0 5px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+  .modal .card p{margin:0 0 9px}
+  .modal .card a{color:var(--accent)}
+  .modal .card ul{margin:0;padding-left:18px}
+  .modal .card ul li{margin-bottom:3px}
+  .modal .card .x{float:right;cursor:pointer;color:var(--mut);font-size:18px;line-height:1;margin:-4px -4px 0 0}
+  .modal .card .x:hover{color:var(--ink)}
+  /* slim footer bar pinned to the bottom of the side panel: About + How it works tabs */
+  .foot-bar{margin-top:auto;display:flex;border-top:1px solid var(--line);background:var(--panel)}
+  .foot-bar button{flex:1;background:none;border:0;border-right:1px solid var(--line);color:var(--mut);
+    padding:10px 8px;font-size:11.5px;font-family:inherit;cursor:pointer;letter-spacing:.02em}
+  .foot-bar button:last-child{border-right:0}
+  .foot-bar button:hover{background:var(--bg-hover);color:var(--ink)}
+  /* --- added: hover journey route (line labels + total badge drawn on the map) --- */
+  .rtwrap{background:none!important;border:none!important;pointer-events:none}
+  /* Line pill on each transit leg of the (single) drawn route: solid line-color fill, white
+     casing-ish border. Only one route draws at a time, so there is no alt-pill variant. */
+  .rtlab{display:inline-block;transform:translate(-50%,-50%);padding:1px 7px;border-radius:7px;
+    font-size:10.5px;font-weight:700;color:#fff;white-space:nowrap;
+    border:1.5px solid rgba(255,255,255,.9);box-shadow:0 1px 4px rgba(0,0,0,.45);
+    text-shadow:0 1px 1px rgba(0,0,0,.4)}
+  .rtbadge{display:inline-block;transform:translate(-50%,-135%);background:var(--panel);color:var(--ink);
+    border:1px solid var(--line);padding:2px 8px;border-radius:10px;font-size:11.5px;font-weight:700;
+    white-space:nowrap;box-shadow:var(--shadow)}
   /* --- added: mobile bottom-sheet handle (hidden on desktop) --- */
-  #sheetbtn{display:none}
+  /* it's a real <button> (keyboard-operable); strip the UA chrome so the sheet styling wins */
+  #sheetbtn{display:none;border:0;padding:0;width:100%;font-family:inherit}
   /* ============ responsive layer (<=719px): desktop >=720px stays byte-identical ============ */
   @media (max-width:719px){
     #map{inset:0}
     /* panel becomes a collapsible bottom sheet */
     #panel{top:auto;right:0;left:0;bottom:0;width:100%;height:auto;max-height:78vh;
       border-left:0;border-top:1px solid var(--line);border-radius:16px 16px 0 0;
-      transform:translateY(calc(100% - 52px));transition:transform .28s ease;box-shadow:0 -8px 30px rgba(0,0,0,.55)}
+      transform:translateY(calc(100% - 52px));transition:transform .28s ease;box-shadow:var(--shadow-sheet)}
     #panel.open{transform:translateY(0)}
     /* a fixed grab handle at the top of the sheet to open/close */
     #sheetbtn{display:flex;align-items:center;justify-content:center;gap:8px;height:52px;flex:0 0 auto;
       cursor:pointer;color:var(--ink);font-size:13px;font-weight:600;border-bottom:1px solid var(--line);
       background:var(--panel);border-radius:16px 16px 0 0;position:relative;touch-action:manipulation}
     #sheetbtn:before{content:"";position:absolute;top:7px;left:50%;transform:translateX(-50%);
-      width:38px;height:4px;border-radius:3px;background:#3a414d}
+      width:38px;height:4px;border-radius:3px;background:var(--bg-handle)}
     #panel h1{padding-top:8px}
     /* #list flows; the bottom sheet (#panel) scrolls */
     /* bigger tap targets */
@@ -108,19 +217,23 @@
     /* breakdown popup fills more width on small screens */
     .bd{width:auto;max-width:78vw}
     .leaflet-popup-content{max-width:80vw}
-    #howmodal .card{font-size:14px}
+    .modal .card{font-size:14px}
+    /* on mobile the side panel is a bottom sheet; float the pinned card to a fixed corner
+       so it isn't trapped inside the collapsed sheet */
+    #pincard{top:10px;right:10px;left:auto;max-width:78vw}
   }
 </style></head>
 <body>
 <div id="map"></div><div id="busy">computing…</div>
 <div id="prompt" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1050;pointer-events:none">
-  <div style="background:rgba(20,23,29,.94);color:#e8eaed;padding:18px 24px;border:1px solid #272b34;border-radius:12px;font-size:15px;text-align:center;box-shadow:0 10px 34px rgba(0,0,0,.55)">
-    Enter your workplace address  →<br><span style="color:#9aa3af;font-size:12.5px">(top-right) to map your commute</span></div></div>
+  <div style="background:rgb(var(--panel-rgb) / .94);color:var(--ink);padding:18px 24px;border:1px solid var(--line);border-radius:12px;font-size:15px;text-align:center;box-shadow:var(--shadow-strong)">
+    Enter your workplace address  →<br><span style="color:var(--mut);font-size:12.5px">(top-right) to map your commute</span></div></div>
 <div id="panel">
-  <div id="sheetbtn" aria-label="Toggle controls">Controls</div>
+  <button id="sheetbtn" aria-label="Toggle controls" aria-expanded="false">Controls</button>
   <h1>Commute to your workplace <a class="info-link" id="howlink" role="button" tabindex="0">How it works</a></h1>
-  <div class="sub">Enter your workplace address to begin. <b>Hover or tap</b> any area for its time + the route
-    behind it; <b>click</b> to pin it with a Google Maps link.</div>
+  <div class="sub">Enter your workplace address to begin. <b>Hover or tap</b> any area to see its time + the
+    route drawn on the map — the lines you'd ride, the transfers, where you'd walk; <b>click</b> to pin
+    the route with a Google Maps link (Esc unpins).</div>
   <div class="ctl"><div class="lab">Workplace</div>
     <div class="addr"><div class="acwrap"><input id="addr" placeholder="e.g. 1 Market St" autocomplete="off"
       role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="ac"><div id="ac" role="listbox"></div></div><button id="go">Set</button></div>
@@ -129,42 +242,75 @@
     <div class="note">Fast map (±~2 min) auto-sharpens to exact times. Use <b>Refine</b> to re-run the exact pass.</div></div>
     <div id="estnote" class="note" style="display:none">Door-to-door <b>estimates</b>, <span id="estphrase"></span> by walk + transit.</div></div>
   <div class="ctl"><div class="lab">Time estimate</div>
-    <div class="seg" id="metric"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
+    <div class="seg" id="metric" role="group" aria-label="Time estimate"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
   <div class="ctl"><div class="lab">Color by</div>
-    <div class="seg" id="cmode"><button data-v="time" class="on">Time</button><button data-v="line">Primary line</button></div></div>
+    <div class="seg" id="cmode" role="group" aria-label="Color by"><button data-v="time" class="on">Time</button><button data-v="line">Primary line</button></div></div>
+  <div class="ctl"><div class="lab">Appearance</div>
+    <div class="seg" id="theme" role="group" aria-label="Appearance"><button data-v="auto" class="on">Auto</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div>
   <div class="ctl"><div class="lab">Max transfers</div>
-    <div class="seg" id="maxrides"><button data-v="0">0</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="any" class="on">Any</button></div></div>
+    <div class="seg" id="maxrides" role="group" aria-label="Max transfers"><button data-v="0">0</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="any" class="on">Any</button></div></div>
   <div class="ctl"><div class="lab">Walk speed</div>
-    <div class="seg" id="speed"><button data-v="slow">Slow</button><button data-v="med" class="on">Medium</button><button data-v="fast">Fast</button></div></div>
+    <div class="seg" id="speed" role="group" aria-label="Walk speed"><button data-v="slow">Slow</button><button data-v="med" class="on">Medium</button><button data-v="fast">Fast</button></div></div>
   <div class="ctl"><div class="lab">Sweet spot — green ≤ <span class="val" id="idval">25</span> min (recolors)</div>
-    <input type="range" id="ideal" min="10" max="45" value="25"></div>
+    <input type="range" id="ideal" min="10" max="45" value="25" aria-label="Sweet spot threshold (minutes)"></div>
   <div class="ctl"><div class="lab">Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</div>
-    <input type="range" id="thr" min="10" max="70" value="40"></div>
+    <input type="range" id="thr" min="10" max="70" value="40" aria-label="Max commute (minutes)"></div>
   <div class="ctl"><div class="lab">Overlay real transit lines</div>
     <div style="display:flex;flex-wrap:wrap;gap:11px;font-size:12.5px">
-      <label style="cursor:pointer"><input type="checkbox" data-m="bart"> <span style="color:#6f8cff">BART</span></label>
-      <label style="cursor:pointer"><input type="checkbox" data-m="metro"> <span style="color:#ff6b6b">Metro</span></label>
-      <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span style="color:#f6a04d">Bus</span></label>
-      <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span style="color:#5cd65c">Cable</span></label>
+      <!-- label colors are set from viz.js MODECOLOR at boot — the ONE mode palette, no drift -->
+      <label style="cursor:pointer"><input type="checkbox" data-m="bart"> <span>BART</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="metro"> <span>Metro</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span>Bus</span></label>
+      <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span>Cable</span></label>
     </div></div>
   <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods <span id="nbcount" style="color:var(--mut);text-transform:none;letter-spacing:0;font-weight:400"></span></div></div>
   <div id="list"></div>
   <div class="export"><button id="copylist">Copy list</button><button id="dlcsv">Download CSV</button></div>
-  <div class="credit">Walk + Muni (511) + BART + Caltrain · self-built RAPTOR transit router + hill-aware
-    walking. Door-to-door <b>estimates</b> (<span id="creditphrase"></span>).
-    Geocoding © <a href="https://www.geoapify.com/" target="_blank" style="color:#5c6470">Geoapify</a>, © OpenStreetMap.</div>
+  <div class="foot-bar">
+    <button id="aboutbtn" type="button">About</button>
+    <button id="howbtn" type="button">How it works</button>
+  </div>
 </div>
 <div id="legend"><b id="legtitle">Realistic door-to-door (min)</b><div class="bar"></div>
   <div class="sc"></div></div>
 <div id="toast"></div>
-<div id="howmodal"><div class="card">
-  <span class="x" id="howx" role="button" aria-label="Close">&times;</span>
+<!-- pinned route card: a fixed corner panel that holds the clicked cell's breakdown so it
+     never covers the route drawn on the map (replaces the old on-cell popup pin). -->
+<div id="pincard" role="dialog" aria-label="Pinned route">
+  <span class="pinx" id="pinx" role="button" tabindex="0" aria-label="Unpin route">&times;</span>
+  <div id="pinbody"></div>
+</div>
+<div id="howmodal" class="modal"><div class="card">
+  <span class="x" id="howx" role="button" tabindex="0" aria-label="Close">&times;</span>
   <h2>How it works</h2>
-  <div>Door-to-door <b>estimates</b> by <b>walking + public transit only</b> (Muni / BART / Caltrain) —
-  no driving or biking — on real weekday schedules, <b><span id="howtime"></span></b>.
-  Walking is <b>hill-aware</b> (uphill is slower than downhill). <b>Hover or tap</b> any area for the
-  route behind the number; the <b>Realistic</b> view adds typical service delays, <b>Best-case</b>
-  assumes perfect timing.</div>
+  <p>The map shows <b>door-to-door</b> travel time by <b>walking + public transit only</b>
+  (Muni / BART / Caltrain) — no driving or biking — on real weekday schedules,
+  <b><span id="howtime"></span></b>. Each area is colored by how long it takes to reach your
+  workplace; <b>hover or tap</b> any area for the route behind the number.</p>
+  <p><b>Best-case</b> assumes perfect timing — you leave to the second and never wait.
+  <b>Realistic</b> is a Monte-Carlo "committed-plan" estimate: you commit to a departure and a
+  first line, then service noise (a late vehicle, a missed transfer) adds a typical wait.</p>
+  <p>Walking is <b>hill-aware</b> — uphill is slower than downhill (Tobler walking speeds over an
+  elevation model).</p>
+  <h3>Data sources</h3>
+  <ul>
+    <li><a href="https://511.org/open-data" target="_blank" rel="noopener">511 SF Bay Open Data</a> — Muni &amp; Caltrain GTFS</li>
+    <li><a href="https://www.bart.gov/dev/schedules/google_transit.zip" target="_blank" rel="noopener">BART developer feed</a> — BART GTFS</li>
+    <li><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> © contributors — walking network</li>
+    <li><a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noopener">USGS 3DEP</a> — elevation (hill-aware walking)</li>
+    <li><a href="https://data.sfgov.org/" target="_blank" rel="noopener">DataSF</a> — SF Find Neighborhoods</li>
+    <li><a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a> — basemap tiles</li>
+  </ul>
+</div></div>
+<div id="aboutmodal" class="modal"><div class="card">
+  <span class="x" id="aboutx" role="button" tabindex="0" aria-label="Close">&times;</span>
+  <h2>About</h2>
+  <p>SF Commute Explorer maps where in San Francisco you can live and still reach a workplace
+  you choose within a reachable transit commute.</p>
+  <p>Built by <a href="https://akshaymanglik.com" target="_blank" rel="noopener">Akshay Manglik</a>.</p>
+  <p>Under the hood it runs a self-built RAPTOR transit router and a hill-aware walk graph over
+  OpenStreetMap + elevation data — no heavyweight routing backend, so the whole thing serves
+  the full city in a fraction of a second.</p>
 </div></div>
 <script>
 /*__VIZ__*/
@@ -180,21 +326,60 @@ let maxxfers="any";   // "0"/"1"/"2" transfers, or "any" (the R5 default 8-ride 
 function ridesParam(){
   if(maxxfers==="any")return "";
   const n=+maxxfers;return Number.isFinite(n)?`&maxrides=${n+1}`:"";}
-let walkspeed="med";                              // walk pace toggle (slow|med|fast); RAPTOR only
-function speedParam(){return walkspeed==="med"?"":`&speed=${walkspeed}`;}
+let walkspeed="med";                              // walk pace toggle (slow|med|fast); RAPTOR arrive-by only
+// CFG.speedtoggle: the server only fully wires walk speed under RAPTOR arrive-by (map AND
+// breakdown apply it). Elsewhere hide the control and never send &speed= — it would be a
+// half-no-op (e.g. under departafter the map shifts but the R5 hover stays at 4.8 km/h).
+function speedParam(){return (walkspeed==="med"||!CFG.speedtoggle)?"":`&speed=${walkspeed}`;}
+if(!CFG.speedtoggle)document.getElementById("speed").closest(".ctl").style.display="none";
 let CURLABEL="";                                  // current workplace label (for permalink + dest line)
 const TOUCH = ("ontouchstart" in window) || (navigator.maxTouchPoints>0) || window.matchMedia("(max-width:719px)").matches;
 let SCALE=ramp(ideal).S;                          // current time->color scale (recomputed in redraw)
 let BDCACHE={};                                   // per-cell route breakdown cache (cleared on new workplace)
+// Appearance: persisted preference is "auto" | "light" | "dark". "auto" follows
+// prefers-color-scheme and re-applies when the OS toggles. The RESOLVED theme (always
+// "light" or "dark") drives the data-theme attribute, the basemap, and cellOpacity().
+let themePref="auto", THEME="dark";
+const _mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
+const cellOpacity=()=>THEME==="light"?0.85:0.72;  // light basemap needs more saturation to read
+function resolveTheme(p){return p==="light"||p==="dark"?p:(_mq&&_mq.matches?"light":"dark");}
+function applyTheme(){
+  THEME=resolveTheme(themePref);
+  document.documentElement.dataset.theme=THEME;
+  // Swap the basemap only when the RESOLVED theme actually changed — Auto->Dark on a dark
+  // OS (or the boot-time dark->dark call) must not discard every loaded tile for a no-op.
+  if(BASE&&baseTheme!==THEME){map.removeLayer(BASE);BASE=L.tileLayer(BASE_TILES[THEME],TILE_OPTS).addTo(map);BASE.bringToBack();baseTheme=THEME;}
+  // `layer` (const, declared below) is initialized before any applyTheme caller can run:
+  // bootTheme/applyHash/button clicks all happen later, and prefers-color-scheme change
+  // events are async tasks that can't fire mid-parse. Plain call is safe.
+  layer.setStyle(style);
+  // Route casing is theme-aware (--route-casing); re-render any drawn route so a live theme
+  // toggle restyles the PRIMARY casing. DRAWN/redrawCurrentRoute are declared below but every
+  // applyTheme caller runs after full parse (same reasoning as layer.setStyle above).
+  if(DRAWN)redrawCurrentRoute();
+}
+if(_mq){const onChange=()=>{if(themePref==="auto")applyTheme();};
+  if(_mq.addEventListener)_mq.addEventListener("change",onChange);else if(_mq.addListener)_mq.addListener(onChange);}
 const gmaps=(olat,olon)=>gmapsURL(olat,olon,DESTLL[0],DESTLL[1]);
 const color=v=>colorScale(v,SCALE);
 let bdToken=0;  // cancels stale hover-breakdown fetches
 const map=L.map("map",{preferCanvas:true}).setView([37.762,-122.43],12.3);  // canvas: 3k polygons stay light on CPU
-L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{maxZoom:19}).addTo(map);
+// Basemap is theme-aware: swapped in applyTheme() when light/dark changes (dark_all <-> light_all).
+const BASE_TILES={dark:"https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+                  light:"https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"};
+// One options object for BOTH tile-layer call sites (boot + the theme-switch rebuild above),
+// so the required OSM/CARTO basemap attribution can't drift between them.
+const TILE_OPTS={maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'};
+// Initial basemap follows the data-theme the <head> script already resolved (hash > saved >
+// OS), so a light-theme visitor never downloads a screenful of dark tiles that get thrown
+// away. baseTheme tracks the theme the TILE LAYER actually uses, so applyTheme can skip the
+// expensive remove/re-add when the resolved theme didn't change (e.g. Auto<->Dark on a dark OS).
+let baseTheme=document.documentElement.dataset.theme==="light"?"light":"dark";
+let BASE=L.tileLayer(BASE_TILES[baseTheme],TILE_OPTS).addTo(map);
 function legend(){const sc=document.querySelector("#legend .sc"),bar=document.querySelector("#legend .bar");
   if(cmode=="line"){bar.style.display="none";sc.style.flexWrap="wrap";
     const ord=Object.keys(LINECOLOR);
-    sc.innerHTML=ord.length?ord.slice(0,16).map(l=>`<span style="white-space:nowrap;margin:0 8px 3px 0"><span style="display:inline-block;width:9px;height:9px;background:${LINECOLOR[l]};border-radius:2px"></span> ${l}</span>`).join(""):"computing line map…";
+    sc.innerHTML=ord.length?ord.slice(0,16).map(l=>`<span style="white-space:nowrap;margin:0 8px 3px 0"><span style="display:inline-block;width:9px;height:9px;background:${LINECOLOR[l]};border-radius:2px"></span> ${escapeHTML(l)}</span>`).join(""):"computing line map…";
     document.getElementById("legtitle").textContent="Primary transit line per area";return;}
   const {hi,S}=ramp(ideal);bar.style.display="block";sc.style.flexWrap="nowrap";
   bar.style.background="linear-gradient(90deg,"+S.map(s=>rgb(s[1])+" "+Math.round(s[0]/hi*100)+"%").join(",")+")";
@@ -207,8 +392,9 @@ function val(id){
   const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
 function style(f){const id=f.properties.id,v=val(id);
   if(v==null||v>thr)return{fillOpacity:0,opacity:0,weight:0};
-  if(cmode=="line"){const ln=ATTR[id];return ln?{fillColor:LINECOLOR[ln]||"#888",fillOpacity:.76,weight:0}:{fillColor:"#888",fillOpacity:.06,weight:0};}
-  return{fillColor:color(v),fillOpacity:.72,weight:0};}
+  const op=cellOpacity();
+  if(cmode=="line"){const ln=ATTR[id];return ln?{fillColor:LINECOLOR[ln]||"#888",fillOpacity:Math.min(op+.04,.9),weight:0}:{fillColor:"#888",fillOpacity:.06,weight:0};}
+  return{fillColor:color(v),fillOpacity:op,weight:0};}
 function buildLineColors(){const PAL=["#e6194B","#3cb44b","#ffe119","#4363d8","#f58231","#911eb4","#42d4f4","#f032e6","#bfef45","#fabed4","#469990","#dcbeff","#9A6324","#800000","#aaffc3","#808000","#000075"];
   const cnt={};Object.values(ATTR).forEach(l=>cnt[l]=(cnt[l]||0)+1);
   LINECOLOR={};Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]).forEach((l,i)=>LINECOLOR[l]=l=="walk only"?"#7fd1ff":PAL[i%PAL.length]);}
@@ -227,63 +413,541 @@ function fragChip(frag,stuck){
   else if(frag<=6){label="some risk";c="#f6a04d";}
   else{label="fragile";c="#ff6b6b";}
   return `<span style="font-size:10px;padding:1px 6px;border-radius:6px;background:${c}22;color:${c};border:1px solid ${c}55;white-space:nowrap">${label}</span>`;}
-function bdHTML(d){
-  if(d.error)return `<div class="bd"><span style="color:#9aa3af">No transit route within ~75 min.</span></div>`;
-  // legs: build chip list, then pair each subsequent chip with its leading arrow as a nowrap
-  // unit so the arrow can't orphan to the start of the next line when the row wraps.
+// Leg-sequence renderer reused by the hover breakdown AND each compare-list strip: build the
+// per-leg chip list (walk / wait / transit-in-its-mode-color), then pair every subsequent chip
+// with its leading ▸ arrow as a nowrap unit so the arrow can't orphan to the next wrapped line.
+// `compact` drops the "wait" chips (the strip rows stay terse) — but ALWAYS keys off a leg's
+// `line` (geom legs use `.name`; the text breakdown uses `.line`) via the caller normalizing.
+function legsRowHTML(legs,compact){
   const chips=[];
-  d.legs.forEach(g=>{
-    if(!g.line){chips.push(`<span class="leg walk">walk ${g.min}m</span>`);return;}
-    if(g.wait&&g.wait>=1)chips.push(`<span class="leg wait">wait ${g.wait}m</span>`);
-    const c=lineColor(g.line);
-    chips.push(`<span class="leg" style="background:${c}26;color:${c};border:1px solid ${c}55">${g.line} · ${g.min}m</span>`);
+  (legs||[]).forEach(g=>{
+    const line=g.line!=null?g.line:g.name;     // text legs: .line; geom legs: .name
+    if(!line){chips.push(`<span class="leg walk">walk ${g.min}m</span>`);return;}
+    if(!compact && g.wait&&g.wait>=1)chips.push(`<span class="leg wait">wait ${g.wait}m</span>`);
+    const c=lineColor(line);
+    chips.push(`<span class="leg" style="background:${c}26;color:${c};border:1px solid ${c}55">${escapeHTML(line)} · ${g.min}m</span>`);
   });
-  const legsHTML = chips.map((c,i)=> i===0 ? c :
+  return chips.map((c,i)=> i===0 ? c :
     `<span style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap"><span class="arr">▸</span>${c}</span>`
   ).join("");
-  // One line per group, consistent across cells:
-  //   headBig   the metric-matched headline number (typical OR best-case)
-  //   ctxLine   "N transfers · {other-metric Xm}" — context, never the prominent number
-  //   vline     "bad-day +Y · {chip}" — only when there's signal (skipped for fully robust cells)
+}
+// Shared header summary (name + headline minutes + transfers/best-case context + bad-day chip),
+// reused by the hover tooltip (bdHTML) AND the pinned compare card (pinHTML). One source so the
+// summary can't drift between the two.
+//   headBig   the metric-matched headline number (typical OR best-case)
+//   ctxLine   "N transfers · {other-metric Xm}" — context, never the prominent number
+//   vline     "bad-day +Y · {chip}" — only when there's signal (skipped for fully robust cells)
+function summaryHTML(d){
   const real=d.real, frag=d.var?d.var.frag:0, stuck=d.var?d.var.stuck:0;
   const showR=(metric=="r" && real!=null);
   const head=showR?real:d.total, headLab=showR?"typical":"best-case";
   const otherVal=showR?d.total:real, otherLab=showR?"best-case":"typical", otherTilde=showR?"":"~";
   const headBig=`<div style="margin:0 0 4px"><b style="font-size:14px">${showR?"~":""}${head} min</b>`+
-    ` <span style="color:#9aa3af;font-size:12px">${headLab}</span></div>`;
+    ` <span style="color:var(--mut);font-size:12px">${headLab}</span></div>`;
   const otherTxt=(otherVal!=null && otherVal!=head) ? ` · ${otherLab} ${otherTilde}${otherVal}m` : ``;
-  const ctxLine=`<div style="margin:0 0 6px;color:#9aa3af;font-size:11.5px">`+
+  const ctxLine=`<div style="margin:0 0 6px;color:var(--mut);font-size:11.5px">`+
     `${d.xfers} transfer${d.xfers==1?"":"s"}${otherTxt}</div>`;
   let vline="";
   if(real!=null && (frag>0 || (stuck||0)>=0.05)){
-    vline=`<div style="margin:0 0 8px;color:#9aa3af;font-size:11.5px;white-space:nowrap">`+
-      (frag>0?`bad-day <b style="color:#e8eaed">+${frag}</b> · `:``)+
+    vline=`<div style="margin:0 0 8px;color:var(--mut);font-size:11.5px;white-space:nowrap">`+
+      (frag>0?`bad-day <b style="color:var(--ink)">+${frag}</b> · `:``)+
       fragChip(frag,stuck)+`</div>`;
   }
-  // alternative lines that serve this commute under delays (re-routes), excluding the normal line
-  let altline="";
-  if(d.var&&d.var.alt&&Object.keys(d.var.alt).length){
-    const ls=Object.keys(d.var.alt).slice(0,4).map(l=>{const c=lineColor(l);
-      return `<span class="leg" style="background:${c}1f;color:${c};border:1px solid ${c}44">${l}</span>`;}).join(" ");
-    altline=`<div style="margin-top:8px;font-size:11px;color:#9aa3af">also serves: ${ls}</div>`;
+  return `<div class="h"><b>${escapeHTML(d.name||"")}</b></div>`+headBig+ctxLine+vline;
+}
+function bdHTML(d){
+  if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
+  const legsHTML = legsRowHTML(d.legs,false);
+  // Hover tooltip: a subtle hint that alternatives exist (the compare list itself lives in the
+  // pinned card — the map never shows >1 route on hover). Count from d.alts (the drawn re-routes).
+  let altfoot="";
+  const nAlt=(d.alts||[]).length;
+  if(nAlt>0){
+    // Tell them the FULL gesture: click pins it, then hovering the listed routes previews each on the map.
+    altfoot=`<div class="altfoot"><b>Click</b> to compare ${nAlt} other route${nAlt==1?"":"s"} — then hover each to see it on the map</div>`;
+  } else {
+    altfoot=`<div class="altfoot"><b>Click</b> to pin this route</div>`;
   }
-  return `<div class="bd"><div class="h"><b>${d.name||""}</b></div>`+
-    headBig+ctxLine+vline+
+  return `<div class="bd">`+summaryHTML(d)+
     `<div class="legs">${legsHTML}</div>`+
-    altline+
+    altfoot+
     `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
     `<div class="foot">best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait</div></div>`;}
-let bdTimer;
-function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){setHTML("—");return;}
-  if(!EXACT){   // map still on the fast estimate — show the SAME value (no contradicting exact breakdown yet)
-    setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ~${v} min <span style="color:#9aa3af;font-weight:400">estimate</span></div><div style="color:#9aa3af">refining to exact times + route…</div></div>`);
+// Pinned compare card: the shared summary, THEN a vertical compare list (primary + each alt as a
+// selectable strip), THEN the Google Maps link. The strip list is built from compareList (set by
+// openPin/refresh via buildCompare). The currently-DRAWN strip (previewKey ?? selKey) is marked
+// (● + .sel highlight); the rest are ○. Row hover previews, row click locks (see wireCompareRows).
+function compareHTML(d){
+  if(!compareList.length)return "";
+  const drawnKey=previewKey!=null?previewKey:selKey;
+  const rows=compareList.map(o=>{
+    const sel=o.key===drawnKey;
+    const seq=legsRowHTML(o.legs,true);
+    return `<div class="strip${sel?" sel":""}" data-key="${escapeHTML(o.key)}" role="button" tabindex="0" aria-pressed="${sel}">`+
+      `<span class="mark">${sel?"●":"○"}</span>`+
+      `<span class="dot" style="background:${o.identityColor}"></span>`+
+      `<span class="seq">${seq}</span>`+
+      `<span class="tot">${o.total}m</span></div>`;
+  }).join("");
+  const loading=(d&&(d.alts||[]).length===0&&!varianceReady())?
+    `<div class="cmploading">loading alternatives…</div>`:"";
+  return `<div class="cmp"><div class="cmphdr">Compare routes</div>${rows}${loading}</div>`;
+}
+// True once /variance has landed (so the absence of alts is real, not "still loading").
+function varianceReady(){return Object.keys(VAR).length>0||Object.keys(REAL).length>0;}
+function pinHTML(d){
+  if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
+  return `<div class="bd">`+summaryHTML(d)+compareHTML(d)+
+    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
+    `<div class="foot">best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait</div></div>`;}
+/* ============ single drawn route + compare mode ============ */
+// MODEL: the map NEVER shows more than ONE route. On HOVER (not pinned) we draw the cell's
+// PRIMARY route, clean. On CLICK (pin) we enter COMPARE MODE: the corner card lists the primary
+// + each alt as a selectable strip, and the map draws exactly ONE route = the selected (or
+// previewed) strip. State:
+//   routePin   cell id whose route is pinned (null = hover mode). While non-null, hovering OTHER
+//              cells does NOTHING (no tooltip, no outline, no draw) — the only interaction is the
+//              card's strips. closeOpenInfo/closePin null it.
+//   DRAWN      {id, legs, identityColor, total} of the SINGLE route currently inked (for the
+//              zoomend re-render + the tooltip-avoidance geometry). null = nothing drawn.
+//   compareList[] the pinned cell's route options [{key,line,identityColor,legs,total,isPrimary}],
+//              primary first; built by buildCompare(d). Empty in hover mode.
+//   selKey     the LOCKED selection in compare mode (a strip key; default PRIMARY_KEY).
+//   previewKey a strip the cursor is hovering (overrides selKey for what's drawn); null otherwise.
+// d.geom is the SAME traced journey as the breakdown chips (legs match 1:1); d.alts are the
+// under-delays re-routes (each {line,min,legs:[geom...]}). Legacy R5 serves geom:null + alts:[]
+// → no route drawn, no compare list, just the text breakdown (graceful).
+const routeLayer=L.layerGroup().addTo(map);   // ONE reused group; the single route's polylines+labels join it
+// preferCanvas keeps the 3k cells light; the route strokes go in a dedicated SVG renderer (their
+// own pane, ABOVE the canvas cells) for crisp casing-under-stroke stacking + dashes. They're
+// NON-interactive so they never steal the cell hover that drives the tooltip.
+const ROUTE_SVG=L.svg();map.addLayer(ROUTE_SVG);
+let routePin=null;      // cell id whose route is pinned (click), or null
+let hoverCell=null;     // cell id currently hovered (gates stale async draws)
+let DRAWN=null;         // {id, legs, identityColor, total} of the single route currently drawn
+function clearRoute(){routeLayer.clearLayers();DRAWN=null;TT_AVOID=[];TT_BLOCKS=[];}
+function routeColor(g){return (g.tmode&&MODECOLOR[g.tmode])||lineColor(g.name||"");}
+// ---- route-identity CASING palette ------------------------------------------------------------
+// The casing is the wide halo under EVERY leg of the drawn route (walk + each transit leg) — its
+// IDENTITY color. Only ONE route draws at a time, but the casing color still matters: it MATCHES
+// the color dot on that route's compare-list strip, so the strip and the drawn line read as the
+// same thing. PRIMARY is always WHITE (theme-aware --route-casing); each ALT gets one of 4 vivid,
+// mutually-distinct hues (slot = the alt's index in d.alts), so its dot is recognizable. A thin
+// DARK SEPARATOR ring sits between the identity casing and the mode-colored stroke so the rim
+// shows on top of any mode color regardless of contrast.
+const ALT_CASING=["#ff3db4","#11c7c7","#f59000","#a16bff"];  // magenta · cyan · amber · violet
+const SEPARATOR="rgba(12,14,18,.85)";                        // dark ring (reads on dark + light)
+const PRIMARY_KEY="__primary__";
+function primaryCasing(){
+  return getComputedStyle(document.documentElement).getPropertyValue("--route-casing").trim()||"#fff";}
+// Walk legs are short dotted gray; transit is solid. (No per-route dashing now — only one route
+// draws, so the dash is just walk-vs-transit.)
+const DASH_WALK="2 6";
+// Container-pixel footprints of EVERY drawn route point, kept for tooltip-avoidance.
+let TT_AVOID=[];
+// Rect footprints (container px {l,t,r,b}) of the drawn PILL anchors + the time BADGE — the
+// tooltip must clear these too (a tooltip over a pill / the "~26 min" badge reads as broken).
+let TT_BLOCKS=[];
+function rebuildAvoid(legs){
+  TT_AVOID=[];
+  (legs||[]).forEach(g=>{if(!g.pts)return;g.pts.forEach(p=>{
+    const cp=map.latLngToContainerPoint(L.latLng(p[0],p[1]));TT_AVOID.push({x:cp.x,y:cp.y});});});
+}
+// Collision pass over the midpoint pill anchors: if two pills land within MINGAP px, nudge the
+// later one along its own leg until clear. Operates on {pts,color,name,min} specs.
+const PILL_MINGAP=26;
+function placePills(specs){
+  const placed=[];                                   // {cp:{x,y}, spec, latlng}
+  specs.forEach(s=>{
+    const arr=s.pts;
+    let idx=Math.floor(arr.length/2);
+    const order=[idx];                               // try midpoint first, then walk outward
+    for(let step=1;step<arr.length;step++){
+      if(idx+step<arr.length)order.push(idx+step);
+      if(idx-step>=0)order.push(idx-step);
+    }
+    let chosen=null;
+    for(const i of order){
+      const ll=L.latLng(arr[i][0],arr[i][1]);
+      const cp=map.latLngToContainerPoint(ll);
+      const clash=placed.some(p=>Math.hypot(p.cp.x-cp.x,p.cp.y-cp.y)<PILL_MINGAP);
+      if(!clash){chosen={cp,latlng:[arr[i][0],arr[i][1]],spec:s};break;}
+    }
+    if(!chosen){                                      // every position clashed — use midpoint anyway
+      const ll=L.latLng(arr[idx][0],arr[idx][1]);
+      chosen={cp:map.latLngToContainerPoint(ll),latlng:[arr[idx][0],arr[idx][1]],spec:s};
+    }
+    placed.push(chosen);
+  });
+  return placed;
+}
+function addPill(latlng,color,name,min){
+  // Solid line-color pill on each transit leg (one route only → always the primary "solid" style).
+  routeLayer.addLayer(L.marker(latlng,{interactive:false,keyboard:false,zIndexOffset:200,
+    icon:L.divIcon({className:"rtwrap",iconSize:null,
+      html:`<span class="rtlab" style="background:${color}">${escapeHTML(name)} · ${min}m</span>`})}));
+}
+// Draw ONE route: 3-layer transit stack (identity casing → dark separator → mode stroke) + dotted
+// gray walk (with its own solid casing+separator so a route's walk+transit share one continuous
+// identity halo) + a pill on each transit leg + a "~N min" total badge at the origin. `legs` are
+// geom legs ({mode,name,min,pts,tmode?}); `identityColor` is the casing (white for primary, an
+// ALT_CASING slot for an alt); `totalMin` labels the badge. Replaces the old multi-route renderer.
+function drawOne(legs,identityColor,totalMin){
+  routeLayer.clearLayers();
+  const segs=(legs||[]).filter(g=>g.pts&&g.pts.length>1);
+  if(!segs.length){DRAWN=null;TT_AVOID=[];TT_BLOCKS=[];return;}
+  const casingW=10, sepW=7, strokeW=4.5;
+  const walkW=3, walkSepW=walkW+2, walkCasingW=walkW+5;
+  // PASS 1: transit identity casing (widest) THEN the dark separator ring — both under every
+  // colored stroke, so a casing/sep never paints over a previous leg's stroke at a transfer.
+  segs.forEach(g=>{
+    if(g.mode==="walk")return;
+    routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:identityColor,weight:casingW,
+      opacity:.95,interactive:false,lineCap:"round",lineJoin:"round"}));
+    routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:SEPARATOR,weight:sepW,
+      opacity:.9,interactive:false,lineCap:"round",lineJoin:"round"}));
+  });
+  // WALK pass: SOLID identity casing + dark separator + dotted gray stroke (a single route's walk
+  // legs don't overlap, so no cross-route edge merge — draw each leg directly).
+  segs.forEach(g=>{
+    if(g.mode!=="walk")return;
+    routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:identityColor,weight:walkCasingW,
+      opacity:.95,interactive:false,lineCap:"round",lineJoin:"round"}));
+    routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:SEPARATOR,weight:walkSepW,
+      opacity:.9,interactive:false,lineCap:"round",lineJoin:"round"}));
+    routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:"#9aa3af",weight:walkW,
+      dashArray:DASH_WALK,opacity:.98,interactive:false,lineCap:"round"}));
+  });
+  // PASS 2: colored transit strokes + gather pill specs.
+  const pillSpecs=[];
+  segs.forEach(g=>{
+    if(g.mode==="walk")return;
+    routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:routeColor(g),weight:strokeW,
+      opacity:1,interactive:false,lineCap:"round",lineJoin:"round"}));
+    pillSpecs.push({pts:g.pts,color:routeColor(g),name:g.name,min:g.min});
+  });
+  // origin total badge (above everything)
+  const badgeLL=segs[0].pts[0];
+  routeLayer.addLayer(L.marker(badgeLL,{interactive:false,keyboard:false,zIndexOffset:300,
+    icon:L.divIcon({className:"rtwrap",iconSize:null,html:`<span class="rtbadge">~${totalMin} min</span>`})}));
+  // within-route pill collision nudge
+  const placed=placePills(pillSpecs);
+  placed.forEach(p=>addPill(p.latlng,p.spec.color,p.spec.name,p.spec.min));
+  rebuildAvoid(legs);                              // tooltip-avoidance: route points
+  rebuildBlocks(placed,badgeLL);                  // + pill anchor rects + the badge rect
+}
+// Estimated container-px rect of a pill / the badge given its anchor latlng.
+const PILL_W=64, PILL_H=20, BADGE_W=82, BADGE_H=24, BLOCK_PAD=4;
+function rectAround(cp,w,h,cx,cy){                 // cx,cy = anchor offset fraction of (w,h)
+  const l=cp.x-w*cx, t=cp.y-h*cy;
+  return {l:l-BLOCK_PAD,t:t-BLOCK_PAD,r:l+w+BLOCK_PAD,b:t+h+BLOCK_PAD};}
+function rebuildBlocks(placed,badgeLL){
+  TT_BLOCKS=[];
+  placed.forEach(p=>{const cp=map.latLngToContainerPoint(L.latLng(p.latlng[0],p.latlng[1]));
+    TT_BLOCKS.push(rectAround(cp,PILL_W,PILL_H,0.5,0.5));});  // centered on anchor
+  if(badgeLL){const cp=map.latLngToContainerPoint(L.latLng(badgeLL[0],badgeLL[1]));
+    TT_BLOCKS.push(rectAround(cp,BADGE_W,BADGE_H,0.5,1.35));}  // badge sits above the anchor
+}
+/* ---- tooltip placement: keep the hover card clear of the drawn route + pills + badge ---------
+   After the route is drawn we know every route point's container pixel (TT_AVOID) AND the pill +
+   badge rects (TT_BLOCKS). For each of the 4 Leaflet tooltip directions we estimate where the
+   tooltip rect would sit RELATIVE TO THE CELL ANCHOR, count how many route points fall inside that
+   rect PLUS how many pill/badge rects overlap it, and pick the direction with zero hits. Escalate
+   the offset if all four hit. Tie-break: prefer the side facing AWAY from the workplace bearing. */
+let hoverLayer=null;            // the L.geoJSON layer whose tooltip is currently open (for re-direction)
+let lastTipDir=null;            // last applied direction (skip a rebind when it didn't change)
+let lastTipOff=null;            // last applied offset distance (escalation level)
+const TIP_OFFSET=14;            // gap (px) between the cell anchor and the tooltip edge
+let tipSize={w:252,h:150};      // measured tooltip size (filled after the first open)
+function measureTip(){
+  const el=document.querySelector(".leaflet-tooltip.tt .bd");
+  if(el){const tt=el.closest(".leaflet-tooltip");if(tt){const r=tt.getBoundingClientRect();
+    if(r.width>20&&r.height>20)tipSize={w:r.width,h:r.height};}}
+}
+function tipRect(cp,dir,o){
+  const w=tipSize.w,h=tipSize.h;if(o==null)o=TIP_OFFSET;
+  if(dir==="right") return {l:cp.x+o, t:cp.y-h/2, r:cp.x+o+w, b:cp.y+h/2};
+  if(dir==="left")  return {l:cp.x-o-w, t:cp.y-h/2, r:cp.x-o, b:cp.y+h/2};
+  if(dir==="top")   return {l:cp.x-w/2, t:cp.y-o-h, r:cp.x+w/2, b:cp.y-o};
+  /* bottom */      return {l:cp.x-w/2, t:cp.y+o, r:cp.x+w/2, b:cp.y+o+h};
+}
+function hitsIn(rect){
+  let n=0;for(const p of TT_AVOID){if(p.x>=rect.l&&p.x<=rect.r&&p.y>=rect.t&&p.y<=rect.b)n++;}
+  for(const b of TT_BLOCKS){if(rect.l<b.r&&rect.r>b.l&&rect.t<b.b&&rect.b>b.t)n+=12;}
+  return n;}
+function bearingOrder(cp){
+  let away=["right","left","top","bottom"];
+  if(DESTLL){
+    const dp=map.latLngToContainerPoint(L.latLng(DESTLL[0],DESTLL[1]));
+    const dx=dp.x-cp.x, dy=dp.y-cp.y;
+    const horiz=Math.abs(dx)>=Math.abs(dy);
+    if(horiz)away = dx>0 ? ["left","top","bottom","right"] : ["right","top","bottom","left"];
+    else      away = dy>0 ? ["top","left","right","bottom"] : ["bottom","left","right","top"];
+  }
+  return away;
+}
+function bearingTipDir(cellLatLng){
+  const cp=map.latLngToContainerPoint(cellLatLng);
+  const sz=map.getSize(), panelW=sz.x>719?330:0;
+  for(const dir of bearingOrder(cp)){
+    const rect=tipRect(cp,dir,TIP_OFFSET);
+    if(!(rect.l<2||rect.r>sz.x-2-panelW||rect.t<2||rect.b>sz.y-2)) return {dir,off:TIP_OFFSET};
+  }
+  return {dir:bearingOrder(cp)[0],off:TIP_OFFSET};
+}
+function pickTooltipDir(cellLatLng){
+  const cp=map.latLngToContainerPoint(cellLatLng);
+  const away=bearingOrder(cp);
+  const sz=map.getSize();
+  const panelW=sz.x>719?330:0;
+  const offsets=[TIP_OFFSET,TIP_OFFSET+34,TIP_OFFSET+72];
+  let best=null,bestScore=Infinity,bestOff=TIP_OFFSET;
+  for(const o of offsets){
+    away.forEach((dir,rank)=>{
+      const rect=tipRect(cp,dir,o);
+      const off = (rect.l<2 || rect.r>sz.x-2-panelW || rect.t<2 || rect.b>sz.y-2);
+      const score = hitsIn(rect) + (off?1e6:0) + rank*0.001 + (o-TIP_OFFSET)*0.01;
+      if(score<bestScore){bestScore=score;best=dir;bestOff=o;}
+    });
+    if(bestScore<1)break;
+  }
+  return {dir:best||"right",off:bestOff};
+}
+function offVec(dir,o){return dir==="right"?[o,0]:dir==="left"?[-o,0]:dir==="top"?[0,-o]:[0,o];}
+function applyTooltipDir(cellLatLng){
+  if(!hoverLayer)return;
+  const tip=hoverLayer.getTooltip&&hoverLayer.getTooltip();
+  if(!tip||!tip.isOpen())return;
+  const tel=tip._container;if(tel&&tel.classList.contains("tt-pending"))return;
+  measureTip();
+  const cp=map.latLngToContainerPoint(cellLatLng);
+  if(lastTipDir){
+    const cur=tipRect(cp,lastTipDir,lastTipOff);
+    const sz=map.getSize(), panelW=sz.x>719?330:0;
+    const offscreen=(cur.l<2||cur.r>sz.x-2-panelW||cur.t<2||cur.b>sz.y-2);
+    if(!offscreen && hitsIn(cur)===0) return;
+  }
+  const pick=pickTooltipDir(cellLatLng);
+  const dir=pick.dir, o=pick.off;
+  if(dir===lastTipDir&&o===lastTipOff)return;
+  lastTipDir=dir;lastTipOff=o;
+  tip.options.direction=dir; tip.options.offset=offVec(dir,o);
+  if(hoverLayer.getTooltip())hoverLayer.openTooltip();
+}
+function openHoverInPlace(l,d){
+  if(!l.getTooltip())return;
+  const tip=l.getTooltip();
+  const anchorLL=(d&&d.olat!=null)?L.latLng(d.olat,d.olon):l.getBounds().getCenter();
+  measureTip();
+  const pick=(d&&d.geom)?pickTooltipDir(anchorLL):bearingTipDir(anchorLL);
+  lastTipDir=pick.dir;lastTipOff=pick.off;
+  tip.options.direction=pick.dir;tip.options.offset=offVec(pick.dir,pick.off);
+  l.openTooltip();
+  measureTip();
+  const el=tip._container||document.querySelector(".leaflet-tooltip.tt");
+  if(el)el.classList.remove("tt-pending");
+}
+/* ---- compare model: build the strip list + draw the selected/previewed route ---------------- */
+let compareList=[];     // pinned cell's route options [{key,line,identityColor,legs,total,isPrimary}]
+let selKey=PRIMARY_KEY; // the LOCKED selection (a strip key); default = primary
+let previewKey=null;    // a strip being hovered (overrides selKey for what's drawn); null otherwise
+// Build the compare list from a breakdown d: primary first, then each alt. Each option carries the
+// geom legs to draw + its identity color (white primary / ALT_CASING slot) + total minutes.
+function buildCompare(d){
+  const out=[];
+  if(d&&d.geom){
+    out.push({key:PRIMARY_KEY,line:dominantLine(d.geom),identityColor:primaryCasing(),
+      legs:d.geom,total:d.total,isPrimary:true});
+  }
+  (d&&d.alts||[]).forEach((a,k)=>{
+    // key is the row's stable slot ("alt0"…), NOT the line name — two alts could share a line
+    // name (rare, but server-dependent), which would collide select/preview if keyed by line.
+    out.push({key:"alt"+k,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],
+      legs:a.legs,total:a.min,isPrimary:false});
+  });
+  return out;
+}
+// The dominant transit line of a geom leg list (the longest in-vehicle leg) — labels the primary
+// strip when there's no single "line" field. Falls back to "walk only".
+function dominantLine(legs){
+  let best=null,bestMin=-1;
+  (legs||[]).forEach(g=>{if(g.mode==="transit"&&g.name&&g.min>bestMin){bestMin=g.min;best=g.name;}});
+  return best||"walk only";
+}
+function findOpt(key){return compareList.find(o=>o.key===key)||null;}
+// Draw whichever route compare mode wants: previewKey if hovering a strip, else the locked selKey.
+function drawSelected(){
+  const key=previewKey!=null?previewKey:selKey;
+  const opt=findOpt(key)||compareList[0];
+  if(!opt){clearRoute();return;}
+  drawOne(opt.legs,opt.identityColor,opt.total);
+  DRAWN={id:routePin,legs:opt.legs,identityColor:opt.identityColor,total:opt.total};
+}
+// HOVER-MODE draw (not pinned): always the PRIMARY route, clean. Called by maybeRoute/drawJourney.
+function drawPrimary(id,d){
+  if(!d||d.error||!d.geom){clearRoute();return;}
+  drawOne(d.geom,primaryCasing(),d.total);
+  DRAWN={id,legs:d.geom,identityColor:primaryCasing(),total:d.total};
+}
+function drawJourney(id,d){
+  // Pinned: the route comes from the compare selection (drawSelected), not the raw primary.
+  if(routePin!=null&&id===routePin){drawSelected();
+    if(pendingFitId!=null&&id===pendingFitId&&d&&d.geom){pendingFitId=null;fitToRoute(d);}
     return;}
-  if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n,real:REAL[id],var:VAR[id]});setHTML(bdHTML(d));return;}
-  setHTML(`<div class="bd"><div class="h"><b>${f.properties.n||""}</b> · ${v} min</div><div style="color:#9aa3af">loading route…</div></div>`);
+  // Hover: draw the clean primary for the hovered cell.
+  drawPrimary(id,d);
+  if(routePin==null&&id===hoverCell&&d&&d.olat!=null){
+    applyTooltipDir(L.latLng(d.olat,d.olon));
+  }
+}
+function maybeRoute(id,d){
+  if(routePin!=null){if(id===routePin)drawJourney(id,d);return;}   // pinned: only the pin draws
+  if(id===hoverCell)drawJourney(id,d);                             // else: still-hovered cell only
+}
+// Re-render the single drawn route on zoom (badge/pill anchors are zoom-dependent).
+map.on("zoomend",()=>{
+  if(!DRAWN)return;
+  drawOne(DRAWN.legs,DRAWN.identityColor,DRAWN.total);
+});
+// Re-render the currently-drawn route (theme toggle: the PRIMARY casing is theme-aware). In
+// compare mode re-run drawSelected (re-resolves the primary option's casing freshly below); in
+// hover mode re-resolve whether DRAWN is the primary (white) and refresh its casing.
+function redrawCurrentRoute(){
+  if(!DRAWN)return;
+  if(routePin!=null&&compareList.length){
+    // refresh the primary option's casing to the new theme, then redraw the selection
+    const prim=findOpt(PRIMARY_KEY);if(prim)prim.identityColor=primaryCasing();
+    drawSelected();
+    return;
+  }
+  // hover mode: the only theme-aware casing is the primary (white). Re-resolve it.
+  const col=DRAWN.identityColor&&ALT_CASING.indexOf(DRAWN.identityColor)>=0?DRAWN.identityColor:primaryCasing();
+  drawOne(DRAWN.legs,col,DRAWN.total);
+  DRAWN.identityColor=col;
+}
+/* ============ pinned corner card (replaces the on-cell popup) ============ */
+// Clicking a cell PINS its breakdown into a fixed corner card so it never sits on top of the
+// drawn route. The card owns the pin lifecycle: opening it sets routePin; closing it (×, Esc,
+// click-elsewhere, or a param/workplace change via closeOpenInfo) nulls routePin and clears the
+// route. While pinned, hover-drawing is suppressed (maybeRoute gates on routePin) but hover text
+// tooltips still work. On pin we fitBounds to the route, padding the corner the card occupies.
+const pinCard=document.getElementById("pincard"),pinBody=document.getElementById("pinbody");
+let pinFeature=null;     // the L.geoJSON feature object currently pinned (for refresh in place)
+let justPinned=false;    // set by a cell click; the map-background click skips closePin this tick
+let pendingFitId=null;   // cell id a pin requested a one-shot fitBounds for (consumed by drawJourney)
+function setPinHTML(h){pinBody.innerHTML=h;}
+function fitToRoute(d){
+  if(!d||!d.geom)return;
+  const pts=[];d.geom.forEach(g=>{if(g.pts)g.pts.forEach(p=>pts.push(p));});
+  if(!pts.length)return;
+  const b=L.latLngBounds(pts);
+  // Reserve the card's corner so the route is fully visible BESIDE it. The card sits top-right
+  // (desktop: ~262px card + the 330px side panel; mobile: a narrower floating card). Pad the
+  // top + right to clear it, the other sides modestly.
+  const sz=map.getSize();
+  const rightPad=Math.min(sz.x*0.6, sz.x<=719?Math.round(sz.x*0.45):300);
+  map.fitBounds(b,{paddingTopLeft:[40,60],paddingBottomRight:[rightPad,40],maxZoom:14,animate:true});
+}
+// Set the pinned card to a breakdown d: build the compare list (default selection = primary),
+// render summary + strips, then draw the selected route. Reused by openPin's load AND the
+// /variance refresh (so the list gains its alternatives in place when they land).
+function renderPin(f,d){
+  compareList=buildCompare(d);
+  // Keep the locked selection if it still exists (e.g. /variance refresh added alts but the user
+  // already picked one); otherwise default to the primary.
+  if(!findOpt(selKey))selKey=compareList.length?compareList[0].key:PRIMARY_KEY;
+  previewKey=null;
+  setPinHTML(pinHTML(d));
+  // Draw the selected route (compare mode). maybeRoute/drawJourney route through drawSelected.
+  maybeRoute(f.properties.id,d);
+}
+function openPin(f,l){
+  pinFeature=f;routePin=f.properties.id;
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;     // fresh compare state for this pin
+  pinCard.classList.add("open");
+  setPinHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b></div><div style="color:var(--mut)">loading route…</div></div>`);
+  // Arm a one-shot fitBounds for this pin: drawJourney consumes it once the pinned cell's geom
+  // is drawn (cached -> immediately within loadBreak; else after the /itinerary fetch lands).
+  pendingFitId=f.properties.id;
+  // loadBreak's setHTML/maybeRoute handle the placeholder; on the FINAL breakdown (onReady), build
+  // the compare card. onReady fires after the route is drawn, with the breakdown d (or null for a
+  // no-route/legacy cell → card stays the text breakdown, no compare list).
+  loadBreak(f,h=>{setPinHTML(h);},d=>{if(routePin===f.properties.id&&d&&!d.error&&d.geom)renderPin(f,d);});
+}
+function closePin(){
+  if(!pinCard.classList.contains("open")&&routePin==null)return;
+  pinCard.classList.remove("open");pinFeature=null;routePin=null;pendingFitId=null;
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;     // reset compare state
+  // If the mouse is parked over another cell with a cached breakdown, fall back to its hover
+  // route immediately; otherwise clear the drawn route.
+  if(hoverCell!=null&&BDCACHE[hoverCell])drawJourney(hoverCell,BDCACHE[hoverCell]);
+  else clearRoute();
+}
+document.getElementById("pinx").onclick=closePin;
+document.getElementById("pinx").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();closePin();}});
+// Compare-row interaction (delegated, document-level): the strips live in the pinned card and are
+// innerHTML-set on every render, so delegate. HOVER a row → preview THAT route on the map (single
+// clean swap). Mouse-leaving the LIST returns to the locked selection. CLICK (or Enter/Space) a row
+// → lock it as the selection (previewKey cleared so it persists after the cursor leaves).
+function previewRow(key){if(routePin==null)return;previewKey=key;drawSelected();markStrips();}
+function clearPreview(){if(routePin==null||previewKey==null)return;previewKey=null;drawSelected();markStrips();}
+function lockRow(key){if(routePin==null)return;selKey=key;previewKey=null;drawSelected();markStrips();}
+// Update only the strips' selected mark/highlight in place (no full re-render → no flicker, keeps
+// focus). The drawn strip = previewKey ?? selKey.
+function markStrips(){
+  const drawnKey=previewKey!=null?previewKey:selKey;
+  pinCard.querySelectorAll(".cmp .strip").forEach(s=>{
+    const sel=s.getAttribute("data-key")===drawnKey;
+    s.classList.toggle("sel",sel);s.setAttribute("aria-pressed",String(sel));
+    const m=s.querySelector(".mark");if(m)m.textContent=sel?"●":"○";});
+}
+document.addEventListener("mouseover",e=>{
+  const strip=e.target.closest&&e.target.closest(".cmp .strip");if(!strip)return;
+  previewRow(strip.getAttribute("data-key"));});
+document.addEventListener("mouseout",e=>{
+  // leaving the WHOLE list (not just moving between strips) restores the locked selection
+  const cmp=e.target.closest&&e.target.closest(".cmp");if(!cmp)return;
+  if(e.relatedTarget&&cmp.contains(e.relatedTarget))return;   // still inside the list → keep preview
+  clearPreview();});
+document.addEventListener("click",e=>{
+  const strip=e.target.closest&&e.target.closest(".cmp .strip");if(!strip)return;
+  lockRow(strip.getAttribute("data-key"));});
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Enter"&&e.key!==" ")return;
+  const strip=e.target.closest&&e.target.closest(".cmp .strip");if(!strip)return;
+  e.preventDefault();lockRow(strip.getAttribute("data-key"));});
+// Click-elsewhere unpins: a click on the map background (not a cell, not the card itself).
+// A cell click sets justPinned for this tick (canvas layer + map both fire click), so skip it.
+map.on("click",()=>{if(justPinned){justPinned=false;return;}closePin();});
+let bdTimer;
+// loadBreak(f, setHTML, onReady?) — fetch/render a cell's breakdown.
+//   setHTML(html)   sets the card/tooltip content (placeholders AND the final breakdown).
+//   onReady(d)      OPTIONAL — fired ONCE, after the content is FINAL and the route (if any) is
+//                   drawn. The hover path uses it to OPEN the tooltip only when it can appear in
+//                   its final, route-aware spot (so it never repositions/grows = no jump). It is
+//                   NOT fired for transient placeholders. d may be null (no-route placeholder
+//                   states: v==null, or the legacy pre-EXACT "refining…" note) — onReady still
+//                   fires so the hover gets feedback, just with no route to avoid.
+//   For CACHED cells everything below runs synchronously → onReady fires in the same tick as the
+//   mouseover, so the tooltip appears instantly in place.
+function loadBreak(f,setHTML,onReady){const id=f.properties.id,v=val(id);
+  const ready=d=>{if(onReady)onReady(d);};
+  if(v==null){setHTML("—");ready(null);return;}
+  if(!EXACT){   // map still on the fast estimate — show the SAME value (no contradicting exact breakdown yet)
+    setHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b> · ~${v} min <span style="color:var(--mut);font-weight:400">estimate</span></div><div style="color:var(--mut)">refining to exact times + route…</div></div>`);
+    ready(null);                                    // no route yet, but show the estimate placeholder in place
+    return;}
+  if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n,real:REAL[id],var:VAR[id]});setHTML(bdHTML(d));maybeRoute(id,d);ready(d);return;}
+  // Uncached: keep the cell highlighted (done on hover) but DON'T flash a placeholder card —
+  // open-after-ready means the hover tooltip stays closed until the fetch lands, so we never show
+  // then reposition a "loading route…" box. The PINNED card (which passes no onReady) still wants
+  // a placeholder, so set it only when there's no onReady (i.e. the corner card, which is fixed and
+  // never jumps).
+  if(!onReady)setHTML(`<div class="bd" style="min-height:150px"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b> · ${v} min</div><div style="color:var(--mut)">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
   bdTimer=setTimeout(async()=>{
     const doFetch=()=>fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
-    const fail=msg=>{if(my===bdToken)setHTML(`<div class="bd"><span style="color:#9aa3af">${msg}</span></div>`);};
+    const fail=msg=>{if(my===bdToken){setHTML(`<div class="bd"><span style="color:var(--mut)">${msg}</span></div>`);ready(null);}};
     try{
       let r=await doFetch();
       if(r.status===429){                              // hit /itinerary's 120/min rate limit -> one polite retry
@@ -294,22 +958,55 @@ function loadBreak(f,setHTML){const id=f.properties.id,v=val(id);if(v==null){set
       if(!r.ok){fail(`Route lookup failed (${r.status}).`);return;}
       const d=await r.json();if(my!==bdToken)return;
       if(!d.error)BDCACHE[id]=d;
-      d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];setHTML(bdHTML(d));
+      d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];setHTML(bdHTML(d));maybeRoute(id,d);ready(d);
     }catch(e){console.error("loadBreak",e);fail("Couldn't load route — try again in a moment.");}
   },150);}
 const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
   // Desktop: hover shows the sticky breakdown tooltip. Touch has no hover, so we skip it
   // (a leftover sticky tooltip on tap is confusing) and rely on click/tap -> popup below.
   if(!TOUCH){
-    l.on("mouseover",()=>{if(!DESTLL)return;l.setStyle({weight:1.4,color:"#fff"});
-      l.bindTooltip("",{className:"tt",sticky:true,opacity:1}).openTooltip();
-      loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});});
-    l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);});
+    l.on("mouseover",()=>{if(!DESTLL)return;
+      // PINNED → compare mode: hovering OTHER squares does NOTHING (no sticky tooltip, no cell
+      // outline highlight, no route change). The only interaction is the corner card's strips.
+      // Unpin (Esc / × / map-background click) restores normal hover.
+      if(routePin!=null)return;
+      hoverCell=f.properties.id;hoverLayer=l;
+      // INSTANT feedback: highlight the cell outline on hover (the canvas outline can't read CSS
+      // vars, so resolve THEME here). This is the only immediate visual — the TOOLTIP is held back.
+      l.setStyle(THEME==="light"?{weight:2,color:"#1a1d23"}:{weight:1.4,color:"#fff"});
+      // OPEN-AFTER-READY: open the tooltip now but HELD INVISIBLE (the .tt-pending class). It exists
+      // for hit-testing + sticky tracking, but the user can't see it until onReady REVEALS it once
+      // its content + route + the final route-aware direction are all ready — so the card appears
+      // once, parked in its final spot, and never visibly repositions/grows (kills the ~0.5s jump).
+      // For a CACHED cell onReady fires synchronously in this same tick → it reveals instantly.
+      const bt=bearingTipDir(l.getBounds().getCenter());
+      lastTipDir=bt.dir;lastTipOff=bt.off;
+      l.bindTooltip("",{className:"tt tt-pending",sticky:true,opacity:1,direction:bt.dir,offset:offVec(bt.dir,bt.off)}).openTooltip();
+      const myCell=f.properties.id;
+      loadBreak(f,
+        h=>{if(l.getTooltip())l.setTooltipContent(h);},   // set content while still invisible (pending)
+        d=>{                                              // onReady: content final + route drawn → reveal in place
+          if(hoverCell!==myCell||!l.getTooltip())return;  // moved away before it landed → leave it hidden
+          openHoverInPlace(l,d);
+        });
+    });
+    l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);
+      if(hoverCell===f.properties.id){hoverCell=null;hoverLayer=null;lastTipDir=null;
+        if(l.getTooltip())l.closeTooltip();}                 // close the (revealed-or-pending) tooltip on leave
+      if(routePin==null)clearRoute();});                      // pinned route survives mouseout
   }
-  // Click (desktop) / tap (touch): same breakdown content, shown as a popup.
-  l.on("click",()=>{if(!DESTLL)return;
-    l.bindPopup("…",{maxWidth:285,autoPan:true,autoPanPadding:[24,24]}).openPopup();
-    loadBreak(f,h=>{if(l.getPopup())l.setPopupContent(h);});});
+  // Click (desktop) / tap (touch): pin the breakdown into the fixed corner card (NOT an on-cell
+  // popup), so it never covers the drawn route. The map-background click handler unpins; this
+  // cell click must not be read as a background click, so flag it for that handler.
+  l.on("click",ev=>{if(!DESTLL)return;
+    justPinned=true;                            // suppress the map-background closePin this tick
+    if(ev&&ev.originalEvent)L.DomEvent.stopPropagation(ev);
+    // UNBIND (not just close) the cell's hover tooltip + drop its outline → compare mode is the
+    // corner card only. closeTooltip() alone leaves the sticky tooltip's mousemove-reopen path live,
+    // so fitBounds panning the cell back under the parked cursor would reopen it on top of the card.
+    // unbindTooltip kills it for good; the mouseover handler rebinds a fresh one on the next hover.
+    if(l.getTooltip())l.unbindTooltip();layer.resetStyle(l);
+    openPin(f,l);});
 }}).addTo(map);
 // ---- info-panel lifecycle: keep open tooltips/popups in sync with the current params --------
 // A Leaflet sticky tooltip stays open until mouseout, so a param change (speed, transfers, new
@@ -325,26 +1022,60 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
 // every layer via inheritance, so `l.isTooltipOpen && l.isTooltipOpen()` doesn't guard.)
 function closeOpenInfo(){
   bdToken++; clearTimeout(bdTimer);
-  if(typeof layer==="undefined"||!layer)return;
+  routePin=null; hoverCell=null; hoverLayer=null; lastTipDir=null; pendingFitId=null; clearRoute();   // drawn route is stale with the open cards
+  pinCard.classList.remove("open"); pinFeature=null;   // close the pinned corner card too
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;   // reset compare state
   layer.eachLayer(l=>{
     const tip=l.getTooltip&&l.getTooltip(); if(tip&&tip.isOpen())l.closeTooltip();
-    const pop=l.getPopup&&l.getPopup(); if(pop&&pop.isOpen())l.closePopup();
   });
 }
 function refreshOpenInfo(){
-  if(typeof layer==="undefined"||!layer)return;
+  // Re-render the pinned corner card in place (metric/cmode toggle, /variance arriving). renderPin
+  // rebuilds the compare list (keeping the locked selKey when it still exists) + redraws.
+  if(pinFeature){
+    const id=pinFeature.properties.id, cached=BDCACHE[id];
+    if(!cached){if(EXACT)loadBreak(pinFeature,h=>setPinHTML(h),d=>{if(routePin===id&&d&&!d.error&&d.geom)renderPin(pinFeature,d);});}
+    else renderPin(pinFeature,Object.assign({},cached,{name:pinFeature.properties.n,real:REAL[id],var:VAR[id]}));
+  }
   layer.eachLayer(l=>{
-    const tip=l.getTooltip&&l.getTooltip(), pop=l.getPopup&&l.getPopup();
-    const tipOpen=tip&&tip.isOpen(), popOpen=pop&&pop.isOpen();
-    if(!tipOpen && !popOpen)return;
+    const tip=l.getTooltip&&l.getTooltip();
+    const tipOpen=tip&&tip.isOpen();
+    if(!tipOpen)return;
     const f=l.feature;if(!f)return;const id=f.properties.id;
-    const cached=BDCACHE[id];if(!cached)return;
+    const cached=BDCACHE[id];
+    if(!cached){
+      // Legacy-R5 path: a tooltip opened pre-refine shows the "refining…" placeholder and
+      // has no cached breakdown yet. Once EXACT, re-trigger the fetch into the open card so
+      // it upgrades in place instead of staying a placeholder until the user re-hovers.
+      if(EXACT)loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});
+      return;
+    }
     const d=Object.assign({},cached,{name:f.properties.n,real:REAL[id],var:VAR[id]});
-    const html=bdHTML(d);
-    if(tipOpen)l.setTooltipContent(html);
-    if(popOpen)l.setPopupContent(html);
+    if(l.getTooltip())l.setTooltipContent(bdHTML(d));
   });
 }
+// After /variance lands the previously-cached /itinerary for the active (pinned or hovered) cell
+// carries alts:[] — re-fetch it so the compare list gains its alternatives without a manual
+// re-hover. (Reuses the existing open-card refresh contract: refresh on data arrival.)
+function refreshDrawnRoute(){
+  const id = routePin!=null ? routePin : hoverCell;
+  if(id==null||!DESTLL)return;
+  const f = pinFeature || (hoverCell!=null ? _featureById(hoverCell) : null);
+  const tok=++bdToken;
+  fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`)
+    .then(r=>r.ok?r.json():null)
+    .then(d=>{
+      if(!d||d.error||tok!==bdToken)return;
+      BDCACHE[id]=d;                                   // refresh cache with the now-populated alts
+      if(f){d.name=f.properties.n;}d.real=REAL[id];d.var=VAR[id];
+      // PINNED: rebuild the compare card (renderPin keeps the locked selection + adds the new alts).
+      if(pinFeature&&pinFeature.properties.id===id){renderPin(pinFeature,d);return;}
+      // HOVER: just redraw the clean primary (the tooltip's "+N alternatives" hint updates via
+      // the existing refreshOpenInfo path; here we only refresh the drawn route).
+      if(hoverCell===id)drawJourney(id,d);
+    }).catch(()=>{});
+}
+function _featureById(id){let out=null;layer.eachLayer(l=>{const f=l.feature;if(f&&f.properties.id===id)out=f;});return out;}
 // transit-line overlays (off by default; non-interactive so cells stay hoverable)
 const LINESTYLE={bus:{color:MODECOLOR.bus,weight:1.3,opacity:.5},metro:{color:MODECOLOR.metro,weight:2.4,opacity:.85},
   cable:{color:MODECOLOR.cable,weight:2,opacity:.8},bart:{color:MODECOLOR.bart,weight:3,opacity:.85}};
@@ -352,14 +1083,16 @@ const overlays={};
 ["bart","metro","bus","cable"].forEach(m=>{overlays[m]=L.geoJSON(
   {type:"FeatureCollection",features:LINES.features.filter(f=>f.properties.mode===m)},
   {style:()=>LINESTYLE[m],interactive:false});});
-document.querySelectorAll("input[data-m]").forEach(cb=>cb.onchange=()=>{
-  const m=cb.dataset.m;if(cb.checked)overlays[m].addTo(map);else map.removeLayer(overlays[m]);});
+document.querySelectorAll("input[data-m]").forEach(cb=>{
+  const m=cb.dataset.m,s=cb.nextElementSibling;            // checkbox label color from the ONE palette (viz.js MODECOLOR)
+  if(s&&MODECOLOR[m])s.style.color=MODECOLOR[m];
+  cb.onchange=()=>{if(cb.checked)overlays[m].addTo(map);else map.removeLayer(overlays[m]);};});
 let pin=null;   // workplace marker — set via the address box only (no map-click / drag)
 
 function redraw(){SCALE=ramp(ideal).S;layer.setStyle(style);legend();renderList();}
 function renderList(){const rows=Object.entries(NB).filter(([k,v])=>v!=null).sort((a,b)=>a[1]-b[1]);
-  document.getElementById("list").innerHTML=rows.map(([n,v])=>{const c=v<=thr?color(v):"#555";
-    return `<div class="nb"><span><span style="color:${c}">●</span> ${n}</span><span class="t" style="color:${c}">${v}<small> min</small></span></div>`;}).join("");
+  document.getElementById("list").innerHTML=rows.map(([n,v])=>{const c=v<=thr?color(v):"var(--ink-arr)";
+    return `<div class="nb"><span><span style="color:${c}">●</span> ${escapeHTML(n)}</span><span class="t" style="color:${c}">${v}<small> min</small></span></div>`;}).join("");
   const under=rows.filter(([n,v])=>v<=thr).length;
   document.getElementById("nbcount").textContent=DESTLL?` — ${under} ≤ ${thr} min`:"";}
 // neighborhoods currently at/under the Max-commute threshold (ranked), for export
@@ -468,7 +1201,8 @@ async function loadVariance(){if(!DESTLL)return;const myGen=GEN;
     }
     if(!r.ok)return;const d=await r.json();if(myGen!==GEN)return;
     if(d.realistic&&Object.keys(d.realistic).length){
-      REAL=d.realistic;VAR=d.variance||{};aggregate();redraw();refreshOpenInfo();}   // realistic now drives metric="r"; refresh any open tooltip to add the bad-day line
+      REAL=d.realistic;VAR=d.variance||{};aggregate();redraw();refreshOpenInfo();   // realistic now drives metric="r"; refresh any open tooltip to add the bad-day line
+      refreshDrawnRoute();}                                // MC built -> /itinerary now returns alts; refresh the active cell's drawn route so they appear
   }catch(e){}}
 // ---- small shared utils for busy handling + toasts --------------------------------------
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -478,19 +1212,24 @@ let toastTimer;
 function toast(msg,ms){const t=document.getElementById("toast");t.textContent=msg;t.style.display="block";
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>{t.style.display="none";},ms||3500);}
 function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onclick=()=>{
-  document.querySelectorAll(`#${id} button`).forEach(x=>x.classList.remove("on"));b.classList.add("on");
+  setSeg(id,b.dataset.v);
   set(b.dataset.v);aggregate();redraw();refreshOpenInfo();syncHash();});}   // re-render open tooltip with new metric/cmode
-function setSeg(id,v){document.querySelectorAll(`#${id} button`).forEach(b=>b.classList.toggle("on",b.dataset.v===v));}
+// setSeg is the ONE place segmented-control selection is rendered: the visual .on class AND
+// aria-pressed for assistive tech move together so they can't drift.
+function setSeg(id,v){document.querySelectorAll(`#${id} button`).forEach(b=>{const on=b.dataset.v===v;
+  b.classList.toggle("on",on);b.setAttribute("aria-pressed",String(on));});}
 seg("metric",v=>metric=v);
 seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
+// stamp the initial aria-pressed state on every segmented control (the HTML only carries .on);
+// theme gets its setSeg in bootTheme below.
+setSeg("metric",metric);setSeg("cmode",cmode);setSeg("maxrides",maxxfers);setSeg("speed",walkspeed);
 // Max transfers is NOT a client-only restyle: a new cap changes the colored TIMES, so it
 // must re-run the map (re-/compute + auto-refine) and invalidate the stale breakdowns. We
 // don't use seg() here (which only aggregate/redraw/syncHash). Always syncHash so the cap is
 // in the permalink even with no workplace yet.
 document.querySelectorAll("#maxrides button").forEach(b=>b.onclick=()=>{
   if(b.dataset.v===maxxfers)return;                       // no-op if unchanged
-  document.querySelectorAll("#maxrides button").forEach(x=>x.classList.remove("on"));
-  b.classList.add("on");maxxfers=b.dataset.v;
+  setSeg("maxrides",b.dataset.v);maxxfers=b.dataset.v;
   BDCACHE={};                                             // breakdowns were for the old cap
   closeOpenInfo();                                        // close stale tooltip; next hover fetches with new cap
   syncHash();
@@ -498,11 +1237,20 @@ document.querySelectorAll("#maxrides button").forEach(b=>b.onclick=()=>{
   // so the user's pan/zoom is preserved even in legacy R5 mode where atomic isn't set.
   if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor,recenter:false});
 });
+// Appearance: client-only restyle (no recompute, no breakdown invalidation). Just swaps the
+// data-theme attribute + basemap + cell saturation, persists the preference, syncs the hash.
+// This explicit button is the ONLY place the preference is persisted (a hash th= applies
+// session-only, like wp). Persist BEFORE the equality early-return so a user who opened a
+// th= link and clicks the already-highlighted button still saves that choice.
+function setThemePref(p){try{localStorage.setItem("theme_v1",p);}catch(e){}
+  if(p===themePref)return;themePref=p;
+  applyTheme();legend();syncHash();}
+document.querySelectorAll("#theme button").forEach(b=>b.onclick=()=>{
+  setSeg("theme",b.dataset.v);setThemePref(b.dataset.v);});
 // Walk speed: like Max transfers, a new pace changes the colored TIMES -> recompute the map.
 document.querySelectorAll("#speed button").forEach(b=>b.onclick=()=>{
   if(b.dataset.v===walkspeed)return;
-  document.querySelectorAll("#speed button").forEach(x=>x.classList.remove("on"));
-  b.classList.add("on");walkspeed=b.dataset.v;
+  setSeg("speed",b.dataset.v);walkspeed=b.dataset.v;
   BDCACHE={};                                             // breakdowns were for the old pace
   closeOpenInfo();                                        // close stale tooltip; next hover fetches with new pace
   syncHash();
@@ -510,24 +1258,30 @@ document.querySelectorAll("#speed button").forEach(b=>b.onclick=()=>{
 });
 document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();syncHash();};
 document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();syncHash();};
+let geoToken=0;  // cancels stale /geocode responses (Set-vs-Set race; chooseAC bumps it too) so an older address can't win the map
 async function geocodeSet(q){if(!q)return;busy("finding address…");closeAC();
+  const my=++geoToken;
   try{const r=await fetch(`/geocode?q=${encodeURIComponent(q)}`);const d=await r.json();
+    if(my!==geoToken)return;                              // a newer Set/selection took over → drop this
     if(d.lat){busy(false);setWorkplace(d.lat,d.lon,q);}   // keep the user's typed string verbatim
-    else{busy(false);alert("address not found");}}catch(e){busy(false);alert(e);}}
+    else{busy(false);alert("address not found");}}catch(e){if(my===geoToken){busy(false);alert(e);}}}
 document.getElementById("go").onclick=()=>geocodeSet(document.getElementById("addr").value);
 document.getElementById("refine").onclick=refine;
 
 /* ============ Feature 3: address autocomplete ============ */
 const addrEl=document.getElementById("addr"),acEl=document.getElementById("ac");
 let acItems=[],acIdx=-1,acTimer,acToken=0;
-function closeAC(){acEl.classList.remove("open");acEl.innerHTML="";acItems=[];acIdx=-1;addrEl.setAttribute("aria-expanded","false");}
+function closeAC(){acEl.classList.remove("open");acEl.innerHTML="";acItems=[];acIdx=-1;
+  addrEl.setAttribute("aria-expanded","false");addrEl.removeAttribute("aria-activedescendant");}
 function renderAC(){if(!acItems.length){closeAC();return;}
-  acEl.innerHTML=acItems.map((it,i)=>`<div class="ac-item${i===acIdx?" hl":""}" role="option" data-i="${i}">${escapeHTML(it.label)}</div>`).join("");
-  acEl.classList.add("open");addrEl.setAttribute("aria-expanded","true");}
+  acEl.innerHTML=acItems.map((it,i)=>`<div class="ac-item${i===acIdx?" hl":""}" id="ac-item-${i}" role="option" aria-selected="${i===acIdx}" data-i="${i}">${escapeHTML(it.label)}</div>`).join("");
+  acEl.classList.add("open");addrEl.setAttribute("aria-expanded","true");
+  if(acIdx>=0)addrEl.setAttribute("aria-activedescendant",`ac-item-${acIdx}`);   // arrow-key highlight visible to AT
+  else addrEl.removeAttribute("aria-activedescendant");}
 function escapeHTML(s){return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 acEl.addEventListener("mousedown",e=>{const el=e.target.closest(".ac-item");if(!el)return;
   e.preventDefault();const it=acItems[+el.dataset.i];if(it){chooseAC(it);}});
-function chooseAC(it){addrEl.value=it.label;closeAC();setWorkplace(it.lat,it.lon,it.label);}
+function chooseAC(it){geoToken++;addrEl.value=it.label;closeAC();setWorkplace(it.lat,it.lon,it.label);}  // bump: a pending geocodeSet must not clobber this pick
 addrEl.addEventListener("input",()=>{const q=addrEl.value.trim();clearTimeout(acTimer);
   if(q.length<3){closeAC();return;}
   acTimer=setTimeout(async()=>{const my=++acToken;
@@ -564,27 +1318,45 @@ document.getElementById("dlcsv").onclick=()=>{const rows=exportRows();
   document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);};
 function csvCell(s){s=String(s);return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;}
 
-/* ============ Feature 7: how-it-works modal ============ */
-const howModal=document.getElementById("howmodal");
-function openHow(){howModal.classList.add("open");}function closeHow(){howModal.classList.remove("open");}
+/* ============ footer modals: About + How it works ============ */
+// One generic modal driver for both overlays (same .modal shell): a click on the backdrop, the
+// ×, or Esc closes the open one. The footer tabs open them; the h1 "How it works" link is kept
+// for the existing deep-link/e2e contract.
+const howModal=document.getElementById("howmodal"), aboutModal=document.getElementById("aboutmodal");
+function openModal(m){closeModals();m.classList.add("open");}
+function closeModals(){howModal.classList.remove("open");aboutModal.classList.remove("open");}
+function openHow(){openModal(howModal);}function closeHow(){howModal.classList.remove("open");}
+document.getElementById("howbtn").onclick=openHow;
+document.getElementById("aboutbtn").onclick=()=>openModal(aboutModal);
 document.getElementById("howlink").onclick=openHow;
 document.getElementById("howlink").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();openHow();}});
 document.getElementById("howx").onclick=closeHow;
+document.getElementById("howx").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();closeHow();}});  // role=button on a span doesn't fire click on Enter/Space
+document.getElementById("aboutx").onclick=()=>aboutModal.classList.remove("open");
+document.getElementById("aboutx").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();aboutModal.classList.remove("open");}});
 howModal.addEventListener("click",e=>{if(e.target===howModal)closeHow();});
-document.addEventListener("keydown",e=>{if(e.key==="Escape")closeHow();});
+aboutModal.addEventListener("click",e=>{if(e.target===aboutModal)aboutModal.classList.remove("open");});
+// Esc closes (in order of priority) an open modal, then the pinned route card.
+document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;
+  if(howModal.classList.contains("open")||aboutModal.classList.contains("open")){closeModals();return;}
+  closePin();});
 
 /* ============ Feature 5: mobile bottom-sheet toggle ============ */
-const panelEl=document.getElementById("panel");
-document.getElementById("sheetbtn").onclick=()=>panelEl.classList.toggle("open");
+const panelEl=document.getElementById("panel"),sheetBtn=document.getElementById("sheetbtn");
+sheetBtn.onclick=()=>sheetBtn.setAttribute("aria-expanded",String(panelEl.classList.toggle("open")));
 
 /* ============ Feature 4: shareable permalink (URL hash) ============ */
 // Format: #wp=<lat>,<lon>,<encodedLabel>&ideal=<n>&thr=<n>&metric=<r|b>&cmode=<time|line>&mt=<0|1|2|any>
-let hashTimer,applyingHash=false;
-function syncHash(){if(applyingHash)return;clearTimeout(hashTimer);
+let hashTimer;
+// No re-entrancy guard needed: replaceState never fires hashchange, there is no hashchange
+// listener (applyHash runs only at boot), and the hash-equality check below makes the write
+// idempotent. If back/forward hash navigation is ever added, a guard must be evaluated
+// inside the debounced callback (the 300ms debounce outlives any flag set around applyHash).
+function syncHash(){clearTimeout(hashTimer);
   hashTimer=setTimeout(()=>{
     const parts=[];
     if(DESTLL)parts.push(`wp=${DESTLL[0].toFixed(6)},${DESTLL[1].toFixed(6)},${encodeURIComponent(CURLABEL)}`);
-    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`,`mt=${maxxfers}`,`sp=${walkspeed}`);
+    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`,`mt=${maxxfers}`,`sp=${walkspeed}`,`th=${themePref}`);
     const h="#"+parts.join("&");
     if(("#"+location.hash.replace(/^#/,""))!==h){history.replaceState(null,"",h);}
   },300);}
@@ -592,7 +1364,7 @@ function parseHash(){const h=location.hash.replace(/^#/,"");if(!h)return null;
   const o={};h.split("&").forEach(kv=>{const i=kv.indexOf("=");if(i<0)return;
     o[kv.slice(0,i)]=kv.slice(i+1);});
   return o;}
-function applyHash(o){applyingHash=true;
+function applyHash(o){
   if(o.ideal!=null&&Number.isFinite(+o.ideal)){ideal=Math.min(45,Math.max(10,+o.ideal));
     document.getElementById("ideal").value=ideal;document.getElementById("idval").textContent=ideal;}
   if(o.thr!=null&&Number.isFinite(+o.thr)){thr=Math.min(70,Math.max(10,+o.thr));
@@ -601,9 +1373,13 @@ function applyHash(o){applyingHash=true;
   if(o.cmode==="time"||o.cmode==="line"){cmode=o.cmode;setSeg("cmode",cmode);}
   if(["0","1","2","any"].includes(o.mt)){maxxfers=o.mt;setSeg("maxrides",maxxfers);}
   if(["slow","med","fast"].includes(o.sp)){walkspeed=o.sp;setSeg("speed",walkspeed);}
-  applyingHash=false;
+  // Hash theme applies for the SESSION only — like wp's {persist:false}, a shared link must
+  // not silently overwrite the recipient's saved preference (only setThemePref persists).
+  if(["auto","light","dark"].includes(o.th)){themePref=o.th;setSeg("theme",themePref);applyTheme();}
   if(o.wp){const wseg=o.wp.split(",");const lat=+wseg[0],lon=+wseg[1];
-    const label=decodeURIComponent(wseg.slice(2).join(","));
+    // a hand-mangled %-sequence in the label must not throw past the lat/lon guard
+    const rawLabel=wseg.slice(2).join(",");let label;
+    try{label=decodeURIComponent(rawLabel);}catch(e){label=rawLabel;}
     if(Number.isFinite(lat)&&Number.isFinite(lon)){
       document.getElementById("addr").value=label||"";
       setWorkplace(lat,lon,label,{persist:false});return true;}}   // a one-time deep link must not clobber the user's saved workplace
@@ -613,19 +1389,32 @@ function applyHash(o){applyingHash=true;
 // and frame the panel as arrive-by-09:00 estimates (CFG.timephrase).
 (function applyCfg(){
   document.getElementById("howtime").textContent=CFG.timephrase;
-  document.getElementById("creditphrase").textContent=CFG.timephrase;
   document.getElementById("estphrase").textContent=CFG.timephrase;
   if(CFG.raptor){
     document.getElementById("refinebox").style.display="none";
     document.getElementById("estnote").style.display="block";
   }
 })();
+// First-paint theming already happened in the tiny <head> script (data-theme is set before
+// the CSS applies — no FOUC). bootTheme only reconciles JS state with it: themePref, the
+// seg control, cell opacity, and the (already-correct, so swap-free) basemap. It uses the
+// SAME precedence as the head script — hash th= (session-only) > saved pref > OS — so the
+// boot-time applyTheme is a no-op for the tiles and applyHash's th branch just re-affirms.
+(function bootTheme(){
+  let saved=null;try{saved=localStorage.getItem("theme_v1");}catch(e){}
+  const o=parseHash();
+  if(o&&["auto","light","dark"].includes(o.th))themePref=o.th;
+  else if(["auto","light","dark"].includes(saved))themePref=saved;
+  setSeg("theme",themePref);applyTheme();
+})();
 legend();   // draw the legend; map stays blank until you set an address
 // Boot: hash takes precedence over localStorage (Feature 4).
 (function boot(){
   const o=parseHash();
-  if(o&&o.wp){applyHash(o);return;}
-  if(o){applyHash(o);}                                 // restore sliders/metric/cmode even without wp
+  // applyHash returns true only when a VALID wp was applied (setWorkplace drives its own
+  // compute/paint). A malformed wp= must fall through to the saved/default workplace below
+  // — applyHash already restored sliders/metric/cmode/theme either way.
+  if(o&&applyHash(o))return;
   let wp=null;
   try{wp=JSON.parse(localStorage.getItem("wp_v1")||"null");}catch(e){}        // previously-typed workplace wins
   if(!(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon))) wp=CFG.default_wp;   // else fall back to .env DEFAULT_ADDRESS

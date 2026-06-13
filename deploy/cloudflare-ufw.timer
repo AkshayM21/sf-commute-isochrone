@@ -1,5 +1,5 @@
 [Unit]
-Description=Weekly refresh of Cloudflare IP allowlist in ufw
+Description=Weekly refresh of Cloudflare IP allowlist in firewalld
 
 [Timer]
 # First refresh 2 min after boot (so a freshly-deployed box gets locked down quickly),

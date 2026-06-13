@@ -12,26 +12,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import numpy as np
-from core import raptor_engine
+from core import raptor_engine, raptor_golden
 
 GOLDEN = ROOT / "tests" / "raptor_golden"
 NAME = os.environ.get("WP", "downtown")
 eng = raptor_engine.RaptorEngine(verbose=False)
 z = np.load(GOLDEN / f"oracle_{NAME}.npz", allow_pickle=True)
-pw = np.array([int(z["purewalk"][i]) for i in range(len(eng.cell_ids))], np.int64)
+pw = raptor_golden.purewalk_aligned(eng, z)
 tree = eng.journey_tree(z["egress_g"], z["egress_w"], pw)
 d = eng.data
 pat_dep, pat_nstops, pat_mat_off = d["pat_dep"], d["pat_nstops"], d["pat_mat_off"]
 CAP = eng.max_min
 
 
-def recovery_headway(pi, trip, bpos, dep_sec):
-    """Minutes until the NEXT trip on pattern pi departs the board stop (>= CAP if none = last)."""
+def recovery_headway(pi, bpos, dep_sec):
+    """Minutes until the NEXT trip on pattern pi departs the board stop (>= CAP if none = last).
+    The ride tuple carries no trip index, so recover the next trip by binary search over the
+    board-stop departure column (trips within a pattern are departure-sorted)."""
     ns = int(pat_nstops[pi]); mb = int(pat_mat_off[pi])
     nt = (int(pat_mat_off[pi + 1]) - mb) // ns
-    if trip + 1 >= nt:
+    deps = pat_dep[mb + bpos: mb + nt * ns: ns]       # departures at bpos, trips 0..nt-1
+    t = int(np.searchsorted(deps, dep_sec, side="right"))   # first trip departing AFTER ours
+    if t >= nt:
         return CAP                                    # last trip of the morning — miss it, stuck
-    return (int(pat_dep[mb + (trip + 1) * ns + bpos]) - dep_sec) // 60
+    return (int(deps[t]) - dep_sec) // 60
 
 
 def fragility(ci):
@@ -40,7 +44,9 @@ def fragility(ci):
         return None
     legs_raw, lh = tr
     rides = [l for l in legs_raw if l[0] == "ride"]
-    recov = [recovery_headway(l[1], l[5], l[4], l[2]) for l in rides]   # per-leg recovery headway
+    # ride tuple = ("ride", pi, dep_sec, arr_sec, bpos, apos, alight_stop): pattern, board
+    # position, and OUR departure (the trip index is recovered inside recovery_headway)
+    recov = [recovery_headway(l[1], l[4], l[2]) for l in rides]         # per-leg recovery headway
     names = [tree._name(l[1]) for l in rides]
     n_xfer = max(0, len(rides) - 1)
     # the uncontrollable risk = worst recovery among the TRANSFER connections (legs after the 1st)

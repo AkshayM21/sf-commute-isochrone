@@ -9,7 +9,7 @@
 #  4. Loops attempting to launch VM.Standard.A1.Flex (1 OCPU / 6 GB) across all ADs in the
 #     region every $RETRY_SECS until ONE succeeds -- that's the A1 capacity squeeze workaround.
 #  5. On success: prints the public IP, instance OCID, ssh command. Saves them to
-#     ~/.sfci_instance.txt for the deploy step next.
+#     $INSTANCE_FILE for the deploy step next.
 #
 # Re-runnable. If the instance already exists (by display name), it just prints its details.
 # Requires: oci CLI configured at ~/.oci/config; SSH public key at $SSH_KEY.
@@ -17,32 +17,50 @@
 set -euo pipefail
 
 # ---- knobs ----------------------------------------------------------------------------
-NAME="sfci"
+# All overridable so a second poller (e.g., parallel SJC region) writes to a distinct file
+# and doesn't collide with this region's resources/result:
+#   OCI_CLI_REGION=us-sanjose-1 NAME=sfci-sjc INSTANCE_FILE=~/.sfci_instance_sjc.txt ./oci_launch.sh
+NAME="${NAME:-sfci}"
 SHAPE="VM.Standard.A1.Flex"
 OCPUS=1
 MEM_GB=6
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519.pub}"
-RETRY_SECS=30                                # wait between capacity-retry rounds
-MAX_ROUNDS="${MAX_ROUNDS:-720}"              # ~6 hours @ 30s
+INSTANCE_FILE="${INSTANCE_FILE:-$HOME/.sfci_instance.txt}"
+RETRY_SECS="${RETRY_SECS:-300}"              # wait between capacity-retry rounds (5 min default
+                                             # since the recent Oracle pattern is "accept then
+                                             # immediately terminate" — slow churn avoids tripping
+                                             # OCI anti-abuse + lets per-round attempts breathe).
+MAX_ROUNDS="${MAX_ROUNDS:-288}"              # ~24 h at 5 min/round
 COMPARTMENT="$(grep '^tenancy' ~/.oci/config | cut -d= -f2)"
-REGION="$(grep '^region' ~/.oci/config | cut -d= -f2)"
 
 [[ -f "$SSH_KEY" ]] || { echo "[!] SSH key not found at $SSH_KEY"; exit 1; }
 
 # ---- helpers --------------------------------------------------------------------------
 log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
-ocid() { oci --query "$2" --raw-output "$@" 2>/dev/null || true; }
+
+parse_instance_ocid() {                      # parse_instance_ocid <out-file>
+  # The OCI CLI prepends prose ("Action completed. Waiting until..." / "Failed to wait...")
+  # before the JSON, and stderr is merged into the capture — so jq chokes on the raw file.
+  # Strip everything before the first standalone `{` line; fallback: greedy grep for
+  # "ocid1.instance.*". Never fails under set -e (both substitutions end in `|| true`).
+  local id
+  id="$(sed -n '/^{/,$p' "$1" | jq -r '.data.id // empty' 2>/dev/null || true)"
+  if [[ -z "$id" ]]; then
+    id="$(grep -oE '"ocid1\.instance\.oc1\.[a-z0-9._-]+"' "$1" | head -1 | tr -d '"' || true)"
+  fi
+  printf '%s' "$id"
+}
 
 find_or_create() {                           # find_or_create <kind-display> <list-cmd...> -- <create-cmd...>
   local kind="$1"; shift
   local list=(); while [[ "$1" != "--" ]]; do list+=("$1"); shift; done; shift
   local create=("$@")
-  local id; id="$(oci ${list[@]} --query 'data[0].id' --raw-output 2>/dev/null || true)"
+  local id; id="$(oci "${list[@]}" --query 'data[0].id' --raw-output 2>/dev/null || true)"
   if [[ -n "$id" && "$id" != "null" ]]; then
     log "$kind already exists: ${id:0:50}..."
   else
     log "creating $kind..."
-    id="$(oci ${create[@]} --query 'data.id' --raw-output)"
+    id="$(oci "${create[@]}" --query 'data.id' --raw-output)"
   fi
   printf '%s' "$id"
 }
@@ -56,7 +74,7 @@ if [[ -n "$EXISTING_INSTANCE" && "$EXISTING_INSTANCE" != "null" ]]; then
   PUB_IP="$(oci compute instance list-vnics --instance-id "$EXISTING_INSTANCE" \
             --query 'data[0]."public-ip"' --raw-output 2>/dev/null)"
   log "public IP: $PUB_IP"
-  echo "$EXISTING_INSTANCE $PUB_IP" > ~/.sfci_instance.txt
+  echo "$EXISTING_INSTANCE $PUB_IP" > "$INSTANCE_FILE"
   echo "ssh ubuntu@$PUB_IP   (or opc@ for Oracle Linux)"
   exit 0
 fi
@@ -131,30 +149,88 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
         --subnet-id "$SUB_ID" \
         --assign-public-ip true \
         --display-name "$NAME" \
-        --hostname-label "$NAME" \
-        --metadata "{\"ssh_authorized_keys\":\"$SSH_KEY_CONTENT\"}" \
+        --metadata "$(jq -n --arg k "$SSH_KEY_CONTENT" '{ssh_authorized_keys:$k}')" \
         --wait-for-state RUNNING \
+        --max-wait-seconds 300 \
         >"$OUT_FILE" 2>&1; then
-      INSTANCE_ID="$(jq -r '.data.id' "$OUT_FILE")"
+      # Same prose-prefixed output as the recovery path (stderr is merged into OUT_FILE),
+      # so use the shared parser — raw `jq` here used to die under set -e on success.
+      INSTANCE_ID="$(parse_instance_ocid "$OUT_FILE")"
+      if [[ -z "$INSTANCE_ID" ]]; then
+        log "[!] launch reported success but OCID could not be parsed from output:"
+        cat "$OUT_FILE" >&2
+        rm -f "$OUT_FILE"
+        exit 1
+      fi
       log "[OK] launched in $AD: $INSTANCE_ID"
       sleep 5    # give the VNIC a moment to bind
+      # list-vnics can transiently 404 right after launch — non-fatal, like the recovery path.
       PUB_IP="$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" \
-                --query 'data[0]."public-ip"' --raw-output)"
+                --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)"
+      PUB_IP="${PUB_IP:-unknown}"
       log "public IP: $PUB_IP"
-      echo "$INSTANCE_ID $PUB_IP" > ~/.sfci_instance.txt
+      echo "$INSTANCE_ID $PUB_IP" > "$INSTANCE_FILE"
       echo
       echo "======================================================================"
       echo "  Instance up.  ssh opc@$PUB_IP"
-      echo "  (saved to ~/.sfci_instance.txt for the deploy step)"
+      echo "  (saved to $INSTANCE_FILE for the deploy step)"
       echo "======================================================================"
       rm -f "$OUT_FILE"
       exit 0
     fi
     # Transient (capacity / rate-limit / network timeout)? -> next AD, sleep, retry.
+    # Wait-for-state timeout? Launch was ACCEPTED -- recover by polling state ourselves.
     # Real error (auth, bad params, missing perm)? -> bail with the message so the user can fix.
     if grep -qiE 'Out of (host )?capacity|InternalError.*capacity|TooManyRequests|RequestException|connection.*timed? out|EndpointConnectionError|Read timed out|ServiceTimeoutException' "$OUT_FILE"; then
       reason="capacity"; grep -qiE 'timed? out|RequestException|ConnectionError' "$OUT_FILE" && reason="network timeout"
       log "   (transient: $reason in $AD -- trying next)"
+    elif grep -qE 'Failed to wait until the resource entered the specified state' "$OUT_FILE"; then
+      # Launch was accepted; the CLI's --wait-for-state RUNNING just gave up. Pull the OCID,
+      # poll lifecycle-state ourselves, then either claim it (RUNNING) or release it (TERMINATED
+      # or stuck-in-PROVISIONING). DISABLE set -e inside this block: oci CLI calls can return
+      # transient non-zero (404 on race, throttle), and we already handle each via `|| true`.
+      set +e
+      RECOVER_ID="$(parse_instance_ocid "$OUT_FILE")"
+      log "   (wait-state timeout in $AD; OCID parsed: [${RECOVER_ID:-EMPTY}])"
+      if [[ -n "$RECOVER_ID" ]]; then
+        log "   polling lifecycle-state up to 20 min (40 x 30s)..."
+        recovered=0
+        for poll in $(seq 1 40); do
+          STATE="$(oci compute instance get --instance-id "$RECOVER_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)"
+          STATE="${STATE:-UNKNOWN}"
+          log "      poll $poll/40: state=$STATE"
+          if [[ "$STATE" == "RUNNING" ]]; then
+            sleep 5
+            PUB_IP="$(oci compute instance list-vnics --instance-id "$RECOVER_ID" --query 'data[0]."public-ip"' --raw-output 2>/dev/null)"
+            PUB_IP="${PUB_IP:-unknown}"
+            log "[OK] recovered $RECOVER_ID in $AD -- public IP: $PUB_IP"
+            echo "$RECOVER_ID $PUB_IP" > "$INSTANCE_FILE"
+            echo
+            echo "======================================================================"
+            echo "  Instance up.  ssh opc@$PUB_IP"
+            echo "  (saved to $INSTANCE_FILE for the deploy step)"
+            echo "======================================================================"
+            rm -f "$OUT_FILE"
+            exit 0
+          fi
+          if [[ "$STATE" == "TERMINATED" || "$STATE" == "TERMINATING" ]]; then
+            log "   (Oracle dropped the instance; trying next AD)"
+            recovered=1
+            break
+          fi
+          sleep 30
+        done
+        # Clean up a stuck instance so it doesn't pin compute quota.
+        if [[ "$recovered" -eq 0 ]]; then
+          FINAL_STATE="$(oci compute instance get --instance-id "$RECOVER_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)"
+          FINAL_STATE="${FINAL_STATE:-UNKNOWN}"
+          if [[ "$FINAL_STATE" != "TERMINATED" && "$FINAL_STATE" != "TERMINATING" ]]; then
+            log "   (terminating stuck instance $RECOVER_ID in state $FINAL_STATE)"
+            oci compute instance terminate --instance-id "$RECOVER_ID" --force --preserve-boot-volume false >/dev/null 2>&1
+          fi
+        fi
+      fi
+      set -e
     else
       echo "[!] launch failed with non-transient error:" >&2
       cat "$OUT_FILE" >&2

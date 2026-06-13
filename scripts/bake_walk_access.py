@@ -11,13 +11,12 @@ oracle. WALK_FLAT=1 bakes the grade-agnostic table (mechanics check); default ba
 
 Usage: .venv/bin/python scripts/bake_walk_access.py   [WALK_FLAT=1]
 """
-import os, sys, time
+import hashlib, os, sys, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import numpy as np
-from core import config, grid as gridmod, feeds, raptor_build, walk, raptor_engine
-from raptor_validate import stats
+from core import config, grid as gridmod, feeds, raptor_build, walk, raptor_engine, raptor_golden
 
 FLAT = os.environ.get("WALK_FLAT", "").lower() in ("1", "true", "yes")
 GRID_M = int(os.environ.get("GRID_M", str(config.GRID_M)))
@@ -51,6 +50,9 @@ def bake():
     cell_ll = np.array([id2ll[c] for c in cell_ids], dtype=np.float64)
 
     wg = walk.WalkGraph.load()
+    # fingerprint the graph these weights come from, so a walk_graph.npz rebuild (OSM repull,
+    # DEM refetch, stairs-mult change) without a rebake is detectable at server boot
+    graph_sha = hashlib.sha256((config.DATA / "walk_graph.npz").read_bytes()).hexdigest()
     valid = np.where(~np.isnan(slat))[0]                       # gids with coords
     stop_nodes, stop_conn = wg.snap(np.column_stack((slon[valid], slat[valid])))
     cell_nodes, cell_conn = wg.snap(cell_ll)
@@ -74,10 +76,16 @@ def bake():
 
     name = f"access_walk{'flat' if FLAT else ''}_{GRID_M}m_{fp}.npz"
     out = CACHE / name
-    np.savez(out, cell_ids=np.array(cell_ids), access_off=off, access_to=access_to,
+    # write tmp + atomic rename so an interrupted bake can't leave a truncated zip at the
+    # canonical (fingerprinted) path the engine's existence check trusts. Tmp name must end
+    # in .npz — np.savez silently appends it otherwise.
+    tmp = out.with_name(out.stem + ".tmp.npz")
+    np.savez(tmp, cell_ids=np.array(cell_ids), access_off=off, access_to=access_to,
              access_w=access_w, grid_m=GRID_M, n_stops=n_stops, raptor_fp=fp,
              service_date=svc.strftime("%Y%m%d"), slope_aware=np.int8(0 if FLAT else 1),
-             walk_ref_kmh=np.float32(config.WALK_KMH))
+             walk_ref_kmh=np.float32(config.WALK_KMH), walk_graph_sha=graph_sha)
+    np.load(tmp, allow_pickle=True).close()      # cheap zip-integrity check before publish
+    os.replace(tmp, out)
     log(f"[bake] saved {out.name} ({out.stat().st_size/1e6:.1f} MB)")
     return out
 
@@ -91,12 +99,7 @@ def validate(acc_path):
         f"(door-to-door p50 vs R5, walk-baked access + R5 egress)")
     for op in oracles:
         z = np.load(op, allow_pickle=True)
-        pw = np.full(len(eng.cell_ids), -1, np.int64)
-        opos = {c: i for i, c in enumerate(z["cell_ids"].astype(str))}
-        for i, c in enumerate(eng.cell_ids):
-            j = opos.get(c)
-            if j is not None:
-                pw[i] = int(z["purewalk"][j])
+        pw = raptor_golden.purewalk_aligned(eng, z)
         res = eng.departafter(z["egress_g"], z["egress_w"], pw)
         p50 = [res[c][1] for c in eng.cell_ids]
         errs, signed = [], []

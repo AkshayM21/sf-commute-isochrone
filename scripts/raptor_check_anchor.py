@@ -4,6 +4,9 @@ For a sample of cells, take RAPTOR's chosen latest-home departure D* and run R5 
 SAME D* (single departure, recorded path). If RAPTOR's route == R5's route at the same D*, the
 engine's routing is correct and the color-by-line gap vs the depart-after oracle is purely the
 arrive-by-vs-depart-after anchor (different question), not a bug.
+
+NOTE: this probe NEEDS the JVM — server.NET + recorded paths are None under the default
+JVM-free boot, so we force the R5 path by defaulting USE_WALK_GRAPH=0 before importing server.
 """
 import os, sys
 import datetime as dt
@@ -11,14 +14,17 @@ from pathlib import Path
 _mem = os.environ.get("R5_MAX_MEMORY")
 if _mem and "--max-memory" not in sys.argv:
     sys.argv += ["--max-memory", _mem]
+# Force the R5 boot BEFORE `import server` (see raptor_wall_probe.py for the rationale).
+os.environ.setdefault("USE_WALK_GRAPH", "0")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import Point
 import server  # boots R5
-from core import config, raptor_engine
-import com.conveyal.r5 as r5
+assert server._NEED_R5, ("this probe needs the R5/JVM boot (server.NET) — "
+                         "don't force USE_WALK_GRAPH=1/RAPTOR_SEMANTIC=arriveby for it")
+from core import config, network, raptor_engine, raptor_golden
 
 GOLDEN = ROOT / "tests" / "raptor_golden"
 NAME = os.environ.get("WP", "downtown")
@@ -27,7 +33,7 @@ N = int(os.environ.get("N", "40"))
 eng = raptor_engine.RaptorEngine(verbose=False)
 z = np.load(GOLDEN / f"oracle_{NAME}.npz", allow_pickle=True)
 lat, lon = float(z["lat"]), float(z["lon"])
-pw = np.array([int(z["purewalk"][i]) for i in range(len(eng.cell_ids))], np.int64)
+pw = raptor_golden.purewalk_aligned(eng, z)
 tree = eng.journey_tree(z["egress_g"], z["egress_w"], pw)
 commute, dom = tree.commute_and_dominant()
 
@@ -38,17 +44,10 @@ def r5_route_at(olat, olon, dep_dt):
     if o.is_empty:
         return None
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    from core.network import _common
-    from r5py.r5.regional_task import RegionalTask
-    import datetime as _dt
-    t = RegionalTask(server.NET, origin=o, destinations=dest, departure=dep_dt,
-                     departure_time_window=_dt.timedelta(minutes=1),
-                     max_time=_dt.timedelta(minutes=config.MAX_MIN),
-                     transport_modes=server.network.MODES, percentiles=config.PERCENTILES,
-                     speed_walking=config.WALK_KMH, max_public_transport_rides=8)
-    t.destinations = dest
-    t._regional_task.includePathResults = True
-    t._regional_task.nPathsPerTarget = 8
+    # canonical params from the ONE template (single-departure window for the probe)
+    t = network.routing_template(server.NET, dest, dep_dt, paths=True,
+                                 window=dt.timedelta(minutes=1))
+    t.origin = o
     it = server._recorded_itin(t)
     if not it:
         return None, it

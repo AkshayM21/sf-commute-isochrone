@@ -1,10 +1,28 @@
 """Numba-compiled reverse range-RAPTOR sweep — the production hot path.
 
-A faithful, byte-equivalent port of the validated pure-python ``raptor.reverse_raptor``
-(same seeding, same one-hop transfer policy, same FIFO per-position binary search), compiled
-to a single ``nogil`` kernel that sweeps ALL arrival deadlines in one call. ``nogil`` lets the
-server run concurrent requests on real threads without GIL contention; ``cache=True`` persists
-the compiled object so warmup is one-time.
+``_profile`` is a faithful, byte-equivalent port of the validated pure-python
+``raptor.reverse_raptor`` (same seeding, same one-hop transfer policy, same FIFO per-position
+binary search), compiled to a single ``nogil`` kernel that sweeps ALL arrival deadlines in one
+call. ``nogil`` lets the server run concurrent requests on real threads without GIL contention;
+``cache=True`` persists the compiled object so warmup is one-time.
+
+LOCKSTEP: ``_profile`` has TWO siblings whose routing semantics must stay byte-equivalent —
+``raptor.reverse_raptor`` (pure-python reference/test oracle) and ``raptor.reverse_raptor_traced``
+(reference + back-pointers for journey reconstruction). A semantic change to any one (board
+slack, transfer seeding, binary-search column, ...) must land in all three.
+
+SNAPSHOT FOOTPATH RELAX (2026-06-10): every footpath relaxation pass (the egress-seed pass and
+each round's pass) reads its SOURCE values from a snapshot frozen at the start of the pass
+(``srcv``), never live ``best[]`` — so the relax is order-independent and the three siblings
+are BYTE-EQUAL despite their different scan orders (index order here, hash-set in the
+reference, sorted in traced). Enforced by tests/test_raptor.py::test_lockstep_byte_equal.
+
+MONOTONE PROFILE ROWS (2026-06-10): ``_profile`` finishes with a row-wise running max across
+the (ascending) deadline axis — the pruned sweep can drop a feasible propagation at a higher
+deadline, and the cummax restores exactly those provably-feasible journeys, so every
+downstream binary search over a profile row (``stop_arrival_profile``, the MC tail readout
+``_first_ge``) operates on genuinely sorted data. The single-deadline siblings are unaffected
+(one column); lockstep is asserted per-deadline on the raw columns, cummaxed for the profile.
 
 Falls back is unnecessary: ``raptor.reverse_profile`` selects this kernel only when numba
 imports cleanly, else uses the pure-python path (kept as the reference + test oracle).
@@ -30,6 +48,7 @@ def _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
     cur = np.empty(n_stops, dtype=np.int64)        # marked stops to scan this round
     new = np.empty(n_stops, dtype=np.int64)        # marked this round (pattern + transfer)
     act = np.empty(n_pat, dtype=np.int64)          # patterns to scan this round
+    srcv = np.empty(n_stops, dtype=np.int64)       # snapshot of relax-source values per pass
 
     for ti in range(nd):
         T = deadlines[ti]
@@ -48,11 +67,13 @@ def _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
                     cur[cn] = g
                     cn += 1
         seed_n = cn
+        for ii in range(seed_n):                   # SNAPSHOT source values (order-independence)
+            srcv[ii] = best[cur[ii]]
         for ii in range(seed_n):
             s = cur[ii]
             for k in range(tr_off[s], tr_off[s + 1]):
                 j = tr_to[k]
-                cand = best[s] - tr_time[k]
+                cand = srcv[ii] - tr_time[k]
                 if cand > best[j]:
                     best[j] = cand
                     prev[j] = cand
@@ -117,13 +138,17 @@ def _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
             # commit prev for pattern-marked stops
             for ii in range(nn):
                 prev[new[ii]] = best[new[ii]]
+            # SNAPSHOT source values: the relax below must never read live best[] (a target
+            # that is also a source would propagate a 2-hop cascade in scan order)
+            for ii in range(nn):
+                srcv[ii] = best[new[ii]]
             # one-hop transfers from the pattern-marked stops (mirror the python policy)
             tn = nn
             for ii in range(nn):
                 s = new[ii]
                 for k in range(tr_off[s], tr_off[s + 1]):
                     j = tr_to[k]
-                    cand = best[s] - tr_time[k]
+                    cand = srcv[ii] - tr_time[k]
                     if cand > best[j]:
                         best[j] = cand
                         prev[j] = cand
@@ -139,6 +164,25 @@ def _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
         for ii in range(cn):
             flag[cur[ii]] = 0
         latest[:, ti] = best
+    # MONOTONE CUMMAX (2026-06-10): a journey arriving by deadline T also arrives by any
+    # T' > T, so every stop's latest-departure row is non-decreasing in the deadline in
+    # EXACT semantics — but the marked-stop pruning + one-hop footpath policy can drop a
+    # propagation at a higher deadline that fired at a lower one (~58 rows, worst 958 s on
+    # the ferry workplace). A row-wise running max restores exactly those provably-feasible
+    # journeys, making every downstream inversion/binary search (stop_arrival_profile,
+    # the MC tail readout `_first_ge`) well-defined. REQUIRES ascending ``deadlines``
+    # (asserted in both reverse_profile wrappers; every caller uses np.arange grids).
+    # This is the numba-side chokepoint: both reverse_profile and the MC _draw_profile
+    # consume `latest` straight from this kernel. Mirrored by np.maximum.accumulate in
+    # the python fallback (raptor.reverse_profile).
+    for s in range(n_stops):
+        run = np.int64(NEG)
+        for ti in range(nd):
+            v = latest[s, ti]
+            if v > run:
+                run = v
+            else:
+                latest[s, ti] = run
     return latest
 
 
@@ -219,6 +263,53 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW,
 
 
 @njit(cache=True, nogil=True)
+def assemble_departafter_arith(access_off, access_to, access_w, purewalk, arrivalW,
+                               dep0, step, ndg, cell_deps, max_min, pct):
+    """``assemble_departafter`` specialized for a UNIFORM dep_grid sharing origin+step with
+    cell_deps (the engine's grids always do; ``raptor.assemble_departafter`` guards and falls
+    back to the binsearch kernel otherwise). Then
+        searchsorted(dep_grid, cell_deps[di] + w, 'left') == di + ceil(w / step)
+    so the ~access_pairs x deadlines binary searches become direct reads, with ceil(w/step)
+    hoisted per access pair and the arrivalW row hoisted out of the deadline loop.
+    Byte-equal to the binsearch kernel on the engine grids (gated on all 5 golden workplaces)."""
+    n_cells = access_off.shape[0] - 1
+    nd = cell_deps.shape[0]
+    npct = pct.shape[0]
+    out = np.full((n_cells, npct), -1, dtype=np.int32)
+    ttm = np.empty(nd, dtype=np.float64)
+    for ci in range(n_cells):
+        a0 = access_off[ci]
+        a1 = access_off[ci + 1]
+        pw = purewalk[ci]
+        for di in range(nd):
+            ttm[di] = 1e18
+        for a in range(a0, a1):
+            w = access_w[a]
+            kw = (w + step - 1) // step              # ceil(w/step), hoisted per pair
+            row = arrivalW[access_to[a]]
+            for di in range(nd):
+                k = di + kw
+                if k < ndg:
+                    v = row[k]
+                    if v < INF:
+                        tt = (v - cell_deps[di]) / 60.0
+                        if tt < ttm[di]:
+                            ttm[di] = tt
+        for di in range(nd):
+            tt = ttm[di]
+            if pw >= 0 and pw / 60.0 < tt:
+                tt = pw / 60.0
+            if tt > max_min:
+                tt = max_min
+            ttm[di] = np.ceil(tt)
+        srt = np.sort(ttm)
+        for p in range(npct):
+            v = _pct_lower(srt, pct[p])
+            out[ci, p] = -1 if v >= max_min else np.int32(v)
+    return out
+
+
+@njit(cache=True, nogil=True)
 def assemble_arriveby(access_off, access_to, access_w, purewalk, latest, deadlines,
                       max_min, pct):
     n_cells = access_off.shape[0] - 1
@@ -254,7 +345,11 @@ def assemble_arriveby(access_off, access_to, access_w, purewalk, latest, deadlin
 
 
 def reverse_profile(data, egress_g, egress_w, deadlines, board_slack, max_rounds):
-    """latest[n_stops, n_deadlines] via the compiled kernel."""
+    """latest[n_stops, n_deadlines] via the compiled kernel. Rows are MONOTONE non-decreasing
+    in the deadline (the in-kernel cummax — see _profile), which requires ascending deadlines."""
+    deadlines = np.asarray(deadlines, dtype=np.int64)
+    assert deadlines.size < 2 or bool(np.all(np.diff(deadlines) > 0)), \
+        "reverse_profile: deadlines must be strictly ascending (the row cummax depends on it)"
     return _profile(
         np.int64(data["n_stops"]),
         data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
@@ -272,11 +367,11 @@ def reverse_profile(data, egress_g, egress_w, deadlines, board_slack, max_rounds
 
 # ============================================================== service-noise Monte-Carlo
 # Perturb the schedule (per-trip cumulative delay) and re-run the SAME validated reverse sweep
-# per draw, streaming each draw's per-cell median-departure commute into an accumulator. This
-# re-routes OPTIMALLY per scenario (miss an express -> the min over patterns lands on the next
-# local), which a naive same-line headway score cannot do. The cell loop's cost is folded into
-# the per-draw work; draws run in `prange` across cores (nogil), each thread holding only ONE
-# perturbed schedule + ONE latest profile at a time (never R x n_stops).
+# per draw. Each draw fills its column of commute_all[n_cells, R] under COMMITTED-PLAN semantics:
+# the first leg is fixed to the published plan (board the next trip on the committed pattern, no
+# optimal re-route), and only the TAIL re-optimizes from the actual late arrival — see the
+# committed banner below. Draws run in `prange` across cores (nogil), each thread holding only
+# ONE perturbed schedule + ONE latest profile at a time (never R x n_stops).
 
 @njit(cache=True, nogil=True)
 def _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
@@ -338,7 +433,8 @@ def _draw_profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pa
 @njit(nogil=True, cache=True)
 def _first_ge(row, n, key):
     """Index of the first entry in row[0:n] that is >= key (n if none). Binary search on a
-    non-decreasing row — the per-cell readout both MC kernels share."""
+    non-decreasing row — the committed kernel's tail readout (earliest reachable deadline
+    from the committed alight)."""
     lo = 0
     hi = n
     while lo < hi:
@@ -367,9 +463,10 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
                          delta0_all, slope_all):
     """commute_all[n_cells, R] float minutes for R draws, COMMITTED-PLAN semantics. Per draw:
     perturb -> reverse profile; per transit cell: catch the next trip on the committed pattern at
-    the committed board position (>= arrival + board_slack), ride to the committed alight, then read
-    the earliest workplace arrival from that alight at the ACTUAL arrival time off the perturbed
-    profile. Deterministic (walk-only) cells take ``perfect`` every draw; unreachable -> cap."""
+    the committed board position, ride to the committed alight, then read the earliest workplace
+    arrival from that alight at the ACTUAL arrival time + board_slack (the sweep's alight->onward
+    convention) off the perturbed profile. Deterministic (walk-only) cells take ``perfect`` every
+    draw; unreachable -> cap."""
     R = delta0_all.shape[0]
     n_cells = commit_home.shape[0]
     nd = deadlines.shape[0]
@@ -412,7 +509,10 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
                 commute_all[ci, r] = capf
                 continue
             arr_as = arr_r[mbase + lo * ns + apos]       # ACTUAL (late) arrival at the transfer stop
-            d = _first_ge(latest[commit_as[ci]], nd, arr_as)    # earliest deadline reachable from there now
+            # Consume the tail at arr_as + board_slack: the sweep charges board_slack at every
+            # transit-alight -> onward seam (`pa - board_slack` in _profile), so the stressed
+            # transfer must pay the same 60s the perfect-timing sweep paid for it.
+            d = _first_ge(latest[commit_as[ci]], nd, arr_as + board_slack)
             if d >= nd:                                  # can't reach work within the horizon
                 commute_all[ci, r] = capf
                 continue

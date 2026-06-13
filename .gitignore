@@ -28,3 +28,15 @@ prototypes/**/__pycache__/
 
 # agent worktrees / local Claude state
 .claude/
+
+# Cloudflare Origin CA key/cert/CSR stay local (mint via deploy/cf/mint.py); the helper
+# SCRIPTS are tracked — they're part of the deploy runbook (CLAUDE.md / DEPLOY.md).
+# NB: must be `deploy/cf/*` (glob), not `deploy/cf/` — a directory exclude stops git from
+# descending, which would make the `!*.py` re-include a no-op.
+deploy/cf/*
+!deploy/cf/*.py
+
+# Working session notes — personal/operator-specific, not for public consumption
+Progress.md
+Issues.md
+REVIEW_REPORT.md

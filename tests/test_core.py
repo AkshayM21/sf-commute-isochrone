@@ -15,6 +15,7 @@ data/, which is JVM-free and fast.
 Run:  .venv/bin/python -m pytest tests/test_core.py -q
 """
 import datetime as dt
+import json
 import os
 import sys
 from pathlib import Path
@@ -298,8 +299,10 @@ def _photon_feature(lon, lat, **props):
 @pytest.fixture(autouse=True)
 def _isolate_geo(monkeypatch):
     """Every geo test starts with a clean LRU, the default (photon) provider,
-    and no persistent cache leaking in."""
+    and no persistent cache leaking in. GEOAPIFY_KEY must be dropped too: its mere
+    presence (e.g. loaded from .env at geo import) now promotes the geoapify provider."""
     monkeypatch.delenv("GEOCODER", raising=False)
+    monkeypatch.delenv("GEOAPIFY_KEY", raising=False)
     geo._clear_lru()
     # Make the persistent .dest_cache.json invisible so geocode() tests are pure.
     monkeypatch.setattr(geo, "_CACHE", config.ROOT / ".test_nonexistent_cache.json")
@@ -327,6 +330,15 @@ class TestGeoAutocomplete:
         assert geo.autocomplete("") == []
         assert geo.autocomplete("   \t  ") == []
 
+    def test_short_query_returns_empty_without_network(self, monkeypatch):
+        """Queries under 3 chars (after normalization) short-circuit BEFORE any HTTP
+        call — the rate-limit hardening contract in geo.autocomplete (len(norm) < 3)."""
+        def boom(url):
+            raise AssertionError("sub-3-char query should not hit the network")
+        monkeypatch.setattr(geo, "_get_json", boom)
+        assert geo.autocomplete("ab") == []
+        assert geo.autocomplete(" a ") == []      # normalizes to 1 char -> short-circuit
+
     def test_lru_caches_second_call(self, monkeypatch):
         calls = {"n": 0}
 
@@ -342,9 +354,9 @@ class TestGeoAutocomplete:
     def test_lru_returns_defensive_copy(self, monkeypatch):
         monkeypatch.setattr(geo, "_get_json",
                             lambda url: {"features": [_photon_feature(-122.4, 37.78, name="X")]})
-        a = geo.autocomplete("x")
+        a = geo.autocomplete("xyz")
         a[0]["label"] = "MUTATED"
-        b = geo.autocomplete("x")  # served from cache; must be unaffected
+        b = geo.autocomplete("xyz")  # served from cache; must be unaffected
         assert b[0]["label"] == "X"
 
     def test_normalized_query_shares_cache(self, monkeypatch):
@@ -362,7 +374,7 @@ class TestGeoAutocomplete:
         feats = [_photon_feature(-122.4 - i / 1000, 37.78, name=f"P{i}")
                  for i in range(10)]
         monkeypatch.setattr(geo, "_get_json", lambda url: {"features": feats})
-        out = geo.autocomplete("p", limit=3)
+        out = geo.autocomplete("park", limit=3)
         assert len(out) == 3
 
     def test_request_url_carries_sf_bbox_and_bias(self, monkeypatch):
@@ -372,22 +384,23 @@ class TestGeoAutocomplete:
             seen["url"] = url
             return {"features": [_photon_feature(-122.4, 37.78, name="Z")]}
         monkeypatch.setattr(geo, "_get_json", capture)
-        geo.autocomplete("z")
+        geo.autocomplete("zoo")
         url = seen["url"]
         assert "photon.komoot.io" in url
-        # SF bias coordinates + the bounding box must be in the query.
-        assert "lat=37.773" in url
-        assert "lon=-122.42" in url
-        assert "37.70" in url and "37.84" in url  # bbox lat extent
-        assert "-122.55" in url and "-122.34" in url  # bbox lon extent
+        # SF bias coordinates + the bounding box must be in the query. Parse the URL
+        # instead of substring-matching float renderings (str(37.7) != "37.70").
+        from urllib.parse import urlsplit, parse_qs
+        qs = parse_qs(urlsplit(url).query)
+        assert float(qs["lat"][0]) == 37.773
+        assert float(qs["lon"][0]) == -122.42
+        bbox = tuple(float(v) for v in qs["bbox"][0].split(","))
+        # The canonical tight SF box from core.config (minLon, minLat, maxLon, maxLat).
+        assert bbox == tuple(config.SF_BBOX)
+        assert bbox == (-122.55, 37.7, -122.34, 37.84)
 
-    @pytest.mark.xfail(strict=False, reason=(
-        "Encodes the KNOWN autocomplete dedup bug: when Photon returns two "
-        "identical features (same label/lat/lon), autocomplete passes both "
-        "through unchanged -- it never de-dupes across results. _photon_label "
-        "only de-dupes the parts WITHIN one label. The correct expectation is "
-        "that identical suggestions are collapsed; this currently FAILS."))
     def test_results_are_deduped(self, monkeypatch):
+        """Guards the _dedup wiring in autocomplete (geo.py): identical upstream
+        features (same label + 5-decimal coords) must collapse to one suggestion."""
         dup = _photon_feature(-122.3937, 37.7955, name="Ferry Building",
                               city="San Francisco")
         payload = {"features": [dup, dict(dup)]}
@@ -449,9 +462,63 @@ class TestGeocode:
         assert calls["n"] == 1
 
 
+class TestDestCacheStore:
+    """The persistent dest cache must never be load-bearing: a corrupt/truncated file
+    falls back to the provider (and gets rewritten valid) instead of crashing boot."""
+
+    def _photon_payload(self):
+        return {"features": [_photon_feature(-122.4, 37.78, name="Q",
+                                             city="San Francisco")]}
+
+    def test_corrupt_cache_falls_back_to_provider_and_self_heals(self, monkeypatch, tmp_path):
+        cache = tmp_path / "dest_cache.json"
+        cache.write_text("{bad json,,,")            # truncated mid-write
+        monkeypatch.setattr(geo, "_CACHE", cache)
+        monkeypatch.setattr(geo, "_get_json", lambda url: self._photon_payload())
+        lat, lon, label = geo.geocode("1 Main St", cache=True)
+        assert (lat, lon) == (37.78, -122.4)
+        assert label == "1 Main St"                 # round-trip contract: label == input
+        # The corrupt file was replaced by a valid store containing the new entry.
+        store = json.loads(cache.read_text())
+        assert store["1 Main St"] == [37.78, -122.4, "1 Main St"]
+
+    def test_cache_hit_round_trips_without_network(self, monkeypatch, tmp_path):
+        cache = tmp_path / "dest_cache.json"
+        cache.write_text(json.dumps({"1 Main St": [37.78, -122.4, "1 Main St"]}))
+        monkeypatch.setattr(geo, "_CACHE", cache)
+
+        def boom(url):
+            raise AssertionError("persistent cache hit must not touch the network")
+        monkeypatch.setattr(geo, "_get_json", boom)
+        assert geo.geocode("1 Main St", cache=True) == (37.78, -122.4, "1 Main St")
+
+    def test_write_is_atomic_no_tmp_left_behind(self, monkeypatch, tmp_path):
+        cache = tmp_path / "dest_cache.json"
+        monkeypatch.setattr(geo, "_CACHE", cache)
+        monkeypatch.setattr(geo, "_get_json", lambda url: self._photon_payload())
+        geo.geocode("1 Main St", cache=True)
+        assert json.loads(cache.read_text())        # valid JSON on disk
+        assert not (tmp_path / "dest_cache.json.tmp").exists()
+
+
 class TestProviderSwitch:
     def test_default_provider_is_photon(self, monkeypatch):
+        # No GEOCODER and no GEOAPIFY_KEY (fixture clears both) -> photon.
         monkeypatch.delenv("GEOCODER", raising=False)
+        assert geo._provider() == "photon"
+
+    def test_geoapify_key_alone_promotes_geoapify(self, monkeypatch):
+        # The documented default chain: key present + no GEOCODER -> geoapify.
+        monkeypatch.setenv("GEOAPIFY_KEY", "k-test")
+        assert geo._provider() == "geoapify"
+
+    def test_geocoder_env_overrides_geoapify_key(self, monkeypatch):
+        monkeypatch.setenv("GEOAPIFY_KEY", "k-test")
+        monkeypatch.setenv("GEOCODER", "photon")
+        assert geo._provider() == "photon"
+
+    def test_geoapify_without_key_demotes_to_photon(self, monkeypatch):
+        monkeypatch.setenv("GEOCODER", "geoapify")
         assert geo._provider() == "photon"
 
     def test_geocoder_env_switches_to_nominatim(self, monkeypatch):
@@ -477,7 +544,7 @@ class TestProviderSwitch:
         monkeypatch.setattr(geo, "_get_json", lambda url: [
             {"lat": "37.78", "lon": "-122.41", "display_name": "A, SF"},
             {"lat": "37.79", "lon": "-122.42", "display_name": "B, SF"}])
-        out = geo.autocomplete("a")
+        out = geo.autocomplete("apt")
         assert out == [{"label": "A, SF", "lat": 37.78, "lon": -122.41},
                        {"label": "B, SF", "lat": 37.79, "lon": -122.42}]
 

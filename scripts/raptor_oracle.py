@@ -39,7 +39,7 @@ import shapely
 from shapely.geometry import Point
 from concurrent.futures import ThreadPoolExecutor
 
-from core import config, grid as gridmod, feeds, network, raptor_build
+from core import config, grid as gridmod, feeds, network, raptor_build, r5_extract
 from r5py import TransportMode, TravelTimeMatrix
 import com.conveyal.r5 as r5  # noqa  JVM started by importing network
 
@@ -127,8 +127,7 @@ def build_access():
         NET, origins=SNAP, destinations=stops_gdf, departure=DEP,
         transport_modes=[TransportMode.WALK], speed_walking=config.WALK_KMH,
         max_time=dt.timedelta(minutes=WALK_CAP_MIN), snap_to_network=True))
-    tcol = "travel_time" if "travel_time" in ttm.columns else \
-        [c for c in ttm.columns if c.startswith("travel_time")][0]
+    tcol = r5_extract.tt_col(ttm)
     ttm["from_id"] = ttm["from_id"].astype(str); ttm["to_id"] = ttm["to_id"].astype(str)
     cpos = {c: i for i, c in enumerate(CELL_IDS)}
     spos = {"S" + str(i): int(i) for i in r5_idx}
@@ -178,40 +177,25 @@ def forward_oracle(lat, lon):
 
 
 def egress_purewalk(lat, lon):
-    """egress = W->stops walk secs (gid-keyed); purewalk = W->cells walk secs (cell order)."""
+    """egress = W->stops walk secs (gid-keyed); purewalk = W->cells walk secs (cell order).
+    Parsing is shared with server._raptor_egress_purewalk via core.r5_extract so the goldens
+    can't drift from what the live R5 branch computes (int32 here: these get baked to .npz)."""
     W = gpd.GeoDataFrame({"id": ["W"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    # W -> stops (egress)
+    # W -> stops (egress); to_id "S<r5idx>" bridges to a RAPTOR gid (None drops the row)
     e = pd.DataFrame(TravelTimeMatrix(
         NET, origins=W, destinations=stops_gdf, departure=DEP,
         transport_modes=[TransportMode.WALK], speed_walking=config.WALK_KMH,
         max_time=dt.timedelta(minutes=WALK_CAP_MIN), snap_to_network=True))
-    ec = "travel_time" if "travel_time" in e.columns else \
-        [c for c in e.columns if c.startswith("travel_time")][0]
     spos = {"S" + str(i): int(i) for i in r5_idx}
-    egr = {}
-    for to, v in zip(e["to_id"].astype(str), e[ec]):
-        if pd.isna(v):
-            continue
-        g = r5_to_gid.get(spos.get(to, -1))
-        if g is not None:
-            egr[g] = min(egr.get(g, 1e18), int(round(float(v) * 60)))
-    eg = np.array(sorted(egr), dtype=np.int32)
-    ew = np.array([egr[g] for g in eg], dtype=np.int32)
+    eg, ew = r5_extract.egress_from_ttm(
+        e, lambda to: r5_to_gid.get(spos.get(to, -1)), dtype=np.int32)
     # W -> cells (purewalk), cap at MAX_MIN
     pw_ttm = pd.DataFrame(TravelTimeMatrix(
         NET, origins=W, destinations=SNAP, departure=DEP,
         transport_modes=[TransportMode.WALK], speed_walking=config.WALK_KMH,
         max_time=dt.timedelta(minutes=config.MAX_MIN), snap_to_network=True))
-    pc = "travel_time" if "travel_time" in pw_ttm.columns else \
-        [c for c in pw_ttm.columns if c.startswith("travel_time")][0]
     cpos = {c: i for i, c in enumerate(CELL_IDS)}
-    pw = np.full(len(CELL_IDS), -1, dtype=np.int32)
-    for to, v in zip(pw_ttm["to_id"].astype(str), pw_ttm[pc]):
-        if pd.isna(v):
-            continue
-        i = cpos.get(to)
-        if i is not None:
-            pw[i] = int(round(float(v) * 60))
+    pw = r5_extract.purewalk_from_ttm(pw_ttm, cpos, len(CELL_IDS), dtype=np.int32)
     return eg, ew, pw
 
 

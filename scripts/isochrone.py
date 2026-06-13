@@ -31,6 +31,14 @@ config.OUT.mkdir(exist_ok=True)
 
 from destination import DEST_LAT, DEST_LON, DEST_LABEL  # configurable; see .env
 
+# discrete bands by design; live ramp lives in scripts/assets/viz.js
+ISOCHRONE_BANDS = [(0, 15, "#08589e", "≤15 min"),
+                   (15, 20, "#2b8cbe", "15–20"),
+                   (20, 25, "#7bccc4", "20–25"),
+                   (25, 30, "#bae4bc", "25–30"),
+                   (30, 40, "#fdae6b", "30–40"),
+                   (40, 60, "#e34a33", "40–60")]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -112,12 +120,7 @@ def make_map(grid, neigh, agg, service_date, suf=""):
     cells = reach.copy()
     cells["geometry"] = gridmod.square_cells(reach.geometry).values
 
-    bands = [(0,15,"#08589e","≤15 min"),
-             (15,20,"#2b8cbe","15–20"),
-             (20,25,"#7bccc4","20–25"),
-             (25,30,"#bae4bc","25–30"),
-             (30,40,"#fdae6b","30–40"),
-             (40,60,"#e34a33","40–60")]
+    bands = ISOCHRONE_BANDS
     def color(v):
         for lo,hi,c,_ in bands:
             if lo < v <= hi or (lo==0 and v<=hi): return c

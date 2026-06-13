@@ -20,6 +20,7 @@ from . import config, raptor_build, raptor as R, raptor_journey
 
 ACCESS_CAP_MIN = int(os.environ.get("RAPTOR_ACCESS_CAP", "25"))  # 25 cleared the worst access-starved periphery (max err 15->7, mism 20->5) vs 20
 DEADLINE_STEP = int(os.environ.get("RAPTOR_DEADLINE_STEP", "180"))
+MC_DEADLINE_STEP = int(os.environ.get("RAPTOR_MC_DEADLINE_STEP", "60"))  # MC tail readout (finer; see _make_grids)
 DEP_STEP = 60
 BOARD_SLACK = int(os.environ.get("RAPTOR_BOARD_SLACK", "60"))
 MAX_ROUNDS = 8                                    # rides = transfers + 1 (R5 default cap)
@@ -29,8 +30,10 @@ ARRIVE_BY_HM = (9, 0)                             # product target: arrive by 09
 MC_DRAWS = int(os.environ.get("RAPTOR_MC_DRAWS", "24"))       # draws for realistic/fragility
 MC_ALT_DRAWS = int(os.environ.get("RAPTOR_MC_ALT_DRAWS", "4"))  # traced draws for alt-lines (pricier)
 MC_SHAPE = float(os.environ.get("RAPTOR_MC_SHAPE", "2.0"))   # Gamma shape (spread); mean=shape*scale
-# mean INITIAL delay (sec) + fractional DRIFT slope, by mode/operator (env-overridable). Buses are
-# the noisiest, rail the steadiest; Caltrain/BART keyed on feed (BART=1, Caltrain=2).
+# mean INITIAL delay (sec, env-overridable via RAPTOR_MC_MU_*) + fractional DRIFT slope (fixed,
+# see _SLOPE). Buses are the noisiest, rail the steadiest; BART/Caltrain resolved by feed STEM in
+# _mc_mode_params (NOT by position — gtfs_paths() drops missing files and appends extras, so
+# positional indices can silently shift).
 _MU = dict(bus=float(os.environ.get("RAPTOR_MC_MU_BUS", "70")),
            metro=float(os.environ.get("RAPTOR_MC_MU_METRO", "45")),
            cable=float(os.environ.get("RAPTOR_MC_MU_CABLE", "40")),
@@ -55,19 +58,26 @@ class RaptorEngine:
 
     # -- access table (baked, workplace-independent) --------------------------------------
     def _load_access(self, access_path, verbose):
-        if access_path is None:
+        expect_grid_m = None                      # set only when WE pick the table (default path);
+        if access_path is None:                   # explicit callers choose their own grid
             fp = raptor_build._fingerprint(
                 config.gtfs_paths(), self.service_date.strftime("%Y%m%d"),
                 raptor_build.band_seconds(), raptor_build.FOOTPATH_M)
-            cands = sorted(raptor_build.CACHE_DIR.glob(f"access_*m_{fp}.npz"))
-            if not cands:
+            # exact name, NOT a glob: a glob would also match access_walk*/access_walkflat*
+            # (and any leftover bake at another resolution would shadow the intended grid)
+            access_path = raptor_build.CACHE_DIR / f"access_{config.GRID_M}m_{fp}.npz"
+            if not access_path.exists():
                 raise FileNotFoundError(
-                    f"no baked access table for fingerprint {fp} in {raptor_build.CACHE_DIR}; "
+                    f"no baked access table {access_path.name} in {raptor_build.CACHE_DIR}; "
                     f"run scripts/raptor_oracle.py")
-            access_path = cands[0]
+            expect_grid_m = config.GRID_M
         z = np.load(access_path, allow_pickle=True)
         if int(z["n_stops"]) != self.data["n_stops"]:
             raise ValueError("access table / raptor structures stop-count mismatch (stale cache)")
+        if (expect_grid_m is not None and "grid_m" in z.files
+                and int(z["grid_m"]) != expect_grid_m):
+            raise ValueError(f"access table {access_path.name} is a {int(z['grid_m'])}m bake "
+                             f"but the configured grid is {expect_grid_m}m")
         self.cell_ids = list(z["cell_ids"].astype(str))
         self.cell_index = {c: i for i, c in enumerate(self.cell_ids)}
         # filter to the access cap and re-pack CSR (seconds)
@@ -103,6 +113,13 @@ class RaptorEngine:
         self.Tgrid = np.arange(dep, self.dep_grid[-1] + maxsec + 1, DEADLINE_STEP)
         # arrive-by: arrival-window deadlines (fine grid ending at the target)
         self.target_sec = ARRIVE_BY_HM[0] * 3600 + ARRIVE_BY_HM[1] * 60
+        # MC tail-readout grid: the committed kernel returns the first GRID deadline reachable
+        # from the actual (late) arrival, so the step size rounds every draw up by U(0, step)s
+        # before the percentile — at 180s that's a systematic ~+1.5 min baked into `realistic`.
+        # A 60s step keeps the quantization within the served 1-min resolution (dep + target are
+        # whole minutes, so 09:00:00 lands exactly on it). MC is lazy + cached off the hover
+        # path, so the ~3x deadline count is affordable; the map's Tgrid stays at DEADLINE_STEP.
+        self.Tgrid_mc = np.arange(dep, self.Tgrid[-1] + 1, MC_DEADLINE_STEP)
 
     def _warm(self):
         """Compile the numba kernel once (cheap dummy) so the first real request is fast."""
@@ -114,17 +131,19 @@ class RaptorEngine:
             pass
 
     # -- walk-speed scalar ----------------------------------------------------------------
-    def _scale_walk(self, egress_w, purewalk, walk_scalar):
+    def _scale_walk(self, egress_w, purewalk, walk_scalar, access_w=None):
         """Scale all WALK reference-seconds (access/egress/pure-walk, baked at 4.8 km/h) to the
-        user's pace: walk_scalar = 4.8/v (slow 1.20, med 1.00, fast 0.857). Returns
-        (egress_w, purewalk, access_w) as int64 at the user's pace."""
+        user's pace: walk_scalar = 4.8/v (slow 1.20, med 1.00, fast 0.857). ``access_w`` None
+        scales the engine's baked grid access table; callers with their own access CSR
+        (``commute_for_access``) pass theirs. Returns (egress_w, purewalk, access_w) as int64
+        at the user's pace."""
         ew = np.asarray(egress_w, np.int64); pw = np.asarray(purewalk, np.int64)
-        aw = self.access_w
+        aw = self.access_w if access_w is None else np.asarray(access_w, np.int64)
         if walk_scalar != 1.0:
             ew = np.rint(ew.astype(np.float64) * walk_scalar).astype(np.int64)
             pw = pw.copy(); m = pw >= 0
             pw[m] = np.rint(pw[m].astype(np.float64) * walk_scalar).astype(np.int64)
-            aw = np.rint(self.access_w.astype(np.float64) * walk_scalar).astype(np.int64)
+            aw = np.rint(aw.astype(np.float64) * walk_scalar).astype(np.int64)
         return ew, pw, aw
 
     # -- compute -------------------------------------------------------------------------
@@ -132,17 +151,54 @@ class RaptorEngine:
         return R.reverse_profile(self.data, egress_g, egress_w, deadlines,
                                  board_slack=BOARD_SLACK, max_rounds=max_rounds)
 
+    def commute_for_access(self, access_off, access_to, access_w, egress_g, egress_w, purewalk,
+                           semantic="departafter", percentiles=(5, 50), max_rounds=MAX_ROUNDS,
+                           walk_scalar=1.0, target_sec=None, window_sec=None):
+        """Door-to-door commute minutes for a CALLER-SUPPLIED origin set (both semantics).
+
+        The public API for off-grid origins (e.g. scripts/commute_origins.py): the caller builds
+        its own CSR access table (origin -> stop walk REFERENCE seconds at config.WALK_KMH,
+        capped like the baked table at ``self.access_cap_min`` so the engine's departure grids
+        cover every boarding) + per-origin ``purewalk`` (origin->W reference seconds, -1 if
+        unwalkable), and the engine runs the SAME grids/steps/assembly the served map uses —
+        so external callers can never drift from the product model.
+
+          semantic   'departafter' — p-percentiles over the [DEP, DEP+WINDOW] departure window
+                     (the R5-validated realistic model);
+                     'arriveby'    — perfect-timing arrive-by window ending at ``target_sec``
+                     (default 09:00; ``window_sec`` None -> config.window(), 0 -> single deadline).
+          walk_scalar  4.8/pace scalar applied to ALL walk legs (access/egress/pure-walk).
+
+        Returns int32[n_origins, n_pct] minutes, -1 = unreachable."""
+        access_off = np.asarray(access_off, np.int64)
+        access_to = np.asarray(access_to, np.int32)
+        egress_g = np.asarray(egress_g, np.int32)
+        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar, access_w=access_w)
+        if semantic == "departafter":
+            latest = self._reverse(egress_g, ew, self.Tgrid, max_rounds)
+            arrivalW = R.stop_arrival_profile(latest, self.Tgrid, self.dep_grid)
+            return R.assemble_departafter(access_off, access_to, aw, pw, arrivalW,
+                                          self.dep_grid, self.cell_deps, self.max_min,
+                                          percentiles=percentiles)
+        if semantic != "arriveby":
+            raise ValueError(f"semantic must be 'departafter' or 'arriveby', got {semantic!r}")
+        target = self.target_sec if target_sec is None else int(target_sec)
+        win = int(config.window().total_seconds()) if window_sec is None else int(window_sec)
+        deadlines = (np.array([target], np.int64) if win <= 0
+                     else np.arange(target - win, target + 1, DEP_STEP, dtype=np.int64))
+        latest = self._reverse(egress_g, ew, deadlines, max_rounds)
+        return _assemble_arriveby_window(access_off, access_to, aw, pw, latest, deadlines,
+                                         self.max_min, np.asarray(percentiles, np.float64))
+
     def departafter(self, egress_g, egress_w, purewalk, percentiles=(5, 50),
                     max_rounds=MAX_ROUNDS, walk_scalar=1.0):
         """{cell_id: [p5, p50]} minutes, depart-after window (R5-comparable). ``purewalk`` is
         cell->W walk seconds aligned to self.cell_ids (-1 if > cap). ``max_rounds`` caps
         public-transport rides (rides = transfers + 1). ``walk_scalar`` sets the walk pace."""
-        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
-        latest = self._reverse(egress_g, ew, self.Tgrid, max_rounds)
-        arrivalW = R.stop_arrival_profile(latest, self.Tgrid, self.dep_grid)
-        out = R.assemble_departafter(self.access_off, self.access_to, aw, pw, arrivalW,
-                                     self.dep_grid, self.cell_deps, self.max_min,
-                                     percentiles=percentiles)
+        out = self.commute_for_access(self.access_off, self.access_to, self.access_w,
+                                      egress_g, egress_w, purewalk, semantic="departafter",
+                                      percentiles=percentiles, max_rounds=max_rounds,
+                                      walk_scalar=walk_scalar)
         return {c: [int(out[i, k]) if out[i, k] >= 0 else None
                     for k in range(out.shape[1])] for i, c in enumerate(self.cell_ids)}
 
@@ -151,14 +207,11 @@ class RaptorEngine:
         """{cell_id: [p5, p50]} minutes, arrive-by an arrival window ending at ``target_sec``
         (default 09:00). ``window_sec`` None -> use config.window(); 0 -> single deadline.
         ``max_rounds`` caps public-transport rides (rides = transfers + 1)."""
-        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
-        target = self.target_sec if target_sec is None else int(target_sec)
-        win = int(config.window().total_seconds()) if window_sec is None else int(window_sec)
-        deadlines = (np.array([target], np.int64) if win <= 0
-                     else np.arange(target - win, target + 1, DEP_STEP, dtype=np.int64))
-        latest = self._reverse(egress_g, ew, deadlines, max_rounds)
-        out = _assemble_arriveby_window(self.access_off, self.access_to, aw, pw, latest, deadlines,
-                                        self.max_min, np.asarray(percentiles, np.float64))
+        out = self.commute_for_access(self.access_off, self.access_to, self.access_w,
+                                      egress_g, egress_w, purewalk, semantic="arriveby",
+                                      percentiles=percentiles, max_rounds=max_rounds,
+                                      walk_scalar=walk_scalar, target_sec=target_sec,
+                                      window_sec=window_sec)
         return {c: [int(out[i, k]) if out[i, k] >= 0 else None
                     for k in range(out.shape[1])] for i, c in enumerate(self.cell_ids)}
 
@@ -179,24 +232,49 @@ class RaptorEngine:
 
     # -- Phase A: service-noise Monte-Carlo (realistic + fragility + alt-lines) ------------
     def _mc_mode_params(self):
-        """Per-pattern (mean initial delay sec, fractional drift slope) from mode + operator."""
+        """Per-pattern (mean initial delay sec, fractional drift slope) from mode + operator.
+        BART/Caltrain are resolved by feed STEM (``data["feeds"]``, e.g. 'bart_gtfs'), never by
+        position: config.gtfs_paths() drops missing files and appends ``extra`` feeds, so a fixed
+        index could silently hand BART's tight rail profile to a bus feed. A feed whose stem
+        matches neither keeps its mode-bucket default (bus/metro/cable)."""
         pf = np.asarray(self.data["pat_feed"]); pm = np.asarray(self.data["pat_mode"])
         mu = np.full(len(pm), _MU["bus"], np.float64); sl = np.full(len(pm), _SLOPE["bus"], np.float64)
         mu[pm == 0] = _MU["metro"]; sl[pm == 0] = _SLOPE["metro"]      # Muni Metro
         mu[pm == 2] = _MU["cable"]; sl[pm == 2] = _SLOPE["cable"]      # cable/streetcar
-        mu[pf == 1] = _MU["bart"]; sl[pf == 1] = _SLOPE["bart"]        # BART (feed 1)
-        mu[pf == 2] = _MU["caltrain"]; sl[pf == 2] = _SLOPE["caltrain"]  # Caltrain (feed 2)
+        stems = [str(s).lower() for s in self.data["feeds"]]
+        for op in ("bart", "caltrain"):                                # operator noise by feed stem
+            fis = [fi for fi, s in enumerate(stems) if op in s]
+            if fis:
+                m = np.isin(pf, fis)
+                mu[m] = _MU[op]; sl[m] = _SLOPE[op]
         return mu, sl
 
     def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
                    seed=None, alt_draws=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS, tree=None):
         """Committed-plan service-noise MC for a workplace. Returns dict of cell-aligned arrays:
-          realistic int32  p50 door-to-door commute over draws (clamped >= ``perfect``)
+          realistic int32  p50 door-to-door commute over draws FLOORED at ``perfect`` (so
+                           realistic/frag/std/stuck all describe one consistent distribution
+                           and realistic >= perfect holds by construction)
+          realistic_raw int32  pre-floor p50 — the non-vacuous perfect<=committed regression
+                           signal for tests/validators (never served)
           frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number)
           std       int32  commute std minutes (secondary)
           stuck     float  fraction of draws where the cell hits the cap (last-train/peak risk)
           alt       list[dict|None]  {line: votes} alternative lines that serve the cell under
                                      delays (re-routes), from ``alt_draws`` traced perturbed trees
+          alt_bundle dict|None  the lightweight per-draw capture that BACKS ``alt``, so the caller
+                                 can re-trace the very draw a vote came from and draw the alt route
+                                 (see ``_mc_alt_lines``). None when alt_draws<=0. Holds:
+                                   draws  list[{pat_dep, pat_arr, par, dom}] — per perturbed draw,
+                                          the int32 perturbed schedule columns (~0.4 MB each) +
+                                          the reverse_raptor_traced parent arrays (n_stops, small)
+                                          + the per-cell dominant-line list (the votes' source);
+                                          enough to rebuild a JourneyTree(dict(data, pat_dep=...,
+                                          pat_arr=...), par, access_off, access_to, access_w,
+                                          purewalk, target, max_min) and trace any cell.
+                                   access_w / purewalk  the walk-scalar-scaled CSR + cell walk
+                                          (shared across draws; the JourneyTree inputs).
+                                   target  the arrive-by deadline seconds (JourneyTree deadline).
         You commit the first leg from the published plan and re-optimize the tail from the actual
         late arrival -> the honest "I missed my transfer and ate a headway" cost. The committed plan
         + ``perfect`` map come from the SAME unperturbed arrive-by tree; the caller can pass an
@@ -219,38 +297,76 @@ class RaptorEngine:
         legs = tree.committed_first_legs()
         if perfect is None:
             perfect, _ = tree.commute_and_dominant()
-        cm = R.montecarlo_commute_committed(self.data, egress_g, ew, self.Tgrid, legs,
-                                            np.asarray(perfect, np.int32), self.max_min,
+        perfect = np.asarray(perfect, np.int32)          # always materialized (tree fallback above)
+        # Truncate the MC tail-readout grid: any deadline beyond max(commit_home) + cap yields
+        # tt > cap -> capf for EVERY cell regardless of the draw, so dropping those deadlines is
+        # provably output-identical (including `stuck`) and trims the kernel's dominant cost (the
+        # per-draw sweep; how many deadlines survive is workplace-dependent — later committed
+        # departures keep more of the grid). Computed HERE, after committed_first_legs(), so the
+        # bound sees the walk-scalar-scaled legs; _make_grids' Tgrid_mc is untouched (tests pass
+        # engine.Tgrid_mc straight to the kernel). Only transit cells (commit_kind == 2) carry a
+        # real commit_home (kind 0 holds NEG); no transit cells -> no bound -> keep the full grid.
+        Tmc = self.Tgrid_mc
+        kind_c = np.asarray(legs["commit_kind"])
+        if (kind_c == 2).any():
+            bound = int(np.asarray(legs["commit_home"])[kind_c == 2].max()) + self.max_min * 60
+            trunc = Tmc[Tmc <= bound]                    # INCLUSIVE: keep deadlines <= bound
+            if trunc.size:
+                Tmc = trunc
+        # the kernel's cummax + _first_ge readout require an ascending grid (np.arange +
+        # prefix mask preserve this; assert in case a future caller breaks the invariant)
+        assert Tmc.size and np.all(np.diff(Tmc) > 0), "MC deadline grid must be ascending"
+        cm = R.montecarlo_commute_committed(self.data, egress_g, ew, Tmc, legs,
+                                            perfect, self.max_min,
                                             delta0_all, slope_all, board_slack=BOARD_SLACK,
                                             max_rounds=max_rounds)
+        # pre-floor p50: the regression signal tests/validators assert on (the floored stats
+        # below satisfy perfect <= realistic by construction, so they carry no signal).
+        realistic_raw = np.ceil(np.percentile(cm, 50, axis=1)).astype(np.int32)
+        # Floor the DRAWS at perfect once, BEFORE any statistic, so the served quartet
+        # (realistic, frag, std, stuck) describes one self-consistent distribution and a frontend
+        # "bad day = realistic + frag" read matches p90. (The old post-hoc clamp lifted only
+        # realistic, so frag was measured from the lower unclamped p50 and overstated the bad day
+        # wherever the clamp fired.) Draws can legitimately dip below perfect: the tail
+        # re-optimizes earliest-arrival over the deadline grid where the traced tree optimized
+        # latest-departure — small + two-sided, see the zero-perturbation test.
+        cm = np.maximum(cm, np.where(perfect >= 0, perfect, 0).astype(np.float64)[:, None])
         p50 = np.percentile(cm, 50, axis=1)
         p90 = np.percentile(cm, 90, axis=1)
         realistic = np.ceil(p50).astype(np.int32)
         frag = np.maximum(0, np.round(p90 - p50)).astype(np.int32)
         std = np.round(np.std(cm, axis=1)).astype(np.int32)
         stuck = np.mean(cm >= self.max_min - 1e-9, axis=1)
-        if perfect is not None:
-            perfect = np.asarray(perfect)
-            m = perfect >= 0
-            realistic[m] = np.maximum(realistic[m], perfect[m].astype(np.int32))
-        alt = self._mc_alt_lines(egress_g, ew, pw, aw, delta0_all, slope_all,
-                                 MC_ALT_DRAWS if alt_draws is None else int(alt_draws), max_rounds)
-        return dict(realistic=realistic, frag=frag, std=std, stuck=stuck, alt=alt)
+        alt, alt_bundle = self._mc_alt_lines(
+            egress_g, ew, pw, aw, delta0_all, slope_all,
+            MC_ALT_DRAWS if alt_draws is None else int(alt_draws), max_rounds)
+        return dict(realistic=realistic, realistic_raw=realistic_raw, frag=frag, std=std,
+                    stuck=stuck, alt=alt, alt_bundle=alt_bundle)
 
     def _mc_alt_lines(self, egress_g, egress_w, purewalk, access_w, delta0_all, slope_all, K,
                       max_rounds=MAX_ROUNDS):
-        """{line: votes} per cell: dominant line across ``K`` perturbed arrive-by traced trees
-        (so a delayed express lets the next local show up as an alternative). Reuses the validated
-        JourneyTree; pricier than the numpy MC, so K is small + env-tunable."""
+        """({line: votes} per cell, alt_bundle) — the dominant line across ``K`` perturbed
+        arrive-by traced trees (so a delayed express lets the next local show up as an
+        alternative). Reuses the validated JourneyTree; pricier than the numpy MC, so K is
+        small + env-tunable.
+
+        Returns the vote list AND a lightweight ``alt_bundle`` (None when K<=0) that lets a
+        caller re-trace the exact draw a vote came from and DRAW the alt route — the perturbed
+        schedule columns + the traced parent arrays + the per-draw dominant list per draw, plus
+        the (shared) walk-scaled access/purewalk and the deadline a JourneyTree needs. We do not
+        keep the perturbed ``pdata`` dict itself (it shallow-aliases the big shared base arrays);
+        the caller rebuilds it from the two small perturbed columns + ``self.data``, so the
+        captured payload is ~K*(pat_dep+pat_arr+par) ≈ a few MB at K=4."""
         if K <= 0:
-            return None
+            return None, None
         off = R.pat_trip_off(self.data)
         target = self.target_sec
         n = len(self.cell_ids)
         votes = [None] * n
         K = min(K, delta0_all.shape[0])
+        draws = []
         for kk in range(K):
-            pdata, _dep, _arr = R.perturbed_data(self.data, delta0_all[kk], slope_all[kk], off)
+            pdata, dep, arr = R.perturbed_data(self.data, delta0_all[kk], slope_all[kk], off)
             par = R.reverse_raptor_traced(pdata, egress_g, target - egress_w, egress_w,
                                           max_rounds=max_rounds, board_slack=BOARD_SLACK)
             tree = raptor_journey.JourneyTree(pdata, par, self.access_off, self.access_to,
@@ -262,7 +378,25 @@ class RaptorEngine:
                     if d is None:
                         d = votes[ci] = {}
                     d[line] = d.get(line, 0) + 1
-        return [None if not d else dict(sorted(d.items(), key=lambda kv: -kv[1])) for d in votes]
+            draws.append({"pat_dep": dep, "pat_arr": arr, "par": par, "dom": dom})
+        bundle = {"draws": draws, "access_w": np.asarray(access_w, np.int64),
+                  "purewalk": np.asarray(purewalk, np.int64), "target": int(target)}
+        return ([None if not d else dict(sorted(d.items(), key=lambda kv: -kv[1])) for d in votes],
+                bundle)
+
+    def alt_journey_tree(self, alt_bundle, draw_idx):
+        """Rebuild the JourneyTree for one captured MC draw, so the caller can trace a cell and
+        assemble the alt-route geometry through the same JourneyTree machinery the primary uses.
+        ``alt_bundle`` is the dict returned by ``montecarlo`` (key 'alt_bundle'); ``draw_idx``
+        indexes its 'draws' list. Cheap (no RAPTOR re-run): wraps the captured parent arrays +
+        the perturbed schedule columns. Stop coords/footpaths come from the shared base data."""
+        dr = alt_bundle["draws"][draw_idx]
+        pdata = dict(self.data)
+        pdata["pat_dep"] = dr["pat_dep"]; pdata["pat_arr"] = dr["pat_arr"]
+        return raptor_journey.JourneyTree(
+            pdata, dr["par"], self.access_off, self.access_to,
+            alt_bundle["access_w"], alt_bundle["purewalk"],
+            alt_bundle["target"], self.max_min)
 
 
 def _assemble_arriveby_window(access_off, access_to, access_w, purewalk, latest, deadlines,

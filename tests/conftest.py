@@ -1,10 +1,18 @@
-"""Shared fixtures for the Flask + R5 API integration suite (tests/test_api.py).
+"""Shared fixtures for the Flask API integration suite (tests/test_api.py).
 
-The app's scripts/server.py boots a real ~1.6 GB R5 JVM at *import* time (~30s). We do
-that exactly ONCE per test session: a session-scoped fixture imports the module a single
-time and exposes both the module (so tests can poke its locks/caches/globals directly) and
-a Flask `app.test_client()`. Every test shares that one in-process R5 — independent of any
-live server another agent may be running on :8000 (we never bind a port), just CPU-bound.
+The app's scripts/server.py boots the JVM-FREE RAPTOR stack by default (since 2026-05-25):
+RAPTOR arrive-by engine + hill-aware walk router + lean static bundle — import takes ~1s,
+no R5/JVM. We import the module exactly ONCE per test session via a session-scoped fixture
+and expose both the module (so tests can poke its locks/caches/globals directly) and a
+Flask `app.test_client()`. We never bind a port, so the suite is independent of any live
+server on :8000 — but do NOT run it beside a server that is still BOOTING (concurrent
+numba JIT corrupts the shared .nbc cache; see CLAUDE.md).
+
+ENGINE PINNING: the setdefaults below match server.py's production defaults, so behavior
+is unchanged on a clean env — but they make the config under test explicit and shield the
+suite from ambient/.env leakage (e.g. an exported USE_RAPTOR=0 silently swapping the
+engine under every test). The legacy R5 path (USE_RAPTOR=0, ~30s JVM boot) is only
+exercised if you opt in by exporting USE_RAPTOR=0 before pytest.
 
 PRIVACY: tests use a neutral public SF coordinate (the Ferry Building) as the workplace.
 The user's real saved address/coords are NEVER imported or hardcoded here.
@@ -20,16 +28,31 @@ _SCRIPTS = os.path.join(_REPO_ROOT, "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
-# Keep the test JVM modest so it coexists with another agent's live server / pytest JVM.
-# Must be set BEFORE server.py is imported (it reads R5_MAX_MEMORY to cap -Xmx at boot).
+# Pin the engine config the suite tests to the production defaults (see module docstring).
+# Must be set BEFORE server.py is imported (it reads these at import time).
+os.environ.setdefault("USE_RAPTOR", "1")
+os.environ.setdefault("USE_WALK_GRAPH", "1")
+os.environ.setdefault("RAPTOR_SEMANTIC", "arriveby")
+os.environ.setdefault("RAPTOR_MC", "1")
+# Only read on the legacy _NEED_R5 path (USE_RAPTOR=0 / missing walk bakes): keep that
+# JVM modest so it coexists with another agent's live server / pytest JVM.
 os.environ.setdefault("R5_MAX_MEMORY", "1200M")
+
+# The Playwright browser suite (tests/e2e/) drives an ALREADY-RUNNING server on :8000 and
+# has its own conftest.py/pytest.ini — run it via tests/e2e/run.sh. Collecting it from a
+# plain `pytest tests/` both shadows this conftest (two top-level modules named
+# `conftest` -> test_api's `from conftest import FERRY_LAT` resolves to e2e's) and would
+# hammer a server this suite assumes is NOT booting (numba .nbc corruption gotcha).
+collect_ignore = ["e2e"]
 
 
 def pytest_configure(config):
-    """Register the `slow` marker (heavy ~30s R5 passes) so it isn't an unknown-mark
-    warning. Deselect with `-m 'not slow'` for a quick shape-only smoke run."""
+    """Register the `slow` marker so it isn't an unknown-mark warning. Under the default
+    RAPTOR boot these tests are seconds, not minutes — the marker survives because they
+    are still the heaviest (full-grid exact/itinerary passes; ~30s+ only on the legacy
+    USE_RAPTOR=0 R5 path). Deselect with `-m 'not slow'` for a shape-only smoke run."""
     config.addinivalue_line(
-        "markers", "slow: heavy test that drives a full R5 exact/itinerary pass (~30s+)"
+        "markers", "slow: full-grid exact/itinerary pass (seconds on RAPTOR; ~30s+ on legacy R5)"
     )
 
 
@@ -45,11 +68,11 @@ TWIN_PEAKS_LON = -122.4477
 
 @pytest.fixture(scope="session")
 def server():
-    """Import scripts/server.py ONCE (boots R5) and return the module.
+    """Import scripts/server.py ONCE (JVM-free RAPTOR boot, ~1s) and return the module.
 
-    Session-scoped so the ~30s JVM boot happens a single time for the whole run. Tests use
-    this to reach into server internals: `_HEAVY_LOCK`, `_CELL_CACHE`, `_LAST_DEST_KEY`,
-    the result caches, etc.
+    Session-scoped so the boot (and the ~30s JVM boot on the legacy USE_RAPTOR=0 path)
+    happens a single time for the whole run. Tests use this to reach into server
+    internals: `_HEAVY_LOCK`, `_CELL_CACHE`, `_LAST_DEST_KEY`, the result caches, etc.
     """
     import server  # noqa: E402 — import here so the JVM boot is attributed to this fixture
     return server

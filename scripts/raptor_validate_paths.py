@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import numpy as np
-from core import raptor_engine
+from core import raptor_engine, raptor_golden
 GOLDEN = ROOT / "tests" / "raptor_golden"
 
 
@@ -34,7 +34,7 @@ def main():
         if not npz.exists():
             continue
         z = np.load(npz, allow_pickle=True)
-        pw = np.array([int(z["purewalk"][i]) for i in range(len(eng.cell_ids))], np.int64)
+        pw = raptor_golden.purewalk_aligned(eng, z)
         tree = eng.journey_tree(z["egress_g"], z["egress_w"], pw)
         commute, dom = tree.commute_and_dominant()
         r5dom = o["dominant"]

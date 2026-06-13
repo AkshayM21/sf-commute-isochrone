@@ -7,6 +7,13 @@
 #
 # Excludes the venv, the numba cache (rebuilt on the box), the personal .dest_cache, the test
 # golden oracles, and out/ — everything the box doesn't need or shouldn't have.
+#
+# PRIVACY/SECRETS INVARIANT: .env, REPORT.md, Progress.md, Issues.md, REVIEW_REPORT.md AND
+# deploy/cf/ are excluded (the .md session notes are operator-personal). deploy/cf/ holds the
+# Cloudflare Origin CA PRIVATE KEY (origin-key.pem) plus operator-local helper scripts — the box
+# never needs them (mint.py/dns.py run on the laptop; the cert/key reach /etc/caddy via the
+# separate scp step in DEPLOY.md). NB: rsync --delete-after protects excluded paths, so if an
+# old push already shipped deploy/cf/, clean it once: ssh <box> 'sudo rm -rf /opt/sfci/deploy/cf'
 
 set -euo pipefail
 TARGET="${1:-}"
@@ -15,7 +22,9 @@ TARGET="${1:-}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-echo "[push] preparing /opt/sfci on $TARGET (one-time mkdir + chown)..."
+# Runs on EVERY push (not one-time): rsync runs as $USER, so it must own the tree to overwrite
+# the sfci-owned files; ownership is restored to sfci right after the rsync below.
+echo "[push] preparing /opt/sfci on $TARGET (mkdir + chown to \$USER so rsync can write)..."
 ssh -o StrictHostKeyChecking=accept-new "$TARGET" \
   "sudo mkdir -p /opt/sfci && sudo chown -R \$USER:\$USER /opt/sfci"
 
@@ -26,6 +35,12 @@ rsync -avzP --delete-after \
   --exclude .venv \
   --exclude __pycache__ \
   --exclude '*.pyc' \
+  --exclude '.env' \
+  --exclude 'REPORT.md' \
+  --exclude 'Progress.md' \
+  --exclude 'Issues.md' \
+  --exclude 'REVIEW_REPORT.md' \
+  --exclude '/deploy/cf/' \
   --exclude '.dest_cache.json' \
   --exclude '.nbc' \
   --exclude '.numba_cache' \
@@ -34,6 +49,12 @@ rsync -avzP --delete-after \
   --exclude '/tests/__pycache__/' \
   --exclude '/data/osm_sf.pbf' \
   ./ "$TARGET:/opt/sfci/"
+
+# Restore service-user ownership so the documented redeploy flow (push + restart, NO install.sh
+# re-run) leaves sfci able to write /opt/sfci/data (ReadWritePaths in sfci.service — e.g. the
+# RAPTOR CSR cache rebake). Guarded: the first push happens before install.sh creates the user.
+echo "[push] restoring sfci ownership of /opt/sfci (if the service user exists)..."
+ssh "$TARGET" 'if id sfci >/dev/null 2>&1; then sudo chown -R sfci:sfci /opt/sfci; fi'
 
 cat <<EOF
 

@@ -27,7 +27,9 @@ log "installing system packages..."
 dnf install -y -q dnf-plugins-core
 
 # Add the Caddy COPR (official)
-if ! dnf repolist | grep -q '@copr:copr.fedorainfracloud.org:group_caddy'; then
+# NB: `dnf repolist` prints the repo id as `copr:copr.fedorainfracloud.org:group_caddy:caddy`
+# (no leading `@` — that form only appears in `dnf copr list`).
+if ! dnf repolist | grep -q 'copr:copr\.fedorainfracloud\.org:group_caddy:caddy'; then
   log "  enabling Caddy COPR..."
   dnf copr enable -y @caddy/caddy
 fi
@@ -42,7 +44,7 @@ dnf install -y -q \
   gcc gcc-c++ make \
   caddy \
   stress-ng \
-  ufw \
+  firewalld \
   curl jq tar rsync logrotate
 
 # ---- 2. dedicated user --------------------------------------------------------------------
@@ -96,7 +98,8 @@ API511_TOKEN=
 GEOAPIFY_KEY=
 
 # Default workplace shown to first-time visitors (server injects it as CFG.default_wp)
-DEFAULT_ADDRESS=650 Townsend St, San Francisco, CA
+# Paste from your laptop's .env -- never commit a real address to the repo.
+DEFAULT_ADDRESS=
 EOF
   chmod 600 /etc/sfci.env
   chown root:root /etc/sfci.env
@@ -122,16 +125,26 @@ install -m 644 "$REPO_DIR/deploy/cloudflare-ufw.timer"    /etc/systemd/system/cl
 mkdir -p /etc/caddy
 install -m 644 "$REPO_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
 
-# ---- 8. ufw bootstrap (cloudflare-ufw.timer narrows 80/443 to CF IPs after first run) ----
-if ! ufw status | grep -q "Status: active"; then
-  log "initializing ufw (allow 22/80/443, deny everything else)..."
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw allow 22/tcp     comment 'SSH'
-  ufw allow 80/tcp     comment 'HTTP — narrowed to CF on first cloudflare-ufw run'
-  ufw allow 443/tcp    comment 'HTTPS — narrowed to CF on first cloudflare-ufw run'
-  ufw --force enable
+# ---- 8. firewalld bootstrap (cloudflare-ufw.timer narrows 80/443 to CF zone after first run) ----
+# OL9 ships firewalld active with SSH allowed in the public zone by default. FIRST INSTALL ONLY:
+# open http+https on the public zone TEMPORARILY so initial Caddy + cert validation works; the
+# cloudflare-ufw.timer fires ~2 min after boot and moves them into a dedicated "cloudflare" zone
+# with CF-IP sources (removing them from public). After that, only CF can reach 80/443; SSH stays
+# open from anywhere. On RE-RUNS the cloudflare zone already exists — re-adding http/https to
+# public would reopen the origin to the world until the weekly timer fires, so skip it.
+systemctl enable --now firewalld
+log "configuring firewalld..."
+firewall-cmd --permanent --zone=public --add-service=ssh   >/dev/null 2>&1 || true
+# NB: the zone list is space-separated on one line — tr to newlines or grep -qx never matches
+# (same pattern as cloudflare-ufw.sh).
+if firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx cloudflare; then
+  log "  cloudflare zone present — preserving CF-only lockdown (public stays SSH-only)"
+else
+  log "  first install: public zone gets temporary HTTP/S; cloudflare-ufw.timer narrows it ~2 min after boot"
+  firewall-cmd --permanent --zone=public --add-service=http  >/dev/null 2>&1 || true
+  firewall-cmd --permanent --zone=public --add-service=https >/dev/null 2>&1 || true
 fi
+firewall-cmd --reload >/dev/null
 
 # ---- 9. log rotation ---------------------------------------------------------------------
 cat > /etc/logrotate.d/sfci <<'EOF'
@@ -152,6 +165,11 @@ systemctl daemon-reload
 systemctl enable --now sfci
 systemctl enable --now sfci-keepalive.timer
 systemctl enable --now cloudflare-ufw.timer
+# Re-run with an existing cloudflare zone: refresh the CF CIDR lockdown NOW (enable --now on an
+# already-active timer is a no-op and OnBootSec only fires once per boot — without this, any
+# firewall drift would persist until the weekly OnUnitActiveSec tick).
+firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx cloudflare \
+  && systemctl start cloudflare-ufw.service || true
 # Caddy: enable but don't start (needs the Origin CA cert installed first; see DEPLOY.md)
 systemctl enable caddy
 

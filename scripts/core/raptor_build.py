@@ -31,7 +31,6 @@ import time
 import pickle
 import zipfile
 import hashlib
-import datetime as dt
 from pathlib import Path
 
 import numpy as np
@@ -50,7 +49,8 @@ def _pd():
         pd = _p
     return pd
 
-BUILD_VERSION = 2            # bump when the struct schema changes (v2: + pat_feed/line/mode);
+BUILD_VERSION = 3            # bump when the struct schema/invariants change (v2: + pat_feed/
+                             # line/mode; v3: FIFO split enforces ARR-column sortedness too);
                              # a cached pkl with a different version is rebuilt in place (the
                              # filename is unchanged, so the gid-keyed access table stays valid).
 FOOTPATH_M = float(os.environ.get("RAPTOR_FOOTPATH_M", "250"))  # synthesized-transfer radius (m)
@@ -74,41 +74,27 @@ def _hms_to_sec(s):
     return int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
 
 
-def _active_service_ids(z, names, date):
-    """service_ids running on YYYYMMDD ``date`` per calendar.txt + calendar_dates.txt."""
-    _pd()
-    wd = dt.datetime.strptime(date, "%Y%m%d").strftime("%A").lower()
-    sids = set()
-    if "calendar.txt" in names:
-        cal = pd.read_csv(io.BytesIO(z.read("calendar.txt")), dtype=str)
-        m = cal[(cal[wd] == "1") & (cal["start_date"] <= date) & (cal["end_date"] >= date)]
-        sids = set(m["service_id"])
-    if "calendar_dates.txt" in names:
-        cd = pd.read_csv(io.BytesIO(z.read("calendar_dates.txt")), dtype=str)
-        sids |= set(cd[(cd["date"] == date) & (cd["exception_type"] == "1")]["service_id"])
-        sids -= set(cd[(cd["date"] == date) & (cd["exception_type"] == "2")]["service_id"])
-    return sids
-
-
 def _split_fifo(dep, arr):
     """Split a stop-sequence group's trips into FIFO sub-patterns (no overtaking).
 
     ``dep``/``arr`` are (ntrips x nstops) int64, already sorted by dep[:,0]. A new trip can
-    join an existing sub-pattern only if, at EVERY position, its departure is >= the last
-    trip's departure (so the column stays sorted and per-position binary search is valid).
+    join an existing sub-pattern only if, at EVERY position, BOTH its departure and its
+    arrival are >= the last trip's (so both columns stay sorted; the hot-path binary search
+    in raptor.py/raptor_numba.py runs on the ARRIVAL column, and dep-sortedness alone does
+    not imply arr-sortedness — a later-departing but faster-running trip can arrive earlier).
     Returns a list of (dep_sub, arr_sub) arrays. Almost always one group; splits are rare
     (express overtaking a local sharing the identical stop list)."""
-    groups = []            # each: [dep_rows list, arr_rows list, last_dep_vector]
+    groups = []            # each: [dep_rows list, arr_rows list, last_dep_vector, last_arr_vector]
     for t in range(dep.shape[0]):
         d, a = dep[t], arr[t]
         placed = False
         for g in groups:
-            if np.all(d >= g[2]):          # does not overtake this group's latest trip
-                g[0].append(d); g[1].append(a); g[2] = d
+            if np.all(d >= g[2]) and np.all(a >= g[3]):  # does not overtake this group's latest trip
+                g[0].append(d); g[1].append(a); g[2] = d; g[3] = a
                 placed = True
                 break
         if not placed:
-            groups.append([[d], [a], d])
+            groups.append([[d], [a], d, a])
     return [(np.array(g[0], dtype=np.int64), np.array(g[1], dtype=np.int64)) for g in groups]
 
 
@@ -140,15 +126,16 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
         feed = feeds_list[fi]
         with zipfile.ZipFile(p) as z:
             names = z.namelist()
-            sids = _active_service_ids(z, names, date_str)
+            sids = feeds.active_service_ids(z, names, date_str)
             sdf = pd.read_csv(io.BytesIO(z.read("stops.txt")), dtype=str)
             slat = dict(zip(sdf.stop_id, pd.to_numeric(sdf.stop_lat, errors="coerce")))
             slon = dict(zip(sdf.stop_id, pd.to_numeric(sdf.stop_lon, errors="coerce")))
             rdf = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
             for _, r in rdf.iterrows():
                 rid = str(r["route_id"])
-                nm = (r.get("route_short_name") or r.get("route_long_name") or rid)
-                route_name[(fi, rid)] = str(nm).strip()
+                # the ONE naming policy (handles None/NaN/blank/whitespace)
+                route_name[(fi, rid)] = feeds._route_display_name(
+                    r.get("route_short_name"), r.get("route_long_name"), rid)
                 route_mode[(fi, rid)] = feeds._MODE.get(str(r.get("route_type", "3")), "bus")
             trips = pd.read_csv(io.BytesIO(z.read("trips.txt")), dtype=str)
             trips = trips[trips.service_id.isin(sids)]
@@ -161,6 +148,14 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
             st["dep"] = st.departure_time.map(_hms_to_sec)
             st.loc[st["arr"] < 0, "arr"] = st["dep"]      # blank intermediate times: use the other
             st.loc[st["dep"] < 0, "dep"] = st["arr"]
+            # rows with BOTH times blank survive the cross-patch as -1; a -1 in pat_arr/pat_dep
+            # silently corrupts the reverse search (searchsorted treats the trip as arriving
+            # before t=0), so drop the whole trip and say so. (Interpolating would guess.)
+            bad = st.loc[(st["arr"] < 0) | (st["dep"] < 0), "trip_id"].unique()
+            if len(bad):
+                _log(f"  {feed}: dropping {len(bad)} trips with stop_times rows "
+                     f"missing BOTH arrival and departure")
+                st = st[~st.trip_id.isin(bad)]
             kept = 0
             for tid, g in st.sort_values(["trip_id", "seq"]).groupby("trip_id", sort=False):
                 gids = tuple(get_gid(feed, sid, slat.get(sid, np.nan), slon.get(sid, np.nan))
@@ -207,6 +202,10 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
         mode_code = _MODE_CODE.get(route_mode.get(key, "bus"), 3)
         garr = np.asarray(gids, dtype=np.int32)
         for dsub, asub in subs:
+            # both time columns must be sorted per position — the reverse search
+            # binary-searches the ARRIVAL column, so fail the bake loudly if not.
+            assert (np.diff(dsub, axis=0) >= 0).all() and (np.diff(asub, axis=0) >= 0).all(), \
+                f"FIFO violation after split: feed {feeds_list[fi]} route {rid}"
             P_stops.append(garr); P_dep.append(dsub); P_arr.append(asub)
             pat_feed_l.append(fi); pat_line_l.append(li); pat_mode_l.append(mode_code)
     n_pat = len(P_stops)
@@ -228,6 +227,9 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
                if n_pat else np.zeros(0, np.int32))
     pat_arr = (np.concatenate([a.ravel() for a in P_arr]).astype(np.int32)
                if n_pat else np.zeros(0, np.int32))
+    if n_pat:   # belt-and-braces: the blank-row drop above must leave no negative times
+        assert pat_dep.min() >= 0 and pat_arr.min() >= 0, \
+            "negative stop time leaked into pattern matrices (blank-row drop failed)"
 
     # routes_at_stop CSR: stop -> list of (pattern, position)
     counts = np.zeros(n_stops, dtype=np.int64)

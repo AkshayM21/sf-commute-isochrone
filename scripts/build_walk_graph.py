@@ -112,8 +112,29 @@ def build():
     import rasterio
     t = time.time()
     with rasterio.open(DEM) as ds:
+        bnd = ds.bounds
+        oob = (lon < bnd.left) | (lon > bnd.right) | (lat < bnd.bottom) | (lat > bnd.top)
+        if oob.any():
+            sys.exit(f"[dem] {int(oob.sum())} graph nodes outside DEM bounds "
+                     f"({bnd.left:.4f},{bnd.bottom:.4f},{bnd.right:.4f},{bnd.top:.4f}) — "
+                     f"re-run scripts/fetch_dem.sh with a wider bbox")
         elev = np.array([v[0] for v in ds.sample(zip(lon, lat))], dtype=np.float64)
-    elev = np.nan_to_num(elev, nan=float(np.nanmedian(elev)))
+    # guard nodata sentinels, not just NaN: exportImage TIFFs carry no nodata tag, so garbage
+    # fill (e.g. -3.4e38) must be caught by range. A bad node would clamp every touching edge
+    # to ±MAX_GRADE (up to 5.75x weight) silently. Fill from the nearest VALID node — a global
+    # median fill builds artificial ~50 m cliffs against true sea-level neighbors at edges.
+    bad = ~np.isfinite(elev) | (elev < -100.0) | (elev > 1000.0)
+    if bad.any():
+        if bad.mean() > 0.01:
+            sys.exit(f"[dem] {int(bad.sum())}/{N} nodes ({100*bad.mean():.1f}%) have invalid "
+                     f"elevation — DEM looks broken, re-run scripts/fetch_dem.sh")
+        from scipy.spatial import cKDTree
+        good = ~bad
+        _, nn = cKDTree(np.column_stack((xs[good], ys[good]))).query(
+            np.column_stack((xs[bad], ys[bad])))
+        elev[bad] = elev[good][nn]
+        log(f"[dem] filled {int(bad.sum())} invalid-elevation nodes from nearest valid node")
+    assert -100.0 < elev.min() and elev.max() < 1000.0, "post-fill elevation out of range"
     log(f"[dem] sampled {N} nodes ({time.time()-t:.1f}s); elev {elev.min():.0f}..{elev.max():.0f} m")
 
     # directed edges from way segments (both directions)
@@ -156,20 +177,38 @@ def build():
         lon, lat, elev = lon[keep], lat[keep], elev[keep]
         N = int(keep.sum())
 
-    # build directed CSR (sorted by source)
+    # build directed CSR (sorted by source). Min-merge duplicate (src,dst) pairs from
+    # overlapping OSM ways (e.g. steps sharing a node pair with a footway): scipy's dijkstra
+    # happens to min-relax duplicate entries today, but any sum_duplicates() canonicalization
+    # (e.g. during walk.py's .T.tocsr()) would SUM them — make the min semantic explicit.
+    # (wf is identical across duplicates of a pair — it depends only on node coords.)
     order = np.lexsort((dst, src))
     src, dst, w, wf = src[order], dst[order], w[order], wf[order]
+    key = src.astype(np.int64) * N + dst
+    first = np.r_[True, key[1:] != key[:-1]]
+    if not first.all():
+        starts = np.flatnonzero(first)
+        w = np.minimum.reduceat(w, starts)
+        wf = np.minimum.reduceat(wf, starts)
+        src, dst = src[first], dst[first]
+        log(f"[edges] min-merged {len(first) - len(starts)} duplicate (src,dst) pairs")
     indptr = np.zeros(N + 1, np.int64)
     np.add.at(indptr, src + 1, 1)
     np.cumsum(indptr, out=indptr)
 
-    np.savez(OUT,
+    # write tmp + atomic rename so an interrupted bake can't leave a truncated zip at the
+    # canonical path (the server's "is it baked?" check is existence-only). Tmp name must
+    # end in .npz — np.savez silently appends it otherwise.
+    tmp = OUT.with_name(OUT.stem + ".tmp.npz")
+    np.savez(tmp,
              node_lon=lon.astype(np.float32), node_lat=lat.astype(np.float32),
              node_elev=elev.astype(np.float32),
              indptr=indptr, indices=dst.astype(np.int32), w_ref=w.astype(np.float32),
              w_flat=wf.astype(np.float32),       # grade-agnostic (R5-comparable) reference seconds
              walk_ref_kmh=np.float32(config.WALK_KMH), slope_aware=np.int8(1),
              stairs_mult=np.float32(STAIRS_MULT))
+    np.load(tmp).close()                         # cheap zip-integrity check before publish
+    os.replace(tmp, OUT)
     log(f"[save] {OUT.name}: {N} nodes, {len(dst)} edges, "
         f"{OUT.stat().st_size/1e6:.1f} MB; ref={config.WALK_KMH}km/h slope_aware=1")
 

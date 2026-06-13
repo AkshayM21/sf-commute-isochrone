@@ -73,7 +73,9 @@ class WalkGraph:
         ll = np.asarray(lonlats, dtype=np.float64).reshape(-1, 2)
         q = np.column_stack((ll[:, 0] * self.mlon, ll[:, 1] * self.mlat))
         d, ix = self._tree.query(q, k=k)
-        d = np.atleast_2d(d); ix = np.atleast_2d(ix)
+        # cKDTree squeezes the k axis when k=1 -> (m,); reshape (not atleast_2d, which would
+        # transpose that case to (1, m)) keeps the documented [m, k] contract for every k.
+        d = d.reshape(len(ll), k); ix = ix.reshape(len(ll), k)
         return ix.astype(np.int32), (d / self.speed_mps)
 
     def _base_from(self, src_lonlat, flat, cap_ref_sec, reverse=False):
@@ -95,11 +97,20 @@ class WalkGraph:
         ref[ref > cap_ref_sec] = np.inf
         return ref
 
+    def path_tree(self, src_lonlat, cap_ref_sec, flat=False, reverse=False):
+        """A PathTree rooted at ``src_lonlat`` for extracting the actual street path of walk
+        legs (one Dijkstra with predecessors from the point's k snap nodes; each target's
+        path is then a cheap predecessor-chain walk). ``reverse=True`` roots on the
+        TRANSPOSED graph (use for a tree rooted at the workplace: paths are node->W in the
+        original graph, matching one_to_many(reverse=True)'s costs)."""
+        return PathTree(self, src_lonlat, cap_ref_sec, flat=flat, reverse=reverse)
+
     def many_to_targets(self, src_nodes, src_conn, target_nodes, target_conn, cap_ref_sec,
                         flat=False, batch=64):
         """[n_src, n_tgt] REFERENCE seconds (np.inf beyond cap) for many pre-snapped sources to
         many pre-snapped targets, both [*, k]. Batched so the transient [batch*k, n_nodes]
-        Dijkstra block stays small. Used by the offline cell->stop access bake."""
+        Dijkstra block stays bounded (~0.5 GB at batch=64 on the SF graph vs ~20 GB
+        unbatched). Used by the offline cell->stop access bake."""
         src_nodes = np.asarray(src_nodes); src_conn = np.asarray(src_conn)
         target_nodes = np.asarray(target_nodes); target_conn = np.asarray(target_conn)
         ns, nt = len(src_nodes), len(target_nodes)
@@ -109,8 +120,61 @@ class WalkGraph:
         for s in range(0, ns, batch):
             sn = src_nodes[s:s + batch]; sc = src_conn[s:s + batch]; b = sn.shape[0]
             D = dijkstra(g, directed=True, indices=sn.ravel(), limit=cap_ref_sec)  # [b*k, n_nodes]
-            base = (D.reshape(b, k, -1) + sc[:, :, None]).min(axis=1)              # [b, n_nodes]
+            Dv = D.reshape(b, k, -1)                       # view; D is dead after the in-place add
+            Dv += sc[:, :, None]                           # avoids a second full-size temporary
+            base = Dv.min(axis=1)                                                  # [b, n_nodes]
             sub = base[:, target_nodes] + target_conn[None, :, :]                  # [b, nt, k]
             out[s:s + b] = sub.min(axis=2)
         out[out > cap_ref_sec] = np.inf
         return out
+
+
+class PathTree:
+    """Predecessor tree from one Dijkstra root point, for walk-leg PATH EXTRACTION (numpy
+    only, JVM-free). Mirrors ``one_to_many``'s cost model exactly: the root snaps to its k
+    nearest nodes (straight connector seconds), one multi-source Dijkstra runs with
+    ``return_predecessors=True``, and a target's path takes the (root-snap, target-snap)
+    pair that minimizes connector + graph + connector — the SAME argmin one_to_many's
+    ``.min`` takes, so the drawn path is the path the served TIME used.
+
+    Orientation: ``path_points`` always returns points in WALKING order.
+      * forward tree (reverse=False, root = the walk's origin): predecessor chains run
+        target->root, so they are reversed -> origin->target.
+      * reverse tree (reverse=True, root = the walk's DESTINATION, e.g. the workplace, on
+        the transposed graph): a transpose-path root->target is the original-graph path
+        target->root reversed, so the raw chain (target ... root) IS the walking order.
+    """
+
+    def __init__(self, wg, src_lonlat, cap_ref_sec, flat=False, reverse=False):
+        self.wg = wg
+        self.reverse = bool(reverse)
+        snodes, sconn = wg.snap([src_lonlat])             # [1,k] each
+        self._snodes = snodes[0]
+        dist, pred = dijkstra(wg._graph(flat, reverse), directed=True,
+                              indices=self._snodes, limit=cap_ref_sec,
+                              return_predecessors=True)
+        self._dist = dist + sconn[0][:, None]             # [k, n_nodes] incl. root connector
+        self._pred = pred                                 # -9999 sentinel = no predecessor
+
+    def path_points(self, tgt_lonlat):
+        """[[lat, lon], ...] node path to/from ``tgt_lonlat`` (lon, lat — same convention
+        as ``snap``) in walking order, or None when unreachable within the cap."""
+        tn, tc = self.wg.snap([tgt_lonlat])
+        tn, tc = tn[0], tc[0]
+        tot = self._dist[:, tn] + tc[None, :]             # [k_root, k_tgt]
+        if not np.isfinite(tot).any():
+            return None
+        i, j = np.unravel_index(int(np.argmin(tot)), tot.shape)
+        pred_row = self._pred[i]
+        chain = [int(tn[j])]
+        cur = int(tn[j])
+        for _ in range(len(self.wg.lat)):                 # bounded (acyclic by construction)
+            p = int(pred_row[cur])
+            if p < 0:                                     # reached the root snap node
+                break
+            chain.append(p)
+            cur = p
+        if not self.reverse:
+            chain.reverse()                               # forward tree: root -> target
+        lat, lon = self.wg.lat, self.wg.lon
+        return [[round(float(lat[c]), 6), round(float(lon[c]), 6)] for c in chain]

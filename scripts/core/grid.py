@@ -9,7 +9,11 @@ from . import config
 
 
 def load_neighborhoods():
-    """SF 'Find Neighborhoods' polygons (DataSF), in WGS84."""
+    """SF neighborhood polygons in WGS84, from config.neigh_path() (data/sf_neighborhoods.geojson)
+    — a BUILT artifact from scripts/build_neighborhoods.py (DataSF Realtor base + tight
+    Chinatown/Japantown grafted from Find-Neighborhoods; 94 features, field `name`).
+    The grid extent derives from this union: changing the file reshapes the grid and
+    requires regenerating tests/golden_exact_ferry.json and the grid-count assertions."""
     return gpd.read_file(config.neigh_path()).to_crs(config.WGS)
 
 

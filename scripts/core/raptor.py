@@ -9,8 +9,8 @@ work from a stop = deadline - latest_departure[stop].
 Range over a sweep of deadlines (``reverse_profile``) gives a per-stop latest-departure
 profile; inverting it (``stop_arrival_profile``) recovers the depart-after arrival profile
 that R5's departure-window percentile model uses, which is what we validate against. The
-SAME profile, read at a single arrival deadline, gives the arrive-by-09:00 product semantic
-(``assemble_arriveby``).
+SAME profile, read at arrival deadlines, gives the arrive-by-09:00 product semantic
+(``raptor_engine._assemble_arriveby_window``; single-deadline = that path with one deadline).
 
 HARD-WON (see prototypes/spike_raptor/NOTES.md), preserved here:
   * 60s BOARD SLACK — you must reach a stop >= 60s before a vehicle departs to catch it;
@@ -42,7 +42,27 @@ def reverse_raptor(data, egress_g, egress_t, max_rounds=8, board_slack=60):
     egress_g : int32[k]  egress stop gids (stops within walking distance of the workplace)
     egress_t : int64[k]  latest time you may ALIGHT at that stop (= deadline - egress walk)
     Returns best : int64[n_stops] latest departure time from each stop that still reaches the
-    workplace by the deadline (NEG if unreachable)."""
+    workplace by the deadline (NEG if unreachable).
+
+    LOCKSTEP: THREE implementations of this algorithm must stay byte-equivalent in routing
+    semantics (seeding, one-hop transfer policy, board slack, FIFO per-position binary search
+    on the ARRIVAL column): (1) this function — the pure-python reference/test oracle;
+    (2) ``reverse_raptor_traced`` below — same algorithm plus back-pointers (and deterministic
+    sorted scan order); (3) ``raptor_numba._profile`` — the compiled production hot path.
+    Any semantic change (e.g. board-slack handling, transfer seeding) must land in all three.
+
+    SNAPSHOT FOOTPATH RELAX (the lockstep-exactness fix, 2026-06-10): every footpath
+    relaxation pass (the egress-seed pass AND each round's pass) computes its candidates from
+    the SOURCE stops' values FROZEN at the start of the pass (``snap``), never from live
+    ``best[]``. The result is order-independent — best_after[j] = max(best_before[j],
+    max over sources s of snap[s] - tr_time) — so all three siblings produce BYTE-EQUAL
+    profiles regardless of scan order (hash-set here, sorted in traced, index order in numba).
+    The old live-read let a multi-hop walk cascade fire or not depending on iteration order
+    (measured on the ferry workplace: 7.8% of reachable stops diverged — the live-read up to
+    ~1183 s better, the snapshot up to ~263 s better; cell-level ~50/2999 served cells moved
+    −2..+6 min, 0 reachability flips); transfers are one-hop per pass by policy, so the
+    snapshot read is the correct semantics, not a restriction (tested byte-equal in
+    tests/test_raptor.py::test_lockstep_byte_equal)."""
     n = data["n_stops"]
     pat_nstops = data["pat_nstops"]; pat_ntrips = data["pat_ntrips"]
     pat_stop_off = data["pat_stop_off"]; pat_mat_off = data["pat_mat_off"]
@@ -57,9 +77,10 @@ def reverse_raptor(data, egress_g, egress_t, max_rounds=8, board_slack=60):
         g = int(g)
         if t > best[g]:
             best[g] = t; prev[g] = t; marked.add(g)
+    snap = best.copy()                           # SNAPSHOT: relax from frozen source values
     for g in list(marked):                       # seed footpath transfers from egress stops
         for k in range(int(tr_off[g]), int(tr_off[g + 1])):
-            j = int(tr_to[k]); cand = best[g] - tr_time[k]
+            j = int(tr_to[k]); cand = snap[g] - tr_time[k]
             if cand > best[j]:
                 best[j] = cand; prev[j] = cand; marked.add(j)
 
@@ -92,10 +113,11 @@ def reverse_raptor(data, egress_g, egress_t, max_rounds=8, board_slack=60):
         newly = list(marked)
         for s in newly:
             prev[s] = best[s]
+        snap = best.copy()                       # SNAPSHOT: relax from frozen source values
         tr_marked = set()
         for s in newly:
             for k in range(int(tr_off[s]), int(tr_off[s + 1])):
-                j = int(tr_to[k]); cand = best[s] - tr_time[k]
+                j = int(tr_to[k]); cand = snap[s] - tr_time[k]
                 if cand > best[j]:
                     best[j] = cand; prev[j] = cand; tr_marked.add(j)
         marked |= tr_marked
@@ -112,6 +134,15 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
     order and a tie (`d == best[s]`) keeps the FIRST writer, so the chosen parent is reproducible
     run-to-run (earlier rounds write first -> fewer-ride journeys preferred; a strictly-faster
     later-round journey still wins). Returns a dict of parent arrays + ``best``.
+
+    LOCKSTEP: keep the routing semantics byte-equivalent with its two siblings —
+    ``reverse_raptor`` above (the pure-python reference; this function only ADDS back-pointers
+    and sorted/deterministic scan order, never different times) and ``raptor_numba._profile``
+    (the compiled hot path). A semantic change to any one must land in all three.
+    Footpath relaxation is SNAPSHOT-BASED like both siblings (candidates read the sources'
+    values frozen at the start of each relax pass — see ``reverse_raptor``), which is what
+    makes ``best`` BYTE-EQUAL across the three despite the different scan orders; only the
+    PARENT choice on equal-value ties depends on the (sorted, deterministic) order here.
 
     Parent encoding per stop s (all sized n_stops):
       par_kind   int8   -1 unreachable, 0 egress-seed (terminal), 1 transit board, 2 footpath
@@ -152,9 +183,10 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
         g = int(g)
         if t > best[g]:
             best[g] = t; prev[g] = t; par_kind[g] = 0; egress_sec[g] = int(w); marked.add(g)
+    snap = best.copy()                           # SNAPSHOT: relax from frozen source values
     for g in sorted(marked):                     # initial one-hop footpaths from egress stops
         for k in range(int(tr_off[g]), int(tr_off[g + 1])):
-            j = int(tr_to[k]); cand = best[g] - tr_time[k]
+            j = int(tr_to[k]); cand = snap[g] - tr_time[k]
             if cand > best[j]:
                 set_foot(j, cand, g, 0); marked.add(j)
 
@@ -189,10 +221,11 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
         newly = list(marked)
         for s in newly:
             prev[s] = best[s]
+        snap = best.copy()                       # SNAPSHOT: relax from frozen source values
         tr_marked = set()
         for s in sorted(newly):
             for k in range(int(tr_off[s]), int(tr_off[s + 1])):
-                j = int(tr_to[k]); cand = best[s] - tr_time[k]
+                j = int(tr_to[k]); cand = snap[s] - tr_time[k]
                 if cand > best[j]:
                     set_foot(j, cand, s, int(par_nxfer[s])); tr_marked.add(j)
         marked |= tr_marked
@@ -206,20 +239,34 @@ def reverse_profile(data, egress_g, egress_w, deadlines, board_slack=60, max_rou
     """Run reverse RAPTOR for each arrival deadline in ``deadlines`` (seconds).
 
     egress_w : int64[k] egress WALK seconds (stop -> workplace) for the stops egress_g.
-    Returns latest : int64[n_stops, n_deadlines] latest departure per stop per deadline."""
+    Returns latest : int64[n_stops, n_deadlines] latest departure per stop per deadline.
+
+    MONOTONE ROWS (2026-06-10): every row is non-decreasing in the deadline. Exact semantics
+    guarantee it (a journey arriving by T also arrives by T' > T), but the marked-stop pruning
+    + one-hop footpath policy can drop a propagation at a higher deadline that fired at a
+    lower one (~58 of 3406 rows, worst 958 s, on the ferry workplace), and the binary
+    searches downstream (``stop_arrival_profile``, the MC tail readout) require sorted rows.
+    A row-wise running max over the (strictly ascending, asserted) deadline axis restores
+    exactly those provably-feasible journeys — applied HERE for the python fallback and
+    in-kernel at the end of ``raptor_numba._profile`` for the compiled path (the numba
+    chokepoint also covers the MC ``_draw_profile``), so both kernels stay byte-equal."""
     n = data["n_stops"]
     deadlines = np.asarray(deadlines, dtype=np.int64)
+    assert deadlines.size < 2 or bool(np.all(np.diff(deadlines) > 0)), \
+        "reverse_profile: deadlines must be strictly ascending (the row cummax depends on it)"
     egress_g = np.asarray(egress_g, dtype=np.int32)
     egress_w = np.asarray(egress_w, dtype=np.int64)
     if kernel is None:
         kernel = _select_kernel()
     if kernel == "numba":
-        return _reverse_profile_numba(data, egress_g, egress_w, deadlines,
-                                      board_slack, max_rounds)
+        from . import raptor_numba
+        return raptor_numba.reverse_profile(data, egress_g, egress_w, deadlines,
+                                            board_slack, max_rounds)
     latest = np.empty((n, len(deadlines)), dtype=np.int64)
     for ti, T in enumerate(deadlines):
         latest[:, ti] = reverse_raptor(data, egress_g, T - egress_w,
                                        max_rounds=max_rounds, board_slack=board_slack)
+    np.maximum.accumulate(latest, axis=1, out=latest)   # monotone rows (see docstring)
     return latest
 
 
@@ -228,7 +275,11 @@ def stop_arrival_profile(latest, deadlines, dep_grid):
 
     arrivalW[s, k] = earliest workplace-arrival deadline reachable if you depart stop s no
     earlier than dep_grid[k] = min{ T in deadlines : latest[s, T] >= dep_grid[k] }.
-    ``latest[s, :]`` is non-decreasing in the deadline, so this is a per-row searchsorted.
+    ``latest`` rows are GUARANTEED monotone non-decreasing since the row-wise cummax in
+    ``reverse_profile`` (2026-06-10 — the old matched-UB caveat about binary-searching
+    ~58 non-monotone rows is moot), so the per-row binary search is well-defined. The
+    python fallback still implements the SAME explicit (lo+hi)>>1 binary search as
+    ``raptor_numba.stop_arrival_profile`` so the two stay byte-equal on ANY input.
     Returns arrivalW : int64[n_stops, len(dep_grid)] (INF where never feasible)."""
     deadlines = np.asarray(deadlines, dtype=np.int64)
     dep_grid = np.asarray(dep_grid, dtype=np.int64)
@@ -236,15 +287,27 @@ def stop_arrival_profile(latest, deadlines, dep_grid):
         from . import raptor_numba
         return raptor_numba.stop_arrival_profile(latest, deadlines, dep_grid)
     n = latest.shape[0]
-    arrivalW = np.full((n, len(dep_grid)), INF, dtype=np.int64)
+    ndg = len(dep_grid)
+    arrivalW = np.full((n, ndg), INF, dtype=np.int64)
     nT = len(deadlines)
     for s in range(n):
         row = latest[s]
         if row[-1] < dep_grid[0]:
             continue
-        ti = np.searchsorted(row, dep_grid, side="left")     # vectorized over dep_grid
-        ok = ti < nT
-        arrivalW[s, ok] = deadlines[ti[ok]]
+        # masked vectorized binary search over the needles — each element follows exactly
+        # the numba kernel's loop: while lo < hi: mid=(lo+hi)>>1; row[mid] < D ? lo : hi.
+        lo = np.zeros(ndg, dtype=np.int64)
+        hi = np.full(ndg, nT, dtype=np.int64)
+        active = lo < hi
+        while active.any():
+            mid = (lo + hi) >> 1
+            less = np.zeros(ndg, dtype=bool)
+            less[active] = row[mid[active]] < dep_grid[active]
+            lo = np.where(active & less, mid + 1, lo)
+            hi = np.where(active & ~less, mid, hi)
+            active = lo < hi
+        ok = lo < nT
+        arrivalW[s, ok] = deadlines[lo[ok]]
     return arrivalW
 
 
@@ -265,10 +328,32 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, de
     cell_deps = np.asarray(cell_deps, dtype=np.int64)
     if _select_kernel() == "numba":
         from . import raptor_numba
+        args = (np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
+                np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64), arrivalW)
+        # Arithmetic-indexing fast path (~7x): searchsorted(dep_grid, D + w) collapses to
+        # di + ceil(w/step) when dep_grid is uniform AND shares origin + step with cell_deps.
+        # The ENGINE's grids always qualify (DEP_STEP literal), but this is a public API with
+        # caller-supplied grids (e.g. prototypes/spike_raptor/validate_core.py), so guard and
+        # fall back to the general binsearch kernel when the assumption doesn't hold.
+        uniform = False
+        if len(dep_grid) >= 2 and len(cell_deps) >= 1:
+            step = int(dep_grid[1] - dep_grid[0])
+            uniform = (step > 0
+                       and bool(np.all(np.diff(dep_grid) == step))
+                       and int(dep_grid[0]) == int(cell_deps[0])
+                       and bool(np.all(np.diff(cell_deps) == step)))
+        if uniform:
+            # arith-kernel guard: kw = ceil(w/step) assumes non-negative walk seconds — a
+            # negative access_w would make k = di + kw index BEFORE the arrivalW row origin
+            # (numba does no bounds checking, so that's a silent out-of-range read, not an
+            # IndexError). Negative walk seconds are invalid input everywhere; fail loudly.
+            assert args[2].size == 0 or int(args[2].min()) >= 0, \
+                "assemble_departafter: access_w contains negative walk seconds"
+            return raptor_numba.assemble_departafter_arith(
+                *args, np.int64(dep_grid[0]), np.int64(step), np.int64(len(dep_grid)),
+                cell_deps, np.int64(max_min), pct)
         return raptor_numba.assemble_departafter(
-            np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
-            np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
-            arrivalW, dep_grid, cell_deps, np.int64(max_min), pct)
+            *args, dep_grid, cell_deps, np.int64(max_min), pct)
     out = np.full((n_cells, len(pct)), -1, dtype=np.int32)
     nd = len(cell_deps)
     ndg = len(dep_grid)
@@ -300,40 +385,6 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, de
     return out
 
 
-def assemble_arriveby(access_off, access_to, access_w, purewalk, latest_at_deadline,
-                      deadline, max_min):
-    """Arrive-by minutes per cell for a single arrival ``deadline`` (seconds).
-
-    latest_home_dep(cell) = max( deadline - pure_walk,
-                                 max over access stops s [ latest_at_deadline[s] - access_walk ] )
-    travel = deadline - latest_home_dep. ``latest_at_deadline`` is the reverse-RAPTOR
-    latest-departure column at ``deadline``. Returns int32[n_cells] minutes (-1 unreachable)."""
-    n_cells = len(access_off) - 1
-    out = np.full(n_cells, -1, dtype=np.int32)
-    cap_sec = max_min * 60
-    for ci in range(n_cells):
-        a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
-        gids = access_to[a0:a1]
-        latest_home = NEG
-        if len(gids):
-            cand = latest_at_deadline[gids] - access_w[a0:a1].astype(np.int64)
-            m = int(cand.max())
-            if m > latest_home:
-                latest_home = m
-        pw = purewalk[ci]
-        if pw >= 0 and deadline - pw > latest_home:
-            latest_home = deadline - int(pw)
-        if latest_home <= NEG:
-            continue
-        tt = (deadline - latest_home) / 60.0
-        if tt < 0:
-            tt = 0.0
-        if tt >= max_min:
-            continue
-        out[ci] = int(np.ceil(tt))
-    return out
-
-
 # --------------------------------------------------------------- kernel selection
 _NUMBA = None
 
@@ -348,12 +399,6 @@ def _select_kernel():
         except Exception:
             _NUMBA = False
     return "numba" if _NUMBA else "python"
-
-
-def _reverse_profile_numba(data, egress_g, egress_w, deadlines, board_slack, max_rounds):
-    from . import raptor_numba
-    return raptor_numba.reverse_profile(data, egress_g, egress_w, deadlines,
-                                        board_slack, max_rounds)
 
 
 # --------------------------------------------------------------- service-noise Monte-Carlo
@@ -401,10 +446,11 @@ def perturbed_data(data, delta0, slope, off=None):
 
 
 def _mc_flat_args(data):
-    """The schedule CSR as the int64 tuple BOTH MC kernels take positionally: n_stops, the pattern
+    """The schedule CSR as the int64 tuple the MC kernel takes positionally: n_stops, the pattern
     arrays (incl. ``pat_trip_off`` for per-trip delay indexing), the routes-at-stop CSR, and the
-    footpath CSR. One source of truth for the kernels' flat-arg contract (kept in sync with
-    ``raptor_numba.montecarlo`` / ``montecarlo_committed`` parameter order)."""
+    footpath CSR. One source of truth for the kernel's flat-arg contract (kept in sync with
+    ``raptor_numba.montecarlo_committed`` parameter order; ``_draw_profile`` consumes the same
+    prefix)."""
     return (np.int64(data["n_stops"]),
             data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
             data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64),
@@ -478,7 +524,8 @@ def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perf
             if lo >= nt:
                 cm[ci, r] = capf; continue
             arr_as = int(arr[mb + lo * ns + ap])
-            lo2 = int(np.searchsorted(latest[int(as_[ci])], arr_as, side="left"))
+            # + board_slack: the sweep charges it at every transit-alight -> onward seam
+            lo2 = int(np.searchsorted(latest[int(as_[ci])], arr_as + board_slack, side="left"))
             if lo2 >= nd:
                 cm[ci, r] = capf; continue
             tt = (int(deadlines[lo2]) - int(home[ci])) / 60.0

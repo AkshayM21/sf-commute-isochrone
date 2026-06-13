@@ -2,6 +2,11 @@
 Description=SF Commute Isochrone (RAPTOR map server)
 After=network.target
 Documentation=https://github.com/akshaymanglik/sf-commute-isochrone
+# Crash-loop budget: cap fast restarts so a real alarm fires instead of consuming the box.
+# (StartLimitIntervalSec/Burst must live in [Unit], not [Service] — systemd silently ignores
+# them in [Service] and logs an "Unknown key name" warning on every restart.)
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -16,16 +21,16 @@ EnvironmentFile=/etc/sfci.env
 Environment=NUMBA_CACHE_DIR=/var/cache/sfci/numba
 # Flask is behind Caddy + Cloudflare -- tell _client_ip it can also fall back to X-Forwarded-For.
 Environment=TRUST_PROXY=1
+# Persistent geocoder cache: live in the systemd-managed CacheDirectory so ProtectSystem=strict
+# (which makes /opt/sfci read-only) doesn't crash the boot-time DEFAULT_ADDRESS lookup.
+Environment=DEST_CACHE_FILE=/var/cache/sfci/dest_cache.json
 # Don't buffer print() output (so journalctl -f shows logs live).
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/sfci/.venv/bin/python scripts/server.py
 
-# Crash-loop strategy: restart on any exit, but stop trying after 5 fast crashes so a real
-# alarm fires (or you `journalctl -u sfci -n 50` to see why) instead of consuming the box.
+# Restart on any exit; the StartLimit{IntervalSec,Burst} pair in [Unit] above caps the loop.
 Restart=always
 RestartSec=10s
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Give the in-flight MC kernel (~0.5s) a moment to finish before SIGKILL.
 TimeoutStopSec=15s

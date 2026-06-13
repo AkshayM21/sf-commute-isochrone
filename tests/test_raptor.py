@@ -164,13 +164,17 @@ def test_color_by_line_deterministic(engine):
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_mc_committed_invariant(engine):
     """Committed-plan MC (the ``realistic`` overlay): fixes the first leg from the published plan
-    and re-optimizes the tail from the actual late arrival. It must (a) never beat perfect-timing
-    (the hard invariant — guards the board-slack regression where committed skipped its own trip and
-    ate a headway), (b) track R5's window p50 closely (committed = best departure + small service
-    delay ≈ R5's depart-window median, so |bias| is small either sign), and (c) show a real, modest
+    and re-optimizes the tail from the actual late arrival. Asserts (a) the SERVED floor exists:
+    realistic >= perfect everywhere — montecarlo() floors the draws at perfect, so this guards the
+    floor itself, not kernel behavior; (b) the non-vacuous PRE-floor signal on ``realistic_raw``:
+    with real delays committed must sit above perfect on average, and the legitimate negative tail
+    (the traced-tree-vs-sweep relaxation, see the zero-pert test) stays a small fraction; (c)
+    committed tracks R5's window p50 closely (committed = best departure + small service delay ≈
+    R5's depart-window median, so |bias| is small either sign — this band is what catches the
+    board-slack class of regression, which inflated committed ~+16 min); (d) a real, modest
     fragility tail. R5 p50 is NOT ground truth for a delayed commute, hence a band, not an error."""
     pos = {c: i for i, c in enumerate(engine.cell_ids)}
-    all_signed, viol, fragmax = [], 0, 0
+    all_signed, all_rawd, viol, fragmax = [], [], 0, 0
     for f in _oracles():
         z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
         pw = _purewalk_aligned(engine, z)
@@ -180,6 +184,7 @@ def test_mc_committed_invariant(engine):
                                seed=7, alt_draws=0)
         real = mc["realistic"]; reach = perfect >= 0
         viol += int(np.sum(real[reach] < perfect[reach]))
+        all_rawd.append(mc["realistic_raw"][reach].astype(np.int64) - perfect[reach])
         fragmax = max(fragmax, int(mc["frag"][reach].max()))
         for k, cid in enumerate(z["cell_ids"].astype(str)):
             i = pos.get(cid)
@@ -189,21 +194,27 @@ def test_mc_committed_invariant(engine):
             if r5 < 0:
                 continue
             all_signed.append(int(real[i]) - r5)
-    signed = np.array(all_signed)
+    signed = np.array(all_signed); rawd = np.concatenate(all_rawd)
     print(f"\n[mc committed] vs R5 p50 bias={signed.mean():+.2f} perfect>realistic={viol} "
-          f"fragmax={fragmax}")
-    assert viol == 0, f"committed realistic beat perfect-timing in {viol} cells"
-    assert -3.0 <= signed.mean() <= 4.0, f"committed bias {signed.mean():+.2f} outside [-3, 4]"
+          f"raw-perfect mean={rawd.mean():+.2f} frac<-6={np.mean(rawd < -6):.3f} fragmax={fragmax}")
+    assert viol == 0, f"served realistic lost its perfect floor in {viol} cells"
+    # pre-floor: delays must push committed ABOVE perfect on average (measured ~+2.5); a broadly
+    # negative raw p50 means an optimistic kernel regression (tail-readout/boarding-key class)
+    assert rawd.mean() >= 0.5, f"pre-floor committed p50 only {rawd.mean():+.2f} vs perfect"
+    assert np.mean(rawd < -6) <= 0.03, \
+        f"pre-floor committed undercut perfect by >6 min on {np.mean(rawd < -6)*100:.1f}% of cells"
+    assert -2.0 <= signed.mean() <= 3.0, f"committed bias {signed.mean():+.2f} outside [-2, 3]"
     assert fragmax > 0, "committed MC produced no fragility tail"
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_mc_committed_zero_perturbation_equals_perfect(engine):
     """With NO delays, the committed forward-sim must reproduce the perfect arrive-by commute on
-    every transit cell (you catch your own planned trip and ride it). Only the 180s deadline-grid
-    rounding may lift it (<= one step). Regression guard for the board-slack bug where the boarding
-    key was commit_home+walk0+board_slack -> it skipped the committed trip and ate a full headway
-    (committed sat ~+16 min above perfect at zero perturbation)."""
+    every transit cell (you catch your own planned trip and ride it). Only the 60s MC deadline-grid
+    (Tgrid_mc, the production grid) rounding may lift it (<= one step + ceil). Regression guard for
+    the board-slack bug where the boarding key was commit_home+walk0+board_slack -> it skipped the
+    committed trip and ate a full headway (committed sat ~+16 min above perfect at zero
+    perturbation)."""
     from core import raptor as R
     z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
     pw = _purewalk_aligned(engine, z)
@@ -214,26 +225,318 @@ def test_mc_committed_zero_perturbation_equals_perfect(engine):
     perfect, _ = tree.commute_and_dominant(); perfect = np.asarray(perfect, np.int32)
     Tn = int(R.pat_trip_off(engine.data)[-1])
     zero = np.zeros((2, Tn))
-    cm = R.montecarlo_commute_committed(engine.data, eg, ew, engine.Tgrid, legs, perfect,
+    cm = R.montecarlo_commute_committed(engine.data, eg, ew, engine.Tgrid_mc, legs, perfect,
                                         engine.max_min, zero, zero)
     committed = np.ceil(cm[:, 0]).astype(np.int32)
     transit = (perfect >= 0) & (np.asarray(legs["commit_kind"]) == 2)
     diff = committed[transit] - perfect[transit]
     print(f"\n[mc committed zero-pert] committed-perfect mean={diff.mean():+.2f} "
-          f"min={int(diff.min())} max={int(diff.max())}")
-    # With no delays committed ≈ perfect; the only spread is the 180s deadline grid + the
-    # traced-tree-vs-sweep relaxation diff (both small, two-sided; production clamps any negative to
-    # perfect). The bug made this +15.85 one-sided — so the guard is "no systematic inflation".
-    assert abs(diff.mean()) <= 1.5, \
+          f"min={int(diff.min())} max={int(diff.max())} frac<-3={np.mean(diff < -3):.3f}")
+    # With no delays committed ≈ perfect; the tail readout pays the same board_slack the sweep
+    # charges at the alight->onward seam (sweep-consistent), so the inflation left is the 60s
+    # MC deadline grid (<= one step + ceil) plus, on a handful of cells, the seam slack charged
+    # where the perfect plan's onward continuation was a footpath (re-stamped at the snapshot
+    # footpath relax, 2026-06-10: max +3 on 9 cells; was <=2 with the old order-dependent trees).
+    # The negative side is the traced-tree-vs-sweep relaxation diff — the clairvoyant tail can
+    # find paths the deterministic trace skipped (down to ~-18 on a few cells; production floors
+    # the draws at perfect) — bounded as a FRACTION so optimistic drift is asserted, not just
+    # printed; tightened 0.06 -> 0.04 at the snapshot re-stamp (measured 0.031, mean -0.34).
+    # The board-slack bug made the mean +15.85 one-sided — guard: "no systematic inflation".
+    assert abs(diff.mean()) <= 1.0, \
         f"committed {diff.mean():+.2f} vs perfect at zero perturbation (board-slack headway regression?)"
-    assert diff.max() <= 4, f"committed +{int(diff.max())} over perfect at zero perturbation (> one grid step)"
+    assert diff.max() <= 3, f"committed +{int(diff.max())} over perfect at zero perturbation (> grid step + seam slack)"
+    assert np.mean(diff < -3) <= 0.04, \
+        f"clairvoyant tail undercut perfect by >3 min on {np.mean(diff < -3)*100:.1f}% of cells (optimistic drift)"
+    # Walk-committed cells (commit_kind == 1, the deterministic-walk plan; no kind==0 cell is
+    # reachable): a walk can't be delayed by service noise, so committed must reproduce perfect
+    # VERBATIM — not within a grid step — on every one of them.
+    kind = np.asarray(legs["commit_kind"])
+    walk = (perfect >= 0) & (kind == 1)
+    assert walk.any(), "oracle 0 has no reachable walk-committed cells — fixture assumption broken"
+    assert (committed[walk] == perfect[walk]).all(), \
+        "walk-only cells must take perfect verbatim every draw"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_committed_huge_delay_hits_cap(engine):
+    """A 12-hour initial delay on EVERY trip wipes out all morning service: every
+    transit-committed cell must hit the engine cap (exercising the no-next-trip 'stuck'
+    branches of the kernel, lo>=nt / d>=nd), while walk-committed cells — untouchable by
+    service noise — keep their perfect time exactly."""
+    from core import raptor as R
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"], np.int32)
+    ew, _, _ = engine._scale_walk(z["egress_w"], pw, 1.0)
+    tree = engine.journey_tree(eg, z["egress_w"], pw)
+    legs = tree.committed_first_legs()
+    perfect, _ = tree.commute_and_dominant(); perfect = np.asarray(perfect, np.int32)
+    Tn = int(R.pat_trip_off(engine.data)[-1])
+    big = np.full((1, Tn), 12 * 3600.0)
+    cm2 = R.montecarlo_commute_committed(engine.data, eg, ew, engine.Tgrid, legs, perfect,
+                                         engine.max_min, big, np.zeros((1, Tn)))
+    kind = np.asarray(legs["commit_kind"])
+    transit = (perfect >= 0) & (kind == 2)
+    walk = (perfect >= 0) & (kind == 1)
+    assert transit.sum() > 1000, f"only {int(transit.sum())} transit-committed cells in oracle 0"
+    assert walk.any(), "oracle 0 has no reachable walk-committed cells"
+    assert (cm2[transit, 0] >= engine.max_min - 1e-9).all(), (
+        f"{int(np.sum(cm2[transit, 0] < engine.max_min - 1e-9))} transit cells beat the cap "
+        "despite a 12h delay on every trip (stuck path regression)"
+    )
+    assert (np.ceil(cm2[walk, 0]).astype(np.int32) == perfect[walk]).all(), \
+        "service noise leaked into walk-committed cells"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_alt_lines_traced(engine):
+    """The alt-lines overlay ('also serves: …', the route-resilience read): montecarlo with
+    alt_draws>0 must vote dominant lines across traced PERTURBED trees — per-cell dicts with
+    integer votes bounded by the draw count, sorted descending, never 'walk only', covering
+    a meaningful share of transit cells, and bit-identical across same-seed runs."""
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"]); ew = np.asarray(z["egress_w"])
+    tree = engine.journey_tree(eg, ew, pw)
+    perfect, dom = tree.commute_and_dominant()
+    perfect = np.asarray(perfect, np.int32)
+    mc = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=4, alt_draws=3)
+    alt = mc["alt"]
+    assert isinstance(alt, list) and len(alt) == len(engine.cell_ids)
+    nonnull = 0
+    for ci, d in enumerate(alt):
+        if d is None:
+            continue
+        nonnull += 1
+        assert isinstance(d, dict) and d, f"cell {ci}: empty alt entry should be None"
+        votes = list(d.values())
+        assert all(isinstance(v, (int, np.integer)) and 1 <= v <= 3 for v in votes), \
+            f"cell {ci}: votes {votes} outside [1, alt_draws=3]"
+        assert sum(votes) <= 3, f"cell {ci}: {sum(votes)} total votes from 3 traced draws"
+        assert votes == sorted(votes, reverse=True), \
+            f"cell {ci}: alt entries not sorted by descending votes: {d}"
+        assert "walk only" not in d, f"cell {ci}: 'walk only' voted as an alt line"
+    # dom is a per-cell-index list (raptor_journey.commute_and_dominant), not a dict.
+    transit_cells = sum(
+        1 for ci in range(len(engine.cell_ids))
+        if perfect[ci] >= 0 and dom[ci] and dom[ci] != "walk only")
+    assert transit_cells > 1000
+    assert nonnull >= 0.5 * transit_cells, (
+        f"alt-lines only populated on {nonnull}/{transit_cells} transit cells — "
+        "the traced-perturbation path looks dead"
+    )
+    # Determinism: an identical seed must reproduce the identical alt structure.
+    mc2 = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=4, alt_draws=3)
+    assert mc2["alt"] == alt, "alt-lines differ across two same-seed runs"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_alt_bundle_traces_the_voted_line(engine):
+    """The alt-route bundle (backs /itinerary's drawn alternatives): montecarlo with alt_draws>0
+    must return ``alt_bundle`` alongside ``alt``, holding one captured draw per perturbation, and
+    a JourneyTree rebuilt from it (engine.alt_journey_tree) must trace the VERY line the votes
+    claimed. So for any cell with an alt vote, there exists a captured draw whose dominant for
+    that cell is that line, and the rebuilt tree's dominant agrees — i.e. the bundle is a faithful
+    handle on the same journeys the votes were counted from, not an independent recompute."""
+    from core import raptor_journey
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"]); ew = np.asarray(z["egress_w"])
+    perfect, _dom = engine.journey_tree(eg, ew, pw).commute_and_dominant()
+    perfect = np.asarray(perfect, np.int32)
+    K = 4
+    mc = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=6, alt_draws=K)
+    alt = mc["alt"]; bundle = mc["alt_bundle"]
+    assert bundle is not None and isinstance(bundle["draws"], list)
+    assert len(bundle["draws"]) == K, f"bundle captured {len(bundle['draws'])} draws, expected {K}"
+    # each captured draw carries the perturbed schedule columns + traced parents + dom list
+    n_cells = len(engine.cell_ids)
+    for dr in bundle["draws"]:
+        assert dr["pat_dep"].shape == np.asarray(engine.data["pat_dep"]).shape
+        assert dr["pat_arr"].shape == np.asarray(engine.data["pat_arr"]).shape
+        assert "best" in dr["par"] and "par_kind" in dr["par"]
+        assert len(dr["dom"]) == n_cells
+    # Memory budget sanity: the captured payload stays small (a few MB at K=4, per the budget).
+    nbytes = sum(dr["pat_dep"].nbytes + dr["pat_arr"].nbytes
+                 + sum(a.nbytes for a in dr["par"].values()) for dr in bundle["draws"])
+    assert nbytes < 20 * 1024 * 1024, f"alt_bundle is {nbytes/1e6:.1f} MB (> 20 MB budget)"
+
+    # The load-bearing claim: a tree rebuilt from the bundle traces the voted line. Build the
+    # K trees once (the server caches these), then for several voted cells confirm the matching
+    # draw's tree's dominant == the vote.
+    trees = [engine.alt_journey_tree(bundle, di) for di in range(K)]
+    for t in trees:
+        assert isinstance(t, raptor_journey.JourneyTree)
+    checked = 0
+    for ci, votes in enumerate(alt):
+        if not votes:
+            continue
+        for line in votes:
+            di = next((d for d in range(K) if bundle["draws"][d]["dom"][ci] == line), None)
+            assert di is not None, f"cell {ci}: voted line {line!r} has no matching captured draw"
+            it = trees[di].itinerary(ci)
+            assert it is not None, f"cell {ci}: draw {di} cannot trace the voted alt"
+            # the rebuilt tree's dominant for this cell IS the voted line (the bundle wraps the
+            # exact perturbed journey, so the trace reproduces the vote — not an approximation).
+            _, dom_di = trees[di].commute_and_dominant()
+            assert dom_di[ci] == line, (
+                f"cell {ci}: rebuilt draw {di} dominant {dom_di[ci]!r} != voted {line!r}")
+            checked += 1
+        if checked >= 40:                              # a representative sample is enough
+            break
+    assert checked > 0, "no voted cell exercised the bundle re-trace"
+
+    # Determinism: same seed -> byte-identical perturbed columns + identical dom lists.
+    mc2 = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=6, alt_draws=K)
+    b2 = mc2["alt_bundle"]
+    for d1, d2 in zip(bundle["draws"], b2["draws"]):
+        assert np.array_equal(d1["pat_dep"], d2["pat_dep"])
+        assert np.array_equal(d1["pat_arr"], d2["pat_arr"])
+        assert d1["dom"] == d2["dom"]
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_traced_matches_reference_sweep(engine):
+    """Lockstep guard: reverse_raptor_traced is documented as 'same algorithm as
+    reverse_raptor but with back-pointers' — its best[] (latest departure per stop) must be
+    BYTE-EQUAL to the reference sweep for the 09:00 arrive-by deadline, or the
+    hover/breakdown tree no longer matches the map's profile semantics.
+
+    GAP CLOSED (2026-06-10): this test originally found that byte-exact lockstep was
+    violated on ~2% of stops because the footpath relaxation in all three siblings read
+    LIVE best[] while iterating, so a multi-hop walk cascade fired or not depending on
+    SCAN ORDER (hash-set vs sorted() vs index order). The footpath relax is now
+    SNAPSHOT-BASED in all three (candidates read source values frozen at the start of
+    each pass), which makes the pass order-independent — so this guard asserts strict
+    byte-equality (it previously allowed <=3% of stops / <=360s of divergence)."""
+    from core import raptor as R
+    from core import raptor_engine as RE
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"], np.int32)
+    ew, _, _ = engine._scale_walk(z["egress_w"], pw, 1.0)
+    egress_t = engine.target_sec - ew                   # latest alight time per egress stop
+    traced = R.reverse_raptor_traced(engine.data, eg, egress_t, ew,
+                                     max_rounds=RE.MAX_ROUNDS, board_slack=RE.BOARD_SLACK)
+    ref = R.reverse_raptor(engine.data, eg, egress_t,
+                           max_rounds=RE.MAX_ROUNDS, board_slack=RE.BOARD_SLACK)
+    best = traced["best"]
+    assert best.shape == ref.shape == (engine.data["n_stops"],)
+    reach_ref = ref > R.NEG // 2
+    assert int(reach_ref.sum()) > 1000, f"reference sweep reached only {int(reach_ref.sum())} stops"
+    assert (best[reach_ref] <= engine.target_sec).all(), "a latest departure exceeds the deadline"
+    n_div = int(np.sum(best != ref))
+    assert n_div == 0, (
+        f"traced best diverges from the reference sweep on {n_div} stops — the snapshot "
+        "footpath relax made the sweep scan-order-independent, so ANY divergence is a "
+        "lockstep semantics regression (board slack / transfer seeding / relax policy)"
+    )
+
+
+@pytest.mark.skipif(len(_oracles()) < 2, reason="need >=2 R5 oracles in tests/raptor_golden/")
+def test_lockstep_byte_equal(engine):
+    """THE lockstep invariant, asserted directly at the profile level: the three sibling
+    implementations of the reverse sweep — ``raptor.reverse_raptor`` (pure-python reference,
+    hash-set scan order), ``raptor.reverse_raptor_traced`` (sorted scan order + back-pointers)
+    and ``raptor_numba._profile`` (compiled, index scan order) — must produce BYTE-EQUAL
+    latest-departure arrays. The snapshot-based footpath relax (2026-06-10) makes each relax
+    pass order-independent, so equality holds REGARDLESS of iteration order; any divergence
+    is a semantic drift in exactly one sibling. Coverage: 2 workplaces x 2 deadlines on the
+    published schedule + 1 perturbed MC draw (the MC path runs the same sweep on a perturbed
+    schedule, so lockstep must survive perturbation too)."""
+    from core import raptor as R
+    from core import raptor_engine as RE
+    if R._select_kernel() != "numba":
+        pytest.skip("numba not installed; the compiled sibling cannot be compared")
+    from core import raptor_numba as RN
+    # one perturbed draw (deterministic): bus-scale initial delays + mild drift
+    off = R.pat_trip_off(engine.data)
+    Tn = int(off[-1])
+    rng = np.random.default_rng(5)
+    pdata, _, _ = R.perturbed_data(engine.data, rng.gamma(2.0, 35.0, size=Tn),
+                                   rng.gamma(2.0, 0.015, size=Tn), off)
+    deadlines = np.array([engine.target_sec - 1800, engine.target_sec], np.int64)
+    compared = 0
+    for fi, f in enumerate(_oracles()[:2]):
+        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
+        pw = _purewalk_aligned(engine, z)
+        eg = np.asarray(z["egress_g"], np.int32)
+        ew, _, _ = engine._scale_walk(z["egress_w"], pw, 1.0)
+        datasets = [("schedule", engine.data)]
+        if fi == 0:
+            datasets.append(("perturbed", pdata))
+        for label, data in datasets:
+            lat_nb = RN.reverse_profile(data, eg, ew, deadlines, RE.BOARD_SLACK, RE.MAX_ROUNDS)
+            # the profile kernel finishes with the row-wise MONOTONE CUMMAX (restores feasible
+            # journeys the pruned sweep dropped at higher deadlines), so the per-deadline
+            # reference columns must be accumulated the same way before comparing.
+            ref_mat = np.empty((data["n_stops"], len(deadlines)), np.int64)
+            for ti, T in enumerate(deadlines):
+                egress_t = T - ew
+                ref = R.reverse_raptor(data, eg, egress_t,
+                                       max_rounds=RE.MAX_ROUNDS, board_slack=RE.BOARD_SLACK)
+                tr = R.reverse_raptor_traced(data, eg, egress_t, ew, max_rounds=RE.MAX_ROUNDS,
+                                             board_slack=RE.BOARD_SLACK)["best"]
+                assert int((ref > R.NEG // 2).sum()) > 1000, \
+                    f"{f}/{label}/T={T}: sweep reached too few stops to be a meaningful compare"
+                assert np.array_equal(ref, tr), (
+                    f"{f}/{label}/T={T}: reference vs traced diverge on "
+                    f"{int(np.sum(ref != tr))} stops (lockstep broke)"
+                )
+                ref_mat[:, ti] = ref
+                compared += 1
+            np.maximum.accumulate(ref_mat, axis=1, out=ref_mat)
+            for ti, T in enumerate(deadlines):
+                assert np.array_equal(ref_mat[:, ti], lat_nb[:, ti]), (
+                    f"{f}/{label}/T={T}: cummaxed reference vs numba profile diverge on "
+                    f"{int(np.sum(ref_mat[:, ti] != lat_nb[:, ti]))} stops (lockstep broke)"
+                )
+    assert compared == 6                          # 2 workplaces x 2 deadlines + 1 perturbed x 2
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_profile_rows_monotone(engine):
+    """PERMANENT guard for the monotone-profile invariant (2026-06-10): every stop's
+    latest-departure row must be non-decreasing in the deadline. Exact semantics guarantee
+    it (arriving by T implies arriving by T' > T), but the pruned sweep used to leave ~58
+    non-monotone rows (worst 958 s on the ferry workplace) that fed binary searches in
+    stop_arrival_profile and the MC tail readout — consistently-wrong-together UB. The
+    row-wise cummax at the profile producer (raptor_numba._profile / the python
+    reverse_profile fallback) restores the dropped feasible journeys; this asserts it on a
+    real workplace for BOTH kernels (delete the cummax and this fails immediately)."""
+    from core import raptor as R
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"], np.int32)
+    ew, _, _ = engine._scale_walk(z["egress_w"], pw, 1.0)
+    # production path (numba when available), full deadline grid
+    latest = engine._reverse(eg, ew, engine.Tgrid)
+    assert latest.shape == (engine.data["n_stops"], len(engine.Tgrid))
+    reach = latest[:, -1] > R.NEG // 2
+    assert int(reach.sum()) > 1000, "profile reached too few stops to be a meaningful check"
+    assert bool(np.all(np.diff(latest, axis=1) >= 0)), (
+        f"{int(np.sum((np.diff(latest, axis=1) < 0).any(axis=1)))} latest-departure rows are "
+        "non-monotone in the deadline — the producer cummax regressed (binary searches over "
+        "these rows are undefined)"
+    )
+    # python fallback chokepoint (np.maximum.accumulate in reverse_profile), grid subset for speed
+    sub = np.asarray(engine.Tgrid[::6], np.int64)
+    lat_py = R.reverse_profile(engine.data, eg, ew, sub, board_slack=60, kernel="python")
+    assert bool(np.all(np.diff(lat_py, axis=1) >= 0)), \
+        "python-fallback profile rows are non-monotone — reverse_profile lost its cummax"
+    # ascending-deadline precondition is enforced loudly, not silently corrupted
+    with pytest.raises(AssertionError, match="ascending"):
+        R.reverse_profile(engine.data, eg, ew, sub[::-1], board_slack=60)
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_mc_committed_numba_matches_python(engine):
-    """The committed-plan kernel agrees between the compiled (production) and pure-python paths at
-    the served p50-``realistic`` level within <= 2 min — the order-dependent transfer relaxation in
-    the reverse profile washes out under the percentile, exactly as for the depart-after kernel."""
+    """The committed-plan kernel is EXACTLY equivalent between the compiled (production) and
+    pure-python paths: the raw commute_all draws are byte-equal (was <=2 min at the served p50
+    while the footpath relax was order-dependent; the snapshot relax removed the only source of
+    divergence). Byte-equality holds despite the float perturbation path because both sides run
+    the identical float64 ops (d0 + slope*elapsed, truncated to int64) before the all-integer
+    sweep, and the tail readout is integer throughout."""
     from core import raptor as R
     if R._select_kernel() != "numba":
         pytest.skip("numba not installed; only the python reference is exercised")
@@ -254,11 +557,13 @@ def test_mc_committed_numba_matches_python(engine):
                                         engine.max_min, d0, sl, kernel="numba")
     py = R.montecarlo_commute_committed(engine.data, eg, ew, engine.Tgrid, legs, perfect,
                                         engine.max_min, d0, sl, kernel="python")
-    reach = perfect >= 0
-    r_nb = np.ceil(np.percentile(nb, 50, axis=1)); r_py = np.ceil(np.percentile(py, 50, axis=1))
-    diff = np.abs(r_nb - r_py)[reach]
-    print(f"\n[mc committed numba==python] realistic p50 max={diff.max():.0f} mean={diff.mean():.3f}")
-    assert diff.max() <= 2, f"committed numba vs python realistic differ by {diff.max():.0f} min (>2)"
+    n_diff = int(np.sum(nb != py))
+    print(f"\n[mc committed numba==python] commute_all cells differing: {n_diff}")
+    assert n_diff == 0, (
+        f"committed numba vs python commute_all differ in {n_diff} entries "
+        f"(max |diff| {np.abs(nb - py).max():.3f} min) — the two paths must be byte-equal "
+        "now that the reverse sweep is snapshot-relaxed"
+    )
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
@@ -308,11 +613,100 @@ def test_mc_fifo_clamp_sorted(engine):
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_assemble_departafter_nonuniform_grid_fallback(engine, monkeypatch):
+    """The arithmetic-indexing assemble kernel (searchsorted -> di + ceil(w/step)) is only
+    valid when dep_grid is uniform and shares origin + step with cell_deps. The engine's grids
+    always qualify, but ``raptor.assemble_departafter`` is a PUBLIC dispatch with
+    caller-supplied grids (prototypes/spike_raptor/validate_core.py passes its own), so the
+    dispatch must (a) route the uniform engine grids to the arith kernel and (b) FALL BACK to
+    the general binsearch kernel on a non-uniform grid — byte-equal to calling it directly."""
+    from core import raptor as R
+    from core import raptor_numba as RN
+    if R._select_kernel() != "numba":
+        pytest.skip("numba not installed; the dispatch only has the python path")
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"], np.int32)
+    ew, pw_s, _ = engine._scale_walk(z["egress_w"], pw, 1.0)
+    latest = engine._reverse(eg, ew, engine.Tgrid)
+    dg = np.asarray(engine.dep_grid, np.int64)
+    cd = np.asarray(engine.cell_deps, np.int64)
+    arrW = R.stop_arrival_profile(latest, engine.Tgrid, dg)
+    acc = (engine.access_off, engine.access_to, engine.access_w)
+
+    def boom(*a, **k):
+        raise AssertionError("dispatch routed to the wrong assemble kernel")
+
+    # (a) uniform engine grids -> the arith kernel (binsearch must never be touched)
+    with monkeypatch.context() as m:
+        m.setattr(RN, "assemble_departafter", boom)
+        out_u = R.assemble_departafter(*acc, pw_s, arrW, dg, cd, engine.max_min, (5, 50))
+    # (b) non-uniform dep_grid (one interior point + its arrivalW column removed) -> the
+    #     binsearch kernel (arith must never be touched)
+    dg_nu = np.delete(dg, 3)
+    arrW_nu = np.ascontiguousarray(np.delete(arrW, 3, axis=1))
+    with monkeypatch.context() as m:
+        m.setattr(RN, "assemble_departafter_arith", boom)
+        out_nu = R.assemble_departafter(*acc, pw_s, arrW_nu, dg_nu, cd,
+                                        engine.max_min, (5, 50))
+    # both routes byte-equal to the binsearch kernel called directly on the same inputs
+    pcts = np.asarray((5, 50), np.float64)
+    a64 = tuple(np.asarray(x, np.int64) for x in acc)
+    ref_u = RN.assemble_departafter(*a64, np.asarray(pw_s, np.int64), arrW, dg, cd,
+                                    np.int64(engine.max_min), pcts)
+    ref_nu = RN.assemble_departafter(*a64, np.asarray(pw_s, np.int64), arrW_nu, dg_nu, cd,
+                                     np.int64(engine.max_min), pcts)
+    assert np.array_equal(out_u, ref_u), "arith fast path diverged from the binsearch kernel"
+    assert np.array_equal(out_nu, ref_nu), "non-uniform fallback diverged from binsearch"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_tgrid_truncation_byte_identical(engine, monkeypatch):
+    """montecarlo() truncates the MC tail-readout grid at max(commit_home over transit cells)
+    + cap: every dropped deadline yields tt > cap -> capf for every cell regardless of the
+    draw, so truncation must be provably OUTPUT-IDENTICAL — the kernel's commute_all byte-equal
+    to a full-Tgrid_mc run with the same draws. (commit_home <= the 09:00 target, so the bound
+    always undercuts the grid end; HOW MANY deadlines drop is workplace-dependent.) Spies on
+    the kernel call from montecarlo() to capture the served grid + result, then re-runs the
+    captured args on the full grid; 2 seeds, small R."""
+    from core import raptor as R
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"]); ew = np.asarray(z["egress_w"])
+    real_fn = R.montecarlo_commute_committed
+    full = np.asarray(engine.Tgrid_mc)
+    for seed in (3, 11):
+        cap = {}
+
+        def spy(data, eg_, ew_, deadlines, legs, perfect, max_min, d0, sl, **kw):
+            cm = real_fn(data, eg_, ew_, deadlines, legs, perfect, max_min, d0, sl, **kw)
+            cap.update(deadlines=np.asarray(deadlines), cm=cm.copy(),
+                       args=(data, eg_, ew_, legs, perfect, max_min, d0, sl), kw=kw)
+            return cm
+
+        with monkeypatch.context() as m:
+            m.setattr(R, "montecarlo_commute_committed", spy)
+            engine.montecarlo(eg, ew, pw, seed=seed, n_draws=6, alt_draws=0)
+        assert cap, "montecarlo() never reached the MC kernel"
+        used = cap["deadlines"]
+        assert np.array_equal(used, full[:len(used)]), \
+            "served MC grid is not an inclusive prefix of Tgrid_mc"
+        assert len(used) < len(full), "truncation dropped no deadline (bound logic regressed?)"
+        data, eg_, ew_, legs, perfect, max_min, d0, sl = cap["args"]
+        cm_full = real_fn(data, eg_, ew_, full, legs, perfect, max_min, d0, sl, **cap["kw"])
+        assert cm_full.shape == cap["cm"].shape
+        assert np.array_equal(cm_full, cap["cm"]), \
+            f"seed {seed}: truncated commute_all != full-grid commute_all"
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_numba_matches_python(engine):
-    """The compiled kernel (production) and the pure-python reference are equivalent: both
-    drive the FULL engine path to the same per-cell p50 within <= 2 min (the order-dependent
-    transfer relaxation washes out in assembly), and both stay accurate vs R5. This is the
-    "speed never costs accuracy" guard for the optimization."""
+    """The compiled kernel (production) and the pure-python reference are EXACTLY equivalent:
+    both drive the FULL engine path (sweep -> profile inversion -> assembly -> percentiles) to
+    the identical per-cell output — every cell, every percentile, including the None
+    (unreachable) pattern (was <=2 min while the footpath relax was scan-order-dependent; the
+    snapshot relax closed that), and both stay accurate vs R5. This is the "speed never costs
+    accuracy" guard for the optimization."""
     from core import raptor as R
     if R._select_kernel() != "numba":
         pytest.skip("numba not installed; only the python reference is exercised")
@@ -325,9 +719,83 @@ def test_numba_matches_python(engine):
         py = engine.departafter(z["egress_g"], z["egress_w"], _purewalk_aligned(engine, z))
     finally:
         R._NUMBA = saved
-    diffs = [abs(nb[c][1] - py[c][1]) for c in engine.cell_ids
-             if nb[c][1] is not None and py[c][1] is not None]
-    assert max(diffs) <= 2, f"numba vs python p50 differ by {max(diffs)} min (> 2)"
+    bad = [c for c in engine.cell_ids if nb[c] != py[c]]
+    assert not bad, (
+        f"numba vs python departafter differ on {len(bad)} cells "
+        f"(first: {bad[0]} -> {nb[bad[0]]} vs {py[bad[0]]}); the two paths must be byte-equal "
+        "now that the reverse sweep is snapshot-relaxed"
+    )
     # both kernels must be accurate vs R5 (not just agree with each other)
     e_nb, _, _ = _errors(engine, z)
     assert e_nb.mean() <= 1.2
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_select_matches_reference_loop(engine):
+    """Permanent loop-equivalence gate for raptor_journey.JourneyTree._select_arrays — the
+    vectorized (segmented-reduce, ~30x) replacement for the original per-cell access-stop
+    selection loop. The loop itself was DELETED in that change, so the one-off gate script
+    that compared the two became unrunnable; this test re-implements the loop verbatim as
+    the reference and asserts _select returns the identical tuple, covering the documented
+    edge cases: empty access segments, all-unreachable segments, the first-index tie rule
+    (strict >), and the pure-walk wins-or-ties rule (>=)."""
+    from core.raptor import NEG
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"], np.int32)
+    tree = engine.journey_tree(eg, z["egress_w"], pw)
+    best, off = tree.best, np.asarray(tree.access_off, np.int64)
+    to, aw_arr = tree.access_to, tree.access_w
+    n = tree.n_cells
+    # a few hundred cells spread across the grid + every empty-access-segment cell (edge case)
+    cells = set(range(0, n, max(1, n // 400)))
+    cells |= set(int(c) for c in np.flatnonzero(np.diff(off) == 0)[:10])
+    n_transit = n_walk = n_empty = 0
+    for ci in sorted(cells):
+        # ---- reference: the original per-cell selection loop, verbatim semantics ----
+        latest = int(NEG); s_star = -1; aw = 0
+        for a in range(int(off[ci]), int(off[ci + 1])):
+            h = int(best[int(to[a])]) - int(aw_arr[a])
+            if h > latest:                       # strict >: FIRST index achieving the max wins
+                latest = h; s_star = int(to[a]); aw = int(aw_arr[a])
+        pwv = int(tree.purewalk[ci])
+        walk_home = tree.deadline - pwv if pwv >= 0 else int(NEG)
+        expect = ((None, pwv, walk_home, True) if walk_home >= latest   # walk wins or ties
+                  else (s_star, aw, latest, False))
+        got = tree._select(ci)
+        assert got == expect, f"cell {ci}: _select {got} != reference loop {expect}"
+        if off[ci] == off[ci + 1]:
+            n_empty += 1
+        if expect[3]:
+            n_walk += 1
+        else:
+            n_transit += 1
+    assert len(cells) >= 300, "fixture spread too thin to be a meaningful gate"
+    assert n_transit > 100 and n_walk > 0, (
+        f"coverage skewed (transit={n_transit}, walk={n_walk}) — both _select branches "
+        "must be exercised"
+    )
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_assemble_departafter_rejects_negative_access_w(engine):
+    """The arith assemble kernel hoists kw = ceil(w/step) per access pair; a NEGATIVE walk
+    seconds entry would make k = di + kw index before the arrivalW row origin — numba does
+    no bounds checking, so that's a silent out-of-range read, not an IndexError. The
+    dispatch must refuse negative access_w loudly before reaching the kernel."""
+    from core import raptor as R
+    if R._select_kernel() != "numba":
+        pytest.skip("numba not installed; the guard protects the numba dispatch")
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    eg = np.asarray(z["egress_g"], np.int32)
+    ew, pw_s, _ = engine._scale_walk(z["egress_w"], pw, 1.0)
+    latest = engine._reverse(eg, ew, engine.Tgrid)
+    dg = np.asarray(engine.dep_grid, np.int64)
+    arrW = R.stop_arrival_profile(latest, engine.Tgrid, dg)
+    aw_bad = engine.access_w.copy()
+    assert aw_bad.size, "engine access table unexpectedly empty"
+    aw_bad[0] = -1
+    with pytest.raises(AssertionError, match="negative walk seconds"):
+        R.assemble_departafter(engine.access_off, engine.access_to, aw_bad, pw_s, arrW,
+                               dg, engine.cell_deps, engine.max_min, (5, 50))

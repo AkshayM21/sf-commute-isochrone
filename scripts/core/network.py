@@ -19,14 +19,16 @@ def build_network(gtfs_paths):
     return TransportNetwork(str(config.osm_path()), [str(p) for p in gtfs_paths])
 
 
-def _common(dep, max_rides=DEFAULT_MAX_RIDES):
+def _common(dep, max_rides=DEFAULT_MAX_RIDES, window=None):
     """The shared routing parameters (the canonical commute model) for both the matrix
     and per-origin RegionalTask paths, so they can never drift. ``max_rides`` caps the
     number of public-transport rides (rides = transfers + 1); the default equals R5's own
-    default so an unset value reproduces today's behavior exactly."""
+    default so an unset value reproduces today's behavior exactly. ``window`` (a timedelta)
+    overrides the canonical departure window — None keeps config.window(); diagnostic probes
+    pass timedelta(minutes=1) for single-departure routing."""
     return dict(
         departure=dep,
-        departure_time_window=config.window(),
+        departure_time_window=config.window() if window is None else window,
         max_time=dt.timedelta(minutes=config.MAX_MIN),
         transport_modes=MODES,
         percentiles=config.PERCENTILES,
@@ -52,12 +54,16 @@ def walk_time_matrix(net, origins, destinations, dep, max_min, *, snap_to_networ
 
 
 def routing_template(net, dest, dep, *, paths=False, n_paths=8,
-                     max_rides=DEFAULT_MAX_RIDES):
+                     max_rides=DEFAULT_MAX_RIDES, window=None):
     """A reusable RegionalTask routing TO `dest` (callers set .origin per request, then
     clone with copy.copy for thread-safe per-origin routing). paths=True records detailed
-    leg paths for itinerary breakdowns. ``max_rides`` caps public-transport rides."""
-    t = RegionalTask(net, origin=None, destinations=dest, **_common(dep, max_rides))
-    t.destinations = dest
+    leg paths for itinerary breakdowns. ``max_rides`` caps public-transport rides;
+    ``window`` overrides the departure window (see ``_common``). RegionalTask.__init__
+    already runs the destinations setter (building the FreeFormPointSet before the
+    transport_modes linkage prewarm) — do NOT re-assign t.destinations afterwards, it
+    would rebuild the point set AFTER the prewarm."""
+    t = RegionalTask(net, origin=None, destinations=dest,
+                     **_common(dep, max_rides, window=window))
     if paths:
         t._regional_task.includePathResults = True
         t._regional_task.nPathsPerTarget = n_paths

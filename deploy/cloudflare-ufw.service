@@ -1,7 +1,8 @@
 [Unit]
-Description=Refresh Cloudflare IP allowlist in ufw
-After=network-online.target ufw.service
+Description=Refresh Cloudflare IP allowlist in firewalld
+After=network-online.target firewalld.service
 Wants=network-online.target
+Requires=firewalld.service
 
 [Service]
 Type=oneshot

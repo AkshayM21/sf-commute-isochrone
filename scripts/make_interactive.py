@@ -30,6 +30,9 @@ def main():
 
     neigh = grid.load_neighborhoods()
     g = gpd.sjoin(g, neigh[["name", "geometry"]], how="left", predicate="within").drop(columns="index_right")
+    # a cell on a neighborhood border matches twice in the within-join -> duplicate features
+    # (mirrors grid.attach_neighborhoods' drop_duplicates guard)
+    g = g.drop_duplicates(subset="id")
 
     # square cells (200m) from the point grid
     cells = g.copy()

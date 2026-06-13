@@ -34,17 +34,42 @@ light R5 walk matrix**, then runs the engine. The only R5 use on the map path; n
 - **Access cap 25 min** cleared the access-starved periphery (max err 15→7, mismatches 20→5 vs a
   20-min cap). 250 m footpaths beat 400 m (400 m adds transfers R5 doesn't take → fast bias).
 - **Wider trip band** (to 10:20 = window + routing cap) fixed most periphery reachability misses.
+- **SNAPSHOT footpath relax** (2026-06-10, output-changing): every footpath relaxation pass (the
+  egress-seed pass + each round's pass) computes candidates from the SOURCE stops' values FROZEN
+  at the start of the pass, never from live `best[]`. That makes the relax order-independent, so
+  the three lockstep siblings (`raptor.reverse_raptor` / `reverse_raptor_traced` /
+  `raptor_numba._profile`) are now **BYTE-EQUAL** despite their different scan orders (the old
+  live-read let multi-hop walk cascades fire per scan order — measured on the ferry workplace:
+  **7.8% of reachable stops** diverged, the live-read better by up to ~1183 s and the snapshot
+  better by up to ~263 s; cell-level ~50/2999 served cells shifted −2..+6 min, 0 reachability
+  flips). numba==python is now exact end-to-end (`test_lockstep_byte_equal`,
+  `test_numba_matches_python` ==0). The python `stop_arrival_profile` fallback mirrors the
+  kernel's explicit binary search (byte-parity on any input).
+- **MONOTONE profile rows** (2026-06-10, output-changing): a stop's latest-departure row must be
+  non-decreasing in the deadline (any journey arriving by T also arrives by T' > T), but the
+  marked-stop pruning + one-hop footpath policy left ~58 non-monotone rows (worst violation
+  958 s, ferry workplace) that the profile inversion + the MC tail readout binary-searched as if
+  sorted. The profile producers now finish with a **row-wise running max** over the deadline
+  axis (in-kernel in `raptor_numba._profile`, `np.maximum.accumulate` in the python
+  `reverse_profile` fallback) — provably valid (it restores only feasible journeys the pruning
+  dropped) and it makes every downstream binary search well-defined. Output effect at minute
+  resolution: **none measured** — 0 cells change on depart-after across the 5 oracles + ferry,
+  0 on the arrive-by traced tree (served map + golden), 0 on the MC overlay; the 5-oracle
+  aggregate (MAE 0.7502) is unchanged. The value is defensive (the restored entries are real
+  but sub-minute on current data). Guard: `test_profile_rows_monotone`; lockstep compares the
+  cummaxed reference columns.
 
 ## Accuracy vs R5 (5 diverse workplaces, full 2999-cell grid, depart-after p50)
+**Snapshot-relax baseline (re-stamped 2026-06-10):**
 
 | workplace  |   n  | MAE | p95 | max | bias  | true-mism | within-2min |
 |------------|-----:|----:|----:|----:|------:|----------:|------------:|
-| downtown   | 2996 | 0.75| 3.0 |  6  | −0.32 |     0     |    95%      |
-| sunset     | 2885 | 0.76| 2.0 |  7  | +0.26 |     0     |    98%      |
-| bayview    | 2753 | 0.97| 2.0 |  7  | +0.61 |     5     |    96%      |
-| westportal | 2997 | 0.57| 2.0 |  6  | +0.11 |     0     |    99%      |
-| caltrain   | 2982 | 0.71| 3.0 |  6  | −0.41 |     0     |    94%      |
-| **AGGREGATE** | **14613** | **0.75** | **2.0** | **7** | **+0.04** | **5** | **96%** |
+| downtown   | 2996 | 0.74| 3.0 |  5  | −0.30 |     0     |    95%      |
+| sunset     | 2885 | 0.76| 2.0 |  7  | +0.28 |     0     |    98%      |
+| bayview    | 2753 | 0.98| 2.0 |  7  | +0.62 |     5     |    96%      |
+| westportal | 2997 | 0.59| 2.0 |  6  | +0.18 |     0     |    99%      |
+| caltrain   | 2982 | 0.70| 3.0 |  6  | −0.40 |     0     |    94%      |
+| **AGGREGATE** | **14613** | **0.75** | **2.0** | **7** | **+0.06** | **5** | **97%** |
 
 Ground truth = R5's exact forward per-cell pass (R5 has no native arrive-by, so the headline is
 its depart-after window p50; the engine reproduces it by inverting the reverse profile, which
@@ -57,10 +82,12 @@ a few-minute modeling nuance flips the cell. Chasing them is diminishing returns
 relaxed the target to "within ~1 min of R5"); the headline beats today's fast map decisively
 (MAE 1.49, max 7, *wrong direction*).
 
-## Speed & footprint
-- Reverse sweep **14 ms**; profile inversion 11 ms; assembly **117 ms** (numba) — full grid.
-- **depart-after 137 ms, arrive-by 26–44 ms** per request, single core (numba, nogil).
-- `/compute` end-to-end (incl. the one R5 walk matrix) **~140 ms** for the full grid.
+## Speed & footprint (re-measured 2026-06-10, post arith-assembly + snapshot relax + monotone cummax)
+- Reverse sweep **14 ms**; profile inversion ~11 ms; assembly now arithmetic-indexed (~7×).
+- **depart-after ~41 ms, arrive-by ~35 ms** per request, full grid, single core (numba, nogil).
+- `/compute` end-to-end **~105–130 ms** for a FRESH workplace (incl. the JVM-free walk-router
+  Dijkstra); repeat for the same workplace+params is served from cache (~0 ms).
+- MC committed kernel (24 draws, full grid, `prange`) **~120 ms**.
 - nogil kernels → concurrent requests scale across cores (no per-request all-core hogging).
 - Resident ~15 MB (structs + access CSR); COW-shareable across fork workers → flat memory under
   load. Suits a small free box with many concurrent users.
@@ -100,6 +127,18 @@ we load), `raptor_build` v2 (feed-aware names: Muni 8 vs BART Red-N). Wired into
 minutes by construction), feed-aware names, color-by-line in ~5 ms and **deterministic across
 reboots** (R5's flipped ~1057 cells per boot). No R5 recorded-path compute, no `_HEAVY_LOCK`/fan.
 
+**Hover route GEOMETRY (2026-06-10):** `/itinerary` now also returns `geom` — an ordered leg
+list aligned **1:1 with the breakdown legs** (same trace, same `_clock` folding), each
+`{mode, name, feed, tmode, min, wait?, pts:[[lat,lon],…], approx?}`. Ride legs = the pattern's
+stop-coordinate sequence board→alight; walk legs = REAL street paths from `core/walk.PathTree`
+(Dijkstra `return_predecessors=True` predecessor chains, direction-aware: egress/pure-walk walk
+the W-rooted TRANSPOSED tree, access a cell-rooted forward tree; straight 2-pt `approx:true`
+fallback without the graph). The W-rooted tree is cached per workplace (`_WALKPATH_TREE_CACHE`),
+assembled responses per cell inside the tree-cache entry (`entry["geom"]`, ~45 ms cold / ~0 ms
+warm). Frontend draws it on hover (white-cased polylines, line-label pills, total badge); click
+PINS it (popup lifecycle = pin lifecycle; hover-draw suppressed while pinned). Legacy R5 path
+serves `geom:null`. Tests: `test_api.py::test_itinerary_geom_*`.
+
 **Open wall (measured):** RAPTOR's reconstructed routes match R5's dominant line only **~46%**
 (59% corridor-collapsed; **18% even at the same departure minute**). Root cause: (1) the reverse
 **latest-departure** objective produces valid-but-different journeys than R5's **earliest-arrival**;
@@ -137,9 +176,9 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   trip on that committed line** (a late earlier train you can also catch), rides to the committed
   alight, then re-optimizes the **tail** from the *actual* (late) arrival via the perturbed reverse
   profile. So a late first leg that blows a transfer **eats a real headway**. It tracks R5's
-  depart-window p50 closely (agg **41.1**, bias ≈ **0** over 5 workplaces — committed = best
+  depart-window p50 closely (agg **41.3**, bias ≈ **0** over 5 workplaces — committed = best
   departure + small service delay, which is what R5's window median already measures), with a modest
-  fragility tail (`frag90` 3–6 min; SF transit is frequent). `perfect ≤ committed` holds (clamped +
+  fragility tail (`frag90` 3–8 min; SF transit is frequent). `perfect ≤ committed` holds (clamped +
   asserted). **GOTCHA:** the boarding key is `commit_home + walk0` with NO extra board_slack —
   `commit_home` already places you at the stop exactly at your committed trip's departure (the
   perfect-timing arrive-by assumption), so adding slack would skip your own trip to the next one and
@@ -153,6 +192,19 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   *traced* perturbed arrive-by trees (reuses `JourneyTree`), so a delayed express lets the next local
   show up as an alternative ("also serves: 38, 5R"). Pricier (pure-python trace, ~0.7 s for 4 draws),
   env-tunable (`RAPTOR_MC_ALT_DRAWS`), excludes the cell's normal line.
+- **Drawn alt routes** (the "draw the alt-line route on hover" feature): `_mc_alt_lines` no longer
+  discards the K perturbed trees — `montecarlo()` returns an `alt_bundle` (per-draw: the perturbed
+  `pat_dep`/`pat_arr` columns + the `reverse_raptor_traced` parent arrays + the per-cell dominant
+  list; ~a few MB at K=4) so any draw can be re-traced cheaply via `engine.alt_journey_tree(bundle,
+  di)` (no RAPTOR re-run). The server stashes the bundle + the per-cell chip set in the `/variance`
+  MC cache entry (same coarse key = workplace+rides+**speed**), and `/itinerary` returns
+  `alts: [{line, min, legs:[…geom legs…]}]` — for each chip line the first captured draw whose
+  dominant for that cell is that line, traced + assembled through the SAME `_JourneyGeomProvider`
+  the primary route uses (real street walk legs; provider shared with the primary geom so the
+  per-cell access Dijkstra isn't redone). Lazy + cached: the K `JourneyTree`s build once per
+  workplace on the first alt hover (~20 ms), the assembled `alts` cache per cell (warm hover ≈0 ms);
+  `/itinerary` **never** triggers the MC build, so `alts: []` until `/variance` lands (then the
+  frontend re-hovers). `server._itinerary_alts` + `_mc_peek`.
 - **Serving:** lazy `/variance` endpoint (`server._raptor_mc`, cached per workplace, deterministic
   per-workplace seed, reuses the cached arrive-by tree → no re-trace), fetched by the frontend AFTER
   `/compute` paints the perfect map (progressive refinement, like `/compute_exact`). NEVER on the
@@ -162,10 +214,11 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
 
 **Validation** (`scripts/raptor_validate_mc.py`, `tests/test_raptor.py::test_mc_*`): committed vs R5's
 *schedule-perfect* p50 (NOT ground truth for a delayed commute — committed should sit ABOVE it).
-Aggregate over 5 workplaces **41.1**, bias vs R5 **≈0** (per-workplace −1.1…+2.3); **0** `perfect ≤
-committed` violations, the zero-perturbation guard (committed == perfect ± grid rounding, the
-board-slack regression test), FIFO-clamp sortedness, and numba==python (the committed kernel agrees
-with the pure-python reference within ≤2 min at the served p50, the depart-after relaxation tolerance).
+Aggregate over 5 workplaces **41.3**, bias vs R5 **+0.25** (per-workplace −0.8…+2.7; snapshot-relax
+re-stamp 2026-06-10); **0** `perfect ≤ committed` violations, the zero-perturbation guard
+(committed == perfect ± grid rounding + seam slack, the board-slack regression test), FIFO-clamp
+sortedness, and numba==python (the committed kernel's `commute_all` is **byte-equal** to the
+pure-python reference since the snapshot footpath relax — the old ≤2 min tolerance is retired).
 
 > **Caveat:** the committed model fixes only the FIRST leg; the **tail** still re-optimizes
 > clairvoyantly (you have real-time info en route, e.g. you check the app and grab the next local). So
@@ -174,7 +227,12 @@ with the pure-python reference within ≤2 min at the served p50, the depart-aft
 > upgrade.
 
 Knobs (env): `RAPTOR_MC` (1), `RAPTOR_MC_DRAWS` (24), `RAPTOR_MC_ALT_DRAWS` (4), `RAPTOR_MC_SHAPE`
-(2.0), `RAPTOR_MC_MU_{BUS,METRO,CABLE,BART,CALTRAIN}` (70/45/40/25/40 s initial delay mean).
+(2.0), `RAPTOR_MC_MU_{BUS,METRO,CABLE,BART,CALTRAIN}` (70/45/40/25/40 s initial delay mean — BART/
+Caltrain matched by feed STEM, not position), `RAPTOR_MC_DEADLINE_STEP` (60 — the MC tail readout
+runs on its own finer deadline grid `Tgrid_mc`, since the map's 180 s step rounded every draw up by
+U(0,180) s ≈ +1.5 min before the percentile). The served stats are one consistent distribution: the
+draws are floored at `perfect` BEFORE p50/p90/std/stuck (so `realistic + frag ≈ p90` per cell), and
+the pre-floor p50 is returned as `realistic_raw` for the tests/validator.
 
 ## Phase B: hill-aware R5-free walk router + walk-speed toggle (`USE_WALK_GRAPH=1`) — DROPS THE JVM
 Replaces R5's last runtime job (the per-workplace walk matrix) with a custom **slope-aware**

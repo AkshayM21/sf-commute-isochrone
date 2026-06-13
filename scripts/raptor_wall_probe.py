@@ -6,6 +6,10 @@ traced journey as FAST as R5's earliest-arrival journey, or slower?
                    latest-departure tree reconstructs a valid-but-not-fastest journey)
 
 Prints concrete side-by-side examples + the distribution of (RAPTOR_total - R5_total).
+
+NOTE: this probe NEEDS the JVM — the R5 side of the diff uses server.NET + recorded paths,
+which are None under the default JVM-free boot (USE_RAPTOR=1 USE_WALK_GRAPH=1 arriveby).
+We force the R5 path below by defaulting USE_WALK_GRAPH=0 before importing server.
 """
 import os, sys
 import datetime as dt
@@ -13,14 +17,19 @@ from pathlib import Path
 _mem = os.environ.get("R5_MAX_MEMORY")
 if _mem and "--max-memory" not in sys.argv:
     sys.argv += ["--max-memory", _mem]
+# Force the R5 boot (server._NEED_R5) BEFORE `import server`: under the default JVM-free env
+# server.NET/server.network are None and every R5 call below would AttributeError. setdefault
+# respects an explicit override; the assert after import catches a still-lean env loudly.
+os.environ.setdefault("USE_WALK_GRAPH", "0")
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import numpy as np
 import geopandas as gpd
 from shapely.geometry import Point
 import server
-from core import config, raptor_engine
-from r5py.r5.regional_task import RegionalTask
+assert server._NEED_R5, ("this probe needs the R5/JVM boot (server.NET) — "
+                         "don't force USE_WALK_GRAPH=1/RAPTOR_SEMANTIC=arriveby for it")
+from core import config, network, raptor_engine, raptor_golden
 
 GOLDEN = ROOT / "tests" / "raptor_golden"
 NAME = os.environ.get("WP", "downtown")
@@ -29,7 +38,7 @@ N = int(os.environ.get("N", "60"))
 eng = raptor_engine.RaptorEngine(verbose=False)
 z = np.load(GOLDEN / f"oracle_{NAME}.npz", allow_pickle=True)
 lat, lon = float(z["lat"]), float(z["lon"])
-pw = np.array([int(z["purewalk"][i]) for i in range(len(eng.cell_ids))], np.int64)
+pw = raptor_golden.purewalk_aligned(eng, z)
 tree = eng.journey_tree(z["egress_g"], z["egress_w"], pw)
 commute, dom = tree.commute_and_dominant()
 svc = eng.service_date
@@ -42,14 +51,10 @@ def r5_itin_at(olat, olon, dep_dt):
     if o.is_empty:
         return None
     dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    t = RegionalTask(server.NET, origin=o, destinations=dest, departure=dep_dt,
-                     departure_time_window=dt.timedelta(minutes=1),
-                     max_time=dt.timedelta(minutes=config.MAX_MIN),
-                     transport_modes=server.network.MODES, percentiles=config.PERCENTILES,
-                     speed_walking=config.WALK_KMH, max_public_transport_rides=8)
-    t.destinations = dest
-    t._regional_task.includePathResults = True
-    t._regional_task.nPathsPerTarget = 8
+    # canonical params from the ONE template (single-departure window for the probe)
+    t = network.routing_template(server.NET, dest, dep_dt, paths=True,
+                                 window=dt.timedelta(minutes=1))
+    t.origin = o
     result = r5.analyst.TravelTimeComputer(t, server.NET).computeTravelTimes()
     vals = result.travelTimes.getValues()
     p5 = int(vals[0][0]); p50 = int(vals[1][0])
@@ -92,15 +97,15 @@ for i in sample:
         r5faster += 1
     else:
         mefaster += 1
-    if len(examples) < 8 and (d != 0 or seq(my) != seq(r5)):
+    if len(examples) < 8 and (d != 0 or seq(my) != seq(r5it)):
         examples.append((eng.cell_ids[i], int(latest_home), my, r5it, d))
 
 print(f"workplace={NAME}  departure = RAPTOR's own latest-feasible D*  (n={len(deltas)})")
 print("\nExamples (RAPTOR vs R5 from the SAME departure):")
-for cid, lh, my, r5, d in examples:
+for cid, lh, my, r5b, d in examples:     # r5b, NOT r5: that name is the com.conveyal.r5 module
     tag = "TIE (route ambiguity)" if d == 0 else (f"R5 faster by {d}m (RAPTOR suboptimal)" if d > 0
                                                   else f"RAPTOR faster by {-d}m")
-    print(f"  cell {cid}: RAPTOR {my['total']}m [{seq(my)}]  |  R5 {r5['total']}m [{seq(r5)}]  -> {tag}")
+    print(f"  cell {cid}: RAPTOR {my['total']}m [{seq(my)}]  |  R5 {r5b['total']}m [{seq(r5b)}]  -> {tag}")
 deltas = np.array(deltas)
 print(f"\nSame-departure travel-time delta (RAPTOR - R5):")
 print(f"  equal time (route ambiguity only): {eq}/{len(deltas)} = {eq/len(deltas)*100:.0f}%")
