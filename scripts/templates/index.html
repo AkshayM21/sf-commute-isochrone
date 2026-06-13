@@ -122,10 +122,23 @@
   #toast{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);z-index:1300;
     background:var(--bg-toast);color:var(--ink);border:1px solid var(--line);padding:9px 15px;border-radius:20px;
     font-size:12.5px;display:none;box-shadow:var(--shadow-toast);max-width:84%;text-align:center}
-  /* --- hover tooltip footer: actionable "click to compare … then hover each" hint --- */
+  /* --- hover tooltip footer: surface that ALTERNATIVE routes exist (read-only "also serves"
+         chips, NON-interactive — the map never previews an alt on hover) + a short compare hint --- */
   .bd .altfoot{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);
     font-size:11px;line-height:1.45;color:var(--mut)}
   .bd .altfoot b{color:var(--accent)}
+  .bd .altfoot .alab{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--mut);margin-bottom:5px}
+  .bd .altfoot .alts{display:flex;flex-wrap:wrap;gap:5px 5px;margin-bottom:6px}
+  /* read-only identity chip: a color dot (the alt's compare-list casing color) + line + ~Nm.
+     Pill chrome reads on both themes; cursor:default + no hover/click handlers = non-interactive. */
+  .bd .altfoot .altchip{display:inline-flex;align-items:center;gap:5px;padding:1px 7px 1px 6px;
+    border-radius:8px;background:var(--bg-hover);border:1px solid var(--line);color:var(--ink);
+    font-size:10.5px;font-weight:600;white-space:nowrap;cursor:default}
+  .bd .altfoot .altchip .adot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;
+    border:1px solid rgba(0,0,0,.35);box-shadow:0 0 0 1px rgba(255,255,255,.18)}
+  .bd .altfoot .altchip .amin{color:var(--mut);font-weight:500}
+  .bd .altfoot .ahint{display:block}
   /* --- compare list (pinned card): one selectable strip per route (primary + alts) ----------
          The strip ties to the SINGLE route drawn on the map: its color dot = the drawn line's
          identity casing color, its leg sequence reuses the .leg chip formatting, total right-
@@ -458,13 +471,23 @@ function summaryHTML(d){
 function bdHTML(d){
   if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
   const legsHTML = legsRowHTML(d.legs,false);
-  // Hover tooltip: a subtle hint that alternatives exist (the compare list itself lives in the
-  // pinned card — the map never shows >1 route on hover). Count from d.alts (the drawn re-routes).
+  // Hover tooltip: SURFACE the alternative lines right here (read-only) so you can see multiple
+  // routes exist WITHOUT clicking — but the map still draws ONLY the primary on hover (these chips
+  // are non-interactive: no hover/click handlers, the interactive compare lives in the pinned card).
+  // Each chip's dot uses the SAME identity color the compare strip will show when pinned
+  // (ALT_CASING[k % len]) so the affordance and the eventual pinned list read as the same routes.
   let altfoot="";
-  const nAlt=(d.alts||[]).length;
+  const alts=d.alts||[];
+  const nAlt=alts.length;
   if(nAlt>0){
-    // Tell them the FULL gesture: click pins it, then hovering the listed routes previews each on the map.
-    altfoot=`<div class="altfoot"><b>Click</b> to compare ${nAlt} other route${nAlt==1?"":"s"} — then hover each to see it on the map</div>`;
+    const chips=alts.map((a,k)=>{
+      const col=ALT_CASING[k%ALT_CASING.length];
+      return `<span class="altchip"><span class="adot" style="background:${col}"></span>`+
+        `${escapeHTML(a.line)} <span class="amin">~${a.min}m</span></span>`;
+    }).join("");
+    altfoot=`<div class="altfoot"><span class="alab">also serves</span>`+
+      `<div class="alts">${chips}</div>`+
+      `<span class="ahint"><b>Click</b> to compare on the map</span></div>`;
   } else {
     altfoot=`<div class="altfoot"><b>Click</b> to pin this route</div>`;
   }
@@ -735,6 +758,9 @@ function applyTooltipDir(cellLatLng){
   if(hoverLayer.getTooltip())hoverLayer.openTooltip();
 }
 function openHoverInPlace(l,d){
+  // NEVER reveal a hover tooltip while pinned: a hover whose /itinerary fetch was in flight at
+  // click-time would otherwise reveal AFTER the pin (the "still hovers after I clicked" bug).
+  if(routePin!=null){if(l.getTooltip())l.unbindTooltip();return;}
   if(!l.getTooltip())return;
   const tip=l.getTooltip();
   const anchorLL=(d&&d.olat!=null)?L.latLng(d.olat,d.olon):l.getBounds().getCenter();
@@ -862,6 +888,18 @@ function renderPin(f,d){
   maybeRoute(f.properties.id,d);
 }
 function openPin(f,l){
+  // Entering compare mode — invalidate any in-flight hover fetch (it bails on my!==bdToken) so its
+  // async success can't paint a hover tooltip/route after the pin. The reveal is also guarded by
+  // routePin in openHoverInPlace; this is belt-and-suspenders. (hoverCell stays so closePin can
+  // restore the hover route on unpin.)
+  bdToken++;
+  // LEAK FIX: unbind EVERY cell's tooltip, not just hoverLayer/the clicked layer. A cell hovered
+  // earlier in a continuous sweep is only closeTooltip()'d on mouseout (still BOUND) — Leaflet's
+  // sticky _onMouseMove then REOPENS that already-bound tooltip when the cursor crosses it during
+  // the pinned sweep, bypassing our mouseover routePin guard (which only blocks re-BINDING, not
+  // Leaflet's internal reopen). Unbinding all of them kills every stale sticky so none can flash
+  // while pinned. The mouseover handler rebinds a fresh tooltip on the next (post-unpin) hover.
+  layer.eachLayer(ll=>{if(ll.getTooltip&&ll.getTooltip())ll.unbindTooltip();});
   pinFeature=f;routePin=f.properties.id;
   compareList=[];selKey=PRIMARY_KEY;previewKey=null;     // fresh compare state for this pin
   pinCard.classList.add("open");
@@ -1000,6 +1038,10 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
   // cell click must not be read as a background click, so flag it for that handler.
   l.on("click",ev=>{if(!DESTLL)return;
     justPinned=true;                            // suppress the map-background closePin this tick
+    // …but if stopPropagation prevents the map click entirely, justPinned would never be consumed
+    // and stick true, eating the NEXT real background unpin-click. Clear it after this tick so a
+    // genuine later background click always unpins.
+    setTimeout(()=>{justPinned=false;},0);
     if(ev&&ev.originalEvent)L.DomEvent.stopPropagation(ev);
     // UNBIND (not just close) the cell's hover tooltip + drop its outline → compare mode is the
     // corner card only. closeTooltip() alone leaves the sticky tooltip's mousemove-reopen path live,
