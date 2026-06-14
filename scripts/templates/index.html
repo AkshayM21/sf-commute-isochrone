@@ -205,7 +205,8 @@
     z-index:1050;pointer-events:none;padding:24px;padding-right:354px}
   #prompt .ob{max-width:420px;text-align:center;background:rgb(var(--panel-rgb) / .96);
     color:var(--ink);padding:26px 30px 24px;border:1px solid var(--line);border-radius:16px;
-    box-shadow:var(--shadow-strong);animation:obIn .45s cubic-bezier(.2,.7,.3,1) both}
+    box-shadow:var(--shadow-strong);animation:obIn .45s cubic-bezier(.2,.7,.3,1) both;
+    pointer-events:auto}  /* re-enable interaction on the card (the wrapper is pointer-events:none) */
   @keyframes obIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
   #prompt .ob h2{margin:0 0 10px;font-size:19px;line-height:1.25;font-weight:700;letter-spacing:-.2px}
   #prompt .ob p{margin:0;font-size:13.5px;line-height:1.5;color:var(--mut)}
@@ -215,6 +216,19 @@
     padding:9px 15px;border-radius:9px}
   #prompt .cta .arr{font-size:16px;line-height:1;animation:obArr 1.3s ease-in-out infinite}
   @keyframes obArr{0%,100%{transform:translateX(0)}50%{transform:translateX(4px)}}
+  /* onboarding address form: a real input + Go button (mirrors the panel's .addr chrome so the
+     two are visually consistent across light/dark). Left-aligned text inside the centered card. */
+  #prompt .obform{margin-top:18px;display:flex;gap:6px;text-align:left}
+  #prompt .obac{position:relative;flex:1}
+  #prompt #obaddr{width:100%;background:var(--bg-input);border:1px solid var(--line);color:var(--ink);
+    padding:10px 11px;border-radius:9px;font-size:14px;font-family:inherit}
+  #prompt #obaddr::placeholder{color:var(--mut)}
+  #prompt #obgo{flex:0 0 auto;background:var(--accent);color:var(--ink-on-accent);border:0;
+    padding:0 16px;border-radius:9px;font-weight:600;font-size:14px;cursor:pointer;font-family:inherit}
+  /* onboarding autocomplete dropdown — reuses .ac-item visuals from the panel's #ac */
+  #prompt #obac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:1200;background:var(--bg-input);
+    border:1px solid var(--line);border-radius:9px;overflow:hidden;display:none;box-shadow:var(--shadow-ac);text-align:left}
+  #prompt #obac.open{display:block}
   /* ============ responsive layer (<=719px): desktop >=720px stays byte-identical ============ */
   @media (max-width:719px){
     #map{inset:0}
@@ -264,9 +278,14 @@
 <div id="prompt">
   <div class="ob" role="dialog" aria-label="Get started">
     <h2>Where can you live and still get to work?</h2>
-    <p>Enter your <b>workplace address</b> in the panel to map every neighborhood you could
+    <p>Enter your <b>workplace address</b> below to map every neighborhood you could
       reach by walk&nbsp;+&nbsp;Muni&nbsp;+&nbsp;BART&nbsp;+&nbsp;Caltrain.</p>
-    <span class="cta">Enter your workplace address <span class="arr" aria-hidden="true">→</span></span>
+    <div class="obform">
+      <div class="obac"><input id="obaddr" placeholder="e.g. 1 Market St, San Francisco" autocomplete="off"
+        role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="obac"
+        aria-label="Workplace address"><div id="obac" role="listbox"></div></div>
+      <button id="obgo" type="button" aria-label="Map this workplace">Go <span class="arr" aria-hidden="true">→</span></button>
+    </div>
   </div></div>
 <div id="panel">
   <button id="sheetbtn" aria-label="Toggle controls" aria-expanded="false">Controls</button>
@@ -706,20 +725,37 @@ function rebuildBlocks(placed,badgeLL){
    the offset if all four hit. Tie-break: prefer the side facing AWAY from the workplace bearing. */
 let hoverLayer=null;            // the L.geoJSON layer whose tooltip is currently open (for re-direction)
 let lastTipDir=null;            // last applied direction (skip a rebind when it didn't change)
-let lastTipOff=null;            // last applied offset distance (escalation level)
+let lastTipAx=null;             // last applied ALONG-axis distance (escalation level)
+let lastTipPerp=0;              // last applied PERPENDICULAR shift (slide along the free axis)
 const TIP_OFFSET=14;            // gap (px) between the cell anchor and the tooltip edge
+// Leaflet 1.9 adds a small CONSTANT gap (its tooltip margin) in the placement direction ON TOP of
+// our offset vector — measured empirically as ~6px (constant across ax/perp; see the rect-vs-render
+// check). tipRect folds it in so the predicted rect matches where Leaflet actually paints, which is
+// what makes the off-screen + route-overlap scoring accurate (without it a placement predicted just
+// on-screen renders ~6px past the edge — the left-edge tall-card overshoot bug).
+const TIP_GAP=6;
 let tipSize={w:252,h:150};      // measured tooltip size (filled after the first open)
-function measureTip(){
-  const el=document.querySelector(".leaflet-tooltip.tt .bd");
-  if(el){const tt=el.closest(".leaflet-tooltip");if(tt){const r=tt.getBoundingClientRect();
-    if(r.width>20&&r.height>20)tipSize={w:r.width,h:r.height};}}
+// Measure the tooltip's true rendered size. Prefer a SPECIFIC tooltip container (the one being
+// placed) so a stale lingering `.tt` from a just-left cell can't be measured by mistake (that
+// mis-sizing made the placement think a tall card fit where it didn't → the off-screen edge cases).
+function measureTip(ttEl){
+  const tt=ttEl||document.querySelector(".leaflet-tooltip.tt");
+  if(tt){const r=tt.getBoundingClientRect();
+    if(r.width>20&&r.height>20)tipSize={w:r.width,h:r.height};}
 }
-function tipRect(cp,dir,o){
-  const w=tipSize.w,h=tipSize.h;if(o==null)o=TIP_OFFSET;
-  if(dir==="right") return {l:cp.x+o, t:cp.y-h/2, r:cp.x+o+w, b:cp.y+h/2};
-  if(dir==="left")  return {l:cp.x-o-w, t:cp.y-h/2, r:cp.x-o, b:cp.y+h/2};
-  if(dir==="top")   return {l:cp.x-w/2, t:cp.y-o-h, r:cp.x+w/2, b:cp.y-o};
-  /* bottom */      return {l:cp.x-w/2, t:cp.y+o, r:cp.x+w/2, b:cp.y+o+h};
+// Predicted container-px rect of the tooltip for a (direction, along-axis distance `ax`,
+// perpendicular shift `perp`). `ax` is the gap from the anchor along the placement direction;
+// `perp` slides the card along its FREE axis (vertical for left/right, horizontal for top/bottom)
+// so a side placement can be nudged on-screen + off the route without changing sides. These match
+// Leaflet 1.9's sticky-tooltip rendering of direction + offset vector (see offVec): the offset is
+// [ax,perp] for right, [-ax,perp] for left, [perp,-ax] for top, [perp,ax] for bottom.
+function tipRect(cp,dir,ax,perp){
+  const w=tipSize.w,h=tipSize.h;if(ax==null)ax=TIP_OFFSET;perp=perp||0;
+  const g=ax+TIP_GAP;                                   // ax + Leaflet's constant tip margin
+  if(dir==="right"){const l=cp.x+g,t=cp.y-h/2+perp;return {l,t,r:l+w,b:t+h};}
+  if(dir==="left"){const r=cp.x-g,t=cp.y-h/2+perp;return {l:r-w,t,r,b:t+h};}
+  if(dir==="top"){const t=cp.y-g-h,l=cp.x-w/2+perp;return {l,t,r:l+w,b:t+h};}
+  /* bottom */     const t=cp.y+g,l=cp.x-w/2+perp;return {l,t,r:l+w,b:t+h};
 }
 function hitsIn(rect){
   let n=0;for(const p of TT_AVOID){if(p.x>=rect.l&&p.x<=rect.r&&p.y>=rect.t&&p.y<=rect.b)n++;}
@@ -736,52 +772,81 @@ function bearingOrder(cp){
   }
   return away;
 }
+// Route-INDEPENDENT first open: the first bearing-ordered direction whose simple (centered, min-
+// offset) placement is on-screen. Stays simple ({dir, ax:14, perp:0}) — the perpendicular search
+// is reserved for the route-aware pickTooltipDir so a clean bearing open never moves (no jump).
 function bearingTipDir(cellLatLng){
   const cp=map.latLngToContainerPoint(cellLatLng);
   const sz=map.getSize(), panelW=sz.x>719?330:0;
   for(const dir of bearingOrder(cp)){
-    const rect=tipRect(cp,dir,TIP_OFFSET);
-    if(!(rect.l<2||rect.r>sz.x-2-panelW||rect.t<2||rect.b>sz.y-2)) return {dir,off:TIP_OFFSET};
+    const rect=tipRect(cp,dir,TIP_OFFSET,0);
+    if(!(rect.l<2||rect.r>sz.x-2-panelW||rect.t<2||rect.b>sz.y-2)) return {dir,ax:TIP_OFFSET,perp:0};
   }
-  return {dir:bearingOrder(cp)[0],off:TIP_OFFSET};
+  return {dir:bearingOrder(cp)[0],ax:TIP_OFFSET,perp:0};
 }
+// Route-AWARE placement. For each direction (in bearingOrder), try every (along-axis distance ax,
+// perpendicular shift perp) combo and pick the GLOBAL minimum score. The perpendicular shift is the
+// fix for tall-card edge cells: a top/bottom-edge cell whose left/right placement would run off the
+// top/bottom of the screen can slide DOWN/UP along its free axis until it fits on-screen AND clears
+// the route — instead of falling back to a bottom/top placement that overlaps the descending route.
+// score = route-point hits + 12/pill-or-badge overlap (via hitsIn) + 1e6 off-screen/under-panel
+// + tiny tie-breaks (bearing rank, ax distance, |perp|) so the cleanest, closest, least-shifted
+// on-screen spot wins. span = the card's FREE-axis extent (height for left/right, width for top/bottom).
 function pickTooltipDir(cellLatLng){
   const cp=map.latLngToContainerPoint(cellLatLng);
   const away=bearingOrder(cp);
   const sz=map.getSize();
   const panelW=sz.x>719?330:0;
-  const offsets=[TIP_OFFSET,TIP_OFFSET+34,TIP_OFFSET+72];
-  let best=null,bestScore=Infinity,bestOff=TIP_OFFSET;
-  for(const o of offsets){
-    away.forEach((dir,rank)=>{
-      const rect=tipRect(cp,dir,o);
-      const off = (rect.l<2 || rect.r>sz.x-2-panelW || rect.t<2 || rect.b>sz.y-2);
-      const score = hitsIn(rect) + (off?1e6:0) + rank*0.001 + (o-TIP_OFFSET)*0.01;
-      if(score<bestScore){bestScore=score;best=dir;bestOff=o;}
-    });
-    if(bestScore<1)break;
-  }
-  return {dir:best||"right",off:bestOff};
+  const axes=[TIP_OFFSET,48,86];                         // along-axis escalation
+  let best=null,bestScore=Infinity,bestAx=TIP_OFFSET,bestPerp=0;
+  away.forEach((dir,rank)=>{
+    const vertical=(dir==="right"||dir==="left");        // free axis is vertical for L/R, horizontal for T/B
+    const span=vertical?tipSize.h:tipSize.w;
+    const perps=[0, 0.45*span, -0.45*span, 0.9*span, -0.9*span];
+    // CLAMPED perps: the exact shifts that pin the card flush to each viewport edge along its free
+    // axis. These guarantee an on-screen candidate exists whenever the card fits the free dimension
+    // (the quantized perps above can miss it for a very tall/wide card at an edge cell), so a tall
+    // top/bottom-edge cell ALWAYS finds a side placement slid fully on-screen instead of overlapping.
+    if(vertical){const b0=cp.y-tipSize.h/2;             // base top at perp=0
+      perps.push(2-b0, (sz.y-2-tipSize.h)-b0);}
+    else{const l0=cp.x-tipSize.w/2;                     // base left at perp=0
+      perps.push(2-l0, (sz.x-2-panelW-tipSize.w)-l0);}
+    for(const ax of axes){
+      for(const perp of perps){
+        const rect=tipRect(cp,dir,ax,perp);
+        const off = (rect.l<2 || rect.r>sz.x-2-panelW || rect.t<2 || rect.b>sz.y-2);
+        const score = hitsIn(rect) + (off?1e6:0)
+                    + rank*0.001 + (ax-TIP_OFFSET)*0.01 + Math.abs(perp)*0.002;
+        if(score<bestScore){bestScore=score;best=dir;bestAx=ax;bestPerp=perp;}
+      }
+    }
+  });
+  return {dir:best||"right",ax:bestAx,perp:bestPerp};
 }
-function offVec(dir,o){return dir==="right"?[o,0]:dir==="left"?[-o,0]:dir==="top"?[0,-o]:[0,o];}
+// Leaflet offset vector for a (direction, along-axis ax, perpendicular perp). Mirrors tipRect.
+function offVec(dir,ax,perp){perp=perp||0;
+  return dir==="right"?[ax,perp]:dir==="left"?[-ax,perp]:dir==="top"?[perp,-ax]:[perp,ax];}
 function applyTooltipDir(cellLatLng){
   if(!hoverLayer)return;
   const tip=hoverLayer.getTooltip&&hoverLayer.getTooltip();
   if(!tip||!tip.isOpen())return;
   const tel=tip._container;if(tel&&tel.classList.contains("tt-pending"))return;
-  measureTip();
+  measureTip(tel);
   const cp=map.latLngToContainerPoint(cellLatLng);
   if(lastTipDir){
-    const cur=tipRect(cp,lastTipDir,lastTipOff);
+    // STAY PUT: if the current placement is on-screen AND clear of the route, never move it (a
+    // clean bearing open must not jump when the route lands). Only a dirty/off-screen current
+    // placement triggers the full perpendicular search + a single reposition.
+    const cur=tipRect(cp,lastTipDir,lastTipAx,lastTipPerp);
     const sz=map.getSize(), panelW=sz.x>719?330:0;
     const offscreen=(cur.l<2||cur.r>sz.x-2-panelW||cur.t<2||cur.b>sz.y-2);
     if(!offscreen && hitsIn(cur)===0) return;
   }
   const pick=pickTooltipDir(cellLatLng);
-  const dir=pick.dir, o=pick.off;
-  if(dir===lastTipDir&&o===lastTipOff)return;
-  lastTipDir=dir;lastTipOff=o;
-  tip.options.direction=dir; tip.options.offset=offVec(dir,o);
+  const dir=pick.dir, ax=pick.ax, perp=pick.perp;
+  if(dir===lastTipDir&&ax===lastTipAx&&perp===lastTipPerp)return;   // same placement → don't re-open
+  lastTipDir=dir;lastTipAx=ax;lastTipPerp=perp;
+  tip.options.direction=dir; tip.options.offset=offVec(dir,ax,perp);
   if(hoverLayer.getTooltip())hoverLayer.openTooltip();
 }
 function openHoverInPlace(l,d){
@@ -791,14 +856,23 @@ function openHoverInPlace(l,d){
   if(!l.getTooltip())return;
   const tip=l.getTooltip();
   const anchorLL=(d&&d.olat!=null)?L.latLng(d.olat,d.olon):l.getBounds().getCenter();
-  measureTip();
-  const pick=(d&&d.geom)?pickTooltipDir(anchorLL):bearingTipDir(anchorLL);
-  lastTipDir=pick.dir;lastTipOff=pick.off;
-  tip.options.direction=pick.dir;tip.options.offset=offVec(pick.dir,pick.off);
+  measureTip(tip._container);
+  // First pass with the size measured while the card is still pending (may be slightly off until the
+  // card is laid out). Open + re-measure THIS tooltip, then — for a route-aware cell — pick AGAIN with
+  // the true revealed size so the placement reflects the card's real height (a tall card can clip the
+  // route or an edge if placed off the pending size). This double-pick happens in ONE invisible→visible
+  // step, so there's no visible jump; the card appears once, already in its final, correct-size spot.
+  const applyPick=p=>{lastTipDir=p.dir;lastTipAx=p.ax;lastTipPerp=p.perp;
+    tip.options.direction=p.dir;tip.options.offset=offVec(p.dir,p.ax,p.perp);};
+  applyPick((d&&d.geom)?pickTooltipDir(anchorLL):bearingTipDir(anchorLL));
   l.openTooltip();
-  measureTip();
+  measureTip(tip._container);                            // now the REAL laid-out size (this tooltip only)
   const el=tip._container||document.querySelector(".leaflet-tooltip.tt");
   if(el)el.classList.remove("tt-pending");
+  if(d&&d.geom){                                         // re-pick with the true size; re-open only if it moved
+    const p2=pickTooltipDir(anchorLL);
+    if(p2.dir!==lastTipDir||p2.ax!==lastTipAx||p2.perp!==lastTipPerp){applyPick(p2);l.openTooltip();}
+  }
 }
 /* ---- compare model: build the strip list + draw the selected/previewed route ---------------- */
 let compareList=[];     // pinned cell's route options [{key,line,identityColor,legs,total,isPrimary}]
@@ -1045,8 +1119,8 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
       // once, parked in its final spot, and never visibly repositions/grows (kills the ~0.5s jump).
       // For a CACHED cell onReady fires synchronously in this same tick → it reveals instantly.
       const bt=bearingTipDir(l.getBounds().getCenter());
-      lastTipDir=bt.dir;lastTipOff=bt.off;
-      l.bindTooltip("",{className:"tt tt-pending",sticky:true,opacity:1,direction:bt.dir,offset:offVec(bt.dir,bt.off)}).openTooltip();
+      lastTipDir=bt.dir;lastTipAx=bt.ax;lastTipPerp=bt.perp;
+      l.bindTooltip("",{className:"tt tt-pending",sticky:true,opacity:1,direction:bt.dir,offset:offVec(bt.dir,bt.ax,bt.perp)}).openTooltip();
       const myCell=f.properties.id;
       loadBreak(f,
         h=>{if(l.getTooltip())l.setTooltipContent(h);},   // set content while still invisible (pending)
@@ -1056,7 +1130,7 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
         });
     });
     l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);
-      if(hoverCell===f.properties.id){hoverCell=null;hoverLayer=null;lastTipDir=null;
+      if(hoverCell===f.properties.id){hoverCell=null;hoverLayer=null;lastTipDir=null;lastTipAx=null;lastTipPerp=0;
         if(l.getTooltip())l.closeTooltip();}                 // close the (revealed-or-pending) tooltip on leave
       if(routePin==null)clearRoute();});                      // pinned route survives mouseout
   }
@@ -1091,7 +1165,7 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
 // every layer via inheritance, so `l.isTooltipOpen && l.isTooltipOpen()` doesn't guard.)
 function closeOpenInfo(){
   bdToken++; clearTimeout(bdTimer);
-  routePin=null; hoverCell=null; hoverLayer=null; lastTipDir=null; pendingFitId=null; clearRoute();   // drawn route is stale with the open cards
+  routePin=null; hoverCell=null; hoverLayer=null; lastTipDir=null; lastTipAx=null; lastTipPerp=0; pendingFitId=null; clearRoute();   // drawn route is stale with the open cards
   pinCard.classList.remove("open"); pinFeature=null;   // close the pinned corner card too
   compareList=[];selKey=PRIMARY_KEY;previewKey=null;   // reset compare state
   layer.eachLayer(l=>{
@@ -1368,6 +1442,45 @@ addrEl.addEventListener("keydown",e=>{
   else if(e.key==="Escape"){closeAC();}});
 addrEl.addEventListener("blur",()=>setTimeout(closeAC,120));  // allow click/mousedown to land first
 
+/* ============ onboarding-modal address input ============ */
+// The first-run card lets you type the workplace RIGHT THERE instead of reaching for the panel.
+// It is a thin shell over the SAME geocode path the panel uses: every submit copies the value
+// into the panel's #addr (so it "populates on the right") and calls geocodeSet/setWorkplace —
+// there is exactly ONE geocode code path. setWorkplace hides #prompt (and thus this input) once a
+// workplace is set. Autocomplete reuses the panel's /autocomplete + chooseAC, rendered into #obac.
+const obAddrEl=document.getElementById("obaddr"),obAcEl=document.getElementById("obac");
+let obAcItems=[],obAcIdx=-1,obAcTimer,obAcToken=0;
+function obCloseAC(){obAcEl.classList.remove("open");obAcEl.innerHTML="";obAcItems=[];obAcIdx=-1;
+  obAddrEl.setAttribute("aria-expanded","false");obAddrEl.removeAttribute("aria-activedescendant");}
+function obRenderAC(){if(!obAcItems.length){obCloseAC();return;}
+  obAcEl.innerHTML=obAcItems.map((it,i)=>`<div class="ac-item${i===obAcIdx?" hl":""}" id="obac-item-${i}" role="option" aria-selected="${i===obAcIdx}" data-i="${i}">${escapeHTML(it.label)}</div>`).join("");
+  obAcEl.classList.add("open");obAddrEl.setAttribute("aria-expanded","true");
+  if(obAcIdx>=0)obAddrEl.setAttribute("aria-activedescendant",`obac-item-${obAcIdx}`);
+  else obAddrEl.removeAttribute("aria-activedescendant");}
+// Submit the modal's text via the panel path: mirror it into #addr, then reuse geocodeSet (#go's fn).
+function obSubmit(q){q=(q||"").trim();if(!q)return;addrEl.value=q;obCloseAC();geocodeSet(q);}
+// Choosing an autocomplete suggestion mirrors into #addr and reuses chooseAC (the panel's pick path).
+function obChoose(it){obAddrEl.value=it.label;addrEl.value=it.label;obCloseAC();chooseAC(it);}
+obAcEl.addEventListener("mousedown",e=>{const el=e.target.closest(".ac-item");if(!el)return;
+  e.preventDefault();const it=obAcItems[+el.dataset.i];if(it)obChoose(it);});
+obAddrEl.addEventListener("input",()=>{const q=obAddrEl.value.trim();clearTimeout(obAcTimer);
+  if(q.length<3){obCloseAC();return;}
+  obAcTimer=setTimeout(async()=>{const my=++obAcToken;
+    try{const r=await fetch(`/autocomplete?q=${encodeURIComponent(q)}`);if(!r.ok)return;
+      const d=await r.json();if(my!==obAcToken)return;
+      obAcItems=(d.results||[]).slice(0,6);obAcIdx=-1;obRenderAC();
+    }catch(e){}},250);});
+obAddrEl.addEventListener("keydown",e=>{
+  const open=obAcEl.classList.contains("open");
+  if(e.key==="ArrowDown"&&open){e.preventDefault();obAcIdx=(obAcIdx+1)%obAcItems.length;obRenderAC();}
+  else if(e.key==="ArrowUp"&&open){e.preventDefault();obAcIdx=(obAcIdx-1+obAcItems.length)%obAcItems.length;obRenderAC();}
+  else if(e.key==="Enter"){e.preventDefault();
+    if(open&&obAcIdx>=0&&obAcItems[obAcIdx])obChoose(obAcItems[obAcIdx]);
+    else obSubmit(obAddrEl.value);}                  // plain geocode of typed text
+  else if(e.key==="Escape"){obCloseAC();}});
+obAddrEl.addEventListener("blur",()=>setTimeout(obCloseAC,120));
+document.getElementById("obgo").onclick=()=>obSubmit(obAddrEl.value);
+
 /* ============ Feature 6: neighborhoods export ============ */
 function exportRows(){return nbUnder().map(([n,v])=>[n,v]);}
 document.getElementById("copylist").onclick=async()=>{const rows=exportRows();
@@ -1492,6 +1605,11 @@ legend();   // draw the legend; map stays blank until you set an address
   // address and NO auto-compute — the onboarding prompt shows over an empty map instead.
   if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){
     document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);
+  } else {
+    // First-time visitor: the onboarding card is showing — focus its address input so the user can
+    // just start typing. (No autofocus when a hash/saved wp already drove setWorkplace, which hides
+    // #prompt.) Guard on the prompt actually being visible in case anything above hid it.
+    if(getComputedStyle(document.getElementById("prompt")).display!=="none")obAddrEl.focus();
   }
   redraw();
 })();
