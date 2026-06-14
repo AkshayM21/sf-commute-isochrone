@@ -895,41 +895,22 @@ def test_index_page_is_clean_and_private(client, server):
     # private literal from the gitignored .env at runtime (NOT hardcoded in this test) and
     # assert its absence from the page, which is built once at boot from a generic template.
     #
-    # ONE deliberate exception (commit db727c0): _build_page injects cfg.default_wp — the
-    # resolved .env DEFAULT_ADDRESS — so a fresh browser shows the configured workplace
-    # without typing. We reconstruct that exact JSON fragment the way _build_page does,
-    # assert it appears AT MOST ONCE, strip it, and require the needles absent from
-    # EVERYTHING ELSE — i.e. the single documented injection is the only carrier.
-    # (Product note: on a PUBLIC deployment, setting DEFAULT_ADDRESS in /etc/sfci.env
-    # exposes that address to every visitor — by design of db727c0; leave it unset there
-    # if that matters.)
+    # The page NEVER injects a default workplace (cfg.default_wp is always null) — the old
+    # db727c0 .env DEFAULT_ADDRESS injection was removed so a fresh visitor sees the
+    # onboarding prompt and types their own address instead. So there is NO whitelist
+    # exception: the private workplace strings must be absent from the ENTIRE page.
+    assert '"default_wp": null' in html or '"default_wp":null' in html, (
+        "cfg.default_wp must be null in the served page (no .env workplace injection)"
+    )
     #
     # NB: we deliberately do NOT scrape .dest_cache.json — its keys are incidental geocoder
     # lookups (e.g. "1 Market St"), some of which legitimately appear as UI placeholder text
     # in the template and are not the user's private workplace. The privacy invariant is
     # specifically about the configured DEFAULT_ADDRESS / DEST_LABEL / DEST_LAT/LON.
-    frag = _injected_default_wp_fragment()
-    if frag:
-        assert html.count(frag) <= 1, "default_wp fragment injected more than once"
-        html = html.replace(frag, "", 1)
     for needle in _private_workplace_needles():
         assert needle not in html, (
-            f"served page leaks private workplace value {needle!r} outside the single "
-            "deliberate cfg.default_wp injection"
+            f"served page leaks private workplace value {needle!r}"
         )
-
-
-def _injected_default_wp_fragment():
-    """Reconstruct the exact default_wp JSON fragment server._build_page embeds in __CFG__
-    (same dict construction order + json.dumps defaults + the '<' hardening replace), so the
-    privacy assertion can whitelist precisely that one deliberate injection and nothing else.
-    Returns None when no default workplace is configured/resolvable (strict mode)."""
-    try:
-        import destination as _dest
-        lat, lon, label = _dest._resolve()
-    except Exception:
-        return None
-    return json.dumps({"lat": lat, "lon": lon, "label": label}).replace("<", "\\u003c")
 
 
 def _private_workplace_needles():

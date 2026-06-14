@@ -198,6 +198,23 @@
   /* --- added: mobile bottom-sheet handle (hidden on desktop) --- */
   /* it's a real <button> (keyboard-operable); strip the UA chrome so the sheet styling wins */
   #sheetbtn{display:none;border:0;padding:0;width:100%;font-family:inherit}
+  /* ---- onboarding prompt: a welcoming first-step card over the empty map. The wrapper
+     spans the map area (right-padded so it centers in the visible map, not under the panel)
+     and is pointer-events:none so it never traps map pan/clicks. */
+  #prompt{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    z-index:1050;pointer-events:none;padding:24px;padding-right:354px}
+  #prompt .ob{max-width:420px;text-align:center;background:rgb(var(--panel-rgb) / .96);
+    color:var(--ink);padding:26px 30px 24px;border:1px solid var(--line);border-radius:16px;
+    box-shadow:var(--shadow-strong);animation:obIn .45s cubic-bezier(.2,.7,.3,1) both}
+  @keyframes obIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
+  #prompt .ob h2{margin:0 0 10px;font-size:19px;line-height:1.25;font-weight:700;letter-spacing:-.2px}
+  #prompt .ob p{margin:0;font-size:13.5px;line-height:1.5;color:var(--mut)}
+  #prompt .ob p b{color:var(--ink);font-weight:600}
+  #prompt .cta{margin-top:18px;display:inline-flex;align-items:center;gap:9px;
+    background:var(--accent);color:var(--ink-on-accent);font-size:13px;font-weight:600;
+    padding:9px 15px;border-radius:9px}
+  #prompt .cta .arr{font-size:16px;line-height:1;animation:obArr 1.3s ease-in-out infinite}
+  @keyframes obArr{0%,100%{transform:translateX(0)}50%{transform:translateX(4px)}}
   /* ============ responsive layer (<=719px): desktop >=720px stays byte-identical ============ */
   @media (max-width:719px){
     #map{inset:0}
@@ -234,13 +251,23 @@
     /* on mobile the side panel is a bottom sheet; float the pinned card to a fixed corner
        so it isn't trapped inside the collapsed sheet */
     #pincard{top:10px;right:10px;left:auto;max-width:78vw}
+    /* onboarding: full-width centering (panel is a bottom sheet, not a side rail) and the
+       CTA points DOWN toward the "Controls" sheet handle. Sits above the 52px sheet. */
+    #prompt{padding:18px;padding-bottom:84px;align-items:center}
+    #prompt .ob{max-width:none}
+    #prompt .cta .arr{animation:obArrDn 1.3s ease-in-out infinite}
+    @keyframes obArrDn{0%,100%{transform:translateY(0)}50%{transform:translateY(4px)}}
   }
 </style></head>
 <body>
 <div id="map"></div><div id="busy">computing…</div>
-<div id="prompt" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1050;pointer-events:none">
-  <div style="background:rgb(var(--panel-rgb) / .94);color:var(--ink);padding:18px 24px;border:1px solid var(--line);border-radius:12px;font-size:15px;text-align:center;box-shadow:var(--shadow-strong)">
-    Enter your workplace address  →<br><span style="color:var(--mut);font-size:12.5px">(top-right) to map your commute</span></div></div>
+<div id="prompt">
+  <div class="ob" role="dialog" aria-label="Get started">
+    <h2>Where can you live and still get to work?</h2>
+    <p>Enter your <b>workplace address</b> in the panel to map every neighborhood you could
+      reach by walk&nbsp;+&nbsp;Muni&nbsp;+&nbsp;BART&nbsp;+&nbsp;Caltrain.</p>
+    <span class="cta">Enter your workplace address <span class="arr" aria-hidden="true">→</span></span>
+  </div></div>
 <div id="panel">
   <button id="sheetbtn" aria-label="Toggle controls" aria-expanded="false">Controls</button>
   <h1>Commute to your workplace <a class="info-link" id="howlink" role="button" tabindex="0">How it works</a></h1>
@@ -1422,7 +1449,9 @@ function applyHash(o){
     // a hand-mangled %-sequence in the label must not throw past the lat/lon guard
     const rawLabel=wseg.slice(2).join(",");let label;
     try{label=decodeURIComponent(rawLabel);}catch(e){label=rawLabel;}
-    if(Number.isFinite(lat)&&Number.isFinite(lon)){
+    // require BOTH coords present + finite — an empty segment (#wp=37.79,,X) makes +"" === 0,
+    // which would slip past Number.isFinite and compute a bogus lon=0; reject it.
+    if(wseg.length>=2&&wseg[0]!==""&&wseg[1]!==""&&Number.isFinite(lat)&&Number.isFinite(lon)){
       document.getElementById("addr").value=label||"";
       setWorkplace(lat,lon,label,{persist:false});return true;}}   // a one-time deep link must not clobber the user's saved workplace
   return false;}
@@ -1458,8 +1487,9 @@ legend();   // draw the legend; map stays blank until you set an address
   // — applyHash already restored sliders/metric/cmode/theme either way.
   if(o&&applyHash(o))return;
   let wp=null;
-  try{wp=JSON.parse(localStorage.getItem("wp_v1")||"null");}catch(e){}        // previously-typed workplace wins
-  if(!(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon))) wp=CFG.default_wp;   // else fall back to .env DEFAULT_ADDRESS
+  try{wp=JSON.parse(localStorage.getItem("wp_v1")||"null");}catch(e){}        // a returning user's OWN previously-typed workplace
+  // No .env/baked default: a first-time visitor (no hash, no saved wp) gets NO pre-filled
+  // address and NO auto-compute — the onboarding prompt shows over an empty map instead.
   if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){
     document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);
   }
