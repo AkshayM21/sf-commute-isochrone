@@ -477,7 +477,12 @@ function fragChip(frag,stuck){
 // with its leading ▸ arrow as a nowrap unit so the arrow can't orphan to the next wrapped line.
 // `compact` drops the "wait" chips (the strip rows stay terse) — but ALWAYS keys off a leg's
 // `line` (geom legs use `.name`; the text breakdown uses `.line`) via the caller normalizing.
-function legsRowHTML(legs,compact){
+// `waitExtra` (min, ≥0): the Realistic "typical wait" RECONCILIATION — the traced legs always
+// sum to best-case (d.total), so when Realistic is selected we append one extra wait segment of
+// (real − best-case) min so the rendered row sums to the displayed typical headline. Styled like a
+// transfer wait (the .wait dashed chip) but labeled "typical wait" so it reads as the statistical
+// service delay (not a specific platform wait). 0 → no chip (Best-case mode, or a fully-robust cell).
+function legsRowHTML(legs,compact,waitExtra){
   const chips=[];
   (legs||[]).forEach(g=>{
     const line=g.line!=null?g.line:g.name;     // text legs: .line; geom legs: .name
@@ -486,9 +491,33 @@ function legsRowHTML(legs,compact){
     const c=lineColor(line);
     chips.push(`<span class="leg" style="background:${c}26;color:${c};border:1px solid ${c}55">${escapeHTML(line)} · ${g.min}m</span>`);
   });
+  if(waitExtra&&waitExtra>=1)chips.push(`<span class="leg wait">typical wait +${waitExtra}m</span>`);
   return chips.map((c,i)=> i===0 ? c :
     `<span style="display:inline-flex;align-items:center;gap:5px;white-space:nowrap"><span class="arr">▸</span>${c}</span>`
   ).join("");
+}
+// ---- the ONE place the selected-metric number for a breakdown d is resolved -------------------
+// The headline, the map route BADGE, the cell COLOR (via val()), and the leg-breakdown all show
+// the SAME number for the selected metric and must add up to it:
+//   Best-case (or Realistic before /variance lands): d.total — the traced perfect-timing journey;
+//     the legs (walk+ride+wait chips) already sum to it, so waitExtra=0 (no reconciliation line).
+//   Realistic (real!=null): d.real — the MC committed-plan typical. The traced legs still sum to
+//     d.total, so waitExtra = real − best-case ≥ 0 (perfect ≤ committed invariant) is the extra
+//     "typical wait" segment that makes the rendered row sum to the displayed typical headline.
+// Returns {showR, head, waitExtra}. `head` is the displayed minutes; `waitExtra` is the wait line.
+function metricRead(d){
+  const real=(d&&d.real!=null)?d.real:null;
+  const showR=(metric=="r" && real!=null);
+  const head=showR?real:d.total;
+  const waitExtra=showR?Math.max(0,real-d.total):0;
+  return {showR,head,waitExtra,real};
+}
+// Map route BADGE number for a DRAWN cell (id) given its structural best-case total: follows the
+// selector exactly like the headline + cell color. Realistic → REAL[id] (the typical) when loaded,
+// else the best-case total so the badge is never blank; Best-case → always the total.
+function badgeFor(id,total){
+  if(metric=="r"){const rv=REAL[id];if(rv!=null)return rv;}
+  return total;
 }
 // Shared header summary (name + headline minutes + transfers/best-case context + bad-day chip),
 // reused by the hover tooltip (bdHTML) AND the pinned compare card (pinHTML). One source so the
@@ -516,7 +545,9 @@ function summaryHTML(d){
 }
 function bdHTML(d){
   if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
-  const legsHTML = legsRowHTML(d.legs,false);
+  // Realistic: append the "typical wait +Nm" reconciliation so legs(best-case)+wait = the typical
+  // headline (summaryHTML's `head`). Best-case: waitExtra=0 → no wait line (legs already sum to head).
+  const legsHTML = legsRowHTML(d.legs,false,metricRead(d).waitExtra);
   // Hover tooltip: SURFACE the alternative lines right here (read-only) so you can see multiple
   // routes exist WITHOUT clicking — but the map still draws ONLY the primary on hover (these chips
   // are non-interactive: no hover/click handlers, the interactive compare lives in the pinned card).
@@ -549,14 +580,22 @@ function bdHTML(d){
 function compareHTML(d){
   if(!compareList.length)return "";
   const drawnKey=previewKey!=null?previewKey:selKey;
+  // Realistic: the PRIMARY strip follows the selector (total=real, legs + "typical wait +Nm" sum to
+  // it) so it matches the headline + cell color + map badge. ALT strips are alternative routes under
+  // delays — each has a single draw-based number (a.min) with a.legs summing to a.min, so they keep
+  // total=a.min and NO typical-wait line. Non-compact so each row's leg chips (incl. transfer waits)
+  // actually sum to the strip's displayed total (the user's "legs add up to the number" rule).
+  const primExtra=metricRead(d).waitExtra;                 // 0 in best-case (and before /variance)
   const rows=compareList.map(o=>{
     const sel=o.key===drawnKey;
-    const seq=legsRowHTML(o.legs,true);
+    const realToggle=(o.isPrimary && metric=="r" && d.real!=null);
+    const total=realToggle?d.real:o.total;                 // primary follows the selector; alts = a.min
+    const seq=legsRowHTML(o.legs,false,realToggle?primExtra:0);
     return `<div class="strip${sel?" sel":""}" data-key="${escapeHTML(o.key)}" role="button" tabindex="0" aria-pressed="${sel}">`+
       `<span class="mark">${sel?"●":"○"}</span>`+
       `<span class="dot" style="background:${o.identityColor}"></span>`+
       `<span class="seq">${seq}</span>`+
-      `<span class="tot">${o.total}m</span></div>`;
+      `<span class="tot">${total}m</span></div>`;
   }).join("");
   const loading=(d&&(d.alts||[]).length===0&&!varianceReady())?
     `<div class="cmploading">loading alternatives…</div>`:"";
@@ -661,7 +700,11 @@ function addPill(latlng,color,name,min){
 // identity halo) + a pill on each transit leg + a "~N min" total badge at the origin. `legs` are
 // geom legs ({mode,name,min,pts,tmode?}); `identityColor` is the casing (white for primary, an
 // ALT_CASING slot for an alt); `totalMin` labels the badge. Replaces the old multi-route renderer.
-function drawOne(legs,identityColor,totalMin){
+// `totalMin` is the route's STRUCTURAL best-case total (the traced journey). `badgeMin` is what the
+// "~N min" badge SHOWS — the selected-metric number for the drawn cell (= the headline + cell color);
+// it defaults to totalMin (best-case) so the badge is never blank when no metric override is given.
+function drawOne(legs,identityColor,totalMin,badgeMin){
+  if(badgeMin==null)badgeMin=totalMin;
   routeLayer.clearLayers();
   const segs=(legs||[]).filter(g=>g.pts&&g.pts.length>1);
   if(!segs.length){DRAWN=null;TT_AVOID=[];TT_BLOCKS=[];return;}
@@ -698,7 +741,7 @@ function drawOne(legs,identityColor,totalMin){
   // origin total badge (above everything)
   const badgeLL=segs[0].pts[0];
   routeLayer.addLayer(L.marker(badgeLL,{interactive:false,keyboard:false,zIndexOffset:300,
-    icon:L.divIcon({className:"rtwrap",iconSize:null,html:`<span class="rtbadge">~${totalMin} min</span>`})}));
+    icon:L.divIcon({className:"rtwrap",iconSize:null,html:`<span class="rtbadge">~${badgeMin} min</span>`})}));
   // within-route pill collision nudge
   const placed=placePills(pillSpecs);
   placed.forEach(p=>addPill(p.latlng,p.spec.color,p.spec.name,p.spec.min));
@@ -903,18 +946,24 @@ function dominantLine(legs){
 }
 function findOpt(key){return compareList.find(o=>o.key===key)||null;}
 // Draw whichever route compare mode wants: previewKey if hovering a strip, else the locked selKey.
+// The BADGE follows the selector ONLY for the PRIMARY (it has a best-case/typical pair via REAL):
+// Realistic → REAL[cell] (the typical, == headline + cell color); Best-case → the structural total.
+// An ALT has only its single draw-based number (a.min == opt.total), so its badge = that.
 function drawSelected(){
   const key=previewKey!=null?previewKey:selKey;
   const opt=findOpt(key)||compareList[0];
   if(!opt){clearRoute();return;}
-  drawOne(opt.legs,opt.identityColor,opt.total);
-  DRAWN={id:routePin,legs:opt.legs,identityColor:opt.identityColor,total:opt.total};
+  const badge=opt.isPrimary?badgeFor(routePin,opt.total):opt.total;
+  drawOne(opt.legs,opt.identityColor,opt.total,badge);
+  DRAWN={id:routePin,legs:opt.legs,identityColor:opt.identityColor,total:opt.total,badge,isPrimary:opt.isPrimary};
 }
 // HOVER-MODE draw (not pinned): always the PRIMARY route, clean. Called by maybeRoute/drawJourney.
+// The badge follows the selector (badgeFor) so it matches the hover card headline + the cell color.
 function drawPrimary(id,d){
   if(!d||d.error||!d.geom){clearRoute();return;}
-  drawOne(d.geom,primaryCasing(),d.total);
-  DRAWN={id,legs:d.geom,identityColor:primaryCasing(),total:d.total};
+  const badge=badgeFor(id,d.total);
+  drawOne(d.geom,primaryCasing(),d.total,badge);
+  DRAWN={id,legs:d.geom,identityColor:primaryCasing(),total:d.total,badge,isPrimary:true};
 }
 function drawJourney(id,d){
   // Pinned: the route comes from the compare selection (drawSelected), not the raw primary.
@@ -931,26 +980,31 @@ function maybeRoute(id,d){
   if(routePin!=null){if(id===routePin)drawJourney(id,d);return;}   // pinned: only the pin draws
   if(id===hoverCell)drawJourney(id,d);                             // else: still-hovered cell only
 }
-// Re-render the single drawn route on zoom (badge/pill anchors are zoom-dependent).
+// Re-render the single drawn route on zoom (badge/pill anchors are zoom-dependent). Reuse the
+// stored metric-aware badge so a zoom never reverts the badge to the best-case total.
 map.on("zoomend",()=>{
   if(!DRAWN)return;
-  drawOne(DRAWN.legs,DRAWN.identityColor,DRAWN.total);
+  drawOne(DRAWN.legs,DRAWN.identityColor,DRAWN.total,DRAWN.badge);
 });
-// Re-render the currently-drawn route (theme toggle: the PRIMARY casing is theme-aware). In
-// compare mode re-run drawSelected (re-resolves the primary option's casing freshly below); in
-// hover mode re-resolve whether DRAWN is the primary (white) and refresh its casing.
+// Re-render the currently-drawn route (theme toggle: the PRIMARY casing is theme-aware; metric
+// toggle: the badge follows the selector). In compare mode re-run drawSelected (re-resolves the
+// primary casing + the metric-aware badge); in hover mode re-resolve casing AND recompute the badge.
 function redrawCurrentRoute(){
   if(!DRAWN)return;
   if(routePin!=null&&compareList.length){
-    // refresh the primary option's casing to the new theme, then redraw the selection
+    // refresh the primary option's casing to the new theme, then redraw the selection (drawSelected
+    // recomputes the metric-aware badge for whichever strip is drawn).
     const prim=findOpt(PRIMARY_KEY);if(prim)prim.identityColor=primaryCasing();
     drawSelected();
     return;
   }
-  // hover mode: the only theme-aware casing is the primary (white). Re-resolve it.
-  const col=DRAWN.identityColor&&ALT_CASING.indexOf(DRAWN.identityColor)>=0?DRAWN.identityColor:primaryCasing();
-  drawOne(DRAWN.legs,col,DRAWN.total);
-  DRAWN.identityColor=col;
+  // hover mode: the only theme-aware casing is the primary (white). Re-resolve it. The hover route is
+  // always the primary, so recompute its badge from the current selector (== headline + cell color).
+  const isAlt=DRAWN.identityColor&&ALT_CASING.indexOf(DRAWN.identityColor)>=0;
+  const col=isAlt?DRAWN.identityColor:primaryCasing();
+  const badge=DRAWN.isPrimary===false?DRAWN.total:badgeFor(DRAWN.id,DRAWN.total);
+  drawOne(DRAWN.legs,col,DRAWN.total,badge);
+  DRAWN.identityColor=col;DRAWN.badge=badge;
 }
 /* ============ pinned corner card (replaces the on-cell popup) ============ */
 // Clicking a cell PINS its breakdown into a fixed corner card so it never sits on top of the
@@ -1361,7 +1415,11 @@ function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onc
 // aria-pressed for assistive tech move together so they can't drift.
 function setSeg(id,v){document.querySelectorAll(`#${id} button`).forEach(b=>{const on=b.dataset.v===v;
   b.classList.toggle("on",on);b.setAttribute("aria-pressed",String(on));});}
-seg("metric",v=>metric=v);
+// Metric toggle: the cell COLOR recolors via redraw()/val(), the open card CONTENT (headline +
+// breakdown + "typical wait" line) re-renders via refreshOpenInfo() — and the on-MAP drawn route's
+// BADGE must follow too, so re-render it with the now-selected metric. redrawCurrentRoute no-ops
+// when nothing is drawn, and handles both hover (drawPrimary) + pinned (drawSelected) routes.
+seg("metric",v=>{metric=v;redrawCurrentRoute();});
 seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
 // stamp the initial aria-pressed state on every segmented control (the HTML only carries .on);
 // theme gets its setSeg in bootTheme below.
