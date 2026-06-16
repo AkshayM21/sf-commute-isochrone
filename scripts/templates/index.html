@@ -750,6 +750,10 @@ function drawOne(legs,identityColor,totalMin,badgeMin){
 }
 // Estimated container-px rect of a pill / the badge given its anchor latlng.
 const PILL_W=64, PILL_H=20, BADGE_W=82, BADGE_H=24, BLOCK_PAD=4;
+// Destination (workplace) marker footprint: a default Leaflet marker, 25x41, anchored bottom-center
+// (its latlng = the bottom tip). cx=0.5/cy=1.0 → the rect spans up+sideways from the anchor. The
+// hover tooltip must never land on the workplace pin, so this is folded into TT_BLOCKS too.
+const DEST_W=25, DEST_H=41;
 function rectAround(cp,w,h,cx,cy){                 // cx,cy = anchor offset fraction of (w,h)
   const l=cp.x-w*cx, t=cp.y-h*cy;
   return {l:l-BLOCK_PAD,t:t-BLOCK_PAD,r:l+w+BLOCK_PAD,b:t+h+BLOCK_PAD};}
@@ -759,6 +763,9 @@ function rebuildBlocks(placed,badgeLL){
     TT_BLOCKS.push(rectAround(cp,PILL_W,PILL_H,0.5,0.5));});  // centered on anchor
   if(badgeLL){const cp=map.latLngToContainerPoint(L.latLng(badgeLL[0],badgeLL[1]));
     TT_BLOCKS.push(rectAround(cp,BADGE_W,BADGE_H,0.5,1.35));}  // badge sits above the anchor
+  // DESTINATION marker: always block it so a hover tooltip never covers the workplace pin.
+  if(DESTLL){const cp=map.latLngToContainerPoint(L.latLng(DESTLL[0],DESTLL[1]));
+    TT_BLOCKS.push(rectAround(cp,DEST_W,DEST_H,0.5,1.0));}     // bottom-anchored marker
 }
 /* ---- tooltip placement: keep the hover card clear of the drawn route + pills + badge ---------
    After the route is drawn we know every route point's container pixel (TT_AVOID) AND the pill +
@@ -967,9 +974,9 @@ function drawPrimary(id,d){
 }
 function drawJourney(id,d){
   // Pinned: the route comes from the compare selection (drawSelected), not the raw primary.
-  if(routePin!=null&&id===routePin){drawSelected();
-    if(pendingFitId!=null&&id===pendingFitId&&d&&d.geom){pendingFitId=null;fitToRoute(d);}
-    return;}
+  // The one-shot UNION fit is NOT done here — it's consumed in renderPin, where compareList (the
+  // full primary+alts set the union frames) is final. drawSelected/preview never move the camera.
+  if(routePin!=null&&id===routePin){drawSelected();return;}
   // Hover: draw the clean primary for the hovered cell.
   drawPrimary(id,d);
   if(routePin==null&&id===hoverCell&&d&&d.olat!=null){
@@ -1017,17 +1024,83 @@ let pinFeature=null;     // the L.geoJSON feature object currently pinned (for r
 let justPinned=false;    // set by a cell click; the map-background click skips closePin this tick
 let pendingFitId=null;   // cell id a pin requested a one-shot fitBounds for (consumed by drawJourney)
 function setPinHTML(h){pinBody.innerHTML=h;}
-function fitToRoute(d){
-  if(!d||!d.geom)return;
-  const pts=[];d.geom.forEach(g=>{if(g.pts)g.pts.forEach(p=>pts.push(p));});
-  if(!pts.length)return;
-  const b=L.latLngBounds(pts);
-  // Reserve the card's corner so the route is fully visible BESIDE it. The card sits top-right
-  // (desktop: ~262px card + the 330px side panel; mobile: a narrower floating card). Pad the
-  // top + right to clear it, the other sides modestly.
+// ---- camera: frame the route + destination + origin INSIDE the unoccluded map rectangle -------
+// Reads the LIVE bounding rects of the fixed UI chrome (side panel, pinned card, legend incl. the
+// time badge) and returns real per-side pixel INSETS of the region those overlays block — measured
+// against the map container. The card/panel are folded into the SAME side (desktop right strip);
+// the card also forces a TOP inset; the legend forces a BOTTOM inset. This is the unoccluded-rect
+// model from the plan (right-only reserve, option A): fitBounds gets these as asymmetric padding so
+// no route point / the destination marker can be placed in any overlay's column.
+const INSET_BREATH=12;          // breathing room added to every measured inset
+const BADGE_RESERVE=24;         // the origin "~N min" badge floats ~32px above the origin cell
+function viewInsets(){
+  const mb=map.getContainer().getBoundingClientRect();
   const sz=map.getSize();
-  const rightPad=Math.min(sz.x*0.6, sz.x<=719?Math.round(sz.x*0.45):300);
-  map.fitBounds(b,{paddingTopLeft:[40,60],paddingBottomRight:[rightPad,40],maxZoom:14,animate:true});
+  let top=0,right=0,bottom=0,left=0;
+  const measure=el=>{ if(!el)return null; const cs=getComputedStyle(el);
+    if(cs.display==='none'||cs.visibility==='hidden')return null;
+    const r=el.getBoundingClientRect(); if(r.width<1||r.height<1)return null;
+    return {l:r.left-mb.left,t:r.top-mb.top,r:r.right-mb.left,b:r.bottom-mb.top}; };
+  const desktop=sz.x>719;
+  // PANEL — desktop: full-height right rail → blocks the right strip from its left edge inward.
+  //         mobile: a bottom sheet → blocks the bottom band from its top edge down.
+  const qp=measure(document.getElementById('panel'));
+  if(qp){ if(desktop) right=Math.max(right, sz.x-qp.l);
+          else bottom=Math.max(bottom, sz.y-qp.t); }
+  // PINCARD — only when open. Desktop (option A, right-only reserve): fold it into the right inset by
+  //   extending `right` all the way to the card's LEFT edge. The card then sits inside the reserved
+  //   right strip alongside the panel, so the route can't pass beside it at a different y AND a route
+  //   hugging the top of the usable LEFT area never collides with it (no separate top inset needed →
+  //   no wasted top band). Mobile: the card is top-centered → a TOP inset = its bottom edge.
+  if(pinCard.classList.contains('open')){
+    const qc=measure(document.getElementById('pincard'));
+    if(qc){ if(desktop) right=Math.max(right, sz.x-qc.l);
+            else top=Math.max(top, qc.b); }
+  }
+  // LEGEND — bottom-left; reserve a bottom inset only as tall as the legend (+ the origin badge that
+  // floats above a low origin cell) so a low route + its badge clear it. It's narrow → no left inset.
+  const ql=measure(document.getElementById('legend'));
+  if(ql) bottom=Math.max(bottom, sz.y-ql.t+BADGE_RESERVE);
+  return {top:top+INSET_BREATH, right:right+INSET_BREATH,
+          bottom:bottom+INSET_BREATH, left:left+INSET_BREATH};
+}
+// Fit `bounds` so it lands fully inside the unoccluded rectangle. A tiny route (a 2-5 min walk)
+// would otherwise hit maxZoom and sit as a low-left island, so first pad sub-MIN_SPAN bounds out
+// symmetrically around their center → it centers at a comfortable zoom instead of stranding. The
+// asymmetric padding = the live occluder insets; maxZoom 15 is the ceiling.
+const MIN_SPAN_DEG=0.012;       // ~1.3 km; below this the route is "tiny" → pad to this span
+function fitBoundsUnoccluded(bounds){
+  if(!bounds||!bounds.isValid())return;
+  let b=bounds;
+  const dLat=b.getNorth()-b.getSouth(), dLon=b.getEast()-b.getWest();
+  if(dLat<MIN_SPAN_DEG && dLon<MIN_SPAN_DEG){
+    const c=b.getCenter(), h=MIN_SPAN_DEG/2;
+    b=L.latLngBounds([c.lat-h,c.lng-h],[c.lat+h,c.lng+h]);
+  }
+  const ins=viewInsets();
+  // the destination marker is BOTTOM-anchored (its body extends ~DEST_H above its latlng); when the
+  // destination sits at the top of the framed bounds (the common case — workplace is the NE/downtown
+  // terminus), reserve its height at the top so the pin can't clip the top edge.
+  let topPad=ins.top;
+  const span=b.getNorth()-b.getSouth();
+  if(DESTLL && span>0 && (b.getNorth()-DESTLL[0])<span*0.15) topPad=Math.max(topPad,DEST_H+INSET_BREATH);
+  map.fitBounds(b,{paddingTopLeft:[ins.left,topPad],
+    paddingBottomRight:[ins.right,ins.bottom],maxZoom:15,animate:true,duration:0.5});
+}
+// UNION-FIT (one fit per pin): frame the union of the PRIMARY + EVERY alt route (+ destination +
+// origin) so toggling/hovering compare strips draws a different polyline inside an UNCHANGED
+// viewport — zero camera lurch, no re-fit on toggle. Alts share origin+dest so the union ≈ primary;
+// the MIN_SPAN floor + maxZoom 15 keep a divergent alt from ballooning the frame. Called once,
+// gated by pendingFitId (consumed in renderPin once compareList is final), so a later /variance
+// refresh never re-fits.
+function fitToCompare(){
+  const pts=[];
+  (compareList||[]).forEach(o=>(o.legs||[]).forEach(g=>{if(g.pts)g.pts.forEach(p=>pts.push(p));}));
+  if(DESTLL)pts.push(DESTLL);
+  if(routePin!=null&&BDCACHE[routePin]){const d=BDCACHE[routePin];
+    if(d.olat!=null)pts.push([d.olat,d.olon]);}            // origin cell
+  if(!pts.length)return;
+  fitBoundsUnoccluded(L.latLngBounds(pts));
 }
 // Set the pinned card to a breakdown d: build the compare list (default selection = primary),
 // render summary + strips, then draw the selected route. Reused by openPin's load AND the
@@ -1041,6 +1114,15 @@ function renderPin(f,d){
   setPinHTML(pinHTML(d));
   // Draw the selected route (compare mode). maybeRoute/drawJourney route through drawSelected.
   maybeRoute(f.properties.id,d);
+  // ONE-SHOT UNION FIT: now that compareList (primary + every alt) AND the card's final HTML/height
+  // are set, frame the union of all routes clear of the panel/card/legend. Gated by pendingFitId so
+  // it runs once per pin — a later /variance refresh (which re-runs renderPin to add alts in place)
+  // has pendingFitId already nulled → it never re-fits/lurches. Defer one frame so the card's tall
+  // final layout is reflected in viewInsets' live rect measurement before we compute the fit.
+  if(pendingFitId!=null&&f.properties.id===pendingFitId){
+    pendingFitId=null;
+    requestAnimationFrame(()=>{if(routePin===f.properties.id)fitToCompare();});
+  }
 }
 function openPin(f,l){
   // Entering compare mode — invalidate any in-flight hover fetch (it bails on my!==bdToken) so its
@@ -1125,7 +1207,10 @@ let bdTimer;
 //   mouseover, so the tooltip appears instantly in place.
 function loadBreak(f,setHTML,onReady){const id=f.properties.id,v=val(id);
   const ready=d=>{if(onReady)onReady(d);};
-  if(v==null){setHTML("—");ready(null);return;}
+  // A cell with no value OR one HIDDEN by the Max-commute filter (v>thr → opacity 0 in style())
+  // shouldn't hover/draw: treat a filtered cell exactly like an unreachable one (no tooltip, no
+  // route, no breakdown). Gating here covers both the hover path and a programmatic pin.
+  if(v==null||v>thr){setHTML("—");ready(null);return;}
   if(!EXACT){   // map still on the fast estimate — show the SAME value (no contradicting exact breakdown yet)
     setHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b> · ~${v} min <span style="color:var(--mut);font-weight:400">estimate</span></div><div style="color:var(--mut)">refining to exact times + route…</div></div>`);
     ready(null);                                    // no route yet, but show the estimate placeholder in place
@@ -1163,6 +1248,10 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
       // outline highlight, no route change). The only interaction is the corner card's strips.
       // Unpin (Esc / × / map-background click) restores normal hover.
       if(routePin!=null)return;
+      // Max-commute filter: a cell hidden by `thr` (opacity 0, or unreachable v==null) is inert —
+      // no outline highlight, no tooltip, no route. Mirrors the loadBreak gate so a hidden cell is
+      // fully non-interactive (a hidden cell shouldn't hover or draw its route).
+      {const v=val(f.properties.id);if(v==null||v>thr)return;}
       hoverCell=f.properties.id;hoverLayer=l;
       // INSTANT feedback: highlight the cell outline on hover (the canvas outline can't read CSS
       // vars, so resolve THEME here). This is the only immediate visual — the TOOLTIP is held back.
@@ -1192,6 +1281,9 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
   // popup), so it never covers the drawn route. The map-background click handler unpins; this
   // cell click must not be read as a background click, so flag it for that handler.
   l.on("click",ev=>{if(!DESTLL)return;
+    // Max-commute filter: a hidden (v>thr) or unreachable (v==null) cell is inert — clicking it must
+    // not pin an empty card. Treat it like a background click (let the map handler unpin if pinned).
+    {const v=val(f.properties.id);if(v==null||v>thr)return;}
     justPinned=true;                            // suppress the map-background closePin this tick
     // …but if stopPropagation prevents the map click entirely, justPinned would never be consumed
     // and stick true, eating the NEXT real background unpin-click. Clear it after this tick so a
@@ -1458,7 +1550,15 @@ document.querySelectorAll("#speed button").forEach(b=>b.onclick=()=>{
   if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor,recenter:false});
 });
 document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();syncHash();};
-document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();syncHash();};
+document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();
+  // If the Max-commute threshold dropped below the currently-DRAWN cell's value, that cell is now
+  // hidden — don't leave its route inked over an invisible cell. Unpin (closePin clears the route)
+  // or, in hover mode, clear the drawn route. Mirrors the loadBreak/mouseover gate for live tweaks.
+  if(DRAWN){const dv=val(DRAWN.id);if(dv==null||dv>thr){
+    if(routePin!=null)closePin();
+    else{clearRoute();                                   // hover mode: also close the now-hidden cell's lingering tooltip
+      if(hoverLayer&&hoverLayer.getTooltip())hoverLayer.closeTooltip();hoverCell=null;hoverLayer=null;}}}
+  syncHash();};
 let geoToken=0;  // cancels stale /geocode responses (Set-vs-Set race; chooseAC bumps it too) so an older address can't win the map
 async function geocodeSet(q){if(!q)return;busy("finding address…");closeAC();
   const my=++geoToken;
