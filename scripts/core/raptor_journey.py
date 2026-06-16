@@ -176,12 +176,19 @@ class JourneyTree:
         precomputed for the whole grid in ONE bottom-up node-table pass (``nd_next[nid] < nid``).
         Returns int64[n_stops]: the dominant pattern id, or -1 for a walk-only / unreachable chain.
 
-        Mirrors ``_dominant``'s pick (max ride seconds wins). For an exact ride-time TIE the lower
-        ``pat_line`` index wins here (deterministic), where ``_dominant`` tie-breaks by route NAME;
-        this only affects rare exact-second ties and is used solely to GROUP access stops by line for
-        the alt window — the displayed alt line/time is always re-derived by ``_dominant`` on the
-        actually-traced legs, so it stays exact. Falls back to all -1 if a legacy ``par`` lacks the
-        node table."""
+        Mirrors ``_dominant``'s pick EXACTLY so the alt window's primary label agrees with the
+        traced-journey label (closes the documented downtown-1601 KNOWN GAP):
+          * FINAL-RIDE NO-OVERSHOOT (2026-06-16): for the board whose continuation is the egress seed
+            (``nxt`` kind 0), measure the ride to the SAME no-overshoot alight ``_trace_from`` emits
+            (``_min_overshoot_alight``), NOT the longer raw-node-chain alight. Without this the final
+            ride is measured at its overshoot length, which can make it (wrongly) beat the true
+            dominant — e.g. cell 1601's F leg measured 811s (overshoot) vs the traced 578s, so this
+            pass labeled the journey "F" while ``_dominant`` (on the re-picked alight) labeled it "28".
+          * TIE-BREAK by route NAME, then feed, then route_id — the SAME key ``_dominant`` uses
+            (was: lower ``pat_line`` index, which could disagree on an exact ride-second tie).
+        Used to GROUP access stops by line for the alt window; the displayed alt line/time is still
+        re-derived by ``_dominant`` on the actually-traced legs, so it stays exact. Falls back to all
+        -1 if a legacy ``par`` lacks the node table."""
         n = self.best.shape[0]
         bn = self.par.get("best_node")
         if bn is None:
@@ -190,23 +197,36 @@ class JourneyTree:
         nd_kind = self.par["nd_kind"]; nd_next = self.par["nd_next"]
         nd_pat = self.par["nd_pat"]; nd_trip = self.par["nd_trip"]
         nd_board = self.par["nd_board"]; nd_alight = self.par["nd_alight"]
-        pat_nstops = d["pat_nstops"]; pat_mat_off = d["pat_mat_off"]
-        pat_dep = d["pat_dep"]; pat_arr = d["pat_arr"]
+        nd_egress = self.par["nd_egress"]
+        pat_nstops = d["pat_nstops"]; pat_mat_off = d["pat_mat_off"]; pat_stop_off = d["pat_stop_off"]
+        pat_dep = d["pat_dep"]; pat_arr = d["pat_arr"]; pat_stops = d["pat_stops"]
+        eg_sec = self.egress_sec
+        lt = self.line_table; pl = self.pat_line
         m = nd_kind.shape[0]
         tiny = _TINY_HOP_MIN * 60
         best_ride = np.full(m, -1, np.int64)   # longest significant ride sec in this node's chain
         best_pat = np.full(m, -1, np.int64)    # the pattern achieving it
+
+        def _dom_key(ride, pi):
+            feed, rid, name, _mode = lt[int(pl[pi])]
+            return (-int(ride), name, feed, rid)
+
         for nid in range(m):                   # increasing id resolves nd_next first
             nxt = int(nd_next[nid])
             br = best_ride[nxt] if nxt >= 0 else -1
             bp = best_pat[nxt] if nxt >= 0 else -1
             if int(nd_kind[nid]) == 1:         # board: compare its ride to the chain's current best
                 pi = int(nd_pat[nid]); trip = int(nd_trip[nid])
-                ns = int(pat_nstops[pi]); mb = int(pat_mat_off[pi])
-                ride = int(pat_arr[mb + trip * ns + int(nd_alight[nid])]) \
-                    - int(pat_dep[mb + trip * ns + int(nd_board[nid])])
-                if ride >= tiny and (ride > br or (ride == br and (bp < 0 or
-                        int(self.pat_line[pi]) < int(self.pat_line[bp])))):
+                ns = int(pat_nstops[pi]); mb = int(pat_mat_off[pi]); sb = int(pat_stop_off[pi])
+                bpos = int(nd_board[nid]); apos = int(nd_alight[nid])
+                trow = mb + trip * ns
+                if nxt >= 0 and int(nd_kind[nxt]) == 0:
+                    # FINAL ride: re-pick the alight to the no-overshoot stop _trace_from emits, so
+                    # the ride length (and thus the dominant pick) matches the displayed journey.
+                    apos, _aw = _min_overshoot_alight(pat_arr, pat_stops, eg_sec, trow, sb, bpos,
+                                                      ns, apos, int(nd_egress[nxt]))
+                ride = int(pat_arr[trow + apos]) - int(pat_dep[trow + bpos])
+                if ride >= tiny and (bp < 0 or _dom_key(ride, pi) < _dom_key(br, bp)):
                     br = ride; bp = pi
             best_ride[nid] = br; best_pat[nid] = bp
         out = np.full(n, -1, np.int64)
