@@ -58,6 +58,59 @@ light R5 walk matrix**, then runs the engine. The only R5 use on the map path; n
   aggregate (MAE 0.7502) is unchanged. The value is defensive (the restored entries are real
   but sub-minute on current data). Guard: `test_profile_rows_monotone`; lockstep compares the
   cummaxed reference columns.
+- **RIDE-DEPTH TRACE NODES — max-transfers phantom-ride fix** (2026-06-15, trace-only, output-changing
+  on the served arrive-by map). The per-stop back-pointer arrays (`par_*`) carry only each stop's
+  LATEST parent, but `par_nxfer` is the RAPTOR round index, **not** the path's ride depth: a round-k
+  footpath-after-board pass can relax a footpath OUT OF a stop freshly BOARDED that round, so a
+  stop's *final* parent sits one ride deeper than the value a later board CONSUMED from it (boards
+  read `prev[]`, captured BEFORE the same round's footpath pass overwrote it). Walking the per-stop
+  chain then appended a **phantom ride** → a trace could draw MORE transit legs than `max_rounds`
+  (e.g. a "0 transfers" cell drawing a 2-leg PM→CA cable transfer; 5–84 cells at `max_rounds=1`,
+  11 at 2, depending on workplace) AND, even at the default `max_rounds=8`, the wrong (longer) trace
+  inflated the served arrive-by map value on ~1 cell/oracle (the map = the traced journey's actual
+  time via `commute_and_dominant`/`_clock`). `reverse_raptor_traced` now also builds an **immutable
+  ride-depth NODE TABLE**: each relaxation captures the EXACT continuation its value consumed (a
+  board captures the alight stop's `prev`-node — what the scan read; a footpath captures the source's
+  SNAPSHOT node — what the frozen relax read), and each node carries its true ride depth (egress=0,
+  footpath inherits, board = consumed+1). Since a board fires only in rounds 1..max_rounds and adds
+  exactly one to a depth ≤ round−1, every node's depth ≤ max_rounds, so `raptor_journey._trace_uncached`
+  (now walking `best_node[]`→`nd_next`) can never exceed the cap. **`best`/the validated profile +
+  lockstep trio are UNTOUCHED** (the node table is built ALONGSIDE the per-stop arrays). Effect: the
+  drawn legs + `xfers` honor the cap; the served arrive-by map drops the phantom-inflated cells to
+  their true journey time (golden re-stamped: ~194 cells −5..−6 min, 0 reachability flips). Guard:
+  `test_traced_journey_respects_max_rounds` (≤ max_rounds transit legs at max_rounds∈{1,2}, hover==map
+  preserved). The MC alt-line traces go through the same path → fixed by the same change.
+- **MILD WALK-RELUCTANCE PRIOR — "transit slightly preferred over walking"** (2026-06-15, decision-only,
+  output-changing on the served arrive-by map; `RAPTOR_WALK_RELUCTANCE` default **1.15**, `RAPTOR_WALK_PRIOR_EPS`
+  default **60 s**, both env-overridable; `=1.0` is an EXACT no-op). The objective is pure
+  earliest-arrival, so among options that reach work at ~the same time it had **no preference for less
+  walking** and the access argmin would send a fast walker to a geometrically FARTHER station at the
+  same displayed minute (the user's exact complaint). The prior weights walk seconds by `beta` in the
+  access-stop **DECISION only**; the reported door-to-door minutes stay **TRUE clock time** (the chosen
+  journey's actual time, never an inflated number). Two safeguards keep it a tie-break, never a
+  multi-minute degradation: (1) an **EPS BAND** — the prior re-selects only among access stops whose
+  TRUE door-to-door time is within ±`eps` (60 s) of the time-optimal (max-latest-departure) winner, so
+  the map value moves by at most the rounding minute; a genuinely-faster farther stop (> eps better)
+  is never traded away. The band compares the TRACED journey time (`jtime[stop] + access_walk` from the
+  node table), NOT the home departure — the arrive-by latest-departure can ARRIVE before the deadline,
+  so two stops with near-equal home departures can have very different door-to-door times (a 22 s
+  home-dep tie hid a 4-min slower journey before this fix). (2) a **TRANSFER GUARD** — candidates are
+  capped to displayed ride depth ≤ the time-optimal stop's depth (the user's "not a million transfers"),
+  using the corrected node-table ride depth (significant rides only, matching `_clock`'s tiny-hop fold),
+  so the prior can never add a transfer. The walk-vs-transit decision stays on the ANCHOR's true home
+  (the prior only re-selects among transit access stops, never flips a cell walk↔transit). Threaded
+  through `assemble_departafter[_arith]` + `assemble_arriveby`/`_assemble_arriveby_window` (the fast
+  kernels, used by the depart-after R5-validation + the `arriveby()` method) AND
+  `JourneyTree._select_arrays` (the served map + hover + color-by-line + committed-MC first legs).
+  Kept OUT of `reverse_raptor*`/`_profile` (lockstep + cummax + MC `_draw_profile` byte-equality
+  intact). **R5 parity holds**: depart-after p50 MAE 0.7502→0.7508 (+0.0006), bias +0.064→+0.064, max 7,
+  true-mism 5 — within noise (R5 has no walk-reluctance field, so this is purely the tie-break;
+  reporting true time means it only re-rounds the rare sub-minute near-tie). Served arrive-by effect
+  over 5 workplaces: ~1300 cells save walking (≈9.5 k walk-min), **590 SHED a transfer, 0 gain one**,
+  reported time ≤+1 min on 64 cells (eps rounding). Golden re-stamped (404/2999 cells: Fix-1 −5/−6
+  corrections + Fix-2 −1 closer-stop + +1 eps rounding; 0 reachability flips). Guards:
+  `test_walk_prior_reduces_walk_without_adding_transfers`, `test_walk_prior_is_noop_at_one`,
+  `test_walk_prior_mae_within_budget`.
 
 ## Accuracy vs R5 (5 diverse workplaces, full 2999-cell grid, depart-after p50)
 **Snapshot-relax baseline (re-stamped 2026-06-10):**
@@ -106,7 +159,8 @@ R5_MAX_MEMORY=4G EXACT_THREADS=6 .venv/bin/python scripts/raptor_oracle.py
 USE_RAPTOR=1 RAPTOR_SEMANTIC=departafter .venv/bin/python scripts/server.py
 ```
 Knobs (env): `USE_RAPTOR`, `RAPTOR_SEMANTIC` (departafter|arriveby), `RAPTOR_ACCESS_CAP` (25),
-`RAPTOR_DEADLINE_STEP` (180), `RAPTOR_BOARD_SLACK` (60), `RAPTOR_FOOTPATH_M` (250).
+`RAPTOR_DEADLINE_STEP` (180), `RAPTOR_BOARD_SLACK` (60), `RAPTOR_FOOTPATH_M` (250),
+`RAPTOR_WALK_RELUCTANCE` (1.15) + `RAPTOR_WALK_PRIOR_EPS` (60) — the mild walk prior (see Hard-won facts).
 Tests: `pytest tests/test_raptor.py` (JVM-free).
 
 ## Two semantics (RAPTOR_SEMANTIC), and what each ships

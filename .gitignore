@@ -40,3 +40,6 @@ deploy/cf/*
 Progress.md
 Issues.md
 REVIEW_REPORT.md
+
+# local planning docs (next-session queue)
+.plans/

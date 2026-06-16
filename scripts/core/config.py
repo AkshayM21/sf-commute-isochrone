@@ -31,6 +31,25 @@ WALK_KMH = 4.8             # walking speed (r5py's 3.6 default is too slow)
 WALK_SPEEDS = {"slow": 4.0, "med": WALK_KMH, "fast": 5.6}   # km/h
 DEFAULT_SPEED = "med"
 
+# --- Mild walk-reluctance prior ("transit slightly preferred over walking") -----------
+# A multiplier on WALK time in the access-stop DECISION/argmin ONLY — the reported door-to-door
+# minutes stay TRUE clock time (the penalty steers the *choice*, the reported number is the chosen
+# journey's true clock time). It fixes the user's anomaly ("fast walk -> walk to a FARTHER station
+# AT THE SAME TIME") by preferring the closer stop among options that reach work at ~the same time.
+#
+# Two knobs work together so the prior is a TIE-BREAK, never a multi-minute degradation:
+#   * WALK_RELUCTANCE (beta, default 1.15) — weights walk seconds in the within-window ranking.
+#   * WALK_PRIOR_EPS_SEC (default 60s) — a HARD CAP: the prior may only re-select among access stops
+#     whose TRUE travel time is within this window of the time-optimal stop, so the reported time
+#     can change by at most ~1 min (the rounding minute) and a genuinely-faster farther stop (>eps)
+#     is NEVER traded away. Without this cap, a raw beta multiplier on the full (<=25 min) access
+#     walk could flip a stop up to ~3.75 min slower — over-correcting the user's "slight" preference.
+# R5 has no walk-reluctance field, so the goal is purely the tie-break: measured MAE vs R5 is ~zero
+# (~+0.001 at the shipping settings). beta=1.0 reproduces the no-prior behavior exactly. The engine
+# threads both through assemble + JourneyTree._select_arrays.
+WALK_RELUCTANCE = float(os.environ.get("RAPTOR_WALK_RELUCTANCE", "1.15"))
+WALK_PRIOR_EPS_SEC = float(os.environ.get("RAPTOR_WALK_PRIOR_EPS", "60"))
+
 # --- Geographic bounds (minLon, minLat, maxLon, maxLat) -------------------------------
 # Two DIFFERENT boxes — don't conflate them:
 #   SF_BBOX       — TIGHT box around San Francisco proper; biases/filters the geocoder

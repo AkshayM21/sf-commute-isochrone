@@ -133,7 +133,7 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
     stays pure-python. Determinism (color-by-line stability): patterns are scanned in SORTED
     order and a tie (`d == best[s]`) keeps the FIRST writer, so the chosen parent is reproducible
     run-to-run (earlier rounds write first -> fewer-ride journeys preferred; a strictly-faster
-    later-round journey still wins). Returns a dict of parent arrays + ``best``.
+    later-round journey still wins). Returns a dict of parent arrays + node table + ``best``.
 
     LOCKSTEP: keep the routing semantics byte-equivalent with its two siblings —
     ``reverse_raptor`` above (the pure-python reference; this function only ADDS back-pointers
@@ -144,13 +144,42 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
     makes ``best`` BYTE-EQUAL across the three despite the different scan orders; only the
     PARENT choice on equal-value ties depends on the (sorted, deterministic) order here.
 
-    Parent encoding per stop s (all sized n_stops):
+    Per-stop parent encoding (all sized n_stops) — kept for the dict contract + the legacy
+    per-stop walk; ``par_nxfer`` is the round it was set in (NOT the ride depth — see below):
       par_kind   int8   -1 unreachable, 0 egress-seed (terminal), 1 transit board, 2 footpath
       par_pat/par_trip/par_board/par_alight  int32  transit leg: board at par_board on par_pat/trip,
                                                      forward-ALIGHT at par_alight (a LATER position)
       par_from   int32  footpath: the stop you walk TO (toward W)
-      par_nxfer  int16  reverse round it was set in (= rides from here to W; tie-break + xfer count)
+      par_nxfer  int16  reverse ROUND it was set in (tie-break aid; do NOT read as ride depth)
       egress_sec int32  egress WALK seconds at seed stops (-1 otherwise)
+
+    RIDE-DEPTH NODE TABLE (the max-transfers phantom-ride fix, 2026-06-15). The per-stop ``par_*``
+    arrays carry only the LATEST parent of each stop, but ``par_nxfer`` (the round index) is NOT
+    the path's ride depth: a round-k footpath-after-board pass can relax a footpath OUT OF a stop
+    that was freshly BOARDED this round, so a stop's *final* parent may sit one ride deeper than the
+    value a later board CONSUMED from it (boards read ``prev[]``, captured BEFORE the same round's
+    footpath pass overwrites it). Walking the per-stop ``par_*`` chain then appends a phantom ride
+    -> a trace can draw MORE transit legs than ``max_rounds`` (e.g. a "0 transfers" cell drawing a
+    2-leg journey). The ``best``/map TIME is correct (it used the lower-ride label); only the drawn
+    legs + xfer count were wrong.
+
+    Fix: an immutable back-pointer NODE TABLE captures, at each relaxation, the EXACT continuation
+    the value consumed (a board captures the alight stop's ``prev``-node — what the pattern scan
+    read; a footpath captures the source's SNAPSHOT node — what the frozen relax read), so the node
+    chain is the journey the value was actually built from. Each node carries its true ride depth
+    (egress=0; footpath inherits its source's depth; board = consumed-node depth + 1), and since a
+    board only fires in rounds 1..max_rounds and adds exactly one to a consumed depth <= round-1,
+    every node's depth is <= max_rounds — so walking the node chain (``raptor_journey._trace_uncached``
+    via ``best_node[]``) can never exceed the cap. The node table is produced ALONGSIDE the per-stop
+    arrays (``best`` is untouched, lockstep preserved). Returned keys:
+      best_node  int32[n_stops]  node id for each stop's best value (-1 if unreachable)
+      nd_kind    int8[m]   0 egress, 1 board, 2 footpath
+      nd_stop    int32[m]  the stop you are AT when at this node
+      nd_pat/nd_trip/nd_board/nd_alight  int32[m]  board leg (board pos -> alight pos on a pattern)
+      nd_to      int32[m]  footpath destination stop (the stop you walk TO; -1 else)
+      nd_egress  int32[m]  egress WALK seconds (egress node; -1 else)
+      nd_depth   int16[m]  ride depth at this node (number of board nodes from here to W)
+      nd_next    int32[m]  next node toward W (-1 at the egress terminal)
     """
     n = data["n_stops"]
     pat_nstops = data["pat_nstops"]; pat_ntrips = data["pat_ntrips"]
@@ -167,28 +196,54 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
     par_from = np.full(n, -1, dtype=np.int32); par_nxfer = np.zeros(n, dtype=np.int16)
     egress_sec = np.full(n, -1, dtype=np.int32)
 
-    def set_transit(s, d, pi, trip, board_pos, alight_pos, rnd):
+    # Immutable back-pointer node table (grown append-only; each node captured at relax time so it
+    # records the continuation its value consumed, never a later overwrite — see the docstring).
+    nd_kind = []; nd_stop = []; nd_pat = []; nd_trip = []; nd_board = []
+    nd_alight = []; nd_to = []; nd_egress = []; nd_depth = []; nd_next = []
+    best_node = np.full(n, -1, dtype=np.int32)   # node id for each stop's best value
+    prev_node = np.full(n, -1, dtype=np.int32)   # node id for each stop's prev value (what boards read)
+
+    def _new_node(kind, stop, depth, nxt, pi=-1, trip=-1, board_pos=-1, alight_pos=-1,
+                  to=-1, egress=-1):
+        nd_kind.append(kind); nd_stop.append(int(stop)); nd_depth.append(int(depth))
+        nd_next.append(int(nxt)); nd_pat.append(int(pi)); nd_trip.append(int(trip))
+        nd_board.append(int(board_pos)); nd_alight.append(int(alight_pos))
+        nd_to.append(int(to)); nd_egress.append(int(egress))
+        return len(nd_kind) - 1
+
+    def set_transit(s, d, pi, trip, board_pos, alight_pos, rnd, cont_node, cont_depth):
         best[s] = d
         par_kind[s] = 1; par_pat[s] = pi; par_trip[s] = trip
         par_board[s] = board_pos; par_alight[s] = alight_pos; par_nxfer[s] = rnd
         par_from[s] = -1
+        # board node: ride from s (board_pos) to alight_pos; continuation = the alight stop's prev
+        # node captured NOW (what the pattern scan consumed). One ride deeper than that node.
+        best_node[s] = _new_node(1, s, cont_depth + 1, cont_node,
+                                 pi=pi, trip=trip, board_pos=board_pos, alight_pos=alight_pos)
 
-    def set_foot(j, cand, frm, nxfer):
+    def set_foot(j, cand, frm, nxfer, cont_node, cont_depth):
         best[j] = cand; prev[j] = cand
         par_kind[j] = 2; par_from[j] = frm; par_nxfer[j] = nxfer
         par_pat[j] = par_trip[j] = par_board[j] = par_alight[j] = -1
+        # footpath node: walk from j to frm; continuation = the source's snapshot node captured NOW
+        # (what the frozen relax consumed). Same ride depth (a footpath is not a ride).
+        nid = _new_node(2, j, cont_depth, cont_node, to=frm)
+        best_node[j] = nid; prev_node[j] = nid   # set_foot also commits prev (mirrors best[]=prev[])
 
     marked = set()
     for g, t, w in zip(egress_g, egress_t, egress_w):
         g = int(g)
         if t > best[g]:
             best[g] = t; prev[g] = t; par_kind[g] = 0; egress_sec[g] = int(w); marked.add(g)
+            nid = _new_node(0, g, 0, -1, egress=int(w))   # egress terminal, ride depth 0
+            best_node[g] = nid; prev_node[g] = nid
     snap = best.copy()                           # SNAPSHOT: relax from frozen source values
+    snap_node = best_node.copy()                 # ... and the matching node ids (order-independence)
     for g in sorted(marked):                     # initial one-hop footpaths from egress stops
         for k in range(int(tr_off[g]), int(tr_off[g + 1])):
             j = int(tr_to[k]); cand = snap[g] - tr_time[k]
             if cand > best[j]:
-                set_foot(j, cand, g, 0); marked.add(j)
+                set_foot(j, cand, g, 0, int(snap_node[g]), 0); marked.add(j)
 
     for rnd in range(1, max_rounds + 1):
         if not marked:
@@ -204,34 +259,45 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
             end_pos = q[pi]
             ns = int(pat_nstops[pi]); nt = int(pat_ntrips[pi])
             sbase = int(pat_stop_off[pi]); mbase = int(pat_mat_off[pi])
-            trip = -1; cur_alight = -1
+            trip = -1; cur_alight = -1; cont_node = -1; cont_depth = -1
             for pos in range(end_pos, -1, -1):
                 s = int(pat_stops[sbase + pos])
                 if trip >= 0:
                     d = int(pat_dep[mbase + trip * ns + pos])
                     if d > best[s]:              # strict improvement; ties keep first writer
-                        set_transit(s, d, pi, trip, pos, cur_alight, rnd)
+                        # cont_node/cont_depth = the alight stop's prev node/depth captured when
+                        # `trip` was selected (= what the scan's prev[] read), NOT a later state.
+                        set_transit(s, d, pi, trip, pos, cur_alight, rnd, cont_node, cont_depth)
                         marked.add(s)
                 pa = prev[s]
                 if pa > NEG:
                     col = pat_arr[mbase + pos: mbase + pos + nt * ns: ns]
                     idx = int(np.searchsorted(col, pa - board_slack, side="right")) - 1
                     if idx >= 0 and (trip < 0 or idx > trip):
+                        # this alight stop s justifies boarding `idx`; capture its prev continuation
                         trip = idx; cur_alight = pos
+                        cont_node = int(prev_node[s]); cont_depth = int(nd_depth[cont_node])
         newly = list(marked)
         for s in newly:
-            prev[s] = best[s]
+            prev[s] = best[s]; prev_node[s] = best_node[s]   # commit prev (+ its node) for boards
         snap = best.copy()                       # SNAPSHOT: relax from frozen source values
+        snap_node = best_node.copy()
         tr_marked = set()
         for s in sorted(newly):
+            scd = int(nd_depth[int(snap_node[s])])           # source's snapshot ride depth
             for k in range(int(tr_off[s]), int(tr_off[s + 1])):
                 j = int(tr_to[k]); cand = snap[s] - tr_time[k]
                 if cand > best[j]:
-                    set_foot(j, cand, s, int(par_nxfer[s])); tr_marked.add(j)
+                    set_foot(j, cand, s, int(par_nxfer[s]), int(snap_node[s]), scd); tr_marked.add(j)
         marked |= tr_marked
     return dict(best=best, par_kind=par_kind, par_pat=par_pat, par_trip=par_trip,
                 par_board=par_board, par_alight=par_alight, par_from=par_from,
-                par_nxfer=par_nxfer, egress_sec=egress_sec)
+                par_nxfer=par_nxfer, egress_sec=egress_sec, best_node=best_node,
+                nd_kind=np.asarray(nd_kind, np.int8), nd_stop=np.asarray(nd_stop, np.int32),
+                nd_pat=np.asarray(nd_pat, np.int32), nd_trip=np.asarray(nd_trip, np.int32),
+                nd_board=np.asarray(nd_board, np.int32), nd_alight=np.asarray(nd_alight, np.int32),
+                nd_to=np.asarray(nd_to, np.int32), nd_egress=np.asarray(nd_egress, np.int32),
+                nd_depth=np.asarray(nd_depth, np.int16), nd_next=np.asarray(nd_next, np.int32))
 
 
 def reverse_profile(data, egress_g, egress_w, deadlines, board_slack=60, max_rounds=8,
@@ -313,19 +379,22 @@ def stop_arrival_profile(latest, deadlines, dep_grid):
 
 # --------------------------------------------------------------- assembly (cells)
 def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, dep_grid,
-                         cell_deps, max_min, percentiles=(5, 50)):
+                         cell_deps, max_min, percentiles=(5, 50), beta=1.0, eps=60.0):
     """Depart-after percentile minutes per cell (the R5-comparable map value).
 
     For each cell and each CELL departure D in ``cell_deps``:
         tt(D) = min( pure_walk, min over access stops s [ arrivalW(s, D + access_walk) - D ] )
     then ceil to minutes; take each requested percentile over the window (R5 counts
     unreachable draws as the cap). ``access_*`` is the cell->stop walk table in CSR (seconds);
-    ``purewalk`` is cell->W walk seconds (-1 if > cap). Returns int32[n_cells, n_pct]
-    (-1 where that percentile is unreachable)."""
+    ``purewalk`` is cell->W walk seconds (-1 if > cap). ``beta`` is the walk-reluctance multiplier
+    (config.WALK_RELUCTANCE; 1.0 = no prior) + ``eps`` the true-time cap (sec): among access stops
+    within ``eps`` of the time-optimal, walk is weighted by ``beta`` in the DECISION only, but the
+    reported minutes stay TRUE clock time. Returns int32[n_cells, n_pct] (-1 where unreachable)."""
     n_cells = len(access_off) - 1
     pct = np.asarray(percentiles, dtype=np.float64)
     dep_grid = np.asarray(dep_grid, dtype=np.int64)
     cell_deps = np.asarray(cell_deps, dtype=np.int64)
+    beta = float(beta); eps = float(eps)
     if _select_kernel() == "numba":
         from . import raptor_numba
         args = (np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
@@ -351,17 +420,19 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, de
                 "assemble_departafter: access_w contains negative walk seconds"
             return raptor_numba.assemble_departafter_arith(
                 *args, np.int64(dep_grid[0]), np.int64(step), np.int64(len(dep_grid)),
-                cell_deps, np.int64(max_min), pct)
+                cell_deps, np.int64(max_min), pct, np.float64(beta), np.float64(eps))
         return raptor_numba.assemble_departafter(
-            *args, dep_grid, cell_deps, np.int64(max_min), pct)
+            *args, dep_grid, cell_deps, np.int64(max_min), pct, np.float64(beta), np.float64(eps))
     out = np.full((n_cells, len(pct)), -1, dtype=np.int32)
     nd = len(cell_deps)
     ndg = len(dep_grid)
+    bw = beta - 1.0
     for ci in range(n_cells):
         a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
         gids = access_to[a0:a1]
         awalk = access_w[a0:a1].astype(np.int64)
-        tt = np.full(nd, np.iinfo(np.int64).max, dtype=np.int64)
+        tt = np.full(nd, np.iinfo(np.int64).max, dtype=np.int64)   # TRUE time of chosen stop
+        sc = np.full(nd, np.inf, dtype=np.float64)                 # penalized score that drove it
         if len(gids):
             sub = arrivalW[gids]                              # (nstops_cell, len(dep_grid))
             for di in range(nd):
@@ -372,13 +443,21 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, de
                     continue
                 rr = np.where(ok)[0]
                 vals = sub[rr, kk[rr]]
-                vals = vals[vals < INF]
-                if vals.size:
-                    tt[di] = int(vals.min()) - D
+                fin = vals < INF
+                if fin.any():
+                    arrf = vals[fin]
+                    truett = (arrf - D).astype(np.float64)              # true seconds to work
+                    in_eps = arrf <= int(arrf.min()) + int(round(eps))  # eps window: ~same time
+                    score = truett + bw * awalk[rr[fin]].astype(np.float64)
+                    score = np.where(in_eps, score, np.inf)             # only eps-window stops
+                    j = int(np.argmin(score))                           # penalized argmin
+                    sc[di] = float(score[j]); tt[di] = int(truett[j])
         ttm = tt.astype(np.float64) / 60.0
         pw = purewalk[ci]
         if pw >= 0:
-            ttm = np.minimum(ttm, pw / 60.0)
+            # pure walk competes on penalized seconds (pw*beta) vs the chosen transit's score
+            win = pw * beta < sc
+            ttm = np.where(win, pw / 60.0, ttm)
         ttm = np.ceil(np.where(ttm > max_min, max_min, ttm))
         vals = np.percentile(ttm, pct, method="lower")
         out[ci] = [(-1 if v >= max_min else int(v)) for v in np.atleast_1d(vals)]

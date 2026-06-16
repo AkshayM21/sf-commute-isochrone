@@ -30,6 +30,8 @@ ARRIVE_BY_HM = (9, 0)                             # product target: arrive by 09
 MC_DRAWS = int(os.environ.get("RAPTOR_MC_DRAWS", "24"))       # draws for realistic/fragility
 MC_ALT_DRAWS = int(os.environ.get("RAPTOR_MC_ALT_DRAWS", "4"))  # traced draws for alt-lines (pricier)
 MC_SHAPE = float(os.environ.get("RAPTOR_MC_SHAPE", "2.0"))   # Gamma shape (spread); mean=shape*scale
+WALK_RELUCTANCE = config.WALK_RELUCTANCE          # mild walk prior (decision-only; see config.py)
+WALK_PRIOR_EPS = config.WALK_PRIOR_EPS_SEC        # hard cap (sec) on the prior's true-time change
 # mean INITIAL delay (sec, env-overridable via RAPTOR_MC_MU_*) + fractional DRIFT slope (fixed,
 # see _SLOPE). Buses are the noisiest, rail the steadiest; BART/Caltrain resolved by feed STEM in
 # _mc_mode_params (NOT by position — gtfs_paths() drops missing files and appends extras, so
@@ -153,7 +155,8 @@ class RaptorEngine:
 
     def commute_for_access(self, access_off, access_to, access_w, egress_g, egress_w, purewalk,
                            semantic="departafter", percentiles=(5, 50), max_rounds=MAX_ROUNDS,
-                           walk_scalar=1.0, target_sec=None, window_sec=None):
+                           walk_scalar=1.0, target_sec=None, window_sec=None,
+                           walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
         """Door-to-door commute minutes for a CALLER-SUPPLIED origin set (both semantics).
 
         The public API for off-grid origins (e.g. scripts/commute_origins.py): the caller builds
@@ -179,7 +182,8 @@ class RaptorEngine:
             arrivalW = R.stop_arrival_profile(latest, self.Tgrid, self.dep_grid)
             return R.assemble_departafter(access_off, access_to, aw, pw, arrivalW,
                                           self.dep_grid, self.cell_deps, self.max_min,
-                                          percentiles=percentiles)
+                                          percentiles=percentiles, beta=walk_reluctance,
+                                          eps=walk_prior_eps)
         if semantic != "arriveby":
             raise ValueError(f"semantic must be 'departafter' or 'arriveby', got {semantic!r}")
         target = self.target_sec if target_sec is None else int(target_sec)
@@ -188,47 +192,58 @@ class RaptorEngine:
                      else np.arange(target - win, target + 1, DEP_STEP, dtype=np.int64))
         latest = self._reverse(egress_g, ew, deadlines, max_rounds)
         return _assemble_arriveby_window(access_off, access_to, aw, pw, latest, deadlines,
-                                         self.max_min, np.asarray(percentiles, np.float64))
+                                         self.max_min, np.asarray(percentiles, np.float64),
+                                         beta=walk_reluctance, eps=walk_prior_eps)
 
     def departafter(self, egress_g, egress_w, purewalk, percentiles=(5, 50),
-                    max_rounds=MAX_ROUNDS, walk_scalar=1.0):
+                    max_rounds=MAX_ROUNDS, walk_scalar=1.0, walk_reluctance=WALK_RELUCTANCE,
+                    walk_prior_eps=WALK_PRIOR_EPS):
         """{cell_id: [p5, p50]} minutes, depart-after window (R5-comparable). ``purewalk`` is
         cell->W walk seconds aligned to self.cell_ids (-1 if > cap). ``max_rounds`` caps
-        public-transport rides (rides = transfers + 1). ``walk_scalar`` sets the walk pace."""
+        public-transport rides (rides = transfers + 1). ``walk_scalar`` sets the walk pace;
+        ``walk_reluctance``/``walk_prior_eps`` the mild walk prior (decision-only)."""
         out = self.commute_for_access(self.access_off, self.access_to, self.access_w,
                                       egress_g, egress_w, purewalk, semantic="departafter",
                                       percentiles=percentiles, max_rounds=max_rounds,
-                                      walk_scalar=walk_scalar)
+                                      walk_scalar=walk_scalar, walk_reluctance=walk_reluctance,
+                                      walk_prior_eps=walk_prior_eps)
         return {c: [int(out[i, k]) if out[i, k] >= 0 else None
                     for k in range(out.shape[1])] for i, c in enumerate(self.cell_ids)}
 
     def arriveby(self, egress_g, egress_w, purewalk, target_sec=None, window_sec=None,
-                 percentiles=(5, 50), max_rounds=MAX_ROUNDS, walk_scalar=1.0):
+                 percentiles=(5, 50), max_rounds=MAX_ROUNDS, walk_scalar=1.0,
+                 walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
         """{cell_id: [p5, p50]} minutes, arrive-by an arrival window ending at ``target_sec``
         (default 09:00). ``window_sec`` None -> use config.window(); 0 -> single deadline.
-        ``max_rounds`` caps public-transport rides (rides = transfers + 1)."""
+        ``max_rounds`` caps public-transport rides (rides = transfers + 1). ``walk_reluctance``/
+        ``walk_prior_eps`` are the mild walk prior (decision-only)."""
         out = self.commute_for_access(self.access_off, self.access_to, self.access_w,
                                       egress_g, egress_w, purewalk, semantic="arriveby",
                                       percentiles=percentiles, max_rounds=max_rounds,
                                       walk_scalar=walk_scalar, target_sec=target_sec,
-                                      window_sec=window_sec)
+                                      window_sec=window_sec, walk_reluctance=walk_reluctance,
+                                      walk_prior_eps=walk_prior_eps)
         return {c: [int(out[i, k]) if out[i, k] >= 0 else None
                     for k in range(out.shape[1])] for i, c in enumerate(self.cell_ids)}
 
 
     # -- Phase 2: traced arrive-by tree -> journey breakdown + color-by-line ---------------
     def journey_tree(self, egress_g, egress_w, purewalk, target_sec=None, max_rounds=MAX_ROUNDS,
-                     walk_scalar=1.0):
+                     walk_scalar=1.0, walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
         """A JourneyTree for the single arrive-by deadline: serves the per-cell breakdown
         (hover), color-by-line, AND the arrive-by map value (actual commute = arrival - latest
-        home departure), all from ONE traced reverse tree so hover == map by construction."""
+        home departure), all from ONE traced reverse tree so hover == map by construction.
+        ``walk_reluctance`` (decision-only) steers the access-stop choice toward less walking on
+        ties (drives hover + map + color-by-line + the committed-MC first legs)."""
         target = self.target_sec if target_sec is None else int(target_sec)
         egress_g = np.asarray(egress_g, np.int32)
         ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
         par = R.reverse_raptor_traced(self.data, egress_g, target - ew, ew,
                                       max_rounds=max_rounds, board_slack=BOARD_SLACK)
         return raptor_journey.JourneyTree(self.data, par, self.access_off, self.access_to,
-                                          aw, pw, target, self.max_min)
+                                          aw, pw, target, self.max_min,
+                                          walk_reluctance=walk_reluctance,
+                                          walk_prior_eps=walk_prior_eps)
 
     # -- Phase A: service-noise Monte-Carlo (realistic + fragility + alt-lines) ------------
     def _mc_mode_params(self):
@@ -250,7 +265,8 @@ class RaptorEngine:
         return mu, sl
 
     def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
-                   seed=None, alt_draws=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS, tree=None):
+                   seed=None, alt_draws=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS, tree=None,
+                   walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
         """Committed-plan service-noise MC for a workplace. Returns dict of cell-aligned arrays:
           realistic int32  p50 door-to-door commute over draws FLOORED at ``perfect`` (so
                            realistic/frag/std/stuck all describe one consistent distribution
@@ -293,7 +309,8 @@ class RaptorEngine:
         slope_all = rng.gamma(k, np.maximum(slope_trip, 1e-9) / k, size=(nR, T))
         if tree is None:
             tree = self.journey_tree(egress_g, egress_w, purewalk, max_rounds=max_rounds,
-                                     walk_scalar=walk_scalar)
+                                     walk_scalar=walk_scalar, walk_reluctance=walk_reluctance,
+                                     walk_prior_eps=walk_prior_eps)
         legs = tree.committed_first_legs()
         if perfect is None:
             perfect, _ = tree.commute_and_dominant()
@@ -339,12 +356,14 @@ class RaptorEngine:
         stuck = np.mean(cm >= self.max_min - 1e-9, axis=1)
         alt, alt_bundle = self._mc_alt_lines(
             egress_g, ew, pw, aw, delta0_all, slope_all,
-            MC_ALT_DRAWS if alt_draws is None else int(alt_draws), max_rounds)
+            MC_ALT_DRAWS if alt_draws is None else int(alt_draws), max_rounds,
+            walk_reluctance=walk_reluctance, walk_prior_eps=walk_prior_eps)
         return dict(realistic=realistic, realistic_raw=realistic_raw, frag=frag, std=std,
                     stuck=stuck, alt=alt, alt_bundle=alt_bundle)
 
     def _mc_alt_lines(self, egress_g, egress_w, purewalk, access_w, delta0_all, slope_all, K,
-                      max_rounds=MAX_ROUNDS):
+                      max_rounds=MAX_ROUNDS, walk_reluctance=WALK_RELUCTANCE,
+                      walk_prior_eps=WALK_PRIOR_EPS):
         """({line: votes} per cell, alt_bundle) — the dominant line across ``K`` perturbed
         arrive-by traced trees (so a delayed express lets the next local show up as an
         alternative). Reuses the validated JourneyTree; pricier than the numpy MC, so K is
@@ -370,7 +389,9 @@ class RaptorEngine:
             par = R.reverse_raptor_traced(pdata, egress_g, target - egress_w, egress_w,
                                           max_rounds=max_rounds, board_slack=BOARD_SLACK)
             tree = raptor_journey.JourneyTree(pdata, par, self.access_off, self.access_to,
-                                              access_w, purewalk, target, self.max_min)
+                                              access_w, purewalk, target, self.max_min,
+                                              walk_reluctance=walk_reluctance,
+                                              walk_prior_eps=walk_prior_eps)
             _, dom = tree.commute_and_dominant()
             for ci, line in enumerate(dom):
                 if line and line != "walk only":
@@ -380,7 +401,8 @@ class RaptorEngine:
                     d[line] = d.get(line, 0) + 1
             draws.append({"pat_dep": dep, "pat_arr": arr, "par": par, "dom": dom})
         bundle = {"draws": draws, "access_w": np.asarray(access_w, np.int64),
-                  "purewalk": np.asarray(purewalk, np.int64), "target": int(target)}
+                  "purewalk": np.asarray(purewalk, np.int64), "target": int(target),
+                  "walk_reluctance": float(walk_reluctance), "walk_prior_eps": float(walk_prior_eps)}
         return ([None if not d else dict(sorted(d.items(), key=lambda kv: -kv[1])) for d in votes],
                 bundle)
 
@@ -396,37 +418,60 @@ class RaptorEngine:
         return raptor_journey.JourneyTree(
             pdata, dr["par"], self.access_off, self.access_to,
             alt_bundle["access_w"], alt_bundle["purewalk"],
-            alt_bundle["target"], self.max_min)
+            alt_bundle["target"], self.max_min,
+            walk_reluctance=alt_bundle.get("walk_reluctance", 1.0),
+            walk_prior_eps=alt_bundle.get("walk_prior_eps", 60.0))
 
 
 def _assemble_arriveby_window(access_off, access_to, access_w, purewalk, latest, deadlines,
-                              max_min, percentiles):
+                              max_min, percentiles, beta=1.0, eps=60.0):
     """Per cell, per arrival deadline T: travel(T) = T - latest_home_departure(cell, T);
-    then percentile over the arrival window. Returns int32[n_cells, n_pct] (-1 unreachable)."""
+    then percentile over the arrival window. ``beta``/``eps`` are the walk-reluctance multiplier +
+    the true-time cap (decision-only): among access stops whose TRUE home is within ``eps`` of the
+    latest one, the access stop maximizing the PENALIZED home ``home - (beta-1)*access_w`` is chosen,
+    but the reported travel uses the TRUE chosen home, so the map minutes stay exact clock time.
+    Returns int32[n_cells, n_pct] (-1 unreachable)."""
     n_cells = len(access_off) - 1
     nd = len(deadlines)
     deadlines = np.asarray(deadlines, np.int64)
+    beta = float(beta); eps = float(eps)
     if R._select_kernel() == "numba":
         from . import raptor_numba
         return raptor_numba.assemble_arriveby(
             np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
             np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64),
-            latest, deadlines, np.int64(max_min), np.asarray(percentiles, np.float64))
+            latest, deadlines, np.int64(max_min), np.asarray(percentiles, np.float64),
+            np.float64(beta), np.float64(eps))
     out = np.full((n_cells, len(percentiles)), -1, dtype=np.int32)
+    bw = beta - 1.0
+    epsi = int(round(eps))
+    BIG = np.iinfo(np.int64).max
     for ci in range(n_cells):
         a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
         gids = access_to[a0:a1]
         awalk = access_w[a0:a1].astype(np.int64)
-        tt = np.full(nd, np.iinfo(np.int64).max, dtype=np.int64)
+        tt = np.full(nd, BIG, dtype=np.int64)              # TRUE travel of the chosen stop
+        pen_tt = np.full(nd, np.inf, dtype=np.float64)     # penalized travel that drove the choice
         if len(gids):
             sub = latest[gids]                                # (nstops_cell, nd)
             home = sub - awalk[:, None]                       # latest home departure per stop,T
-            best_home = home.max(axis=0)                      # over access stops
-            reachable = best_home > R.NEG // 2
-            tt = np.where(reachable, deadlines - best_home, np.iinfo(np.int64).max)
+            reachable_each = home > R.NEG // 2
+            opt = np.where(reachable_each, home, R.NEG).max(axis=0)    # time-optimal true home per T
+            in_eps = reachable_each & (home >= opt[None, :] - epsi)    # eps window: ~same time only
+            pen_home = home.astype(np.float64) - bw * awalk[:, None]   # penalized home (decision)
+            pen_home = np.where(in_eps, pen_home, -np.inf)
+            sel = np.argmax(pen_home, axis=0)                 # penalized argmax within the eps window
+            best_home = home[sel, np.arange(nd)]
+            reachable = opt > R.NEG // 2
+            tt = np.where(reachable, deadlines - best_home, BIG)
+            pen_tt = np.where(reachable, deadlines - pen_home[sel, np.arange(nd)], np.inf)
         pw = purewalk[ci]
         if pw >= 0:
-            tt = np.minimum(tt, np.where((deadlines - pw) >= 0, pw, np.iinfo(np.int64).max))
+            # pure walk competes on penalized travel (pw*beta) vs the chosen transit's penalized
+            # travel; reports the TRUE pw seconds where it wins and the deadline allows it.
+            walk_ok = (deadlines - pw) >= 0
+            win = walk_ok & (pw * beta < pen_tt)
+            tt = np.where(win, pw, tt)
         ttm = tt.astype(np.float64) / 60.0
         ttm = np.where(ttm < 0, 0.0, ttm)
         ttm = np.ceil(np.where(ttm > max_min, max_min, ttm))

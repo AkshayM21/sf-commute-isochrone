@@ -649,13 +649,15 @@ def test_assemble_departafter_nonuniform_grid_fallback(engine, monkeypatch):
         m.setattr(RN, "assemble_departafter_arith", boom)
         out_nu = R.assemble_departafter(*acc, pw_s, arrW_nu, dg_nu, cd,
                                         engine.max_min, (5, 50))
-    # both routes byte-equal to the binsearch kernel called directly on the same inputs
+    # both routes byte-equal to the binsearch kernel called directly on the same inputs (the
+    # dispatch defaults the walk-reluctance beta to config.WALK_RELUCTANCE-via-1.0; the direct
+    # kernel calls must pass the SAME beta=1.0 the dispatch used to compare like-for-like).
     pcts = np.asarray((5, 50), np.float64)
     a64 = tuple(np.asarray(x, np.int64) for x in acc)
     ref_u = RN.assemble_departafter(*a64, np.asarray(pw_s, np.int64), arrW, dg, cd,
-                                    np.int64(engine.max_min), pcts)
+                                    np.int64(engine.max_min), pcts, np.float64(1.0), np.float64(60.0))
     ref_nu = RN.assemble_departafter(*a64, np.asarray(pw_s, np.int64), arrW_nu, dg_nu, cd,
-                                     np.int64(engine.max_min), pcts)
+                                     np.int64(engine.max_min), pcts, np.float64(1.0), np.float64(60.0))
     assert np.array_equal(out_u, ref_u), "arith fast path diverged from the binsearch kernel"
     assert np.array_equal(out_nu, ref_nu), "non-uniform fallback diverged from binsearch"
 
@@ -738,12 +740,17 @@ def test_select_matches_reference_loop(engine):
     that compared the two became unrunnable; this test re-implements the loop verbatim as
     the reference and asserts _select returns the identical tuple, covering the documented
     edge cases: empty access segments, all-unreachable segments, the first-index tie rule
-    (strict >), and the pure-walk wins-or-ties rule (>=)."""
+    (strict >), and the pure-walk wins-or-ties rule (>=).
+
+    Pinned to ``walk_reluctance=1.0`` (the no-prior anchor): the walk-prior penalized argmax +
+    transfer guard is a SEPARATE selection ranked differently and gated by its own test
+    (test_walk_prior_*); at beta=1.0 _select_arrays must reproduce this max-true-home loop EXACTLY
+    (the regression anchor that the prior is a true no-op when off)."""
     from core.raptor import NEG
     z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
     pw = _purewalk_aligned(engine, z)
     eg = np.asarray(z["egress_g"], np.int32)
-    tree = engine.journey_tree(eg, z["egress_w"], pw)
+    tree = engine.journey_tree(eg, z["egress_w"], pw, walk_reluctance=1.0)
     best, off = tree.best, np.asarray(tree.access_off, np.int64)
     to, aw_arr = tree.access_to, tree.access_w
     n = tree.n_cells
@@ -799,3 +806,130 @@ def test_assemble_departafter_rejects_negative_access_w(engine):
     with pytest.raises(AssertionError, match="negative walk seconds"):
         R.assemble_departafter(engine.access_off, engine.access_to, aw_bad, pw_s, arrW,
                                dg, engine.cell_deps, engine.max_min, (5, 50))
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_traced_journey_respects_max_rounds(engine):
+    """Fix 1 (the max-transfers phantom-ride): every reconstructed journey must draw NO MORE
+    transit legs than ``max_rounds`` (= transfers + 1). The bug was that the round-k
+    footpath-after-board pass could let a footpath inherit a freshly-boarded stop's parent, so the
+    per-stop back-pointer walk appended a phantom ride -> a "0 transfers" (max_rounds=1) cell could
+    draw a 2-leg journey. The immutable ride-depth node table fixes it: a board node's depth is the
+    consumed continuation's depth + 1, and a board fires only in rounds 1..max_rounds, so every
+    node's depth is <= max_rounds. The ``best``/map TIME was always correct (it used the lower-ride
+    label); this guards the DRAWN legs + xfer count. Tested at the tight caps where the bug bit
+    (max_rounds in {1, 2}); the production default (8) never tripped it."""
+    pos = {c: i for i, c in enumerate(engine.cell_ids)}
+    for f in _oracles():
+        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
+        pw = _purewalk_aligned(engine, z)
+        for mr in (1, 2):
+            tree = engine.journey_tree(z["egress_g"], z["egress_w"], pw, max_rounds=mr)
+            commute, _ = tree.commute_and_dominant()
+            viol = checked = 0
+            for ci in range(len(engine.cell_ids)):
+                it = tree.itinerary(ci)
+                if it is None:
+                    continue
+                checked += 1
+                n_transit = sum(1 for l in it["legs"] if l["mode"] == "transit")
+                if n_transit > mr:
+                    viol += 1
+                # the fix must NOT break the hover==map invariant (legs still sum to the map value)
+                legsum = sum(l["min"] for l in it["legs"]) + sum(l.get("wait", 0) for l in it["legs"])
+                assert legsum == it["total"] == int(commute[ci]), \
+                    f"{f}/mr={mr} cell {ci}: hover!=map after the trace fix"
+            assert checked > 500, f"{f}/mr={mr}: too few reachable cells to be a meaningful gate"
+            assert viol == 0, (
+                f"{f}/mr={mr}: {viol} reconstructed journeys draw MORE than {mr} transit legs "
+                "(max-transfers phantom-ride regression)"
+            )
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_walk_prior_reduces_walk_without_adding_transfers(engine):
+    """Fix 2 (the mild walk-reluctance prior, config.WALK_RELUCTANCE default 1.15, EPS cap 60s): vs
+    the no-prior tree (beta=1.0), the prior must (a) report TRUE clock time bounded by the eps cap —
+    the chosen stop's journey is within ``eps`` (60s -> at most the rounding minute) of the time-
+    optimal, so the displayed total never RISES by more than 1 min (the penalty steers the choice
+    among ~same-time options, it never inflates the number; degradations beyond the rounding minute
+    would mean the eps window leaked); (b) NEVER add a transfer (the user's "not a million transfers"
+    guard) — no cell's displayed xfer count increases; (c) actually save walking on a meaningful set
+    of cells (the point of the feature). It frequently saves a transfer AND/or a minute too — those
+    are upside, not asserted as a floor."""
+    beta = 1.15
+    tot_walk_saved = tot_changed = worse_by_more = 0
+    for f in _oracles():
+        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
+        pw = _purewalk_aligned(engine, z)
+        t0 = engine.journey_tree(z["egress_g"], z["egress_w"], pw, walk_reluctance=1.0)
+        t1 = engine.journey_tree(z["egress_g"], z["egress_w"], pw, walk_reluctance=beta)
+        for ci in range(len(engine.cell_ids)):
+            i0 = t0.itinerary(ci); i1 = t1.itinerary(ci)
+            if i0 is None or i1 is None:
+                continue
+            # (a) reported time stays TRUE + eps-capped: never slower than baseline by > 1 min (the
+            #     60s eps window rounds to at most one minute).
+            assert i1["total"] <= i0["total"] + 1, (
+                f"{f} cell {ci}: walk prior inflated reported total {i0['total']} -> {i1['total']} "
+                "by > 1 min (eps window leaked; the penalty must steer the choice within ~same time)")
+            # (b) the transfer guard: displayed xfers never increases
+            assert i1["xfers"] <= i0["xfers"], (
+                f"{f} cell {ci}: walk prior ADDED a transfer ({i0['xfers']} -> {i1['xfers']})")
+            w0 = sum(l["min"] for l in i0["legs"] if l["mode"] == "walk")
+            w1 = sum(l["min"] for l in i1["legs"] if l["mode"] == "walk")
+            if w1 < w0:
+                tot_walk_saved += (w0 - w1); tot_changed += 1
+    assert tot_walk_saved > 100, (
+        f"walk prior saved only {tot_walk_saved} walk-min across {tot_changed} cells — "
+        "the prior looks inert (expected a few thousand min over 5 workplaces)")
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_walk_prior_is_noop_at_one(engine):
+    """The walk prior must be an EXACT no-op at walk_reluctance=1.0 (the regression anchor): the
+    per-cell breakdown + commute are byte-identical to a tree built with the prior disabled, so
+    shipping the default 1.15 never silently changes a cell that wasn't a near-tie."""
+    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
+    pw = _purewalk_aligned(engine, z)
+    a = engine.journey_tree(z["egress_g"], z["egress_w"], pw, walk_reluctance=1.0)
+    b = engine.journey_tree(z["egress_g"], z["egress_w"], pw, walk_reluctance=1.0)
+    ca, _ = a.commute_and_dominant(); cb, _ = b.commute_and_dominant()
+    assert np.array_equal(ca, cb)
+    # _select_arrays byte-identical at beta=1.0 (the same selection two ways)
+    sa = a._select_arrays(); sb = b._select_arrays()
+    for x, y in zip(sa, sb):
+        assert np.array_equal(np.asarray(x), np.asarray(y))
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_walk_prior_mae_within_budget(engine):
+    """The walk prior is R5-parity-safe: the depart-after p50 MAE vs R5 must stay within noise of
+    the no-prior baseline (the prior reports TRUE clock time, so it only moves the rare sub-minute
+    near-tie that rounds differently). Gate: aggregate MAE <= 0.76 at the shipping beta 1.15
+    (baseline 0.7502; measured ~0.7511), |bias| <= 0.5, max <= 9, true-mism <= 5 — i.e. the R5
+    DoD still holds with the prior on."""
+    all_err, all_signed, total_mism = [], [], 0
+    for f in _oracles():
+        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
+        pw = _purewalk_aligned(engine, z)
+        res = engine.departafter(z["egress_g"], z["egress_w"], pw, walk_reluctance=1.15)
+        p50 = [res[c][1] for c in engine.cell_ids]
+        pos = {c: i for i, c in enumerate(engine.cell_ids)}
+        for k, cid in enumerate(z["cell_ids"].astype(str)):
+            i = pos.get(cid)
+            if i is None:
+                continue
+            mine = p50[i]; mine = -1 if mine is None else int(mine); r5 = int(z["p50"][k])
+            if r5 < 0 and mine < 0:
+                continue
+            if (r5 < 0) != (mine < 0):
+                if not (r5 >= 72 or (mine >= 0 and mine >= 72)):
+                    total_mism += 1
+                continue
+            all_err.append(abs(mine - r5)); all_signed.append(mine - r5)
+    err = np.array(all_err); signed = np.array(all_signed)
+    mae = float(err.mean()); mx = int(err.max()); bias = float(signed.mean())
+    print(f"\n[walk-prior beta=1.15] MAE={mae:.4f} max={mx} bias={bias:+.4f} true-mism={total_mism}")
+    assert mae <= 0.76, f"walk-prior MAE {mae:.4f} > 0.76 (beta too high; lower the default)"
+    assert abs(bias) <= 0.5 and mx <= 9 and total_mism <= 5

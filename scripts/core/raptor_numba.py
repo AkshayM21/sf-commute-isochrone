@@ -221,20 +221,27 @@ def _pct_lower(srt, p):
 
 @njit(cache=True, nogil=True)
 def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW,
-                         dep_grid, cell_deps, max_min, pct):
+                         dep_grid, cell_deps, max_min, pct, beta, eps):
+    """``beta`` = walk-reluctance multiplier (config.WALK_RELUCTANCE; 1.0 = no prior), ``eps`` = the
+    hard cap (sec) on how much true time the prior may give up. Among access stops whose TRUE
+    travel is within ``eps`` of the time-optimal (so the reported time changes by <= ~1 min and a
+    genuinely-faster stop is never traded away), the stop minimizing ``true_time + (beta-1)*aw`` is
+    chosen, but the TRUE ``true_time`` is reported. Pure walk competes on ``pw*beta`` but reports
+    true ``pw``. ``beta == 1.0`` -> plain min-true-time."""
     n_cells = access_off.shape[0] - 1
     ndg = dep_grid.shape[0]
     nd = cell_deps.shape[0]
     npct = pct.shape[0]
     out = np.full((n_cells, npct), -1, dtype=np.int32)
     ttm = np.empty(nd, dtype=np.float64)
+    bw = beta - 1.0
     for ci in range(n_cells):
         a0 = access_off[ci]
         a1 = access_off[ci + 1]
         pw = purewalk[ci]
         for di in range(nd):
             D = cell_deps[di]
-            best = INF
+            opt = INF                             # pass 1: the time-optimal TRUE arrival
             for a in range(a0, a1):
                 board = D + access_w[a]
                 lo = 0
@@ -247,10 +254,31 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW,
                         hi = mid
                 if lo < ndg:
                     v = arrivalW[access_to[a], lo]
-                    if v < INF and v < best:
-                        best = v
+                    if v < opt:
+                        opt = v
+            best = INF                            # pass 2: penalized winner WITHIN the eps window
+            bestsc = 1e18
+            if opt < INF:
+                for a in range(a0, a1):
+                    board = D + access_w[a]
+                    lo = 0
+                    hi = ndg
+                    while lo < hi:
+                        mid = (lo + hi) >> 1
+                        if dep_grid[mid] < board:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    if lo < ndg:
+                        v = arrivalW[access_to[a], lo]
+                        if v < INF and v <= opt + eps:       # eps window: ~same time only
+                            sc = (v - D) + bw * access_w[a]  # penalized score (decision only)
+                            if sc < bestsc:
+                                bestsc = sc; best = v
             tt = (best - D) / 60.0 if best < INF else 1e18
-            if pw >= 0 and pw / 60.0 < tt:
+            # pure walk competes on its PENALIZED seconds (pw*beta) vs the chosen transit's
+            # penalized score (bestsc), reporting the TRUE pw seconds if it wins.
+            if pw >= 0 and pw * beta < (bestsc if best < INF else 1e18):
                 tt = pw / 60.0
             if tt > max_min:
                 tt = max_min
@@ -264,40 +292,59 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW,
 
 @njit(cache=True, nogil=True)
 def assemble_departafter_arith(access_off, access_to, access_w, purewalk, arrivalW,
-                               dep0, step, ndg, cell_deps, max_min, pct):
+                               dep0, step, ndg, cell_deps, max_min, pct, beta, eps):
     """``assemble_departafter`` specialized for a UNIFORM dep_grid sharing origin+step with
     cell_deps (the engine's grids always do; ``raptor.assemble_departafter`` guards and falls
     back to the binsearch kernel otherwise). Then
         searchsorted(dep_grid, cell_deps[di] + w, 'left') == di + ceil(w / step)
     so the ~access_pairs x deadlines binary searches become direct reads, with ceil(w/step)
     hoisted per access pair and the arrivalW row hoisted out of the deadline loop.
-    Byte-equal to the binsearch kernel on the engine grids (gated on all 5 golden workplaces)."""
+    Byte-equal to the binsearch kernel on the engine grids (gated on all 5 golden workplaces).
+    ``beta``/``eps`` = the walk-reluctance multiplier + true-time cap (decision-only; reports true
+    clock time — see ``assemble_departafter``). Two passes per cell: pass 1 the time-optimal true
+    arrival per di, pass 2 the penalized winner within the eps window."""
     n_cells = access_off.shape[0] - 1
     nd = cell_deps.shape[0]
     npct = pct.shape[0]
     out = np.full((n_cells, npct), -1, dtype=np.int32)
-    ttm = np.empty(nd, dtype=np.float64)
+    ttm = np.empty(nd, dtype=np.float64)          # TRUE time (sec) of the chosen access stop per di
+    scm = np.empty(nd, dtype=np.float64)          # penalized score (sec) that drove the choice
+    optv = np.empty(nd, dtype=np.int64)           # time-optimal TRUE arrival per di
+    bw = beta - 1.0
     for ci in range(n_cells):
         a0 = access_off[ci]
         a1 = access_off[ci + 1]
         pw = purewalk[ci]
         for di in range(nd):
-            ttm[di] = 1e18
-        for a in range(a0, a1):
+            ttm[di] = 1e18; scm[di] = 1e18; optv[di] = INF
+        for a in range(a0, a1):                      # pass 1: time-optimal arrival per di
             w = access_w[a]
-            kw = (w + step - 1) // step              # ceil(w/step), hoisted per pair
+            kw = (w + step - 1) // step
             row = arrivalW[access_to[a]]
             for di in range(nd):
                 k = di + kw
                 if k < ndg:
                     v = row[k]
-                    if v < INF:
-                        tt = (v - cell_deps[di]) / 60.0
-                        if tt < ttm[di]:
-                            ttm[di] = tt
+                    if v < optv[di]:
+                        optv[di] = v
+        for a in range(a0, a1):                      # pass 2: penalized winner within eps window
+            w = access_w[a]
+            kw = (w + step - 1) // step
+            pen = bw * w                             # walk penalty for this pair (sec), hoisted
+            row = arrivalW[access_to[a]]
+            for di in range(nd):
+                k = di + kw
+                if k < ndg:
+                    v = row[k]
+                    if v < INF and v <= optv[di] + eps:    # eps window: ~same time only
+                        tt = (v - cell_deps[di])     # TRUE seconds to work
+                        sc = tt + pen                # penalized score (decision only)
+                        if sc < scm[di]:
+                            scm[di] = sc; ttm[di] = tt / 60.0
         for di in range(nd):
             tt = ttm[di]
-            if pw >= 0 and pw / 60.0 < tt:
+            # pure walk competes on its penalized seconds vs the chosen transit's penalized score
+            if pw >= 0 and pw * beta < scm[di]:
                 tt = pw / 60.0
             if tt > max_min:
                 tt = max_min
@@ -311,26 +358,43 @@ def assemble_departafter_arith(access_off, access_to, access_w, purewalk, arriva
 
 @njit(cache=True, nogil=True)
 def assemble_arriveby(access_off, access_to, access_w, purewalk, latest, deadlines,
-                      max_min, pct):
+                      max_min, pct, beta, eps):
+    """``beta``/``eps`` = the walk-reluctance multiplier + the true-time cap (decision-only). Among
+    access stops whose TRUE home departure is within ``eps`` of the latest (time-optimal) one, the
+    stop maximizing the PENALIZED home ``home - (beta-1)*access_w`` is chosen, but the reported time
+    uses the TRUE chosen ``home`` so the map minutes stay exact clock time. Pure walk competes on
+    ``pw*beta``. ``beta == 1.0`` -> plain max-true-home."""
     n_cells = access_off.shape[0] - 1
     nd = deadlines.shape[0]
     npct = pct.shape[0]
     out = np.full((n_cells, npct), -1, dtype=np.int32)
     ttm = np.empty(nd, dtype=np.float64)
     NEGH = -(1 << 60) // 2
+    bw = beta - 1.0
     for ci in range(n_cells):
         a0 = access_off[ci]
         a1 = access_off[ci + 1]
         pw = purewalk[ci]
         for di in range(nd):
             T = deadlines[di]
-            home = -(1 << 60)
+            opt = -(1 << 60)                      # pass 1: time-optimal (latest) TRUE home
             for a in range(a0, a1):
                 h = latest[access_to[a], di] - access_w[a]
-                if h > home:
-                    home = h
+                if h > opt:
+                    opt = h
+            home = -(1 << 60)                     # pass 2: penalized winner WITHIN the eps window
+            bestph = -1e18
+            if opt > NEGH:
+                for a in range(a0, a1):
+                    h = latest[access_to[a], di] - access_w[a]
+                    if h > NEGH and h >= opt - eps:           # eps window: ~same time only
+                        ph = h - bw * access_w[a]             # penalized home (decision only)
+                        if ph > bestph:
+                            bestph = ph; home = h
             tt = (T - home) / 60.0 if home > NEGH else 1e18
-            if pw >= 0 and (T - pw) >= 0 and pw / 60.0 < tt:
+            # pure walk competes on penalized travel pw*beta vs the chosen transit's penalized
+            # travel (T - bestph); reports the true pw minutes if it wins.
+            if pw >= 0 and (T - pw) >= 0 and pw * beta < (T - bestph if home > NEGH else 1e18):
                 tt = pw / 60.0
             if tt < 0:
                 tt = 0.0
