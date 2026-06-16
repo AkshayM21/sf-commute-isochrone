@@ -160,6 +160,16 @@
   .cmp .strip .tot{flex:0 0 auto;font-variant-numeric:tabular-nums;font-weight:700;font-size:12px;
     margin-top:1px;white-space:nowrap}
   .cmp .cmploading{font-size:11px;color:var(--mut);padding:4px 2px}
+  /* --- keep-pin recompute loading state on the pinned card (Max transfers / Walk speed) --- */
+  /* The "updating…" line sits at the top of the card; the compare strips dim + go inert so the
+     user sees it's recalculating while the card stays put (same position/size) and the OLD route
+     stays drawn until the new one lands. */
+  #pincard.pinloading .cmp{opacity:.42;pointer-events:none;transition:opacity .12s}
+  #pincard .pinupd{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--mut);
+    margin:0 0 7px;font-variant-numeric:tabular-nums}
+  #pincard .pinupd .spin{flex:0 0 auto;width:12px;height:12px;border-radius:50%;
+    border:2px solid var(--line);border-top-color:var(--accent);animation:pinspin .7s linear infinite}
+  @keyframes pinspin{to{transform:rotate(360deg)}}
   /* --- added: how-it-works link + modal --- */
   .info-link{color:var(--accent);font-size:11.5px;cursor:pointer;text-decoration:none;margin-left:6px}
   .info-link:hover{text-decoration:underline}
@@ -1318,6 +1328,28 @@ function closeOpenInfo(){
     const tip=l.getTooltip&&l.getTooltip(); if(tip&&tip.isOpen())l.closeTooltip();
   });
 }
+// PIN-PRESERVE variant of closeOpenInfo: shut the HOVER affordances (in-flight hover fetch +
+// every open/bound sticky tooltip) WITHOUT touching the pin. routePin / pinFeature / compareList /
+// selKey and the currently-DRAWN route all SURVIVE so the pinned card + its route stay on screen
+// (no blank flash) while the new params recompute. Called by applyRecomputeParam when a cell is
+// pinned. (Unbind, not just close, so a sticky tooltip can't mousemove-reopen over the pinned card
+// — same reasoning as openPin's leak fix.)
+function closeHoverKeepPin(){
+  bdToken++; clearTimeout(bdTimer);
+  hoverCell=null; hoverLayer=null; lastTipDir=null; lastTipAx=null; lastTipPerp=0;
+  layer.eachLayer(l=>{if(l.getTooltip&&l.getTooltip())l.unbindTooltip();});
+}
+// Loading state on the PINNED card during a param recompute: a header line + dimmed compare strips
+// so the user sees the card is recalculating, while it stays at the same position/size-ish (the
+// drawn route is left untouched until the new one lands). Idempotent; pinLoading(false) clears it.
+function setPinLoading(on){
+  pinCard.classList.toggle("pinloading",!!on);
+  const body=pinCard.querySelector(".bd");if(!body)return;
+  let note=body.querySelector(".pinupd");
+  if(on){if(!note){note=document.createElement("div");note.className="pinupd";
+    note.innerHTML='<span class="spin"></span>updating…';body.insertBefore(note,body.firstChild);}}
+  else if(note)note.remove();
+}
 function refreshOpenInfo(){
   // Re-render the pinned corner card in place (metric/cmode toggle, /variance arriving). renderPin
   // rebuilds the compare list (keeping the locked selKey when it still exists) + redraws.
@@ -1399,15 +1431,21 @@ async function setWorkplace(lat,lon,label,opts){
   //                    scroll position is preserved regardless of RAPTOR/R5 mode.
   //   persist  true  -> store the workplace in localStorage. Hash-applied permalinks pass false so
   //                    a one-time deep link can't silently clobber the user's saved workplace.
+  //   keepPinId      -> cell id to PRESERVE across a param recompute (Max transfers / Walk speed).
+  //                    When set: skip closeOpenInfo (the caller already ran closeHoverKeepPin, which
+  //                    keeps the pin + the drawn route), then re-fetch /itinerary for that cell with
+  //                    the NEW params and re-render the pinned card in place (no camera move). null =
+  //                    normal behaviour (a new workplace / hover-mode tweak unpins via closeOpenInfo).
   opts=opts||{};
   const atomic=!!opts.atomic;
   const recenter=opts.recenter!==false;
   const persist=opts.persist!==false;
+  const keepPinId=opts.keepPinId!=null?opts.keepPinId:null;
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   document.getElementById("prompt").style.display="none";
   DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};REAL={};VAR={};
   if(recenter)TT={};                                 // new workplace -> drop OLD times so a hover before /compute lands doesn't show last workplace's commute under the new name (param tweaks keep TT visible during the load window — same workplace, just new speed)
-  closeOpenInfo();                                   // workplace changed -> any open tooltip is stale
+  if(keepPinId==null)closeOpenInfo();                // workplace changed -> any open tooltip is stale (a keepPin recompute keeps the pin + its drawn route; the caller already closed the hover affordances)
   if(!CFG.raptor)document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
   // Pan/zoom to the workplace ONLY when it's a NEW one (param tweaks keep the user's scroll).
   if(recenter){
@@ -1435,9 +1473,51 @@ async function setWorkplace(lat,lon,label,opts){
     if(myGen===GEN && Object.keys(REAL).length===0){aggregate();redraw();}   // /variance no-op -> fall back to perfect
   } else loadVariance();
   if(myGen===GEN)busy(false);
+  // KEEP-PIN re-render (RAPTOR route-viz path): the new map (+ atomic /variance) has landed for
+  // these params; re-fetch the pinned cell's /itinerary with the NEW params and re-render the card +
+  // drawn route IN PLACE. The myGen guard means a SECOND rapid param change (which bumped GEN)
+  // cancels this stale re-fetch, so the pin always ends consistent with the latest params. No
+  // pendingFitId -> the camera never moves. (Legacy R5 has no traced geom to preserve, so the
+  // applyRecomputeParam fallback simply unpins there.)
+  if(keepPinId!=null && CFG.raptor && myGen===GEN)refreshPinForParams(keepPinId,myGen);
   // Legacy R5 only: auto-sharpen the fast approximation to the EXACT map. With RAPTOR the map is
   // already exact (== the engine), so there is nothing to refine to.
   if(myGen===GEN && !CFG.raptor)refine();
+}
+// Re-fetch the pinned cell with the current params + re-render the pinned card and its drawn route
+// in place (keep-pin path). Gen-guarded against a newer param change. Handles the UNREACHABLE edge:
+// if the cell is now hidden (val>thr / unreachable) OR /itinerary returns an error, keep the card
+// PINNED but show the no-route state and clear the drawn route (no broken/empty card, no crash).
+async function refreshPinForParams(id,gen){
+  if(routePin!==id||!pinFeature||!DESTLL){setPinLoading(false);return;}
+  const f=pinFeature;
+  // Cell now filtered/unreachable under the new params -> no route to draw. Keep it PINNED with a
+  // settings-specific message (the user can close it) rather than a broken/empty card or a crash.
+  if(val(id)==null){
+    if(gen!==GEN||routePin!==id)return;
+    pinNoRoute(f);return;
+  }
+  const tok=++bdToken;
+  try{
+    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
+    if(gen!==GEN||routePin!==id||tok!==bdToken)return;     // a newer param change / unpin took over
+    const d=r.ok?await r.json():{error:"http "+r.status};
+    if(gen!==GEN||routePin!==id||tok!==bdToken)return;
+    if(!d||d.error||!d.geom){pinNoRoute(f);return;}        // unreachable under the new cap/pace
+    setPinLoading(false);
+    BDCACHE[id]=d;d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];
+    renderPin(f,d);                                        // pendingFitId is null on this path -> no camera move
+  }catch(e){if(gen===GEN&&routePin===id&&tok===bdToken)setPinLoading(false);}
+}
+// Pinned cell unreachable under the current settings: keep the card OPEN (still pinned, routePin
+// intact) with a clear settings-specific message + the cell name, drop the now-stale compare list,
+// and clear the drawn route. The user can close it via ×/Esc/background-click as usual.
+function pinNoRoute(f){
+  setPinLoading(false);compareList=[];selKey=PRIMARY_KEY;previewKey=null;
+  setPinHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b></div>`+
+    `<div style="color:var(--mut);font-size:12px;margin-top:4px">No route within these settings.</div>`+
+    `<div class="foot" style="margin-top:8px">Try raising Max transfers or the Max-commute limit.</div></div>`);
+  clearRoute();
 }
 // ---- exact refine: auto-run after every address (above) AND re-runnable via the button.
 //      503-aware with one retry; keeps the fast approximation if exact is unavailable/busy. ----
@@ -1516,19 +1596,32 @@ seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAt
 // stamp the initial aria-pressed state on every segmented control (the HTML only carries .on);
 // theme gets its setSeg in bootTheme below.
 setSeg("metric",metric);setSeg("cmode",cmode);setSeg("maxrides",maxxfers);setSeg("speed",walkspeed);
-// Max transfers is NOT a client-only restyle: a new cap changes the colored TIMES, so it
-// must re-run the map (re-/compute + auto-refine) and invalidate the stale breakdowns. We
-// don't use seg() here (which only aggregate/redraw/syncHash). Always syncHash so the cap is
-// in the permalink even with no workplace yet.
+// Max transfers / Walk speed are NOT client-only restyles: a new cap/pace changes the colored
+// TIMES, so each must re-run the map (re-/compute + the atomic /variance) and invalidate the
+// stale breakdowns. Shared driver so both controls behave identically. Always syncHash so the
+// param lands in the permalink even with no workplace yet.
+// PIN-PRESERVE: if a cell is PINNED when the param changes, we keep the pin (card + drawn route)
+// across the recompute instead of unpinning. closeHoverKeepPin shuts only the hover tooltips +
+// in-flight hover fetch (NOT the pin), the card shows a loading state, and setWorkplace runs with
+// {keepPinId} so it skips closeOpenInfo. After /compute (+ atomic /variance) land, the param-aware
+// re-fetch in setWorkplace re-renders the pinned card + drawn route in place with the new params.
+function applyRecomputeParam(){
+  // Keep the pin only under RAPTOR (the only stack with a traced drawn route to preserve). In legacy
+  // R5 there's no geom, so fall through to the normal unpin path.
+  const keepId=(CFG.raptor&&routePin!=null)?routePin:null;
+  BDCACHE={};                                              // breakdowns were for the old cap/pace
+  if(keepId!=null){closeHoverKeepPin();setPinLoading(true);}// keep the pin; dim the strips while it recomputes
+  else closeOpenInfo();                                    // hover mode (or no pin / legacy R5): close stale tooltip + unpin; next hover fetches with the new param
+  syncHash();
+  // Param tweak (same workplace, new param): atomic in RAPTOR (no flicker), recenter:false ALWAYS
+  // so the user's pan/zoom is preserved even in legacy R5 mode where atomic isn't set.
+  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor,recenter:false,keepPinId:keepId});
+  else if(keepId!=null)setPinLoading(false);              // no workplace -> nothing recomputes; drop the loading state
+}
 document.querySelectorAll("#maxrides button").forEach(b=>b.onclick=()=>{
   if(b.dataset.v===maxxfers)return;                       // no-op if unchanged
   setSeg("maxrides",b.dataset.v);maxxfers=b.dataset.v;
-  BDCACHE={};                                             // breakdowns were for the old cap
-  closeOpenInfo();                                        // close stale tooltip; next hover fetches with new cap
-  syncHash();
-  // Param tweak (same workplace, new param): atomic in RAPTOR (no flicker), and recenter:false ALWAYS
-  // so the user's pan/zoom is preserved even in legacy R5 mode where atomic isn't set.
-  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor,recenter:false});
+  applyRecomputeParam();
 });
 // Appearance: client-only restyle (no recompute, no breakdown invalidation). Just swaps the
 // data-theme attribute + basemap + cell saturation, persists the preference, syncs the hash.
@@ -1544,10 +1637,7 @@ document.querySelectorAll("#theme button").forEach(b=>b.onclick=()=>{
 document.querySelectorAll("#speed button").forEach(b=>b.onclick=()=>{
   if(b.dataset.v===walkspeed)return;
   setSeg("speed",b.dataset.v);walkspeed=b.dataset.v;
-  BDCACHE={};                                             // breakdowns were for the old pace
-  closeOpenInfo();                                        // close stale tooltip; next hover fetches with new pace
-  syncHash();
-  if(DESTLL)setWorkplace(DESTLL[0],DESTLL[1],CURLABEL,{atomic:CFG.raptor,recenter:false});
+  applyRecomputeParam();
 });
 document.getElementById("ideal").oninput=e=>{ideal=+e.target.value;document.getElementById("idval").textContent=ideal;redraw();syncHash();};
 document.getElementById("thr").oninput=e=>{thr=+e.target.value;document.getElementById("thrval").textContent=thr;redraw();
