@@ -798,48 +798,62 @@ def test_numba_matches_python(engine):
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
 def test_select_matches_reference_loop(engine):
     """Permanent loop-equivalence gate for raptor_journey.JourneyTree._select_arrays — the
-    vectorized (segmented-reduce, ~30x) replacement for the original per-cell access-stop
-    selection loop. The loop itself was DELETED in that change, so the one-off gate script
-    that compared the two became unrunnable; this test re-implements the loop verbatim as
-    the reference and asserts _select returns the identical tuple, covering the documented
-    edge cases: empty access segments, all-unreachable segments, the first-index tie rule
-    (strict >), and the pure-walk wins-or-ties rule (>=).
+    vectorized (segmented-reduce) per-cell access-stop selection. This re-implements the selection
+    as a straightforward python reference loop and asserts ``_select`` returns the identical tuple,
+    covering the documented edge cases: empty access segments, all-unreachable segments, the
+    first-index tie rule, and the pure-walk wins-or-ties rule.
 
-    Pinned to ``walk_reluctance=1.0`` (the no-prior anchor): the walk-prior penalized argmax +
-    transfer guard is a SEPARATE selection ranked differently and gated by its own test
-    (test_walk_prior_*); at beta=1.0 _select_arrays must reproduce this max-true-home loop EXACTLY
-    (the regression anchor that the prior is a true no-op when off)."""
-    from core.raptor import NEG
+    Pinned to ``walk_reluctance=1.0`` (the no-prior anchor). The OBJECTIVE is MIN DOOR-TO-DOOR
+    JOURNEY (2026-06-16): the access stop minimizing ``cell_jt = jtime[stop] + access_walk`` wins
+    (first index on ties), where ``jtime`` is the per-stop traced journey seconds (``_stop_jtime``,
+    from the node table). ``latest`` (the reported home departure) is the TRUE ``best[stop] - aw``.
+    Walk vs transit compares DURATIONS: pure walk wins iff its seconds <= the chosen transit
+    journey's seconds (walk wins ties). The walk-prior penalized re-pick (beta>1) is gated
+    separately by test_walk_prior_*; at beta=1.0 it's the plain min-journey/first-index pick."""
+    JBIG = 1 << 39
     z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
     pw = _purewalk_aligned(engine, z)
     eg = np.asarray(z["egress_g"], np.int32)
     tree = engine.journey_tree(eg, z["egress_w"], pw, walk_reluctance=1.0)
     best, off = tree.best, np.asarray(tree.access_off, np.int64)
     to, aw_arr = tree.access_to, tree.access_w
+    jt = tree._stop_jtime
     n = tree.n_cells
     # a few hundred cells spread across the grid + every empty-access-segment cell (edge case)
     cells = set(range(0, n, max(1, n // 400)))
     cells |= set(int(c) for c in np.flatnonzero(np.diff(off) == 0)[:10])
     n_transit = n_walk = n_empty = 0
     for ci in sorted(cells):
-        # ---- reference: the original per-cell selection loop, verbatim semantics ----
-        latest = int(NEG); s_star = -1; aw = 0
+        # ---- reference: MIN door-to-door journey, first index on ties ----
+        anchor_jt = JBIG << 1; s_star = -1; aw = 0; latest = 0
         for a in range(int(off[ci]), int(off[ci + 1])):
-            h = int(best[int(to[a])]) - int(aw_arr[a])
-            if h > latest:                       # strict >: FIRST index achieving the max wins
-                latest = h; s_star = int(to[a]); aw = int(aw_arr[a])
+            s = int(to[a]); j = int(jt[s])
+            if j >= JBIG:                        # unreachable access pair
+                continue
+            cj = j + int(aw_arr[a])
+            if cj < anchor_jt:                   # strict <: FIRST index achieving the min wins
+                anchor_jt = cj; s_star = s; aw = int(aw_arr[a]); latest = int(best[s]) - int(aw_arr[a])
         pwv = int(tree.purewalk[ci])
-        walk_home = tree.deadline - pwv if pwv >= 0 else int(NEG)
-        expect = ((None, pwv, walk_home, True) if walk_home >= latest   # walk wins or ties
-                  else (s_star, aw, latest, False))
+        walk_home = tree.deadline - pwv if pwv >= 0 else int(-(1 << 30))
+        # walk wins iff pure-walk DURATION <= the chosen transit journey DURATION (walk wins ties);
+        # with no reachable transit (anchor_jt huge) any walkable cell is walk-only.
+        if pwv >= 0 and pwv <= anchor_jt:
+            expect = (None, pwv, walk_home, True)
+            n_walk += 1
+        elif s_star >= 0:
+            expect = (s_star, aw, latest, False)
+            n_transit += 1
+        else:
+            expect = (-1, 0, int(-(1 << 30)), False)  # unreachable both ways (NEG sentinel)
         got = tree._select(ci)
-        assert got == expect, f"cell {ci}: _select {got} != reference loop {expect}"
+        # the NEG sentinel value differs only in magnitude for unreachable; compare the meaningful
+        # fields (stop, walk, is_walk) and, when reachable, the exact latest home.
+        if expect[0] == -1 and not expect[3]:
+            assert got[0] == -1 and got[3] is False, f"cell {ci}: {got} != unreachable"
+        else:
+            assert got == expect, f"cell {ci}: _select {got} != reference {expect}"
         if off[ci] == off[ci + 1]:
             n_empty += 1
-        if expect[3]:
-            n_walk += 1
-        else:
-            n_transit += 1
     assert len(cells) >= 300, "fixture spread too thin to be a meaningful gate"
     assert n_transit > 100 and n_walk > 0, (
         f"coverage skewed (transit={n_transit}, walk={n_walk}) — both _select branches "

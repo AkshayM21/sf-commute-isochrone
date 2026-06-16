@@ -111,6 +111,46 @@ light R5 walk matrix**, then runs the engine. The only R5 use on the map path; n
   corrections + Fix-2 −1 closer-stop + +1 eps rounding; 0 reachability flips). Guards:
   `test_walk_prior_reduces_walk_without_adding_transfers`, `test_walk_prior_is_noop_at_one`,
   `test_walk_prior_mae_within_budget`.
+- **MIN-JOURNEY SELECTION + NO-OVERSHOOT ALIGHT — "the shown route is always the fastest"**
+  (2026-06-16, reconstruction-only, output-changing on the served arrive-by map; ALL in
+  `core/raptor_journey.py` + a 1-line constructor plumb in `raptor_engine.journey_tree`). The
+  arrive-by reverse tree optimizes LATEST HOME DEPARTURE, not the shortest trip — a latest-departure
+  journey can ARRIVE well before the deadline (it just couldn't have left later), so two stops with
+  near-equal latest departures can have very different door-to-door durations. Two visible bugs
+  followed: (1) `JourneyTree._select_arrays` anchored the access-stop pick on max-latest-home
+  (`base_key = best[stop] - aw`), so on ~1774 cells it showed a SLOWER route than an available faster
+  line (which surfaced only as an "alt"; the primary could even be absent from its own "also serves").
+  (2) `_trace_from` followed the latest-departure node chain's `nd_alight`, which could ride PAST the
+  stop closest to W and walk back (a longer ride AND longer egress walk — strictly dominated; proven:
+  the 22 bus 198 Dolores→650 Townsend rode to −122.39991 at faster walk instead of −122.40286, 13 min
+  ride + 11 min walk vs 11 + 8). **CHANGE 1:** the `_select_arrays` anchor is now the segmented ARGMIN
+  of `cell_jt = jtime[stop] + access_walk` (the SAME true-time quantity `alt_lines_window` ranks by, so
+  primary == fastest alt), with the walk prior re-applied as a tie-break (eps band one-sided off the
+  min + transfer guard, min `cell_jt + (beta-1)·aw` then least walk then first index). `latest` stays
+  `best[chosen]-aw` so reported clock time is exact; walk-vs-transit now compares DURATIONS (pure walk
+  wins iff its sec ≤ the min-journey transit sec, walk wins ties). **`beta==1.0` is no longer the old
+  byte-equal max-latest-home anchor — it is "min-journey, first index"** (the objective changed; the
+  golden + `test_select_matches_reference_loop` were re-stamped). **CHANGE 2:** for the FINAL ride (the
+  board whose continuation is the egress seed), `_trace_from` + `_build_node_stats` keep the line/trip
+  + board (preserving CHANGE 1's selection + the reported departure + the committed-MC first leg) but
+  re-pick the alight to MINIMIZE `arr[p] + egress_walk(stop@p)` over forward egress-reachable positions
+  (shared `_min_overshoot_alight`); intermediate rides keep their alight (the transfer stop is fixed —
+  changing it would alter the transfer sequence). Per-stop egress seconds are threaded into the
+  constructor (`egress_g, egress_w` from `journey_tree`, gid→sec, `EGRESS_INF` sentinel for
+  unreachable; legacy callers without them fall back to the node's `nd_egress`, behavior unchanged).
+  `jtime` is computed off the SAME no-overshoot arrival so the anchor, the alt window, and the traced
+  journey agree — **hover==map preserved** (`commute_and_dominant` traces via the same path, so the map
+  value automatically drops to the optimized time). **Kept OUT of `reverse_raptor*`/`_profile`/the
+  numba reverse kernel + the depart-after `assemble_*` path** — R5 parity is UNMOVED (depart-after p50
+  MAE 0.75 aggregate, bias +0.06, max 7, mism 5 — byte-identical to baseline; this is arrive-by
+  reconstruction only). Golden re-stamped (284/2999 cells: **283 faster −1..−6 min** + 1 eps-rounding
+  +1; 0 reachability flips). Faster-walk→longer-commute non-monotonicity on the served map nearly
+  halved over 5 workplaces (922→496 cells, 6.35%→3.41%; max magnitude 10→8 min); the residual is the
+  structural single-journey-per-access-stop limit + the arrive-by latest-departure re-pick genuinely
+  opening a different corridor at a different walk speed (a real routing effect, not the bug). Full-grid
+  trace ~50 ms (no perf regression). Guards: the re-stamped `test_select_matches_reference_loop`
+  (min-journey reference loop) + the unchanged `test_hover_equals_map_invariant`,
+  `test_traced_journey_respects_max_rounds`, `test_walk_prior_*`.
 
 ## Accuracy vs R5 (5 diverse workplaces, full 2999-cell grid, depart-after p50)
 **Snapshot-relax baseline (re-stamped 2026-06-10):**

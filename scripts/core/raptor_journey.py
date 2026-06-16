@@ -19,6 +19,7 @@ import numpy as np
 from .raptor import NEG
 
 _TINY_HOP_MIN = 2.0          # fold sub-2-min transit hops into adjacent walk (matches server.py)
+EGRESS_INF = np.int64(1 << 40)   # per-stop egress-walk sentinel: not egress-reachable from W
 
 
 def reconcile_legs(legs, total_min):
@@ -51,7 +52,7 @@ class JourneyTree:
     can be reconstructed without re-running RAPTOR."""
 
     def __init__(self, data, par, access_off, access_to, access_w, purewalk, deadline, max_min,
-                 walk_reluctance=1.0, walk_prior_eps=60.0):
+                 walk_reluctance=1.0, walk_prior_eps=60.0, egress_g=None, egress_w=None):
         self.d = data
         self.par = par
         self.best = par["best"]
@@ -66,6 +67,20 @@ class JourneyTree:
         self.n_cells = len(access_off) - 1
         self.line_table = data["line_table"]
         self.pat_line = data["pat_line"]
+        # Per-stop egress WALK seconds (gid -> sec, sentinel for non-egress-reachable stops): drives
+        # the no-overshoot alight pick in ``_trace_from`` (the final ride alights at the forward stop
+        # minimizing arr + egress_walk, never riding PAST the workplace and walking back). Passed
+        # explicitly from ``raptor_engine.journey_tree`` (it has egress_g/egress_w); a legacy caller
+        # without them keeps egress_sec = sentinel everywhere -> the final-ride scan finds only the
+        # tree's own alight stop (egress-reachable), so behavior is unchanged.
+        self.egress_sec = np.full(data["n_stops"], EGRESS_INF, np.int64)
+        if egress_g is not None and egress_w is not None:
+            eg = np.asarray(egress_g, np.int64); ew = np.asarray(egress_w, np.int64)
+            # keep the MIN per gid (a stop may appear once, but be defensive); ignore negatives
+            for g, w in zip(eg, ew):
+                w = int(w)
+                if w >= 0 and w < self.egress_sec[g]:
+                    self.egress_sec[g] = w
         self._node_stats = None              # lazy (depth, jtime) per stop — walk-prior guards
         self._node_dom = None                # lazy per-stop dominant pattern — alt enumeration
         self._traces = None                  # lazy full-grid trace memo (tree is immutable)
@@ -102,13 +117,16 @@ class JourneyTree:
         nd_board = self.par["nd_board"]; nd_alight = self.par["nd_alight"]
         nd_egress = self.par["nd_egress"]; nd_stop = self.par["nd_stop"]
         nd_to = self.par["nd_to"]
-        pat_nstops = d["pat_nstops"]; pat_mat_off = d["pat_mat_off"]
-        pat_dep = d["pat_dep"]; pat_arr = d["pat_arr"]
+        pat_nstops = d["pat_nstops"]; pat_mat_off = d["pat_mat_off"]; pat_stop_off = d["pat_stop_off"]
+        pat_dep = d["pat_dep"]; pat_arr = d["pat_arr"]; pat_stops = d["pat_stops"]
         tr_off = d["tr_off"]; tr_to = d["tr_to"]; tr_time = d["tr_time"]
+        eg_sec = self.egress_sec
         m = nd_kind.shape[0]
         sig = np.zeros(m, np.int64)            # displayed-ride depth from this node
         tail = np.zeros(m, np.int64)           # trailing walk sec to W (no board below)
         warr = np.full(m, -1, np.int64)        # absolute W-arrival (-1 if no board in chain)
+        # ride seconds the board node actually contributes (post no-overshoot alight): used so the
+        # depth's significant-ride test matches the TRACED ride, not the (possibly longer) node ride.
         tiny = _TINY_HOP_MIN * 60
         for nid in range(m):                   # increasing id: nd_next[nid] < nid resolved
             nxt = int(nd_next[nid])
@@ -121,15 +139,25 @@ class JourneyTree:
                 tail[nid] = fp + tail[nxt]; sig[nid] = sig[nxt]; warr[nid] = warr[nxt]
             else:                              # board: anchor absolute arrival
                 pi = int(nd_pat[nid]); trip = int(nd_trip[nid])
-                ns = int(pat_nstops[pi]); mb = int(pat_mat_off[pi])
+                ns = int(pat_nstops[pi]); mb = int(pat_mat_off[pi]); sb = int(pat_stop_off[pi])
                 bp = int(nd_board[nid]); ap = int(nd_alight[nid])
-                arr_sec = int(pat_arr[mb + trip * ns + ap])
-                ride = arr_sec - int(pat_dep[mb + trip * ns + bp])
-                sig[nid] = sig[nxt] + (1 if ride >= tiny else 0)
+                trow = mb + trip * ns
+                dep_sec = int(pat_dep[trow + bp])
                 tail[nid] = 0                  # board resets the trailing-walk accumulator
-                # the board CLOSEST to W sets the arrival: if a deeper board exists use its warr,
-                # else this board's alight + the trailing walk after it.
-                warr[nid] = warr[nxt] if warr[nxt] >= 0 else arr_sec + tail[nxt]
+                if nxt >= 0 and int(nd_kind[nxt]) == 0:
+                    # FINAL ride (continuation = egress): mirror _trace_from's no-overshoot alight so
+                    # jtime matches the TRACED (optimized) journey, not the overshoot node chain.
+                    ap, aw = _min_overshoot_alight(pat_arr, pat_stops, eg_sec, trow, sb, bp, ns,
+                                                   ap, int(nd_egress[nxt]))
+                    arr_sec = int(pat_arr[trow + ap])
+                    warr[nid] = arr_sec + aw
+                else:
+                    arr_sec = int(pat_arr[trow + ap])
+                    # the board CLOSEST to W sets the arrival: if a deeper board exists use its warr,
+                    # else this board's alight + the trailing walk after it.
+                    warr[nid] = warr[nxt] if warr[nxt] >= 0 else arr_sec + tail[nxt]
+                ride = arr_sec - dep_sec
+                sig[nid] = sig[nxt] + (1 if ride >= tiny else 0)
         depth = np.zeros(n, np.int64); jtime = np.full(n, 1 << 40, np.int64)
         ok = bn >= 0
         nodes = bn[ok]
@@ -204,41 +232,51 @@ class JourneyTree:
             self._node_stats = self._build_node_stats()
         return self._node_stats[1]
 
-    # -- cell -> chosen access stop (must match assemble_arriveby's penalized argmax) -------
+    # -- cell -> chosen access stop (MIN door-to-door journey + walk prior) ----------------
     def _select_arrays(self):
         """Vectorized per-cell access-stop selection over the whole grid, computed lazily ONCE
         per tree (the per-cell python loop was ~93% of _trace_all; the segmented-reduce version
         is ~30x faster). Returns cell-aligned arrays
         (s_star int64, aw int64, latest int64, is_walk bool, walk_home int64).
 
-        WALK-RELUCTANCE PRIOR (``self.beta`` + ``self.eps``, decision-only): the user's anomaly is
-        "fast walk -> walk to a FARTHER station AT ~THE SAME TIME". So the prior re-selects the
-        access stop ONLY among options that reach work at essentially the same time, preferring the
-        closer one. Two safeguards keep it a tie-break, never a degradation:
-          * EPS WINDOW (``self.eps`` sec, hard cap): only access stops whose TRUE travel is within
-            ``eps`` of the time-optimal stop (true home >= best_true_home - eps) are candidates, so
-            the reported time can change by at most ~1 min and a genuinely-faster farther stop
-            (> eps better) is NEVER traded away. ``latest`` is the TRUE chosen home (reported time
-            stays exact clock time; hover == map).
-          * TRANSFER GUARD (the user's "not a million transfers"): candidates are further capped to
-            ride depth (displayed transit legs, from the node table) ``<=`` the time-optimal stop's
-            depth, so the prior can never add a transfer vs ``beta=1.0``.
-        Within that candidate window the stop maximizing the PENALIZED home ``ph = h - (beta-1)*aw``
-        wins (then LESS walk, then first-index) — i.e. the closer stop among ~same-time options.
-        ``beta == 1.0`` keeps the original max-true-home, first-index behavior BYTE-FOR-BYTE (the
-        golden regression anchor; the eps window is irrelevant there).
+        OBJECTIVE = MIN DOOR-TO-DOOR JOURNEY (2026-06-16, output-changing on the served arrive-by
+        map). The arrive-by reverse tree optimizes LATEST HOME DEPARTURE (leave as late as possible
+        and still arrive by the deadline), NOT the shortest trip — two access stops with near-equal
+        latest departures can have very different door-to-door durations, because a latest-departure
+        journey may ARRIVE well before the deadline (it just couldn't have left later). Picking the
+        access stop by max-latest-home therefore showed a SLOWER route than an available faster line
+        on ~1774 cells (the faster line surfaced only as an "alt"). We now anchor the selection on
+        the SAME quantity the alt window ranks by — the cell's MINIMUM ``cell_jt = jtime[stop] + aw``
+        (true door-to-door seconds; ``jtime`` from the node table is the TRACED arrival minus the
+        departure, see ``_build_node_stats``) — so the primary is always the fastest route and faster
+        walking can never lengthen the commute. ``latest`` (the REPORTED home departure) stays
+        ``best[chosen] - aw[chosen]``, so the reported clock time is the chosen journey's exact time.
+
+        WALK-RELUCTANCE PRIOR (``self.beta`` + ``self.eps``, decision-only): a tie-break ON TOP of
+        the min-journey anchor — among access stops whose journey is within ``eps`` of the cell's
+        MIN journey and whose ride depth is ``<=`` the anchor's, prefer LESS walking. Two safeguards:
+          * EPS BAND (``self.eps`` sec): only stops with ``cell_jt <= anchor_jt + eps`` are
+            candidates (the anchor IS the min, so the band is naturally one-sided; the symmetric
+            ``lo`` bound is harmless). A genuinely-faster farther stop can't exist — the anchor is
+            already the fastest — so the reported time can rise by at most the rounding minute.
+          * TRANSFER GUARD: candidates capped to ride depth ``<=`` the anchor's depth, so the prior
+            can never add a transfer.
+        Within that window the stop minimizing ``pen = cell_jt + (beta-1)*aw`` wins (then LESS walk,
+        then first index). ``beta == 1.0`` reduces to "min-journey, then least aw, then first index"
+        (NO LONGER the old max-latest-home byte-equal anchor — the objective changed).
 
         Edge cases replicated from the loop:
           * empty access segments (cells with zero access pairs): reduce only over nonempty segments
             (``nz = flatnonzero(diff(off) > 0)``) — empty cells keep (-1, 0, NEG).
-          * all-unreachable segments: clamp with ``latest > NEG // 2`` so they keep (-1, 0, NEG).
+          * all-unreachable segments: an unreachable pair has ``jtime`` at the sentinel, so its
+            ``cell_jt`` exceeds the cap and it never wins; segments with no reachable pair keep
+            (-1, 0, NEG) via the ``ok`` mask.
           * first-index tie: the segmented first-argmax (``minimum.reduceat`` over masked indices)."""
         if self._sel is None:
             off = np.asarray(self.access_off, np.int64)
             aw_all = self.access_w
             h = self.best[self.access_to] - aw_all              # int64 TRUE home; NEG - w if unreach
             bw = self.beta - 1.0
-            reach_pair = h > NEG // 2
             n = self.n_cells
             seglen = np.diff(off)
             nz = np.flatnonzero(seglen > 0)
@@ -260,40 +298,37 @@ class JourneyTree:
                 ok = segmax > IMIN
                 return first, ok
 
-            # ANCHOR = the no-prior (max-true-home) winner, identical to beta=1.0 — its journey time
-            # is the eps reference and its ride depth the transfer ceiling, so the prior re-selects
-            # only AROUND the cell's existing displayed journey (never a different/slower corridor).
-            base_key = np.where(reach_pair, h, IMIN)
+            # per-pair door-to-door journey seconds (the alt window's ranking key); unreachable pairs
+            # carry the jtime sentinel (~1<<40) so cell_jt overflows the cap and never wins.
+            jt_stop = self._stop_jtime[self.access_to]
+            cell_jt = jt_stop + aw_all
+            JBIG = np.int64(1 << 39)
+            reach_pair = jt_stop < JBIG
+            depth = self._stop_depth[self.access_to]
+            cellid = np.repeat(np.arange(n), seglen)
+
+            # ANCHOR = the cell's MIN journey (segmented argmin over cell_jt) — its journey time is
+            # the eps reference and its ride depth the transfer ceiling. Implemented as a first-argmax
+            # over the negated journey (so ties keep the FIRST index, identical reduce machinery).
+            base_key = np.where(reach_pair, -cell_jt, IMIN)
             base_first, base_ok = _seg_first_argmax(base_key)
             if bw == 0.0:
                 first, ok = base_first, base_ok
             else:
-                depth = self._stop_depth[self.access_to]
-                # cell journey time via each pair = jtime(stop) + access_walk. The arrive-by tree's
-                # latest departure can ARRIVE before the deadline, so the door-to-door minutes are
-                # jtime + aw, NOT deadline - home — the eps window MUST compare these (see
-                # _build_node_stats); comparing home departures alone let a 22 s home-dep tie hide a
-                # 4-min slower journey.
-                cell_jt = self._stop_jtime[self.access_to] + aw_all
-                cellid = np.repeat(np.arange(n), seglen)
                 base_jt = np.full(n, 1 << 40, np.int64); d_base = np.full(n, 1 << 30, np.int64)
                 bsel = base_first[base_ok]
-                base_jt[nz[base_ok]] = cell_jt[bsel]      # the anchor's displayed journey time
+                base_jt[nz[base_ok]] = cell_jt[bsel]      # the anchor's (min) journey time
                 d_base[nz[base_ok]] = depth[bsel]
                 eps = np.int64(round(self.eps))
-                # SYMMETRIC eps window around the ANCHOR (max-h winner) journey time: the prior is a
-                # TIE-BREAK among ~same-time options, so the map value changes by at most ~1 min in
-                # EITHER direction (a band, not just an upper cap — without the lower bound the
-                # journey-time argmin would also pull in genuinely-faster stops and shift the
-                # validated arrive-by map by many minutes, which is a different feature than the
-                # walk-preference the user asked for).
+                # eps band around the MIN journey + transfer guard. The anchor IS the min, so
+                # cell_jt >= base_jt always holds for reachable pairs; the lower ``lo`` bound is kept
+                # (harmless: never excludes a candidate) so the form mirrors the symmetric original.
                 lo = base_jt[cellid] - eps; hi = base_jt[cellid] + eps
                 allowed = (reach_pair
-                           & (cell_jt >= lo) & (cell_jt <= hi)       # +/- eps band: ~same journey time
+                           & (cell_jt >= lo) & (cell_jt <= hi)       # within eps of the min journey
                            & (depth <= d_base[cellid]))             # transfer guard: <= anchor rides
                 # within the band: MINIMIZE penalized journey (jtime + beta*aw), so a closer stop
-                # (less aw) wins among ~equal-time options, then LESS walk, then first index. cs
-                # resolution keeps exact/near ties; disallowed pairs clamped out (maximize -key).
+                # (less aw) wins among ~equal-time options, then LESS walk, then first index.
                 pen = cell_jt.astype(np.float64) + bw * aw_all.astype(np.float64)   # = jt + beta*aw
                 _W = np.int64(10_000_000)
                 key = np.where(allowed, -(np.rint(pen * 100.0).astype(np.int64) * _W + aw_all), IMIN)
@@ -301,25 +336,25 @@ class JourneyTree:
             latest = np.full(n, NEG, np.int64)
             s_star = np.full(n, -1, np.int64)
             aw = np.zeros(n, np.int64)
-            anchor_home = np.full(n, NEG, np.int64)             # the no-prior winner's TRUE home
+            anchor_jt = np.full(n, 1 << 40, np.int64)           # the min-journey anchor's true sec
             if len(nz):
                 sel = first[ok]
                 latest[nz[ok]] = h[sel]                          # TRUE home of the chosen stop
                 s_star[nz[ok]] = self.access_to[sel]
                 aw[nz[ok]] = aw_all[sel]
                 if bw == 0.0:
-                    anchor_home[nz[ok]] = h[sel]
+                    anchor_jt[nz[ok]] = cell_jt[sel]
                 else:
-                    anchor_home[nz[base_ok]] = h[bsel]
+                    anchor_jt[nz[base_ok]] = cell_jt[bsel]
             pw = self.purewalk
             walk_home = np.where(pw >= 0, self.deadline - pw, NEG)
-            # Walk-vs-transit decided against the ANCHOR (no-prior, max-true-home) transit stop, so
-            # the prior NEVER flips a cell between walk-only and transit — it only re-selects among
-            # transit access stops (the user's "walk to a farther STATION"). The anchor's home is the
-            # original ``latest``, so this is byte-identical to the old ``walk_home >= latest`` at
-            # beta=1.0; at beta>1.0 the chosen transit stop may differ but the WALK decision (and
-            # thus which cells are walk-only) is unchanged from baseline.
-            is_walk = walk_home >= anchor_home
+            # Walk-vs-transit decided against the MIN-JOURNEY transit anchor (durations, not home
+            # departures): pure walk wins iff its duration <= the anchor transit journey's duration
+            # (walk wins ties, matching the old ``walk_home >= anchor_home`` direction translated to
+            # durations). The prior re-selects only AMONG transit access stops, never flips a cell
+            # walk<->transit, so which cells are walk-only is set purely by this comparison.
+            pw_dur = np.where(pw >= 0, pw.astype(np.int64), 1 << 40)
+            is_walk = (pw >= 0) & (pw_dur <= anchor_jt)
             self._sel = (s_star, aw, latest, is_walk, walk_home)
         return self._sel
 
@@ -382,7 +417,18 @@ class JourneyTree:
         produces — or None if the stop is unreachable / the chain is malformed. Used both by the
         cell's SELECTED journey (``_trace_uncached``) and by the per-access-stop ALTERNATIVE
         enumeration (``alt_lines_window`` / ``itinerary_via_stop``), so an alt route is traced by the
-        exact same machinery as the primary."""
+        exact same machinery as the primary.
+
+        NO-OVERSHOOT ALIGHT (2026-06-16): the reverse tree optimizes LATEST HOME DEPARTURE, so its
+        node chain can ride PAST the stop closest to W and then walk back (a longer ride AND a longer
+        egress walk — strictly dominated). For the FINAL ride (the board whose continuation is the
+        egress seed), we keep the line/trip + board (preserving the access selection + reported
+        departure) but re-pick the ALIGHT to MINIMIZE the downstream W-arrival = ``arr[p] +
+        egress_walk(stop@p)`` over every forward, egress-reachable position ``p >= bpos`` on that
+        trip, then emit the egress from that optimal stop. Intermediate rides (continuation is a
+        footpath or another board) keep the tree's alight: the transfer stop is structurally fixed,
+        and moving it would change the transfer sequence (out of scope). The board CLOSEST to W
+        already sets the arrival, so this never rides slower — it only stops overshooting."""
         if s_star < 0:
             return None
         par = self.par
@@ -393,6 +439,7 @@ class JourneyTree:
         nd_kind = par["nd_kind"]; nd_stop = par["nd_stop"]; nd_pat = par["nd_pat"]
         nd_trip = par["nd_trip"]; nd_board = par["nd_board"]; nd_alight = par["nd_alight"]
         nd_to = par["nd_to"]; nd_egress = par["nd_egress"]; nd_next = par["nd_next"]
+        eg_sec = self.egress_sec
 
         # Trace from s* (home-side access stop) FORWARD toward W via the node chain: each node moves
         # W-ward (a board rides to its alight nearer W; a footpath walks toward W), so the list is
@@ -407,9 +454,23 @@ class JourneyTree:
                 pi = int(nd_pat[nid]); trip = int(nd_trip[nid])
                 bpos = int(nd_board[nid]); apos = int(nd_alight[nid])
                 ns = int(pat_nstops[pi]); mbase = int(pat_mat_off[pi]); sbase = int(pat_stop_off[pi])
+                trow = mbase + trip * ns
+                nxt = int(nd_next[nid])
+                if nxt >= 0 and int(nd_kind[nxt]) == 0:
+                    # FINAL ride (continuation = egress): re-pick the alight to minimize the
+                    # downstream W-arrival arr[p] + egress_walk(stop@p) over forward egress-reachable
+                    # positions, then walk to W from that optimal stop (no overshoot).
+                    apos, eg = _min_overshoot_alight(pat_arr, pat_stops, eg_sec, trow, sbase, bpos,
+                                                     ns, apos, int(nd_egress[nxt]))
+                    alight_stop = int(pat_stops[sbase + apos])
+                    arr_sec = int(pat_arr[trow + apos])
+                    dep_sec = int(pat_dep[trow + bpos])
+                    legs.append(("ride", pi, dep_sec, arr_sec, bpos, apos, alight_stop))
+                    legs.append(("egress", eg, alight_stop))
+                    return legs, latest_home
                 alight_stop = int(pat_stops[sbase + apos])
-                dep_sec = int(pat_dep[mbase + trip * ns + bpos])
-                arr_sec = int(pat_arr[mbase + trip * ns + apos])
+                dep_sec = int(pat_dep[trow + bpos])
+                arr_sec = int(pat_arr[trow + apos])
                 legs.append(("ride", pi, dep_sec, arr_sec, bpos, apos, alight_stop))
             elif k == 2:                        # footpath nd_stop -> nd_to (toward W)
                 s = int(nd_stop[nid]); j = int(nd_to[nid])
@@ -756,3 +817,27 @@ def _footpath_sec(tr_off, tr_to, tr_time, s, j):
         if int(tr_to[k]) == j:
             return int(tr_time[k])
     return 0                                             # same-stop transfer (no footpath edge)
+
+
+def _min_overshoot_alight(pat_arr, pat_stops, eg_sec, trow, sbase, bpos, ns, apos, nd_egress):
+    """The no-overshoot FINAL-ride alight: the forward, egress-reachable position p >= bpos+1 on
+    this trip minimizing the W-arrival arr[p] + egress_walk(stop@p). Seeded with the tree's own
+    alight ``apos`` (egress-reachable by construction); ``nd_egress`` is the egress node's stored
+    walk seconds, used as a fallback when the per-stop egress table is absent (legacy caller).
+    Shared by ``_trace_from`` and ``_build_node_stats`` so the traced journey and the jtime/depth
+    stats agree byte-for-byte. Returns ``(alight_position, egress_walk_sec)`` — both call sites use
+    the SAME resolved egress (incl. the legacy fallback), so there is ONE place the egress is
+    derived and no chance of byte-drift between the trace and the stats."""
+    best_p = int(apos)
+    best_w = int(eg_sec[int(pat_stops[sbase + best_p])])
+    if best_w >= EGRESS_INF:
+        best_w = int(nd_egress) if nd_egress >= 0 else 0
+    best_arrW = int(pat_arr[trow + best_p]) + best_w
+    for p in range(int(bpos) + 1, int(ns)):
+        w = int(eg_sec[int(pat_stops[sbase + p])])
+        if w >= EGRESS_INF:
+            continue
+        cand = int(pat_arr[trow + p]) + w
+        if cand < best_arrW:
+            best_arrW = cand; best_p = p; best_w = w
+    return best_p, best_w

@@ -253,7 +253,8 @@ class RaptorEngine:
         return raptor_journey.JourneyTree(self.data, par, self.access_off, self.access_to,
                                           aw, pw, target, self.max_min,
                                           walk_reluctance=walk_reluctance,
-                                          walk_prior_eps=walk_prior_eps)
+                                          walk_prior_eps=walk_prior_eps,
+                                          egress_g=egress_g, egress_w=ew)
 
     # -- Phase A: service-noise Monte-Carlo (realistic + fragility + alt-lines) ------------
     def _mc_mode_params(self):
