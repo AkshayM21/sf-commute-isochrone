@@ -67,6 +67,7 @@ class JourneyTree:
         self.line_table = data["line_table"]
         self.pat_line = data["pat_line"]
         self._node_stats = None              # lazy (depth, jtime) per stop — walk-prior guards
+        self._node_dom = None                # lazy per-stop dominant pattern — alt enumeration
         self._traces = None                  # lazy full-grid trace memo (tree is immutable)
         self._sel = None                     # lazy vectorized _select memo (cell-aligned arrays)
 
@@ -140,6 +141,56 @@ class JourneyTree:
         jtime[ok] = np.where(wa >= 0, wa - self.best[ok], tail[nodes])
         depth[~ok] = 1 << 30                   # unreachable: never wins a guarded tie
         return depth, jtime
+
+    def _build_stop_dominant(self):
+        """Per-stop DOMINANT pattern index (the pattern of the longest SIGNIFICANT ride along that
+        stop's single traced journey) — the line that journey would be labeled by ``_dominant``,
+        precomputed for the whole grid in ONE bottom-up node-table pass (``nd_next[nid] < nid``).
+        Returns int64[n_stops]: the dominant pattern id, or -1 for a walk-only / unreachable chain.
+
+        Mirrors ``_dominant``'s pick (max ride seconds wins). For an exact ride-time TIE the lower
+        ``pat_line`` index wins here (deterministic), where ``_dominant`` tie-breaks by route NAME;
+        this only affects rare exact-second ties and is used solely to GROUP access stops by line for
+        the alt window — the displayed alt line/time is always re-derived by ``_dominant`` on the
+        actually-traced legs, so it stays exact. Falls back to all -1 if a legacy ``par`` lacks the
+        node table."""
+        n = self.best.shape[0]
+        bn = self.par.get("best_node")
+        if bn is None:
+            return np.full(n, -1, np.int64)
+        d = self.d
+        nd_kind = self.par["nd_kind"]; nd_next = self.par["nd_next"]
+        nd_pat = self.par["nd_pat"]; nd_trip = self.par["nd_trip"]
+        nd_board = self.par["nd_board"]; nd_alight = self.par["nd_alight"]
+        pat_nstops = d["pat_nstops"]; pat_mat_off = d["pat_mat_off"]
+        pat_dep = d["pat_dep"]; pat_arr = d["pat_arr"]
+        m = nd_kind.shape[0]
+        tiny = _TINY_HOP_MIN * 60
+        best_ride = np.full(m, -1, np.int64)   # longest significant ride sec in this node's chain
+        best_pat = np.full(m, -1, np.int64)    # the pattern achieving it
+        for nid in range(m):                   # increasing id resolves nd_next first
+            nxt = int(nd_next[nid])
+            br = best_ride[nxt] if nxt >= 0 else -1
+            bp = best_pat[nxt] if nxt >= 0 else -1
+            if int(nd_kind[nid]) == 1:         # board: compare its ride to the chain's current best
+                pi = int(nd_pat[nid]); trip = int(nd_trip[nid])
+                ns = int(pat_nstops[pi]); mb = int(pat_mat_off[pi])
+                ride = int(pat_arr[mb + trip * ns + int(nd_alight[nid])]) \
+                    - int(pat_dep[mb + trip * ns + int(nd_board[nid])])
+                if ride >= tiny and (ride > br or (ride == br and (bp < 0 or
+                        int(self.pat_line[pi]) < int(self.pat_line[bp])))):
+                    br = ride; bp = pi
+            best_ride[nid] = br; best_pat[nid] = bp
+        out = np.full(n, -1, np.int64)
+        ok = bn >= 0
+        out[ok] = best_pat[bn[ok]]
+        return out
+
+    @property
+    def _stop_dominant(self):
+        if self._node_dom is None:
+            self._node_dom = self._build_stop_dominant()
+        return self._node_dom
 
     @property
     def _stop_depth(self):
@@ -322,6 +373,18 @@ class JourneyTree:
             return [("walk", int(self.purewalk[ci]))], latest_home
         if s_star < 0:
             return None
+        return self._trace_from(s_star, aw, latest_home)
+
+    def _trace_from(self, s_star, aw, latest_home):
+        """The shared node-chain walk: trace the tree's single journey FROM access stop ``s_star``
+        (reached after ``aw`` access-walk seconds, departing home at ``latest_home``) FORWARD toward
+        W. Returns (legs_raw, latest_home) — the same forward-order tuple list ``_trace_uncached``
+        produces — or None if the stop is unreachable / the chain is malformed. Used both by the
+        cell's SELECTED journey (``_trace_uncached``) and by the per-access-stop ALTERNATIVE
+        enumeration (``alt_lines_window`` / ``itinerary_via_stop``), so an alt route is traced by the
+        exact same machinery as the primary."""
+        if s_star < 0:
+            return None
         par = self.par
         d = self.d
         pat_nstops = d["pat_nstops"]; pat_mat_off = d["pat_mat_off"]; pat_stop_off = d["pat_stop_off"]
@@ -416,6 +479,95 @@ class JourneyTree:
                 l.pop("segs", None)              # internal plumbing; not part of the response
         return res
 
+    # -- alternatives: dominance window over the per-access-stop journeys ------------------
+    def alt_lines_window(self, perfect, window_min):
+        """Per-cell ALTERNATIVE lines as a deterministic, walk-speed-STABLE dominance window over
+        THIS (unperturbed) tree's per-access-stop journeys — the diag's recommended fix (option A,
+        .plans/alt_walkspeed_diag.md). For each cell, every access stop offers exactly one journey
+        (the tree's latest-departure chain from that stop); its door-to-door time = jtime[stop] +
+        access_walk and its dominant line = ``_stop_dominant[stop]``. We keep, per distinct line, its
+        FASTEST such time + the access stop achieving it, then keep every line whose best time is
+        within ``window_min`` of the cell's best (= min over perfect + all access-stop journeys).
+
+        Unlike the old K-draw MC vote (which dropped a within-1-2-min short-walk bus when faster
+        walking made some OTHER journey the strict argmin in all K draws), this is K-free and stable:
+        a bus within the window at slow walk stays within it at fast (its gap to best grows only by
+        the walk-speed delta on the access leg). Each kept line carries a real access stop, so the
+        route is traceable via ``itinerary_via_stop``.
+
+        Returns list[dict|None]: per cell ``{line_name: (min_minutes, access_stop_gid)}`` sorted
+        closest-first (the PRIMARY line is NOT excluded here — the caller drops it), or None when no
+        transit line is within the window."""
+        perfect = np.asarray(perfect, np.int64)
+        off = np.asarray(self.access_off, np.int64)
+        to = np.asarray(self.access_to, np.int64)
+        aw = self.access_w
+        jtime = self._stop_jtime                       # per-stop journey sec to W (node table)
+        sdom = self._stop_dominant                     # per-stop dominant pattern (node table)
+        win = int(round(window_min))
+        cap = self.max_min
+        out = [None] * self.n_cells
+        for ci in range(self.n_cells):
+            a0, a1 = int(off[ci]), int(off[ci + 1])
+            if a1 <= a0:
+                continue
+            cb = int(perfect[ci]) if perfect[ci] >= 0 else (1 << 30)
+            best = {}                                  # line_name -> [min_minutes, access_stop]
+            for k in range(a0, a1):
+                s = int(to[k]); pi = int(sdom[s])
+                if pi < 0:
+                    continue                           # walk-only / unreachable chain from s
+                jt = int(jtime[s])
+                if jt >= (1 << 39):
+                    continue                           # unreachable sentinel
+                m = int(np.ceil((jt + int(aw[k])) / 60.0))
+                if m >= cap:
+                    continue
+                if m < cb:
+                    cb = m                             # an access-stop journey can beat perfect's round
+                name = self._name(pi)
+                cur = best.get(name)
+                if cur is None or m < cur[0] or (m == cur[0] and s < cur[1]):
+                    best[name] = [m, s]
+            if not best:
+                continue
+            kept = {ln: (mk[0], mk[1]) for ln, mk in best.items() if mk[0] <= cb + win}
+            if not kept:
+                continue
+            out[ci] = dict(sorted(kept.items(), key=lambda kv: (kv[1][0], kv[0])))
+        return out
+
+    def itinerary_via_stop(self, ci, s_star, geom_provider=None):
+        """Like ``itinerary`` but for an EXPLICIT access stop (an alternative route surfaced by
+        ``alt_lines_window``): trace the tree's journey from ``s_star`` to W for cell ``ci`` using
+        the same machinery the primary route uses, so the alt's breakdown/geometry are byte-faithful
+        to the tree. ``s_star`` must be one of cell ``ci``'s access stops (its access-walk seconds
+        are looked up from the CSR). Returns the same dict ``itinerary`` returns, or None."""
+        off = np.asarray(self.access_off, np.int64)
+        to = np.asarray(self.access_to, np.int64)
+        a0, a1 = int(off[ci]), int(off[ci + 1])
+        awk = None
+        for k in range(a0, a1):
+            if int(to[k]) == int(s_star):
+                awk = int(self.access_w[k]); break
+        if awk is None:
+            return None
+        latest_home = int(self.best[int(s_star)]) - awk
+        tr = self._trace_from(int(s_star), awk, latest_home)
+        if tr is None:
+            return None
+        legs_raw, latest_home = tr
+        out, total_sec = self._clock(legs_raw, latest_home, segs=geom_provider is not None)
+        total_min = int(np.ceil(total_sec / 60.0))
+        if total_min >= self.max_min:
+            return None
+        res = self._format(out, total_min)
+        if geom_provider is not None:
+            res["geom"] = self._geometry(ci, res["legs"], geom_provider, s_star=int(s_star))
+            for l in res["legs"]:
+                l.pop("segs", None)
+        return res
+
     # -- route geometry (hover map drawing) -----------------------------------------------
     def _ride_pts(self, pi, bpos, apos):
         """[[lat, lon], ...] stop-coordinate polyline for a ride from board to alight position
@@ -433,16 +585,18 @@ class JourneyTree:
             pts.append([round(la, 6), round(lo, 6)])
         return pts
 
-    def _geometry(self, ci, legs, provider):
+    def _geometry(self, ci, legs, provider, s_star=None):
         """Assemble the per-leg map geometry for an already-formatted leg list (each leg
         carrying its "segs" descriptors from ``_clock``). The provider supplies WALK paths:
           access(ci, stop_gid) / purewalk(ci) / transfer(s, j) / egress(s)
         each returning ([[lat,lon],...], approx_bool) — real walk-graph paths, or a straight
         2-point fallback with approx=True. Ride points come from the pattern stop sequence
         of the SAME traced legs the breakdown shows (the hover==map invariant extends to the
-        drawn route). Returns [{mode, name, feed?, tmode?, min, wait?, pts, approx?}, ...]
-        aligned 1:1 with ``legs``."""
-        s_star, _aw, _lh, _is_walk = self._select(ci)
+        drawn route). ``s_star`` overrides the access stop (for an ALTERNATIVE route via a
+        different stop); None uses the cell's SELECTED stop. Returns
+        [{mode, name, feed?, tmode?, min, wait?, pts, approx?}, ...] aligned 1:1 with ``legs``."""
+        if s_star is None:
+            s_star, _aw, _lh, _is_walk = self._select(ci)
         geom = []
         for l in legs:
             pts, approx = [], False

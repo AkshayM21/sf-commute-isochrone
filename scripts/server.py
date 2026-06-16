@@ -863,14 +863,14 @@ def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_S
 # copy_mode='shallow': dict(entry) on get, callers can't reassign the cached entry's keys.
 _MC_CACHE_MAX = 8
 _RAPTOR_MC_CACHE = _BoundedLRU(_MC_CACHE_MAX, copy_mode="shallow")
-# (coarse_key incl. rides+speed) -> {realistic, variance, alt_bundle, alt_chips, alt_trees,
-#  alt_geom, dlat, dlon}. The alt_* keys back /itinerary's drawn alternative routes: alt_bundle
-# is the engine's lightweight per-draw capture (perturbed schedule columns + traced parents +
-# per-draw dominant lines), alt_chips[ci] the served alt-line chip set per cell (same exclusion +
-# 4-cap /variance applies), alt_trees the K JourneyTrees rebuilt lazily on first hover (cached so
-# warm hovers only trace), alt_geom[ci] the assembled per-cell alt response. They live and die
-# with the MC entry (same coarse key: workplace + rides + SPEED — alt traces depend on the
-# speed-scaled access/purewalk, so a slow-walk hover can never read a medium-walk bundle).
+# (coarse_key incl. rides+speed) -> {realistic, variance, alt_bundle, alt_chips, alt_geom, dlat,
+#  dlon}. The alt_* keys back /itinerary's drawn alternative routes: alt_bundle is the engine's
+# dominance-window geometry handle ({alt_stop: per-cell {line: access_stop}}, the route traced from
+# the SAME cached primary tree via itinerary_via_stop — no perturbed re-trace), alt_chips[ci] the
+# served alt-line chip set per cell (same primary-exclusion + 4-cap /variance applies), alt_geom[ci]
+# the assembled per-cell alt response. They live and die with the MC entry (same coarse key:
+# workplace + rides + SPEED — alt times depend on the speed-scaled walk, so a slow-walk hover can
+# never read a medium-walk bundle).
 _RAPTOR_MC_INFLIGHT = {}                     # key -> threading.Event (MC build in progress)
 _RAPTOR_MC_LOCK = threading.Lock()           # guards the in-flight registry; held AROUND the
 # cache-miss check + owner registration so "miss => exactly one owner" stays atomic (the
@@ -883,9 +883,9 @@ _RAPTOR_MC_LOCK = threading.Lock()           # guards the in-flight registry; he
 # frontend's loadVariance already retries once. Same-key concurrency is de-duped separately via
 # _RAPTOR_MC_INFLIGHT (waiters block briefly on the owner's Event, then re-read the cache).
 _MC_BUSY = threading.Lock()
-# Lazy alt-route building mutates the cached MC entry's shared values (alt_trees + alt_geom) on
-# the hover path, so writes go through this lock (the documented rule for mutating a cached
-# entry's values, mirroring _GEOM_LOCK for the primary route geometry).
+# Lazy alt-route building mutates the cached MC entry's shared value (alt_geom) on the hover path,
+# so writes go through this lock (the documented rule for mutating a cached entry's values,
+# mirroring _GEOM_LOCK for the primary route geometry).
 _ALT_LOCK = threading.Lock()
 
 
@@ -957,17 +957,20 @@ def _raptor_mc_build(key, dlat, dlon, max_rides, speed, walk_scalar):
         a = alt_all[i] if alt_all else None
         if a:
             domc = dom.get(c)
-            a = {k: vv for k, vv in a.items() if k != domc}   # only OTHER lines (not the normal one)
+            # alt is the dominance window {line: min_minutes}, already sorted closest-first; drop
+            # the cell's PRIMARY line (its own chip is redundant) and keep the 4 closest.
+            a = {k: vv for k, vv in a.items() if k != domc}
             if a:
                 a = dict(list(a.items())[:4])
                 v["alt"] = a
                 alt_chips[i] = list(a.keys())          # SAME chips /itinerary will draw
         variance[c] = v
-    # alt_bundle (+ the matching per-cell chips) backs /itinerary's drawn alternative routes;
-    # alt_trees/alt_geom start empty and fill lazily on the first alt hover (under _ALT_LOCK).
+    # alt_bundle (per-cell {line: access_stop}) + the matching per-cell chips back /itinerary's
+    # drawn alternative routes (traced from the cached primary tree); alt_geom fills lazily on the
+    # first alt hover (under _ALT_LOCK).
     out = {"realistic": realistic, "variance": variance,
            "alt_bundle": mc.get("alt_bundle"), "alt_chips": alt_chips,
-           "alt_trees": {}, "alt_geom": {}, "dlat": float(dlat), "dlon": float(dlon)}
+           "alt_geom": {}, "dlat": float(dlat), "dlon": float(dlon)}
     _RAPTOR_MC_CACHE.put(key, out)
     return out
 
@@ -977,27 +980,28 @@ def _mc_peek(dlat, dlon, max_rides, speed):
     triggering a build. /itinerary uses this so a hover never pays the ~1s MC cost; the alt
     routes simply stay [] until the frontend's /variance fetch lands (after which the next
     hover finds the entry). A shallow dict(entry) copy, so the returned wrapper is private but
-    the shared alt_trees/alt_geom dicts are the live cache values (mutated under _ALT_LOCK)."""
+    the shared alt_geom dict is the live cache value (mutated under _ALT_LOCK)."""
     return _RAPTOR_MC_CACHE.get(_coarse_key(dlat, dlon, max_rides, speed))
 
 
 def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None):
-    """The drawn alternative routes for cell ``ci``: for each alt chip line the MC overlay
-    surfaced for this cell (the SAME exclusion + 4-cap /variance applies), find the first
-    captured perturbed draw whose dominant line for this cell is that line, rebuild that draw's
-    JourneyTree (lazily, cached per workplace — NOT per cell), trace the cell, and assemble the
-    geometry through the SAME _JourneyGeomProvider the primary route uses (so alt walk legs get
-    real street paths too). Returns [{line, min, legs:[...geom legs...]}], or [] if the MC build
-    hasn't run yet (we never trigger it here) or the cell has no alt chips.
+    """The drawn alternative routes for cell ``ci``: for each alt chip line the MC overlay surfaced
+    for this cell (the dominance-window alts, after the SAME primary-exclusion + 4-cap /variance
+    applies), trace that line's journey from the access stop the window picked (the bundle's per-cell
+    ``alt_stop`` map) on the SAME (unperturbed) cached tree the primary route uses, via
+    ``JourneyTree.itinerary_via_stop``, and assemble the geometry through the SAME
+    _JourneyGeomProvider (so alt walk legs get real street paths too). Returns
+    [{line, min, legs:[...geom legs...]}], or [] if the MC build hasn't run yet (we never trigger it
+    here) or the cell has no alt chips.
 
-    ``provider`` lets the caller pass the primary route's _JourneyGeomProvider so the per-cell
-    access walk-tree (one Dijkstra) is shared rather than recomputed for the alts; absent, a
-    fresh one is built (only reached when the cell's alt_geom isn't already cached).
+    ``provider`` lets the caller pass the primary route's _JourneyGeomProvider so the per-cell access
+    walk-tree (one Dijkstra) is shared rather than recomputed for the alts; absent, a fresh one is
+    built (only reached when the cell's alt_geom isn't already cached).
 
-    Determinism: the captured draws are seed-derived and the first-matching-draw scan is in draw
-    order, so the same request yields identical alts run-to-run. Performance: warm (alt_geom
-    cached) returns immediately; the K JourneyTrees are built once per workplace on the first
-    alt hover, then reused."""
+    Determinism: the alts are a deterministic window over the (deterministic) tree, so the same
+    request yields identical alts run-to-run AND the same set at any walk speed within the window.
+    Performance: warm (alt_geom cached) returns immediately; the tree is the one /compute already
+    built + cached for this workplace, so no extra RAPTOR work."""
     mc = _mc_peek(dlat, dlon, max_rides, speed)
     if mc is None:
         return []                                       # variance not built yet -> no alts
@@ -1009,30 +1013,21 @@ def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None):
     cached = geom_cache.get(ci)
     if cached is not None:
         return cached
-    # Map each chip line -> the first captured draw where this cell's dominant == that line.
-    draws = bundle["draws"]
-    line_to_draw = {}
-    for line in chips:
-        for di, dr in enumerate(draws):
-            if ci < len(dr["dom"]) and dr["dom"][ci] == line:
-                line_to_draw[line] = di
-                break
-    if not line_to_draw:
+    # Each chip line -> the access stop the window picked for it (the bundle's per-cell alt_stop).
+    alt_stop = bundle.get("alt_stop")
+    cell_alt_stop = (alt_stop[ci] if alt_stop and ci < len(alt_stop) else None) or {}
+    if not cell_alt_stop:
         return []
+    walk_scalar = config.WALK_KMH / WALK_SPEEDS.get(speed, config.WALK_KMH)
+    tree = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)["tree"]  # cache hit (same tree)
     if provider is None:
         provider = _JourneyGeomProvider(dlat, dlon)      # per-workplace walk paths (shared trees)
-    trees = mc["alt_trees"]
     out = []
-    for line in chips:                                   # preserve the chip (vote) order
-        di = line_to_draw.get(line)
-        if di is None:
+    for line in chips:                                   # preserve the chip (closest-first) order
+        s = cell_alt_stop.get(line)
+        if s is None:
             continue
-        with _ALT_LOCK:                                  # rebuild + cache the draw's tree once
-            tree = trees.get(di)
-            if tree is None:
-                tree = _RAPTOR.alt_journey_tree(bundle, di)
-                trees[di] = tree
-        it = tree.itinerary(ci, geom_provider=provider)
+        it = tree.itinerary_via_stop(ci, int(s), geom_provider=provider)
         if it is None:
             continue
         out.append({"line": line, "min": it["total"], "legs": it["geom"]})

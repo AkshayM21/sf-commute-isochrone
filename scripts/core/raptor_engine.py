@@ -28,7 +28,17 @@ ARRIVE_BY_HM = (9, 0)                             # product target: arrive by 09
 
 # --- service-noise Monte-Carlo (realistic + fragility + alt-lines) --------------------
 MC_DRAWS = int(os.environ.get("RAPTOR_MC_DRAWS", "24"))       # draws for realistic/fragility
-MC_ALT_DRAWS = int(os.environ.get("RAPTOR_MC_ALT_DRAWS", "4"))  # traced draws for alt-lines (pricier)
+# Alt-lines are a DOMINANCE WINDOW over the UNPERTURBED tree's per-access-stop journeys (NOT a
+# draw-vote): a transit line whose best per-access-stop door-to-door time is within ALT_WINDOW_MIN
+# of the cell's best is an alternative — deterministic, K-free, and walk-speed-STABLE (a line within
+# the window at slow walk stays within it at fast; its gap to best changes only by the walk-speed
+# delta on the access leg). This replaced the old K-draw ">=1-draw vote" lottery that dropped
+# near-best short-walk buses when walking sped up — and a perturbation-draw candidate pool only ADDS
+# churn back (measured), so alts come purely from the deterministic tree (see
+# .plans/alt_walkspeed_diag.md). MC_ALT_DRAWS now just GATES alts on/off (>0 = on) — it no longer
+# drives any perturbed traces; the realistic/fragility MC keeps its own RAPTOR_MC_DRAWS.
+MC_ALT_DRAWS = int(os.environ.get("RAPTOR_MC_ALT_DRAWS", "12"))  # >0 enables the alt-lines window
+ALT_WINDOW_MIN = float(os.environ.get("RAPTOR_ALT_WINDOW_MIN", "5"))  # alt = within this of the cell best
 MC_SHAPE = float(os.environ.get("RAPTOR_MC_SHAPE", "2.0"))   # Gamma shape (spread); mean=shape*scale
 WALK_RELUCTANCE = config.WALK_RELUCTANCE          # mild walk prior (decision-only; see config.py)
 WALK_PRIOR_EPS = config.WALK_PRIOR_EPS_SEC        # hard cap (sec) on the prior's true-time change
@@ -276,21 +286,18 @@ class RaptorEngine:
           frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number)
           std       int32  commute std minutes (secondary)
           stuck     float  fraction of draws where the cell hits the cap (last-train/peak risk)
-          alt       list[dict|None]  {line: votes} alternative lines that serve the cell under
-                                     delays (re-routes), from ``alt_draws`` traced perturbed trees
-          alt_bundle dict|None  the lightweight per-draw capture that BACKS ``alt``, so the caller
-                                 can re-trace the very draw a vote came from and draw the alt route
-                                 (see ``_mc_alt_lines``). None when alt_draws<=0. Holds:
-                                   draws  list[{pat_dep, pat_arr, par, dom}] — per perturbed draw,
-                                          the int32 perturbed schedule columns (~0.4 MB each) +
-                                          the reverse_raptor_traced parent arrays (n_stops, small)
-                                          + the per-cell dominant-line list (the votes' source);
-                                          enough to rebuild a JourneyTree(dict(data, pat_dep=...,
-                                          pat_arr=...), par, access_off, access_to, access_w,
-                                          purewalk, target, max_min) and trace any cell.
-                                   access_w / purewalk  the walk-scalar-scaled CSR + cell walk
-                                          (shared across draws; the JourneyTree inputs).
-                                   target  the arrive-by deadline seconds (JourneyTree deadline).
+          alt       list[dict|None]  {line: min_minutes} alternative lines by a DOMINANCE WINDOW
+                                     over the UNPERTURBED tree's per-access-stop journeys — every
+                                     distinct transit line whose best door-to-door time is within
+                                     ALT_WINDOW_MIN of the cell's best (deterministic + walk-speed-
+                                     stable; sorted closest-first). The server drops the PRIMARY line
+                                     + caps at 4. See ``_alt_window`` + ``JourneyTree.alt_lines_window``.
+          alt_bundle dict|None  the geometry handle for the drawn alternatives (None when
+                                 alt_draws<=0): ``{"alt_stop": list[{line: access_stop}|None],
+                                 "draws": []}``. The alt routes trace from the SAME (unperturbed)
+                                 tree via ``JourneyTree.itinerary_via_stop(ci, alt_stop[ci][line])``
+                                 — no perturbed schedules, no re-trace; ``draws`` is empty (the tree,
+                                 cached by the caller, IS the source).
         You commit the first leg from the published plan and re-optimize the tail from the actual
         late arrival -> the honest "I missed my transfer and ate a headway" cost. The committed plan
         + ``perfect`` map come from the SAME unperturbed arrive-by tree; the caller can pass an
@@ -298,7 +305,7 @@ class RaptorEngine:
         workplace by the caller; never on the hover path. ``seed`` makes it reproducible."""
         nR = MC_DRAWS if n_draws is None else int(n_draws)
         egress_g = np.asarray(egress_g, np.int32)
-        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)   # pw/aw feed alt-lines traces
+        ew, _pw, _aw = self._scale_walk(egress_w, purewalk, walk_scalar)   # ew feeds the committed kernel
         mu_pat, slope_pat = self._mc_mode_params()
         ntrips = np.asarray(self.data["pat_ntrips"])
         mu_trip = np.repeat(mu_pat, ntrips); slope_trip = np.repeat(slope_pat, ntrips)
@@ -354,73 +361,37 @@ class RaptorEngine:
         frag = np.maximum(0, np.round(p90 - p50)).astype(np.int32)
         std = np.round(np.std(cm, axis=1)).astype(np.int32)
         stuck = np.mean(cm >= self.max_min - 1e-9, axis=1)
-        alt, alt_bundle = self._mc_alt_lines(
-            egress_g, ew, pw, aw, delta0_all, slope_all,
-            MC_ALT_DRAWS if alt_draws is None else int(alt_draws), max_rounds,
-            walk_reluctance=walk_reluctance, walk_prior_eps=walk_prior_eps)
+        alt, alt_bundle = self._alt_window(tree, perfect,
+                                           MC_ALT_DRAWS if alt_draws is None else int(alt_draws))
         return dict(realistic=realistic, realistic_raw=realistic_raw, frag=frag, std=std,
                     stuck=stuck, alt=alt, alt_bundle=alt_bundle)
 
-    def _mc_alt_lines(self, egress_g, egress_w, purewalk, access_w, delta0_all, slope_all, K,
-                      max_rounds=MAX_ROUNDS, walk_reluctance=WALK_RELUCTANCE,
-                      walk_prior_eps=WALK_PRIOR_EPS):
-        """({line: votes} per cell, alt_bundle) — the dominant line across ``K`` perturbed
-        arrive-by traced trees (so a delayed express lets the next local show up as an
-        alternative). Reuses the validated JourneyTree; pricier than the numpy MC, so K is
-        small + env-tunable.
+    def _alt_window(self, tree, perfect, alt_draws):
+        """Alternatives by a DOMINANCE WINDOW over the UNPERTURBED arrive-by tree (NOT a draw-vote).
+        Returns (alt, alt_bundle):
+          alt        list[dict|None]  per cell ``{line: min_minutes}`` — every distinct transit line
+                     whose best per-access-stop door-to-door time is within ``ALT_WINDOW_MIN`` of the
+                     cell's best, sorted closest-first (the PRIMARY line is dropped by the server).
+          alt_bundle dict  the geometry handle for /itinerary's drawn alternatives — it carries the
+                     per-cell ``{line: access_stop}`` map (``alt_stop``) so the route is traced from
+                     the SAME tree via ``JourneyTree.itinerary_via_stop`` (no perturbed re-trace,
+                     no separate bundle of schedules). ``draws`` is empty (the tree IS the source).
 
-        Returns the vote list AND a lightweight ``alt_bundle`` (None when K<=0) that lets a
-        caller re-trace the exact draw a vote came from and DRAW the alt route — the perturbed
-        schedule columns + the traced parent arrays + the per-draw dominant list per draw, plus
-        the (shared) walk-scaled access/purewalk and the deadline a JourneyTree needs. We do not
-        keep the perturbed ``pdata`` dict itself (it shallow-aliases the big shared base arrays);
-        the caller rebuilds it from the two small perturbed columns + ``self.data``, so the
-        captured payload is ~K*(pat_dep+pat_arr+par) ≈ a few MB at K=4."""
-        if K <= 0:
+        ``alt_draws <= 0`` disables alts (returns (None, None)), preserving the old knob's "off"
+        semantics for callers/tests. (The old K perturbation draws no longer drive alts — the window
+        is K-free and deterministic; the realistic/fragility MC keeps its own draws.)"""
+        if alt_draws <= 0:
             return None, None
-        off = R.pat_trip_off(self.data)
-        target = self.target_sec
-        n = len(self.cell_ids)
-        votes = [None] * n
-        K = min(K, delta0_all.shape[0])
-        draws = []
-        for kk in range(K):
-            pdata, dep, arr = R.perturbed_data(self.data, delta0_all[kk], slope_all[kk], off)
-            par = R.reverse_raptor_traced(pdata, egress_g, target - egress_w, egress_w,
-                                          max_rounds=max_rounds, board_slack=BOARD_SLACK)
-            tree = raptor_journey.JourneyTree(pdata, par, self.access_off, self.access_to,
-                                              access_w, purewalk, target, self.max_min,
-                                              walk_reluctance=walk_reluctance,
-                                              walk_prior_eps=walk_prior_eps)
-            _, dom = tree.commute_and_dominant()
-            for ci, line in enumerate(dom):
-                if line and line != "walk only":
-                    d = votes[ci]
-                    if d is None:
-                        d = votes[ci] = {}
-                    d[line] = d.get(line, 0) + 1
-            draws.append({"pat_dep": dep, "pat_arr": arr, "par": par, "dom": dom})
-        bundle = {"draws": draws, "access_w": np.asarray(access_w, np.int64),
-                  "purewalk": np.asarray(purewalk, np.int64), "target": int(target),
-                  "walk_reluctance": float(walk_reluctance), "walk_prior_eps": float(walk_prior_eps)}
-        return ([None if not d else dict(sorted(d.items(), key=lambda kv: -kv[1])) for d in votes],
-                bundle)
-
-    def alt_journey_tree(self, alt_bundle, draw_idx):
-        """Rebuild the JourneyTree for one captured MC draw, so the caller can trace a cell and
-        assemble the alt-route geometry through the same JourneyTree machinery the primary uses.
-        ``alt_bundle`` is the dict returned by ``montecarlo`` (key 'alt_bundle'); ``draw_idx``
-        indexes its 'draws' list. Cheap (no RAPTOR re-run): wraps the captured parent arrays +
-        the perturbed schedule columns. Stop coords/footpaths come from the shared base data."""
-        dr = alt_bundle["draws"][draw_idx]
-        pdata = dict(self.data)
-        pdata["pat_dep"] = dr["pat_dep"]; pdata["pat_arr"] = dr["pat_arr"]
-        return raptor_journey.JourneyTree(
-            pdata, dr["par"], self.access_off, self.access_to,
-            alt_bundle["access_w"], alt_bundle["purewalk"],
-            alt_bundle["target"], self.max_min,
-            walk_reluctance=alt_bundle.get("walk_reluctance", 1.0),
-            walk_prior_eps=alt_bundle.get("walk_prior_eps", 60.0))
+        win = tree.alt_lines_window(perfect, ALT_WINDOW_MIN)   # per cell {line: (min, stop)}
+        alt = [None] * len(win)
+        alt_stop = [None] * len(win)
+        for ci, d in enumerate(win):
+            if not d:
+                continue
+            alt[ci] = {ln: int(ms[0]) for ln, ms in d.items()}
+            alt_stop[ci] = {ln: int(ms[1]) for ln, ms in d.items()}
+        bundle = {"alt_stop": alt_stop, "draws": []}
+        return alt, bundle
 
 
 def _assemble_arriveby_window(access_off, access_to, access_w, purewalk, latest, deadlines,

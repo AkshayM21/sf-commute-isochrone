@@ -573,16 +573,20 @@ def test_itinerary_alts_lines_subset_chips_and_geometry_contract(client, server)
         assert gsum == alt["min"], f"{cid}: alt {alt['line']} legs {gsum} != total {alt['min']}"
     assert seen_ride > 0, "no alt exercised a transit ride's geometry"
 
-    # Cross-check ride endpoints against the captured draw's actual board/alight stops (the alt
-    # geometry is traced from the SAME perturbed journey the vote came from, not a recompute).
+    # Cross-check ride endpoints against the access stop the dominance window picked for each alt
+    # (the alt geometry is traced from the SAME unperturbed cached primary tree via the bundle's
+    # per-cell alt_stop map — JourneyTree.itinerary_via_stop — not a recompute or a perturbed draw).
     mc = server._mc_peek(FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
     bundle = mc["alt_bundle"]
+    assert bundle["draws"] == [], "alt_bundle should carry no perturbed draws (tree-window source)"
     ci = server._RAPTOR.cell_index[cid]
+    cell_alt_stop = bundle["alt_stop"][ci]
+    walk_scalar = server.config.WALK_KMH / server.WALK_SPEEDS.get(server.DEFAULT_SPEED, server.config.WALK_KMH)
+    tree = server._raptor_tree(FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES,
+                               server.DEFAULT_SPEED, walk_scalar)["tree"]
     for alt in alts:
-        di = next(d for d in range(len(bundle["draws"]))
-                  if bundle["draws"][d]["dom"][ci] == alt["line"])
-        tree = server._RAPTOR.alt_journey_tree(bundle, di)
-        legs_raw, _lh = tree._trace(ci)
+        s_star = cell_alt_stop[alt["line"]]              # the window's access stop for this line
+        legs_raw, _lh = tree._trace_from(int(s_star), 0, 0)   # aw/home irrelevant for stop coords
         rides = [l for l in legs_raw if l[0] == "ride" and (l[3] - l[2]) >= 120]
         transit_geoms = [l for l in alt["legs"] if l["mode"] == "transit"]
         assert len(transit_geoms) == len(rides), (

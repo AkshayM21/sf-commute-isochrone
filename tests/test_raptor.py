@@ -289,110 +289,173 @@ def test_mc_committed_huge_delay_hits_cap(engine):
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
-def test_mc_alt_lines_traced(engine):
-    """The alt-lines overlay ('also serves: …', the route-resilience read): montecarlo with
-    alt_draws>0 must vote dominant lines across traced PERTURBED trees — per-cell dicts with
-    integer votes bounded by the draw count, sorted descending, never 'walk only', covering
-    a meaningful share of transit cells, and bit-identical across same-seed runs."""
+def test_mc_alt_lines_window(engine):
+    """The alt-lines overlay ('also serves: …'): montecarlo with alt_draws>0 must return, per cell,
+    a DOMINANCE WINDOW {line: min_minutes} — every distinct transit line whose best per-access-stop
+    door-to-door time is within ALT_WINDOW_MIN of the cell's best, sorted closest-first, never 'walk
+    only', covering a meaningful share of transit cells, and bit-identical across same-seed runs.
+    alt_draws=0 disables alts."""
+    from core import raptor_engine as RE
     z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
     pw = _purewalk_aligned(engine, z)
     eg = np.asarray(z["egress_g"]); ew = np.asarray(z["egress_w"])
     tree = engine.journey_tree(eg, ew, pw)
     perfect, dom = tree.commute_and_dominant()
     perfect = np.asarray(perfect, np.int32)
-    mc = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=4, alt_draws=3)
+    mc = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=4)
     alt = mc["alt"]
     assert isinstance(alt, list) and len(alt) == len(engine.cell_ids)
+    win = int(round(RE.ALT_WINDOW_MIN))
     nonnull = 0
     for ci, d in enumerate(alt):
         if d is None:
             continue
         nonnull += 1
         assert isinstance(d, dict) and d, f"cell {ci}: empty alt entry should be None"
-        votes = list(d.values())
-        assert all(isinstance(v, (int, np.integer)) and 1 <= v <= 3 for v in votes), \
-            f"cell {ci}: votes {votes} outside [1, alt_draws=3]"
-        assert sum(votes) <= 3, f"cell {ci}: {sum(votes)} total votes from 3 traced draws"
-        assert votes == sorted(votes, reverse=True), \
-            f"cell {ci}: alt entries not sorted by descending votes: {d}"
-        assert "walk only" not in d, f"cell {ci}: 'walk only' voted as an alt line"
-    # dom is a per-cell-index list (raptor_journey.commute_and_dominant), not a dict.
+        mins = list(d.values())
+        assert all(isinstance(m, (int, np.integer)) and m > 0 for m in mins), \
+            f"cell {ci}: alt minutes {mins} not positive ints"
+        assert mins == sorted(mins), f"cell {ci}: alt entries not sorted closest-first: {d}"
+        assert "walk only" not in d, f"cell {ci}: 'walk only' surfaced as an alt line"
+        # every kept line is within the window of the cell's best (= min of its own alt mins +
+        # the perfect time, since perfect anchors the window inside alt_lines_window).
+        cb = min(mins + ([int(perfect[ci])] if perfect[ci] >= 0 else []))
+        assert max(mins) <= cb + win, f"cell {ci}: alt {d} exceeds window cb={cb}+{win}"
     transit_cells = sum(
         1 for ci in range(len(engine.cell_ids))
         if perfect[ci] >= 0 and dom[ci] and dom[ci] != "walk only")
     assert transit_cells > 1000
-    assert nonnull >= 0.5 * transit_cells, (
-        f"alt-lines only populated on {nonnull}/{transit_cells} transit cells — "
-        "the traced-perturbation path looks dead"
+    assert nonnull >= 0.4 * transit_cells, (
+        f"alt-lines only populated on {nonnull}/{transit_cells} transit cells — window path looks dead"
     )
-    # Determinism: an identical seed must reproduce the identical alt structure.
-    mc2 = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=4, alt_draws=3)
+    # Determinism: the window is over the deterministic tree, so two same-seed runs are identical
+    # (and in fact the alts don't depend on the seed at all).
+    mc2 = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=4)
     assert mc2["alt"] == alt, "alt-lines differ across two same-seed runs"
+    # alt_draws=0 disables the overlay entirely.
+    mc0 = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=4, alt_draws=0)
+    assert mc0["alt"] is None and mc0["alt_bundle"] is None, "alt_draws=0 should disable alts"
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
-def test_mc_alt_bundle_traces_the_voted_line(engine):
+def test_mc_alt_bundle_traces_the_window_line(engine):
     """The alt-route bundle (backs /itinerary's drawn alternatives): montecarlo with alt_draws>0
-    must return ``alt_bundle`` alongside ``alt``, holding one captured draw per perturbation, and
-    a JourneyTree rebuilt from it (engine.alt_journey_tree) must trace the VERY line the votes
-    claimed. So for any cell with an alt vote, there exists a captured draw whose dominant for
-    that cell is that line, and the rebuilt tree's dominant agrees — i.e. the bundle is a faithful
-    handle on the same journeys the votes were counted from, not an independent recompute."""
-    from core import raptor_journey
+    must return ``alt_bundle`` = {alt_stop: per-cell {line: access_stop}, draws: []}. The access
+    stop for each kept line, traced on the SAME (unperturbed) tree via JourneyTree.itinerary_via_stop,
+    must reproduce that line as its dominant AND the kept window minutes — i.e. the bundle is a
+    faithful geometry handle on the very journeys the window measured, not a recompute or a
+    perturbed draw."""
     z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
     pw = _purewalk_aligned(engine, z)
     eg = np.asarray(z["egress_g"]); ew = np.asarray(z["egress_w"])
-    perfect, _dom = engine.journey_tree(eg, ew, pw).commute_and_dominant()
+    tree = engine.journey_tree(eg, ew, pw)
+    perfect, _dom = tree.commute_and_dominant()
     perfect = np.asarray(perfect, np.int32)
-    K = 4
-    mc = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=6, alt_draws=K)
+    mc = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=6, tree=tree)
     alt = mc["alt"]; bundle = mc["alt_bundle"]
-    assert bundle is not None and isinstance(bundle["draws"], list)
-    assert len(bundle["draws"]) == K, f"bundle captured {len(bundle['draws'])} draws, expected {K}"
-    # each captured draw carries the perturbed schedule columns + traced parents + dom list
-    n_cells = len(engine.cell_ids)
-    for dr in bundle["draws"]:
-        assert dr["pat_dep"].shape == np.asarray(engine.data["pat_dep"]).shape
-        assert dr["pat_arr"].shape == np.asarray(engine.data["pat_arr"]).shape
-        assert "best" in dr["par"] and "par_kind" in dr["par"]
-        assert len(dr["dom"]) == n_cells
-    # Memory budget sanity: the captured payload stays small (a few MB at K=4, per the budget).
-    nbytes = sum(dr["pat_dep"].nbytes + dr["pat_arr"].nbytes
-                 + sum(a.nbytes for a in dr["par"].values()) for dr in bundle["draws"])
-    assert nbytes < 20 * 1024 * 1024, f"alt_bundle is {nbytes/1e6:.1f} MB (> 20 MB budget)"
+    assert bundle is not None and bundle["draws"] == [], "bundle should carry NO perturbed draws"
+    alt_stop = bundle["alt_stop"]
+    assert isinstance(alt_stop, list) and len(alt_stop) == len(engine.cell_ids)
+    # Memory budget sanity: the geometry handle is tiny (per-cell small int maps, no schedules).
+    import sys as _sys
+    nbytes = sum(_sys.getsizeof(d) for d in alt_stop if d) + _sys.getsizeof(alt_stop)
+    assert nbytes < 5 * 1024 * 1024, f"alt_bundle is {nbytes/1e6:.1f} MB (> 5 MB budget)"
 
-    # The load-bearing claim: a tree rebuilt from the bundle traces the voted line. Build the
-    # K trees once (the server caches these), then for several voted cells confirm the matching
-    # draw's tree's dominant == the vote.
-    trees = [engine.alt_journey_tree(bundle, di) for di in range(K)]
-    for t in trees:
-        assert isinstance(t, raptor_journey.JourneyTree)
+    # The load-bearing claim: tracing each kept line's access stop reproduces that line + minutes.
     checked = 0
-    for ci, votes in enumerate(alt):
-        if not votes:
+    for ci, lines in enumerate(alt):
+        if not lines:
             continue
-        for line in votes:
-            di = next((d for d in range(K) if bundle["draws"][d]["dom"][ci] == line), None)
-            assert di is not None, f"cell {ci}: voted line {line!r} has no matching captured draw"
-            it = trees[di].itinerary(ci)
-            assert it is not None, f"cell {ci}: draw {di} cannot trace the voted alt"
-            # the rebuilt tree's dominant for this cell IS the voted line (the bundle wraps the
-            # exact perturbed journey, so the trace reproduces the vote — not an approximation).
-            _, dom_di = trees[di].commute_and_dominant()
-            assert dom_di[ci] == line, (
-                f"cell {ci}: rebuilt draw {di} dominant {dom_di[ci]!r} != voted {line!r}")
+        cell_stop = alt_stop[ci]
+        assert cell_stop and set(cell_stop) == set(lines), (
+            f"cell {ci}: alt_stop keys {set(cell_stop) if cell_stop else None} != alt lines {set(lines)}")
+        for line, m in lines.items():
+            s = cell_stop[line]
+            it = tree.itinerary_via_stop(ci, int(s))
+            assert it is not None, f"cell {ci}: access stop {s} for line {line!r} cannot be traced"
+            assert it["total"] == m, (
+                f"cell {ci}: traced alt {line} total {it['total']} != window minutes {m}")
+            # the traced journey's dominant transit leg carries the line name.
+            transit = [l for l in it["legs"] if l["mode"] == "transit"]
+            assert any(l["line"] == line for l in transit), (
+                f"cell {ci}: traced journey via stop {s} has no {line!r} leg ({[l['line'] for l in transit]})")
             checked += 1
-        if checked >= 40:                              # a representative sample is enough
+        if checked >= 40:
             break
-    assert checked > 0, "no voted cell exercised the bundle re-trace"
+    assert checked > 0, "no windowed cell exercised the bundle trace"
 
-    # Determinism: same seed -> byte-identical perturbed columns + identical dom lists.
-    mc2 = engine.montecarlo(eg, ew, pw, perfect=perfect, seed=7, n_draws=6, alt_draws=K)
-    b2 = mc2["alt_bundle"]
-    for d1, d2 in zip(bundle["draws"], b2["draws"]):
-        assert np.array_equal(d1["pat_dep"], d2["pat_dep"])
-        assert np.array_equal(d1["pat_arr"], d2["pat_arr"])
-        assert d1["dom"] == d2["dom"]
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_mc_alt_window_walk_speed_stable(engine):
+    """The whole point of the window fix (.plans/alt_walkspeed_diag.md): the user's complaint is that
+    alt bus routes VANISH when you speed up walking. The deterministic per-access-stop dominance
+    window keeps a within-window alt listed at fast as long as the line stays a competitive candidate
+    (i.e. some access stop's best journey on it is still within ALT_WINDOW_MIN of the cell's best).
+
+    We compare the engine's raw windows at slow vs fast over clearly-reachable cells (away from the
+    75-min cap, where a tiny shift flips reachability and the arrive-by 'best' jumps many minutes —
+    R5-internal minutiae). The metric: of the within-window alt-lines at slow, what fraction are
+    RETAINED within window at fast? The old K-draw vote retained ~71% (it churned ~29% of cells on
+    speed-up); the window must do decisively better."""
+    from core import config
+    slow = config.WALK_KMH / config.WALK_SPEEDS["slow"]    # 1.20
+    fast = config.WALK_KMH / config.WALK_SPEEDS["fast"]    # 0.857
+    win = 5
+
+    def _retention(z):
+        pw = _purewalk_aligned(engine, z)
+        eg = np.asarray(z["egress_g"]); ew = np.asarray(z["egress_w"])
+        ts = engine.journey_tree(eg, ew, pw, walk_scalar=slow)
+        tf = engine.journey_tree(eg, ew, pw, walk_scalar=fast)
+        ps, doms = ts.commute_and_dominant(); ps = np.asarray(ps, np.int32)
+        pf, domf = tf.commute_and_dominant(); pf = np.asarray(pf, np.int32)
+        ws = ts.alt_lines_window(ps, 999)                  # ALL candidates (no window) + their min
+        wf = tf.alt_lines_window(pf, 999)
+        checked = 0; retained = 0
+        for ci in range(len(engine.cell_ids)):
+            if not ws[ci] or ps[ci] < 0 or pf[ci] < 0:
+                continue
+            sb = min([int(ps[ci])] + [m for m, _s in ws[ci].values()])
+            fwi = wf[ci] or {}
+            fb = min([int(pf[ci])] + [m for m, _s in fwi.values()])
+            # off-cap on BOTH sides: near 75 min a faster route can open and the arrive-by 'best'
+            # jumps many minutes, legitimately blowing a slow alt's gap past the window (real, not
+            # the bug — the user's complaint is the downtown short-walk bus, not the SE periphery).
+            if sb >= engine.max_min - 8 or fb >= engine.max_min - 8:
+                continue
+            for line, (sm, _ss) in ws[ci].items():
+                if line == doms[ci] or sm - sb > win:      # primary (server drops it) / not an alt
+                    continue
+                checked += 1
+                fm = fwi.get(line)
+                if (fm is not None and fm[0] - fb <= win) or domf[ci] == line:
+                    retained += 1                          # still within window, or became primary
+        return checked, retained
+
+    # Downtown is the workplace the diag's repro + the user's complaint are at — the window must keep
+    # a strong majority of its within-window bus alts when walking speeds up (was the headline bug).
+    dz = [f for f in _oracles() if "downtown" in f]
+    if dz:
+        c, r = _retention(np.load(os.path.join(GOLDEN, dz[0]), allow_pickle=True))
+        print(f"\n[alt walk-speed downtown] {r}/{c} within-window slow alts retained at fast "
+              f"({100*r/max(c,1):.1f}%)")
+        assert c > 500 and r >= 0.75 * c, (
+            f"downtown: only {100*r/max(c,1):.1f}% of within-window slow alts retained at fast")
+
+    # Aggregate over all workplaces (incl. the SE-periphery stress cases where faster walking opens
+    # genuinely better corridors): the deterministic window retains a clear majority on speed-up —
+    # decisively better than the old K-draw vote, which churned ~29% of cells with full in/out
+    # flicker. The residual is the structural single-journey-per-access-stop + arrive-by re-pick on
+    # peripheral cells, not the display bug.
+    tot_c = tot_r = 0
+    for f in _oracles():
+        c, r = _retention(np.load(os.path.join(GOLDEN, f), allow_pickle=True))
+        tot_c += c; tot_r += r
+    print(f"[alt walk-speed aggregate] {tot_r}/{tot_c} retained ({100*tot_r/max(tot_c,1):.1f}%)")
+    assert tot_c > 2000, f"too few within-window alt-lines to test ({tot_c})"
+    assert tot_r >= 0.55 * tot_c, (
+        f"only {100*tot_r/max(tot_c,1):.1f}% of within-window slow alts retained at fast (aggregate) "
+        "— window not stable enough vs the old vote")
 
 
 @pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")

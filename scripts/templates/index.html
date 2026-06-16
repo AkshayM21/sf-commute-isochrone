@@ -591,9 +591,9 @@ function compareHTML(d){
   if(!compareList.length)return "";
   const drawnKey=previewKey!=null?previewKey:selKey;
   // Realistic: the PRIMARY strip follows the selector (total=real, legs + "typical wait +Nm" sum to
-  // it) so it matches the headline + cell color + map badge. ALT strips are alternative routes under
-  // delays — each has a single draw-based number (a.min) with a.legs summing to a.min, so they keep
-  // total=a.min and NO typical-wait line. Non-compact so each row's leg chips (incl. transfer waits)
+  // it) so it matches the headline + cell color + map badge. ALT strips are alternative routes within
+  // the door-to-door dominance window — each has its own window-best number (a.min) with a.legs
+  // summing to a.min, so they keep total=a.min and NO typical-wait line. Non-compact so each row's
   // actually sum to the strip's displayed total (the user's "legs add up to the number" rule).
   const primExtra=metricRead(d).waitExtra;                 // 0 in best-case (and before /variance)
   const rows=compareList.map(o=>{

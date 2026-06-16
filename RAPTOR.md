@@ -242,23 +242,38 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   (never R×n_stops). ~**0.1–0.2 s** for 24 draws (full grid). Per-cell outputs: `realistic = p50`
   (clamped ≥ perfect), `frag = p90−p50` (the "bad-day +Y" headline), `std`, `stuck` (fraction of
   draws hitting the cap = last-train/peak risk).
-- **Alt-lines = route resilience** (`RaptorEngine._mc_alt_lines`): the dominant line across ~4
-  *traced* perturbed arrive-by trees (reuses `JourneyTree`), so a delayed express lets the next local
-  show up as an alternative ("also serves: 38, 5R"). Pricier (pure-python trace, ~0.7 s for 4 draws),
-  env-tunable (`RAPTOR_MC_ALT_DRAWS`), excludes the cell's normal line.
-- **Drawn alt routes** (the "draw the alt-line route on hover" feature): `_mc_alt_lines` no longer
-  discards the K perturbed trees — `montecarlo()` returns an `alt_bundle` (per-draw: the perturbed
-  `pat_dep`/`pat_arr` columns + the `reverse_raptor_traced` parent arrays + the per-cell dominant
-  list; ~a few MB at K=4) so any draw can be re-traced cheaply via `engine.alt_journey_tree(bundle,
-  di)` (no RAPTOR re-run). The server stashes the bundle + the per-cell chip set in the `/variance`
-  MC cache entry (same coarse key = workplace+rides+**speed**), and `/itinerary` returns
-  `alts: [{line, min, legs:[…geom legs…]}]` — for each chip line the first captured draw whose
-  dominant for that cell is that line, traced + assembled through the SAME `_JourneyGeomProvider`
-  the primary route uses (real street walk legs; provider shared with the primary geom so the
-  per-cell access Dijkstra isn't redone). Lazy + cached: the K `JourneyTree`s build once per
-  workplace on the first alt hover (~20 ms), the assembled `alts` cache per cell (warm hover ≈0 ms);
-  `/itinerary` **never** triggers the MC build, so `alts: []` until `/variance` lands (then the
-  frontend re-hovers). `server._itinerary_alts` + `_mc_peek`.
+- **Alt-lines = a door-to-door DOMINANCE WINDOW** (`RaptorEngine._alt_window` +
+  `JourneyTree.alt_lines_window`, 2026-06-16, replaces the old K-draw vote): per cell, every distinct
+  transit line whose **best per-access-stop door-to-door time is within `ALT_WINDOW_MIN` (default 5,
+  env `RAPTOR_ALT_WINDOW_MIN`) of the cell's best** is an alternative ("also serves: 38, 5R"), sorted
+  closest-first. Computed off the UNPERTURBED arrive-by tree: each access stop offers exactly one
+  journey (its latest-departure node chain → `jtime[stop] + access_walk` + a per-stop dominant line
+  from one bottom-up node-table pass, `_build_stop_dominant`), so the window is **deterministic,
+  K-free, and walk-speed-STABLE** — a within-window bus stays listed when you walk faster (its gap to
+  best changes only by the walk-speed delta on the access leg). This fixed the user's complaint that
+  short-walk buses VANISHED on speed-up: the old "dominant in ≥1 of K=4 random perturbed draws minus
+  primary" was a noisy lottery that dropped near-best buses on ~29% of cells (862/2984) when walking
+  sped up because they stopped winning ANY of 4 dice rolls (`.plans/alt_walkspeed_diag.md`). A
+  perturbation-draw candidate pool was *measured to ADD churn*, so alts come purely from the
+  deterministic tree; the realistic/fragility MC keeps its own `RAPTOR_MC_DRAWS`. `RAPTOR_MC_ALT_DRAWS`
+  now only GATES alts on/off (>0). Retention on speed-up: **downtown 80%, aggregate 63%** of
+  within-window slow alts (guard `test_mc_alt_window_walk_speed_stable`); the residual is the
+  structural single-journey-per-access-stop limit + the arrive-by latest-departure re-pick on the
+  SE/periphery where faster walking genuinely opens a better corridor (a real, correct drop, not the
+  display bug). The server still drops the cell's PRIMARY line + caps at 4 closest.
+- **Drawn alt routes** (the "draw the alt-line route on hover" feature): `montecarlo()` returns an
+  `alt_bundle` = `{"alt_stop": list[{line: access_stop}|None], "draws": []}` (a tiny per-cell map, no
+  perturbed schedules). The server stashes the bundle + the per-cell chip set in the `/variance` MC
+  cache entry (same coarse key = workplace+rides+**speed**), and `/itinerary` returns
+  `alts: [{line, min, legs:[…geom legs…]}]` — for each chip line the journey traced from that line's
+  windowed access stop on the SAME (cached) primary tree via `JourneyTree.itinerary_via_stop`, then
+  assembled through the SAME `_JourneyGeomProvider` the primary route uses (real street walk legs;
+  provider shared with the primary geom so the per-cell access Dijkstra isn't redone). No perturbed
+  re-trace, no separate JourneyTrees: the tree is the one `/compute` already built. Lazy + cached: the
+  assembled `alts` cache per cell (`alt_geom`, warm hover ≈0 ms); `/itinerary` **never** triggers the
+  MC build, so `alts: []` until `/variance` lands (then the frontend re-hovers). `server._itinerary_alts`
+  + `_mc_peek`. The alt geom legs sum to the alt total and honor `max_rounds` (the node-chain trace,
+  same as the primary).
 - **Serving:** lazy `/variance` endpoint (`server._raptor_mc`, cached per workplace, deterministic
   per-workplace seed, reuses the cached arrive-by tree → no re-trace), fetched by the frontend AFTER
   `/compute` paints the perfect map (progressive refinement, like `/compute_exact`). NEVER on the
@@ -280,7 +295,9 @@ pure-python reference since the snapshot footpath relax — the old ≤2 min tol
 > every leg as the delay reveals itself) would be a per-leg forward simulation and is the remaining
 > upgrade.
 
-Knobs (env): `RAPTOR_MC` (1), `RAPTOR_MC_DRAWS` (24), `RAPTOR_MC_ALT_DRAWS` (4), `RAPTOR_MC_SHAPE`
+Knobs (env): `RAPTOR_MC` (1), `RAPTOR_MC_DRAWS` (24), `RAPTOR_MC_ALT_DRAWS` (12 — now just an alt
+on/off gate, >0 = on; no longer drives perturbed traces), `RAPTOR_ALT_WINDOW_MIN` (5 — the alt
+dominance window: a line within this many minutes of the cell's best is "also serves"), `RAPTOR_MC_SHAPE`
 (2.0), `RAPTOR_MC_MU_{BUS,METRO,CABLE,BART,CALTRAIN}` (70/45/40/25/40 s initial delay mean — BART/
 Caltrain matched by feed STEM, not position), `RAPTOR_MC_DEADLINE_STEP` (60 — the MC tail readout
 runs on its own finer deadline grid `Tgrid_mc`, since the map's 180 s step rounded every draw up by
