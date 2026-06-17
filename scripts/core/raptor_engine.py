@@ -331,7 +331,11 @@ class RaptorEngine:
                            and realistic >= perfect holds by construction)
           realistic_raw int32  pre-floor p50 — the non-vacuous perfect<=committed regression
                            signal for tests/validators (never served)
-          frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number)
+          frag      int32  p90-p50 "bad-day delta" minutes (the headline fragility number;
+                           arrive-by serves it directly because its headline IS committed p50)
+          committed_p90 int32  committed bad-day ABSOLUTE minute (round(p90) of the floored draws).
+                           Depart-after derives its frag = committed_p90 - served_p50 off this (its
+                           headline is the bare served p50, not committed p50); arrive-by ignores it.
           std       int32  commute std minutes (secondary)
           stuck     float  fraction of draws where the cell hits the cap (last-train/peak risk)
           alt       list[dict|None]  {line: min_minutes} alternative lines by a DOMINANCE WINDOW
@@ -400,11 +404,19 @@ class RaptorEngine:
         p90 = np.percentile(cm, 90, axis=1)
         realistic = np.ceil(p50).astype(np.int32)
         frag = np.maximum(0, np.round(p90 - p50)).astype(np.int32)
+        # committed_p90 (rounded) — the committed bad-day ABSOLUTE minute. Arrive-by reconciles its
+        # chip as headline(=realistic=committed_p50)+frag; depart-after's headline is the BARE served
+        # p50 (the painted floor, != committed_p50 wherever committed_p50 drifted above the floor), so
+        # it can't use frag=p90-p50 — it derives frag = committed_p90 - served_p50 off this absolute
+        # so served_p50 + frag == committed_p90 exactly. Exposed for that depart-after caller;
+        # arrive-by ignores it and keeps `frag` byte-identical.
+        committed_p90 = np.round(p90).astype(np.int32)
         std = np.round(np.std(cm, axis=1)).astype(np.int32)
         stuck = np.mean(cm >= self.max_min - 1e-9, axis=1)
         alt, alt_bundle = self._alt_window(tree, perfect,
                                            MC_ALT_DRAWS if alt_draws is None else int(alt_draws))
-        return dict(realistic=realistic, realistic_raw=realistic_raw, frag=frag, std=std,
+        return dict(realistic=realistic, realistic_raw=realistic_raw, frag=frag,
+                    committed_p90=committed_p90, std=std,
                     stuck=stuck, alt=alt, alt_bundle=alt_bundle)
 
     def _alt_window(self, tree, perfect, alt_draws):
@@ -435,7 +447,8 @@ class RaptorEngine:
         return alt, bundle
 
     def route_typicals(self, tree, ci, stops, egress_g, egress_w, perfect_route_mins=None,
-                       n_draws=None, seed=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS):
+                       n_draws=None, seed=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS,
+                       return_committed_p90=False):
         """Per-ROUTE committed-plan TYPICAL (p50) + FRAGILITY (p90-p50) for ONE pinned cell ``ci``.
 
         ``stops`` is the list of access stops (gids) of the routes to score — the PRIMARY's selected
@@ -455,7 +468,11 @@ class RaptorEngine:
         minutes; the returned typical is FLOORED at it so ``perfect <= committed`` holds PER ROUTE.
 
         Returns list[(real_min, frag_min) | None] aligned to ``stops`` — None for a route whose stop
-        is unreachable / off-cell (so the caller falls back to that route's best-case)."""
+        is unreachable / off-cell (so the caller falls back to that route's best-case). With
+        ``return_committed_p90=True`` each tuple is (real_min, frag_min, committed_p90_min) so the
+        depart-after caller can derive frag = committed_p90 - that route's served p50 (its displayed
+        typical is the bare served p50, not committed p50); arrive-by leaves the default 2-tuple
+        untouched (byte-identical)."""
         stops = [int(s) for s in stops]
         if not stops:
             return []
@@ -484,11 +501,14 @@ class RaptorEngine:
         p90 = np.percentile(cm, 90, axis=1)
         real = np.ceil(p50).astype(np.int32)
         frag = np.maximum(0, np.round(p90 - p50)).astype(np.int32)
+        committed_p90 = np.round(p90).astype(np.int32)   # absolute bad-day minute (depart-after frag)
         kind = np.asarray(legs["commit_kind"])
         out = []
         for row in range(n):
             if kind[row] == 0:                # stop unreachable / off-cell -> no typical
                 out.append(None)
+            elif return_committed_p90:
+                out.append((int(real[row]), int(frag[row]), int(committed_p90[row])))
             else:
                 out.append((int(real[row]), int(frag[row])))
         return out

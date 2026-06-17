@@ -656,3 +656,224 @@ def test_departafter_hover_equals_map_all_speeds(engine):
             assert viol == 0, f"{fname}/{sp}: depart-after hover!=map on {viol}/{checked}"
             grand += checked
     assert grand > 3000
+
+
+# ---------------------------------------------------------------------------------------------
+# 7. DEPART-AFTER service-noise MC overlay + per-route typicals (Stage 3 of the migration)
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.slow
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_departafter_mc_overlay_and_per_route_journeys(engine):
+    """The depart-after metric contract (Stage-3 fix). Scans the default workplace subset and asserts
+    the engine pieces the server serves match the target model:
+
+      1. BOTH percentile journeys (hover==map for BOTH): the p50 ``DepartAfterJourneyTree`` traces a
+         per-cell journey whose total == the painted p50 (cells[c][1]); the p5 tree's journey total ==
+         the painted p5 (cells[c][0]); and p5 <= p50 per cell. STRICT: 0 violations.
+      2. The service-noise MC (``montecarlo`` floored at the painted p50 the server passes) yields,
+         per reachable cell, ``frag = p90 - p50 >= 0`` (one self-consistent distribution), with a real
+         positive-fragility tail. The depart-after typical headline is the BARE p50 — the test does
+         NOT treat the committed ``realistic`` as a served headline (the server drops it from
+         /variance under depart-after).
+      3. PER-ROUTE journeys: each alt's best-case (``itinerary_via_stop(ci,s,percentile=5)``) and
+         typical (``...percentile=50``) follow its OWN per-stop percentile, so the alt's p5 <= p50
+         PER alt (the per-stop percentile is monotone in the percentile). STRICT: 0 violations.
+      4. PER-ROUTE fragility: ``route_typicals`` (the /itinerary?pin=1 path) scores the PRIMARY + each
+         alt with the committed MC; each route's frag (p90-p50) >= 0. STRICT: 0 negatives.
+
+    JVM-free (pure numpy/numba). Mirrors the exact server code path (_raptor_tree builds p5+p50 trees;
+    _raptor_mc_build floors at cells[c][1]==the painted p50 -> frag>=0; _itinerary_alts_departafter
+    traces each alt at its own per-stop p5/p50; _itinerary_alt_typicals_departafter floors the primary
+    at cells[ci][1] and each alt at its per-stop p50)."""
+    from core import raptor_golden
+    grand = v_pct = v_frag = frag_pos = 0
+    prim_p50_checked = prim_p50_bad = 0
+    alt_journey_checked = alt_p5_gt_p50 = 0
+    route_frag_checked = route_frag_bad = 0
+    fragmax = 0
+    for fname in _DEFAULT_SUBSET:
+        if fname not in set(_oracles()):
+            continue
+        z = np.load(os.path.join(GOLDEN, fname), allow_pickle=True)
+        pw = raptor_golden.purewalk_aligned(engine, z)
+        dat = engine.journey_tree_departafter(z["egress_g"], z["egress_w"], pw, percentile=50)
+        dat5 = engine.journey_tree_departafter(z["egress_g"], z["egress_w"], pw, percentile=5)
+        painted = engine.departafter(z["egress_g"], z["egress_w"], pw, percentiles=(5, 50))
+        ids = list(engine.cell_ids)
+        p5 = np.array([(painted[c][0] if painted[c][0] is not None else -1) for c in ids], np.int32)
+        p50 = np.array([(painted[c][1] if painted[c][1] is not None else -1) for c in ids], np.int32)
+        # 1. tree.commute() == painted percentile (hover==map for both) + p5<=p50
+        c50 = dat.commute(); c5 = dat5.commute()
+        reach = p50 >= 0
+        for ci in range(len(ids)):
+            if not reach[ci]:
+                continue
+            grand += 1
+            if int(c50[ci]) != int(p50[ci]) or (p5[ci] >= 0 and int(c5[ci]) != int(p5[ci])):
+                v_pct += 1
+            if p5[ci] >= 0 and int(p5[ci]) > int(p50[ci]):
+                v_pct += 1
+        seed = 1234
+        # 2. service-noise MC frag = p90 - p50 (floored at the served p50) >= 0
+        mc = engine.montecarlo(z["egress_g"], z["egress_w"], pw, perfect=p50, seed=seed, tree=dat)
+        frag = mc["frag"]
+        for ci in range(len(ids)):
+            if not reach[ci]:
+                continue
+            if frag[ci] < 0: v_frag += 1
+            frag_pos += frag[ci] > 0
+        fragmax = max(fragmax, int(frag[reach].max()))
+        # 3-4. per-route journeys (per-stop p5/p50) + per-route fragility on cells with alts
+        dom = dat.dominant()
+        win = dat.alt_lines_window(p50, ALT_WINDOW_MIN)
+        cand = [ci for ci, w in enumerate(win) if w and len(w) >= 2 and p50[ci] >= 0]
+        for ci in cand[:80]:
+            s_star, _aw, _lh, is_walk = dat._select(ci)
+            if is_walk or s_star < 0:
+                continue
+            # primary p50 journey total == the painted p50 (cells[c][1])
+            itp = dat.itinerary(ci)
+            if itp is not None:
+                prim_p50_checked += 1
+                if itp["total"] != int(p50[ci]):
+                    prim_p50_bad += 1
+            prim_line = dom[ci]
+            alt_items = [(ln, mk) for ln, mk in win[ci].items() if ln != prim_line][:4]
+            if not alt_items:
+                continue
+            alt_p50_floors = []
+            for _ln, mk in alt_items:
+                it5 = dat.itinerary_via_stop(ci, int(mk[1]), percentile=5)
+                it50 = dat.itinerary_via_stop(ci, int(mk[1]), percentile=50)
+                alt_journey_checked += 1
+                if it5 is not None and it50 is not None and it5["total"] > it50["total"]:
+                    alt_p5_gt_p50 += 1                    # an alt's best-case beat its typical -> bug
+                alt_p50_floors.append(it50["total"] if it50 else None)
+            stops = [int(s_star)] + [int(mk[1]) for _ln, mk in alt_items]
+            floors = [int(p50[ci])] + alt_p50_floors     # primary floored at p50, each alt at its p50
+            pairs = engine.route_typicals(dat, ci, stops, z["egress_g"], z["egress_w"],
+                                          perfect_route_mins=floors, seed=seed)
+            for p in pairs:                               # per-route fragility >= 0
+                if p is None:
+                    continue
+                route_frag_checked += 1
+                if p[1] < 0:
+                    route_frag_bad += 1
+    assert grand > 1000, f"only {grand} reachable cells scanned — fixture too thin"
+    assert v_pct == 0, f"{v_pct} cells: tree journey total != painted percentile or p5>p50"
+    assert v_frag == 0, f"{v_frag} cells with negative fragility"
+    assert frag_pos > 0, "depart-after committed MC produced no fragility tail"
+    assert fragmax > 0
+    assert prim_p50_checked > 0, "no cell exercised the primary p50 journey"
+    assert prim_p50_bad == 0, f"{prim_p50_bad}/{prim_p50_checked} primary p50 totals != painted p50"
+    assert alt_journey_checked > 0, "no alt journey exercised"
+    assert alt_p5_gt_p50 == 0, (
+        f"{alt_p5_gt_p50}/{alt_journey_checked} alts with per-stop p5 (best-case) > p50 (typical)")
+    assert route_frag_checked > 0
+    assert route_frag_bad == 0, (
+        f"{route_frag_bad}/{route_frag_checked} routes with negative per-route fragility")
+
+
+# ---------------------------------------------------------------------------------------------
+# 8. DEPART-AFTER frag RECONCILIATION (regression for the metric-contract bug)
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.slow
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_departafter_frag_reconciles_with_headline(engine):
+    """REGRESSION (the depart-after metric-contract bug): the "bad-day +Y" chip must reconcile with
+    the DISPLAYED headline, i.e. ``served_headline_p50 + frag == committed_p90`` — both per CELL
+    (/variance) and per ROUTE (/itinerary?pin=1). The bug: depart-after's headline is the BARE served
+    p50 (the painted floor = cells[c][1]), NOT the committed p50, but frag was the engine's
+    ``mc["frag"] = committed_p90 - committed_p50``. Since committed_p50 > served_p50 on most cells,
+    ``served_p50 + frag`` UNDERSTATED committed_p90. The fix: depart-after derives
+    ``frag = max(0, committed_p90 - served_p50)`` off the engine's new ``committed_p90`` (per route:
+    ``route_typicals(..., return_committed_p90=True)`` -> committed_p90 minus that route's served p50).
+
+    This test mirrors the SERVER derivation EXACTLY (no server import — pure engine, JVM-free):
+      * per cell: frag_served = max(0, mc["committed_p90"] - served_p50); assert
+        served_p50 + frag_served == committed_p90 (0 violations) and frag_served >= 0;
+      * per route: route_typicals(..., return_committed_p90=True) -> (real, _frag, committed_p90);
+        frag_served = max(0, committed_p90 - floor); assert floor + frag_served == committed_p90;
+      * the OLD-vs-NEW sentinel: count cells where committed_p50 > served_p50 and report the mean/max
+        frag INCREASE (new frag - old engine frag) — must be > 0 on those cells (that's the bug)."""
+    from core import raptor_golden
+    cells_checked = cells_bad = 0
+    frag_neg = 0
+    bug_cells = 0
+    inc_sum = inc_max = 0
+    route_checked = route_bad = route_frag_neg = 0
+    seed = 1234
+    for fname in _DEFAULT_SUBSET:
+        if fname not in set(_oracles()):
+            continue
+        z = np.load(os.path.join(GOLDEN, fname), allow_pickle=True)
+        pw = raptor_golden.purewalk_aligned(engine, z)
+        dat = engine.journey_tree_departafter(z["egress_g"], z["egress_w"], pw, percentile=50)
+        painted = engine.departafter(z["egress_g"], z["egress_w"], pw, percentiles=(5, 50))
+        ids = list(engine.cell_ids)
+        # served headline = the painted p50 (cells[c][1]) — the SAME floor the server passes to the MC.
+        served_p50 = np.array([(painted[c][1] if painted[c][1] is not None else -1) for c in ids],
+                              np.int32)
+        reach = served_p50 >= 0
+        mc = engine.montecarlo(z["egress_g"], z["egress_w"], pw, perfect=served_p50, seed=seed,
+                               tree=dat)
+        cp90 = mc["committed_p90"]
+        old_frag = mc["frag"]                              # = committed_p90 - committed_p50
+        for ci in range(len(ids)):
+            if not reach[ci]:
+                continue
+            cells_checked += 1
+            sp = int(served_p50[ci]); p90 = int(cp90[ci])
+            frag_served = max(0, p90 - sp)                # the SERVER's depart-after frag
+            if frag_served < 0:
+                frag_neg += 1
+            if sp + frag_served != p90:                   # the reconciliation contract
+                cells_bad += 1
+            # OLD-vs-NEW sentinel: where committed_p50 > served_p50 the new frag MUST be larger.
+            if frag_served > int(old_frag[ci]):
+                bug_cells += 1
+                inc = frag_served - int(old_frag[ci])
+                inc_sum += inc; inc_max = max(inc_max, inc)
+        # PER-ROUTE: scan cells with alts; assert floor + frag == committed_p90 per route.
+        dom = dat.dominant()
+        win = dat.alt_lines_window(served_p50, ALT_WINDOW_MIN)
+        cand = [ci for ci, w in enumerate(win) if w and len(w) >= 2 and served_p50[ci] >= 0]
+        for ci in cand[:80]:
+            s_star, _aw, _lh, is_walk = dat._select(ci)
+            if is_walk or s_star < 0:
+                continue
+            prim_line = dom[ci]
+            alt_items = [(ln, mk) for ln, mk in win[ci].items() if ln != prim_line][:4]
+            floors = [int(served_p50[ci])]
+            stops = [int(s_star)]
+            for _ln, mk in alt_items:
+                it50 = dat.itinerary_via_stop(ci, int(mk[1]), percentile=50)
+                stops.append(int(mk[1]))
+                floors.append(it50["total"] if it50 else None)
+            pairs = engine.route_typicals(dat, ci, stops, z["egress_g"], z["egress_w"],
+                                          perfect_route_mins=floors, seed=seed,
+                                          return_committed_p90=True)
+            for k, p in enumerate(pairs):
+                if p is None or floors[k] is None:
+                    continue
+                route_checked += 1
+                fl = int(floors[k]); rp90 = int(p[2])
+                frag_served = max(0, rp90 - fl)
+                if frag_served < 0:
+                    route_frag_neg += 1
+                if fl + frag_served != rp90:
+                    route_bad += 1
+    assert cells_checked > 1000, f"only {cells_checked} reachable cells — fixture too thin"
+    assert frag_neg == 0, f"{frag_neg} cells with negative served frag"
+    assert cells_bad == 0, (
+        f"{cells_bad}/{cells_checked} cells: served_p50 + frag != committed_p90 (reconciliation broke)")
+    assert route_checked > 0, "no per-route reconciliation exercised"
+    assert route_frag_neg == 0, f"{route_frag_neg} routes with negative served frag"
+    assert route_bad == 0, (
+        f"{route_bad}/{route_checked} routes: floor + frag != committed_p90 (per-route reconcile broke)")
+    # The bug sentinel: there MUST be cells where the new frag exceeds the old (committed_p50>served_p50),
+    # else the fix is a no-op / the fixture can't exercise it.
+    assert bug_cells > 0, (
+        "no cell where committed_p50 > served_p50 — fixture cannot exercise the metric-contract bug")
+    print(f"[departafter frag reconcile] cells={cells_checked} routes={route_checked} "
+          f"bug_cells={bug_cells} mean_increase={inc_sum / max(1, bug_cells):.2f} max_increase={inc_max}")

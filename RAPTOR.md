@@ -338,6 +338,63 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   realistic/fragility/alt are header annotations. The `Realistic`/`Best-case` `#metric` toggle
   switches MC-p50 ↔ perfect.
 
+- **Depart-after metric contract (Stage 3 of the depart-after map migration, 2026-06-17).** Under
+  depart-after **best-case and typical are DIFFERENT percentiles of the departure window, so each is a
+  DIFFERENT drawn journey** (can be a different route). The contract reflects that — it does NOT make
+  "Typical" the MC committed number:
+  - **Map color.** best-case = p5 (`cells[c][0]`), typical = p50 (`cells[c][1]`), served by `/compute`.
+    The MC never overrides the typical color (the depart-after `/variance` carries NO `realistic`).
+  - **`/itinerary` returns BOTH journeys** so the frontend switches on the metric toggle WITHOUT a
+    re-fetch. `server._raptor_tree` caches BOTH a p50 `DepartAfterJourneyTree` (`tree`) and a p5 tree
+    (`tree5`) per workplace (~50 ms each; the per-T* reverse-traced trees inside are lazy). Each
+    journey's total is the cell's painted percentile EXACTLY (hover==map for BOTH): the p50 journey
+    (`tree.itinerary(ci)`) total == `cells[c][1]`, the p5 journey (`tree5.itinerary(ci)`) total ==
+    `cells[c][0]`. Response shape: root + `typical` = the p50 journey, `best` = the p5 journey (each
+    `{total, xfers, legs, geom}`); legs reconcile to each journey's own total.
+  - **`/variance` (depart-after) = `{frag, stuck, alt}` ONLY, NO `realistic`.** The typical headline is
+    the bare p50 the map paints; the MC is used SOLELY for the p90 tail (→ `frag = max(0, p90 − p50)`,
+    with p90 the committed-MC p90 and p50 the served depart-after p50 = the floor `_raptor_mc_build`
+    passes to `montecarlo`, so frag ≥ 0 by construction) + the alt-line set. `arrive-by` is
+    BYTE-UNCHANGED — it still serves `{realistic, variance}` (its perfect-timing base is too rosy, so
+    the committed `realistic` IS its typical headline; depart-after's p50 already is the typical).
+    - **frag derivation (the metric-contract fix, 2026-06-17):** the chip reconciles as
+      `displayed_headline + frag == committed_p90`. Arrive-by's headline IS the committed p50, so its
+      frag is the engine's `mc["frag"] = round(p90 − p50)` (kept byte-identical). Depart-after's
+      headline is the BARE served p50 (the painted floor `cells[c][1]`), which is `< committed_p50` on
+      ~77% of cells (committed p50 drifts above the floor), so `mc["frag"]` would understate the bad
+      day by `committed_p50 − served_p50` (mean +2.2, max +15). So `montecarlo`/`route_typicals` now
+      ALSO return `committed_p90` (= `round(p90)` of the floored draws; `route_typicals` only with
+      `return_committed_p90=True`), and the depart-after callers derive `frag = max(0, committed_p90 −
+      served_p50)` → `served_p50 + frag == committed_p90` EXACTLY. NOTE: you can NOT reuse the absolute
+      for arrive-by (`realistic + frag != committed_p90` on ~half the cells: `realistic = ceil(p50)` vs
+      `frag = round(p90 − p50)` use different rounding) — arrive-by keeps its own `frag` field, which is
+      why the two derivations are kept separate, not unified.
+  - **Per-route (`/itinerary?pin=1`):** each route (primary + each alt) carries its OWN p5 + p50
+    journey + its OWN `frag`. The alt journeys are anchored on the alt's **per-stop percentile**
+    (`DepartAfterJourneyTree.itinerary_via_stop(ci, s, percentile=5|50)` →
+    `_stop_percentile_anchor`: the percentile of `tt_s(D) = arrivalW[s, D+aw] − D` over the window),
+    which guarantees **alt p5 ≤ alt p50 PER alt** (the per-stop percentile is monotone in the
+    percentile — the old latest-departure best-case mixed the cell's p5/p50 deadline trees and could
+    read an alt's best-case SLOWER than its typical). The primary's p50 journey total == the served
+    p50 (`cells[c][1]`). Per-route `frag` comes from `route_typicals` on the p50 tree (primary floored
+    at `cells[ci][1]`, each alt at its per-stop p50); each route's frag ≥ 0.
+
+  Reused from the earlier Stage-3 build: the committed-MC surface on `DepartAfterJourneyTree`
+  (`committed_first_legs` / `committed_legs_via_stops` / `_select` / `alt_lines_window`), the
+  `_raptor_mc_build` p50 floor (which is what makes frag ≥ 0), and the alt enumeration. Changed: the
+  served `realistic` is no longer the depart-after typical (dropped from `/variance`); `/itinerary`
+  returns both p5 + p50 journeys (was p50-only); each alt journey is anchored on its per-stop
+  percentile (was the latest-departure best-case); per-route surfaces p5+p50 totals + frag (was a
+  single committed "real"). Guards: `test_route_quality.py::test_departafter_mc_overlay_and_per_route_journeys`
+  (engine) + `test_route_quality.py::test_departafter_frag_reconciles_with_headline` (the metric-contract
+  regression: `served_p50 + frag == committed_p90` per cell AND per route, 0 violations across the golden
+  workplaces, plus a sentinel that the new frag exceeds the old `committed_p90 − committed_p50` where
+  committed_p50 > served_p50 — mean +3.2, max +16) + `test_api.py::test_itinerary_equals_map_departafter`
+  (the subprocess driver now asserts the both-journey hover==map + the `{frag,stuck,alt}`-only `/variance`
+  + per-route p5≤p50 + that the primary pinned strip's frag == the served `/variance` frag). The
+  frontend wiring is a SEPARATE follow-up. RAPTOR_SEMANTIC default stays `arriveby`; the arrive-by MC
+  + `/itinerary` + `/variance` paths are byte-unchanged.
+
 **Validation** (`scripts/raptor_validate_mc.py`, `tests/test_raptor.py::test_mc_*`): committed vs R5's
 *schedule-perfect* p50 (NOT ground truth for a delayed commute — committed should sit ABOVE it).
 Aggregate over 5 workplaces **41.3**, bias vs R5 **+0.25** (per-workplace −0.8…+2.7; snapshot-relax

@@ -513,6 +513,19 @@ def _coarse_key(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=None):
     return base
 
 
+def _mc_seed(dlat, dlon, max_rides, speed):
+    """Deterministic per-workplace committed-MC seed. LOAD-BEARING: the byte-identical seed across
+    the three MC entry points (/variance's _raptor_mc_build + the two /itinerary?pin=1 per-route
+    typical helpers) is what makes the primary compare strip's committed p50 byte-identical to the
+    cell's served `realistic` (REAL[id]) — route_typicals and montecarlo draw the same-shaped
+    (nR, T) delta arrays from this seed. Keep this the ONE source so the three can never drift.
+    (The expression is unchanged from the inline copies it replaced, so served numbers are
+    byte-identical to before the extraction.)"""
+    import hashlib as _hl
+    return int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)},{speed}"
+                          .encode()).hexdigest()[:8], 16)
+
+
 def _req_max_rides():
     """Parse the ``maxrides`` query param into an R5 ride cap. Absent/blank/invalid ->
     DEFAULT_MAX_RIDES (today's behavior). The frontend sends rides directly (transfers+1):
@@ -820,20 +833,27 @@ def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
     if hit is not None:
         return hit
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
+    tree5 = None
     if RAPTOR_SEMANTIC == "departafter":
-        # Depart-after p50 map color comes straight from the selection kernel (commute(), no trees);
-        # p5 from a second cheap painted percentile pass. The dominant line is NOT computed here:
-        # dominant() would trace the window's ~20 per-T* trees (~0.9s), and only color-by-line needs
-        # it — so it's built lazily on the first /attribution (cached inside the tree). Keeping it off
-        # this path is what holds the /compute + hover build to ~80ms.
+        # Under depart-after best-case (p5) and typical (p50) are DIFFERENT percentiles of the
+        # departure window -> DIFFERENT drawn journeys (can be different routes), so each must show
+        # its OWN journey. We build BOTH a p50 tree (the typical headline + the map color) and a p5
+        # tree (the best-case), each anchored on the SAME arrivalW the served map paints with, so
+        # tree.itinerary(ci).total == that percentile EXACTLY (hover==map for BOTH percentiles, by
+        # construction). Two cheap trees (~50ms each; the per-T* reverse-traced trees inside are
+        # lazy, only built on first hover/color-by-line); the p5 painted minute comes straight off
+        # tree5.commute() (the SAME kernel engine.departafter p5 uses), so we no longer pay a
+        # separate departafter(percentiles=(5,)) pass. The dominant line is NOT computed here:
+        # dominant() would trace the window's ~20 per-T* trees (~0.9s) and only color-by-line needs
+        # it — built lazily on the first /attribution (cached inside the p50 tree), which holds the
+        # /compute + hover build to ~80ms.
         tree = _RAPTOR.journey_tree_departafter(egress_g, egress_w, purewalk, percentile=50.0,
                                                 max_rounds=int(max_rides), walk_scalar=walk_scalar)
-        commute = tree.commute()                          # p50 painted minute, == itinerary total
-        # p5 (the "best-case" of the depart-after window) — same painted-percentile source as
-        # engine.departafter's p5, so cells[c] = [p5, p50] matches the served /compute shape.
-        p5 = _RAPTOR.departafter(egress_g, egress_w, purewalk, percentiles=(5,),
-                                 max_rounds=int(max_rides), walk_scalar=walk_scalar)
-        cells = {c: ([int(p5[c][0]) if p5[c][0] is not None else int(commute[i]),
+        tree5 = _RAPTOR.journey_tree_departafter(egress_g, egress_w, purewalk, percentile=5.0,
+                                                 max_rounds=int(max_rides), walk_scalar=walk_scalar)
+        commute = tree.commute()                          # p50 painted minute, == p50 itinerary total
+        p5 = tree5.commute()                              # p5 painted minute, == p5 itinerary total
+        cells = {c: ([int(p5[i]) if p5[i] >= 0 else int(commute[i]),
                       int(commute[i])] if commute[i] >= 0 else [None, None])
                  for i, c in enumerate(_RAPTOR.cell_ids)}
         domd = None                                       # lazy; filled by _raptor_attribution
@@ -844,10 +864,14 @@ def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
         cells = {c: ([int(commute[i]), int(commute[i])] if commute[i] >= 0 else [None, None])
                  for i, c in enumerate(_RAPTOR.cell_ids)}
         domd = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
-    # "geom": per-cell hover-route geometry responses (ci -> /itinerary dict incl. "geom"),
-    # filled lazily by /itinerary under _GEOM_LOCK; shared across the LRU's shallow copies
-    # so it lives exactly as long as the tree it was traced from.
-    entry = {"tree": tree, "cells": cells, "dom": domd, "geom": {}}
+    # "geom": per-cell TYPICAL (p50/arrive-by) hover-route geometry responses (ci -> /itinerary dict
+    # incl. "geom"), filled lazily by /itinerary under _GEOM_LOCK; shared across the LRU's shallow
+    # copies so it lives exactly as long as the tree it was traced from. "geom5" is the SAME cache
+    # for the depart-after BEST-CASE (p5) journey (None entry under arrive-by — p5==p50, one tree).
+    # "tree5" is the p5 DepartAfterJourneyTree (None under arrive-by). The arrive-by entry shape is
+    # unchanged for the keys it had ({tree, cells, dom, geom}); tree5/geom5 are additive + None there.
+    entry = {"tree": tree, "tree5": tree5, "cells": cells, "dom": domd,
+             "geom": {}, "geom5": ({} if tree5 is not None else None)}
     _RAPTOR_TREE_CACHE.put(key, entry)
     return entry
 
@@ -969,28 +993,70 @@ def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
 
 
 def _raptor_mc_build(key, dlat, dlon, max_rides, speed, walk_scalar):
-    """The actual MC build + cache write for _raptor_mc (callers go through the guard above)."""
+    """The actual MC build + cache write for _raptor_mc (callers go through the guard above).
+
+    Semantic-agnostic build: the committed-plan MC (``RaptorEngine.montecarlo``) takes the
+    workplace's CACHED traced tree (arrive-by ``JourneyTree`` OR depart-after
+    ``DepartAfterJourneyTree`` p50) and re-runs the SAME committed model on it (commit the home
+    departure + first board from the displayed plan, re-optimize the tail per perturbed draw). The
+    SERVED shape differs by semantic (see _variance): arrive-by serves the committed ``realistic``
+    as the headline typical; depart-after serves ONLY the ``frag``/``stuck``/``alt`` overlay (the
+    headline typical is the bare depart-after p50 the map already paints, NOT the committed value).
+
+    ``perfect`` floors the draws at the cell's painted p50 (``cells[c][1]``) under BOTH semantics:
+    arrive-by ``[1]==[0]==`` the perfect commute (byte-identical to the old ``cells[c][0]`` floor);
+    depart-after ``[1]==`` the served p50 HEADLINE. Flooring at p50 makes ``frag = p90-p50 >= 0`` by
+    construction (one self-consistent distribution: frag/std/stuck off the SAME p50-floored draws),
+    and under arrive-by keeps ``realistic >= commute`` (perfect<=committed). The internal ``realistic``
+    dict is still computed (arrive-by serves it; depart-after ignores it). The PRIMARY line dropped
+    from the alt chips is the cell's dominant line, which arrive-by populates eagerly (entry["dom"])
+    and depart-after traces lazily here (the per-T* trees ``committed_first_legs`` already built)."""
     import numpy as _np
-    import hashlib as _hl
     entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)   # perfect map + dom (cached)
-    cells = entry["cells"]; dom = entry["dom"] or {}
+    cells = entry["cells"]
     ids = _RAPTOR.cell_ids
-    perfect = _np.array([(cells[c][0] if cells[c][0] is not None else -1) for c in ids], _np.int32)
+    # Floor the committed MC at the painted p50 (cells[c][1]): arrive-by [1]==[0]==commute (the old
+    # behavior, byte-unchanged); depart-after [1]==the served p50 headline. This makes frag=p90-p50>=0
+    # under both, off ONE p50-floored distribution. (depart-after no longer SERVES `realistic` — only
+    # the frag/stuck/alt overlay — so the floor's role here is purely to anchor the frag tail at the
+    # served p50, not to publish a number above it.)
+    perfect = _np.array([(cells[c][1] if cells[c][1] is not None else -1) for c in ids], _np.int32)
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(dlat, dlon)
     # deterministic per-workplace seed -> the realistic numbers are stable across reboots/reloads
-    seed = int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)},{speed}"
-                          .encode()).hexdigest()[:8], 16)
+    seed = _mc_seed(dlat, dlon, max_rides, speed)
     mc = _RAPTOR.montecarlo(egress_g, egress_w, purewalk, perfect=perfect, seed=seed,
                             walk_scalar=walk_scalar, max_rounds=int(max_rides),
-                            tree=entry.get("tree"))   # reuse the cached arrive-by trace (no re-trace)
+                            tree=entry.get("tree"))   # reuse the cached trace (no re-trace)
+    # dominant line per cell (to drop the cell's PRIMARY line from its alt chips). Arrive-by filled
+    # entry["dom"] eagerly at tree build; depart-after left it None (lazy) -> trace it now off the
+    # SAME cached tree (the per-T* trees are already built by committed_first_legs above, so this is
+    # cheap and stays JVM-free). _raptor_attribution caches it on the tree for /attribution reuse.
+    dom = entry["dom"]
+    if dom is None and mc["alt"]:
+        dom = _raptor_attribution(dlat, dlon, max_rides, speed, walk_scalar)
+    dom = dom or {}
     realistic, variance = {}, {}
     alt_all = mc["alt"]
     alt_chips = {}                                       # ci -> [chip lines] (drawn-route source)
+    # frag = the bad-day delta the chip ADDS to the displayed headline. The reconciliation invariant
+    # is `displayed_headline + frag == committed_p90`, so frag depends on WHAT the headline is:
+    #   - ARRIVE-BY: headline == realistic == committed p50 -> frag = committed_p90 - committed_p50,
+    #     which is exactly the engine's `mc["frag"]` (kept byte-identical).
+    #   - DEPART-AFTER: headline == the bare served p50 (`perfect[i]` == cells[c][1], the painted
+    #     floor), NOT committed p50 (committed p50 drifts above the floor on ~77% of cells). So
+    #     mc["frag"] (=committed_p90-committed_p50) would UNDERSTATE the bad day by committed_p50 -
+    #     served_p50. Derive it off the absolute instead: frag = committed_p90 - served_p50 (>=0
+    #     since the draws are floored at served_p50), so served_p50 + frag == committed_p90 exactly.
+    _departafter = (RAPTOR_SEMANTIC == "departafter")
+    cp90 = mc["committed_p90"]
     for i, c in enumerate(ids):
         if perfect[i] < 0:                              # follow the perfect map's reachability
             continue
-        realistic[c] = int(mc["realistic"][i])
-        v = {"frag": int(mc["frag"][i]), "std": int(mc["std"][i]),
+        if not _departafter:                           # depart-after never SERVES realistic (the
+            realistic[c] = int(mc["realistic"][i])     # headline is the bare served p50) -> skip it
+        frag = (max(0, int(cp90[i]) - int(perfect[i])) if _departafter
+                else int(mc["frag"][i]))
+        v = {"frag": frag, "std": int(mc["std"][i]),
              "stuck": round(float(mc["stuck"][i]), 2)}
         a = alt_all[i] if alt_all else None
         if a:
@@ -1105,19 +1171,21 @@ def _itinerary_alt_typicals(ci, dlat, dlon, max_rides, speed, alts):
     alt_stop = bundle.get("alt_stop")
     cell_alt_stop = (alt_stop[ci] if alt_stop and ci < len(alt_stop) else None) or {}
     cells = entry["cells"]
-    prim_best = cells.get(_RAPTOR.cell_ids[ci], [None, None])[0]
+    # PRIMARY floor = the HEADLINE metric (cells[ci][1]) — the SAME floor _raptor_mc_build passes to
+    # montecarlo for this cell (arrive-by [1]==[0]==commute; depart-after [1]==painted p50). Sharing
+    # the floor + the seed makes the primary's committed p50 here byte-identical to the served
+    # realistic (REAL[id]) under BOTH semantics, so the primary strip matches the headline exactly.
+    prim_best = cells.get(_RAPTOR.cell_ids[ci], [None, None])[1]
     stops = [int(s_star) if (not is_walk and s_star >= 0) else -1]
     floors = [prim_best]
     for a in alts:
         stops.append(int(cell_alt_stop.get(a["line"], -1)))
         floors.append(a.get("min"))
     egress_g, egress_w, _purewalk = _raptor_egress_purewalk(dlat, dlon)
-    import hashlib as _hl
     # SAME per-workplace seed as _raptor_mc_build's /variance MC: route_typicals draws the same-shaped
     # (nR, T) delta arrays, so the PRIMARY route's committed p50 here is byte-identical to that cell's
     # served `realistic` (REAL[id]) -> the primary compare strip matches the headline exactly.
-    seed = int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)},{speed}"
-                          .encode()).hexdigest()[:8], 16)
+    seed = _mc_seed(dlat, dlon, max_rides, speed)
     pairs = _RAPTOR.route_typicals(tree, ci, stops, egress_g, egress_w,
                                    perfect_route_mins=floors, seed=seed,
                                    walk_scalar=walk_scalar, max_rounds=int(max_rides))
@@ -1125,6 +1193,205 @@ def _itinerary_alt_typicals(ci, dlat, dlon, max_rides, speed, alts):
     with _TYP_LOCK:                                      # cache the typicals for this pinned cell
         typ_cache[ci] = out
     return out
+
+
+# ---- Depart-after /itinerary: BOTH the best-case (p5) and typical (p50) journeys -------
+# Under depart-after the BEST-CASE and TYPICAL are DIFFERENT percentiles of the [DEP, DEP+WINDOW]
+# departure window, so each is a DIFFERENT drawn journey (can be a different route). The frontend's
+# metric toggle must switch between them LOCALLY (no re-fetch), so /itinerary ships BOTH journeys in
+# one response. Each journey's total is the cell's painted percentile EXACTLY (hover==map for BOTH):
+# the p50 journey traced from the cached p50 DepartAfterJourneyTree (== cells[c][1]), the p5 journey
+# from the cached p5 tree (== cells[c][0]). See the JSON contract docstring in _itinerary_departafter.
+def _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed, prov50, prov5):
+    """The drawn alternative routes for cell ``ci`` under DEPART-AFTER, each carrying BOTH its
+    best-case (p5) and typical (p50) journey (total + geom legs) so the compare card can switch on
+    the metric toggle without re-fetching. For each alt chip line the MC overlay surfaced for this
+    cell (the dominance-window alts, after the SAME primary-exclusion + 4-cap /variance applies),
+    trace that line's access stop (the bundle's per-cell ``alt_stop`` map) on the p50 tree at the
+    alt's OWN per-stop p50 + p5 percentiles (``itinerary_via_stop(..., percentile=)``) — the per-stop
+    percentile guarantees the alt's best-case <= its typical. Returns
+    ``[{line, best:{total,legs}, typical:{total,legs}}]`` (closest-first), or [] until the MC build
+    has run (we never trigger it here) / no alt chips. ``prov50``/``prov5`` are the primary route's
+    geom providers reused so the per-cell access walk-tree (one Dijkstra each) is shared (p50 geom on
+    prov50, p5 geom on prov5)."""
+    mc = _mc_peek(dlat, dlon, max_rides, speed)
+    if mc is None:
+        return []                                       # variance not built yet -> no alts
+    chips = mc.get("alt_chips", {}).get(ci)
+    bundle = mc.get("alt_bundle")
+    if not chips or not bundle:
+        return []
+    geom_cache = mc["alt_geom"]
+    cached = geom_cache.get(ci)
+    if cached is not None:
+        return cached
+    alt_stop = bundle.get("alt_stop")
+    cell_alt_stop = (alt_stop[ci] if alt_stop and ci < len(alt_stop) else None) or {}
+    if not cell_alt_stop:
+        return []
+    tree50 = entry["tree"]                               # owns arrivalW + the per-T* tree cache
+    if prov50 is None:
+        prov50 = _JourneyGeomProvider(dlat, dlon)
+    if prov5 is None:
+        prov5 = _JourneyGeomProvider(dlat, dlon)
+    out = []
+    for line in chips:                                   # preserve the chip (closest-first) order
+        s = cell_alt_stop.get(line)
+        if s is None:
+            continue
+        # Each alt journey is anchored on the alt's OWN per-stop percentile (p5 best-case, p50
+        # typical) so alt p5 <= alt p50 holds PER alt (the latest-departure best-case would mix the
+        # cell's p5/p50 deadline trees and could read the alt's best-case SLOWER than its typical).
+        # The p50 tree owns the per-T* reverse-traced trees + arrivalW for both (same workplace).
+        it50 = tree50.itinerary_via_stop(ci, int(s), geom_provider=prov50, percentile=50)
+        it5 = tree50.itinerary_via_stop(ci, int(s), geom_provider=prov5, percentile=5)
+        if it50 is None and it5 is None:
+            continue
+        d = {"line": line}
+        if it50 is not None:
+            d["typical"] = {"total": it50["total"], "legs": it50["geom"]}
+        if it5 is not None:
+            d["best"] = {"total": it5["total"], "legs": it5["geom"]}
+        out.append(d)
+    with _ALT_LOCK:                                      # cache the assembled alts for this cell
+        geom_cache[ci] = out
+    return out
+
+
+def _itinerary_alt_typicals_departafter(ci, entry, dlat, dlon, max_rides, speed, alts):
+    """Per-ROUTE committed-plan FRAGILITY (p90-p50) for a PINNED depart-after cell ``ci``, one per
+    route: the PRIMARY (the cell's p50 journey) then each alt in ``alts`` (closest-first). Every
+    route is scored by the SAME committed Monte-Carlo (``RaptorEngine.route_typicals``) on the p50
+    DepartAfterJourneyTree, floored at that route's p50 best-case, so its p90 tail (-> frag) is
+    measured against the SAME baseline the headline shows. We surface ONLY the fragility (p90-p50)
+    per route — the TYPICAL displayed per route is the bare p50 journey total (``best``/``typical``
+    are already on each route from ``_itinerary_alts_departafter``), NOT the MC committed value
+    (the depart-after typical headline is the bare p50, not the committed number).
+
+    Returns {"prim_frag": int|None, "alt_frags": [int|None, ...]} aligned to ``alts``. Lazy +
+    cached per pinned cell in the MC entry (``typ``) under _TYP_LOCK; ONLY on /itinerary?pin=1."""
+    mc = _mc_peek(dlat, dlon, max_rides, speed)
+    if mc is None:
+        return None                                     # variance not built yet -> no fragility
+    typ_cache = mc["typ"]
+    cached = typ_cache.get(ci)
+    if cached is not None:
+        return cached
+    walk_scalar = config.WALK_KMH / WALK_SPEEDS.get(speed, config.WALK_KMH)
+    tree = entry["tree"]                                 # the p50 tree (committed MC base)
+    s_star, _aw, _lh, is_walk = tree._select(ci)
+    bundle = mc.get("alt_bundle") or {}
+    alt_stop = bundle.get("alt_stop")
+    cell_alt_stop = (alt_stop[ci] if alt_stop and ci < len(alt_stop) else None) or {}
+    cells = entry["cells"]
+    # PRIMARY floor = the painted p50 (cells[ci][1]) — the SAME floor _raptor_mc_build passes to
+    # montecarlo for this cell. Each alt floors at its OWN p50 journey best-case (the alt's "typical"
+    # total). Sharing the floor + the per-workplace seed makes the per-route p90-p50 here the SAME
+    # tail the served /variance frag is measured from.
+    prim_p50 = cells.get(_RAPTOR.cell_ids[ci], [None, None])[1]
+    stops = [int(s_star) if (not is_walk and s_star >= 0) else -1]
+    floors = [prim_p50]
+    for a in alts:
+        stops.append(int(cell_alt_stop.get(a["line"], -1)))
+        floors.append((a.get("typical") or {}).get("total"))
+    egress_g, egress_w, _purewalk = _raptor_egress_purewalk(dlat, dlon)
+    seed = _mc_seed(dlat, dlon, max_rides, speed)
+    pairs = _RAPTOR.route_typicals(tree, ci, stops, egress_g, egress_w,
+                                   perfect_route_mins=floors, seed=seed,
+                                   walk_scalar=walk_scalar, max_rounds=int(max_rides),
+                                   return_committed_p90=True)
+    # Per-route frag = committed_p90 - that route's displayed served p50 (its `floors` entry), so each
+    # strip reconciles `displayed_typical + frag == committed_p90` — the SAME contract the served
+    # per-cell /variance frag uses. We must NOT use pairs[k][1] (= committed_p90 - committed_p50): the
+    # displayed per-route typical is the bare served p50, not committed p50, so committed-p50-based
+    # frag would understate the bad day exactly where committed_p50 > served_p50 (the bug this fixes).
+    # pairs[k] = (committed_p50, _frag_unused, committed_p90); None for an unreachable-via-its-stop
+    # route. floors[k] is None for a walk-only primary -> no frag (the strip shows no chip).
+    def _df(k):
+        p = pairs[k] if (pairs and k < len(pairs)) else None
+        if p is None or floors[k] is None:
+            return None
+        return max(0, int(p[2]) - int(floors[k]))
+    prim_frag = _df(0)
+    alt_frags = [_df(k) for k in range(1, len(alts) + 1)]
+    out = {"prim_frag": prim_frag, "alt_frags": alt_frags}
+    with _TYP_LOCK:                                      # cache the fragility for this pinned cell
+        typ_cache[ci] = out
+    return out
+
+
+def _itinerary_departafter(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scalar, pin=False):
+    """Assemble the DEPART-AFTER /itinerary response carrying BOTH the best-case (p5) and typical
+    (p50) journeys for cell ``cid`` (or the nearest grid cell to olat/olon). JSON shape:
+
+      {
+        # the TYPICAL (p50) journey on the response root (back-compat: root total == cells[c][1]):
+        "total": int,  "xfers": int,  "legs": [...],  "geom": [...],
+        # the BEST-CASE (p5) journey (total == cells[c][0]); never null on a reachable cell:
+        "best":    {"total": int, "xfers": int, "legs": [...], "geom": [...]},
+        # the TYPICAL journey ALSO mirrored under "typical" for symmetry with "best":
+        "typical": {"total": int, "xfers": int, "legs": [...], "geom": [...]},
+        # alternative routes, each carrying BOTH percentiles' journeys (closest-first):
+        "alts": [{"line": str,
+                  "best":    {"total": int, "legs": [...]},
+                  "typical": {"total": int, "legs": [...]}
+                  [, "frag": int]   # only on ?pin=1
+                 }, ...],
+        # ONLY on ?pin=1: the PRIMARY route's per-route fragility (p90-p50), MC-committed:
+        "frag": int
+      }
+
+    hover==map holds for BOTH percentiles by construction: root/typical.total == cells[c][1] and
+    best.total == cells[c][0], because both journeys are traced from the SAME arrivalW the served
+    /compute map paints with (the p50 + p5 DepartAfterJourneyTrees). The MC supplies ONLY the
+    per-cell fragility (on pin) + the alt-line set; the displayed TYPICAL is the bare p50, never the
+    committed MC value. ``error`` key on an unreachable cell."""
+    ci = _RAPTOR.cell_index.get(cid) if cid is not None else None
+    if ci is None:
+        ci = _nearest_raptor_cell(olat, olon)
+    if ci is None:
+        return {"error": "no route"}
+    entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)
+    # TYPICAL (p50) journey — cached per cell in entry["geom"].
+    typ_j = entry["geom"].get(ci)
+    prov50 = None
+    if typ_j is None:
+        prov50 = _JourneyGeomProvider(dlat, dlon)
+        typ_j = entry["tree"].itinerary(ci, geom_provider=prov50)
+        if typ_j is not None:
+            with _GEOM_LOCK:
+                entry["geom"][ci] = typ_j
+    if typ_j is None:
+        return {"error": "no route"}
+    # BEST-CASE (p5) journey — cached per cell in entry["geom5"].
+    best_j = entry["geom5"].get(ci)
+    prov5 = None
+    if best_j is None:
+        prov5 = _JourneyGeomProvider(dlat, dlon)
+        best_j = entry["tree5"].itinerary(ci, geom_provider=prov5)
+        if best_j is not None:
+            with _GEOM_LOCK:
+                entry["geom5"][ci] = best_j
+    # Root = the TYPICAL journey (back-compat default), plus explicit best/typical objects.
+    res = dict(typ_j)
+    res["typical"] = {k: typ_j[k] for k in ("total", "xfers", "legs", "geom") if k in typ_j}
+    if best_j is not None:
+        res["best"] = {k: best_j[k] for k in ("total", "xfers", "legs", "geom") if k in best_j}
+    # Drawn alternative routes, each with BOTH percentiles' journeys. Empty until /variance built
+    # the MC for this workplace (we never trigger it here, so the hover stays cheap).
+    res["alts"] = _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed,
+                                              prov50, prov5)
+    # PINNED cells (?pin=1): per-route fragility (p90-p50), MC-committed, on the primary + each alt.
+    if pin and res.get("alts") is not None:
+        fr = _itinerary_alt_typicals_departafter(ci, entry, dlat, dlon, max_rides, speed,
+                                                 res["alts"])
+        if fr is not None:
+            if fr.get("prim_frag") is not None:
+                res["frag"] = fr["prim_frag"]
+            for a, f in zip(res["alts"], fr.get("alt_frags", [])):
+                if f is not None:
+                    a["frag"] = f
+    return res
 
 
 # ---- Map TIME: fast reverse approximation + exact forward refine ----------------------
@@ -1444,7 +1711,12 @@ def _itinerary():
     # EQUALS the cell's map value by construction (no R5), for BOTH semantics — arrive-by from the
     # single-deadline JourneyTree, depart-after from the DepartAfterJourneyTree's per-T* tracer.
     # Off-grid points snap to nearest cell. (The R5 fallback below now serves only USE_RAPTOR=0.)
-    if USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter"):
+    if USE_RAPTOR and RAPTOR_SEMANTIC == "departafter":
+        res = _itinerary_departafter(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scalar,
+                                     pin=request.args.get("pin") == "1")
+        res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
+        return jsonify(res)
+    if USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby":
         ci = _RAPTOR.cell_index.get(cid) if cid is not None else None
         if ci is None:
             ci = _nearest_raptor_cell(olat, olon)
@@ -1560,11 +1832,23 @@ def _attribution():
 @app.route("/variance")
 @limiter.limit("20/minute")
 def _variance():
-    """Service-noise overlay (RAPTOR arrive-by only): realistic (MC p50) + per-cell fragility +
-    alternative lines. Lazy + cached; fetched by the frontend AFTER /compute paints the perfect
-    map (progressive refinement, like /compute_exact). Empty when the flag/semantic is off so the
-    frontend simply keeps the perfect map."""
-    if not (USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby" and RAPTOR_MC):
+    """Service-noise overlay (RAPTOR, both semantics). Lazy + cached; fetched by the frontend AFTER
+    /compute paints the map (progressive refinement, like /compute_exact). Empty when the flag is off
+    so the frontend simply keeps the painted map.
+
+    BOTH semantics build the SAME committed-plan MC off the workplace's cached traced tree, but serve
+    DIFFERENT shapes because the headline TYPICAL differs:
+      - ARRIVE-BY: ``{realistic, variance}`` (byte-unchanged). The headline typical IS the committed
+        MC ``realistic`` (the arrive-by "perfect-timing" base is too rosy, so the realistic overlay
+        replaces it as the typical color/number).
+      - DEPART-AFTER: ``{variance}`` ONLY (NO ``realistic``). The headline typical is the bare
+        depart-after p50 (served by /compute as cells[c][1]); the MC is used solely for the
+        ``frag``/``stuck``/``alt`` overlay — surfacing a committed ``realistic`` here would override
+        the p50 the map already paints, which the target model forbids. ``frag`` = p90-p50 with p90
+        the committed-MC p90 and p50 the served depart-after p50 (the SAME floor _raptor_mc_build
+        passes to montecarlo), so frag >= 0 by construction.
+    Per-cell ``variance`` shape is identical for both: ``{frag, std, stuck[, alt:[lines]]}``."""
+    if not (USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter") and RAPTOR_MC):
         return jsonify({"realistic": {}, "variance": {}})
     dlat, dlon = _parse_ll(request.args.get("dlat"), request.args.get("dlon"))
     max_rides = _req_max_rides()
@@ -1579,12 +1863,16 @@ def _variance():
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     print(f"[variance:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} speed={speed} {ms:.0f}ms "
-          f"-> {len(out['realistic'])} cells")
+          f"-> {len(out['variance'])} cells")
     # Pick the JSON-able keys explicitly: the MC entry also carries the internal alt-route
     # plumbing (alt_bundle's numpy arrays, the lazy JourneyTree cache) that backs /itinerary's
     # drawn alternatives — never serialize those.
-    return jsonify({"dest": [dlat, dlon], "realistic": out["realistic"],
-                    "variance": out["variance"], "ms": round(ms)})
+    body = {"dest": [dlat, dlon], "variance": out["variance"], "ms": round(ms)}
+    if RAPTOR_SEMANTIC == "arriveby":
+        # arrive-by: the committed realistic IS the headline typical -> serve it (byte-unchanged).
+        body["realistic"] = out["realistic"]
+    # depart-after: NO realistic — the headline typical is the bare p50 the map paints (cells[c][1]).
+    return jsonify(body)
 
 
 @app.route("/geocode")

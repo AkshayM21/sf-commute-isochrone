@@ -233,54 +233,132 @@ shape_bad = [(cid, v) for cid, v in cells.items()
              if v[1] is not None and not (isinstance(v[0], int) and isinstance(v[1], int)
                                           and v[0] <= v[1])]
 
-# Sample reachable cells across the time distribution; assert itinerary total == the cell's
-# p50 map value, legs reconcile, and geom (when present) mirrors the breakdown 1:1.
+# Sample reachable cells across the time distribution. Stage-3 target model: /itinerary returns
+# BOTH the best-case (p5) and typical (p50) journeys; hover==map must hold for BOTH percentiles —
+# the p50 journey total == cells[c][1] (root + .typical), the p5 journey total == cells[c][0]
+# (.best). Each journey's legs reconcile to its own total and its geom mirrors its legs 1:1.
 reach = [(cid, v[1]) for cid, v in cells.items() if v[1] is not None and v[1] >= 8]
 reach.sort(key=lambda t: t[1])
 step = max(1, len(reach) // 30)
 sample = reach[::step][:30]
 
-match = mism = legs_bad = transit = geom_checked = geom_bad = 0
+p50_match = p50_total = p5_match = p5_total = best_present = 0
+legs50_bad = legs5_bad = transit = geom_checked = geom_bad = 0
 mismatches = []
 for cid, p50 in sample:
     it = c.get("/itinerary?id=%%s&dlat=%%s&dlon=%%s" %% (cid, FLAT, FLON)).get_json()
     if "error" in it:
-        mism += 1; mismatches.append((cid, "error")); continue
-    if it["total"] == cells[cid][1]:
-        match += 1
+        mismatches.append((cid, "error")); continue
+    p5_exp, p50_exp = cells[cid][0], cells[cid][1]
+    # TYPICAL (p50): root total + .typical.total both == cells[c][1]
+    p50_total += 1
+    if it["total"] == p50_exp and it.get("typical", {}).get("total") == p50_exp:
+        p50_match += 1
     else:
-        mism += 1; mismatches.append((cid, it["total"], cells[cid][1]))
-    legs = it["legs"]
-    ls = sum(l["min"] for l in legs) + sum(l.get("wait", 0) for l in legs)
-    if ls != it["total"]:
-        legs_bad += 1
-    for l in legs:
-        if l["mode"] == "transit" and l["line"]:
-            transit += 1
-    geom = it.get("geom")
-    if geom is not None:
-        geom_checked += 1
-        if len(geom) != len(legs):
-            geom_bad += 1
+        mismatches.append((cid, "p50", it["total"], it.get("typical", {}).get("total"), p50_exp))
+    # BEST-CASE (p5): .best.total == cells[c][0]
+    if "best" in it:
+        best_present += 1; p5_total += 1
+        if it["best"]["total"] == p5_exp:
+            p5_match += 1
         else:
-            for g, l in zip(geom, legs):
-                if g["mode"] != l["mode"] or g["min"] != l["min"] \
-                   or (g.get("name") or None) != (l.get("line") or None):
-                    geom_bad += 1; break
+            mismatches.append((cid, "p5", it["best"]["total"], p5_exp))
+    # legs (min + wait) reconcile to EACH journey's total; geom mirrors legs 1:1.
+    for jk, exp_total, badctr in (("typical", p50_exp, "t"), ("best", p5_exp, "b")):
+        j = it.get(jk)
+        if not j:
+            continue
+        legs = j["legs"]
+        ls = sum(l["min"] for l in legs) + sum(l.get("wait", 0) for l in legs)
+        if ls != j["total"]:
+            if jk == "typical": legs50_bad += 1
+            else: legs5_bad += 1
+        for l in legs:
+            if l["mode"] == "transit" and l["line"]:
+                transit += 1
+        geom = j.get("geom")
+        if geom is not None:
+            geom_checked += 1
+            if len(geom) != len(legs):
+                geom_bad += 1
+            else:
+                for g, l in zip(geom, legs):
+                    if g["mode"] != l["mode"] or g["min"] != l["min"] \
+                       or (g.get("name") or None) != (l.get("line") or None):
+                        geom_bad += 1; break
 
 attr = c.get("/attribution?dlat=%%s&dlon=%%s" %% (FLAT, FLON)).get_json()
 attr_bad = sum(1 for v in attr.values() if not (isinstance(v, str) and v.strip()))
 
+# Stage 3 target model: /variance under depart-after carries the service-noise overlay
+# {frag, stuck, alt} ONLY — NO "realistic" headline (the typical headline is the bare p50 the map
+# already paints, cells[c][1]). frag >= 0 per reachable cell; alt cap 4, never the cell's own line.
 var = c.get("/variance?dlat=%%s&dlon=%%s" %% (FLAT, FLON))
+vb = var.get_json()
+has_realistic = "realistic" in vb
+variance = vb.get("variance", {})
+v_frag = v_altcap = v_altdom = alt_cells = frag_pos = 0
+for cid, vv in variance.items():
+    if vv.get("frag", 0) < 0: v_frag += 1
+    frag_pos += vv.get("frag", 0) > 0
+    a = vv.get("alt")
+    if a:
+        alt_cells += 1
+        if len(a) > 4: v_altcap += 1
+        if attr.get(cid) in a: v_altdom += 1
+# determinism: a second identical GET is byte-identical (LRU cache + per-workplace seed)
+vb2 = c.get("/variance?dlat=%%s&dlon=%%s" %% (FLAT, FLON)).get_json()
+var_cache_ok = (vb2.get("variance") == variance and ("realistic" in vb2) == has_realistic)
+
+# /itinerary?pin=1 per-route p5/p50/frag: pick a cell with alt chips. Each route (primary + alts)
+# carries its OWN best-case (p5) + typical (p50) journey + (on pin) its OWN frag (p90-p50). The
+# primary's p50 == the cell's served p50 (cells[c][1]); every route p5 <= p50; frag >= 0.
+pin = {}
+cell_alt = next((cid for cid, vv in variance.items() if vv.get("alt")), None)
+if cell_alt is not None:
+    hov = c.get("/itinerary?id=%%s&dlat=%%s&dlon=%%s" %% (cell_alt, FLAT, FLON)).get_json()
+    plain_no_frag = ("frag" not in hov) and all("frag" not in a for a in hov.get("alts", []))
+    body = c.get("/itinerary?id=%%s&dlat=%%s&dlon=%%s&pin=1" %% (cell_alt, FLAT, FLON)).get_json()
+    palts = body.get("alts", [])
+    prim_p50_ok = (body.get("total") == cells[cell_alt][1]
+                   and body.get("typical", {}).get("total") == cells[cell_alt][1])
+    prim_p5_le_p50 = ("best" in body and body["best"]["total"] <= body["typical"]["total"])
+    prim_frag = body.get("frag")
+    # RECONCILIATION (the metric-contract fix): the PRIMARY pinned strip's frag must equal the cell's
+    # served /variance frag (both = committed_p90 - the bare served p50, same seed) -> the primary
+    # strip's "bad day" reconciles with the headline chip. And served_p50 + frag is the displayed
+    # bad-day clock (>= served_p50; the per-route fragility is measured off the SAME served p50).
+    served_frag = variance.get(cell_alt, {}).get("frag")
+    prim_frag_matches_variance = (prim_frag is not None and prim_frag == served_frag)
+    # each alt: alt's served p50 (its typical.total) + its frag must be a non-decreasing bad-day.
+    alt_reconcile_bad = sum(1 for a in palts
+                            if "frag" in a and "typical" in a and a["frag"] < 0)
+    alt_both = sum(1 for a in palts if "best" in a and "typical" in a)
+    alt_p5_gt_p50 = sum(1 for a in palts if "best" in a and "typical" in a
+                        and a["best"]["total"] > a["typical"]["total"])
+    alt_with_frag = sum(1 for a in palts if "frag" in a)
+    alt_frag_bad = sum(1 for a in palts if "frag" in a and a["frag"] < 0)
+    pin = dict(cell=cell_alt, n_alts=len(palts), plain_no_frag=plain_no_frag,
+               prim_p50_ok=prim_p50_ok, prim_p5_le_p50=prim_p5_le_p50,
+               prim_frag=prim_frag, prim_frag_ok=(prim_frag is not None and prim_frag >= 0),
+               served_frag=served_frag,
+               prim_frag_matches_variance=prim_frag_matches_variance,
+               alt_reconcile_bad=alt_reconcile_bad,
+               alt_both=alt_both, alt_p5_gt_p50=alt_p5_gt_p50,
+               alt_with_frag=alt_with_frag, alt_frag_bad=alt_frag_bad)
 
 print(json.dumps({
     "health": {k: health.get(k) for k in ("engine", "semantic", "walk")},
     "n_cells": len(cells), "n_reach": len(reach), "n_sample": len(sample),
-    "shape_bad": shape_bad[:5], "match": match, "mism": mism, "mismatches": mismatches[:5],
-    "legs_bad": legs_bad, "transit": transit,
-    "geom_checked": geom_checked, "geom_bad": geom_bad,
+    "shape_bad": shape_bad[:5], "p50_match": p50_match, "p50_total": p50_total,
+    "p5_match": p5_match, "p5_total": p5_total, "best_present": best_present,
+    "mismatches": mismatches[:5], "legs50_bad": legs50_bad, "legs5_bad": legs5_bad,
+    "transit": transit, "geom_checked": geom_checked, "geom_bad": geom_bad,
     "attr_cells": len(attr), "attr_bad": attr_bad,
-    "var_status": var.status_code, "var_keys": sorted(var.get_json().keys()),
+    "var_status": var.status_code, "var_keys": sorted(vb.keys()), "has_realistic": has_realistic,
+    "n_variance": len(variance), "v_frag": v_frag,
+    "v_altcap": v_altcap, "v_altdom": v_altdom, "alt_cells": alt_cells,
+    "frag_pos": frag_pos, "var_cache_ok": var_cache_ok, "pin": pin,
 }))
 '''
 
@@ -291,8 +369,16 @@ def test_itinerary_equals_map_departafter():
     R5 fallback. Over many reachable cells the /itinerary total must equal the cell's /compute p50
     (itinerary == map by construction), its legs (min + wait) must reconcile to that total, the
     geom legs must mirror the breakdown 1:1, /attribution must return a non-empty dominant line
-    per reachable cell, /variance must not crash (Stage 3 leaves it returning empty), and the
-    boot must be JVM-free."""
+    per reachable cell, and the boot must be JVM-free.
+
+    Stage 3 (the metric-contract fix): best-case (p5) and typical (p50) are DIFFERENT percentiles
+    of the departure window -> DIFFERENT journeys, so /itinerary returns BOTH (root/.typical = the
+    p50 journey, .best = the p5 journey) and hover==map holds for BOTH (p50 journey total ==
+    cells[c][1], p5 journey total == cells[c][0]). /variance carries the service-noise overlay
+    {frag, stuck, alt} ONLY — NO "realistic" headline (the typical headline is the bare p50 the map
+    paints, never the MC committed value). /itinerary?pin=1 gives each route (primary + each alt) its
+    OWN p5 + p50 journey + its OWN frag (p90-p50); every route's p5 <= p50, frag >= 0, and the
+    primary's p50 == the cell's served p50."""
     import subprocess
     import sys as _sys
 
@@ -317,19 +403,60 @@ def test_itinerary_equals_map_departafter():
     assert res["n_reach"] >= 100, f"only {res['n_reach']} reachable cells (depart-after)"
     assert res["n_sample"] >= 15, f"only {res['n_sample']} sampled cells"
     assert not res["shape_bad"], f"/compute not [p5<=p50]: {res['shape_bad']}"
-    # itinerary == map for EVERY sampled cell (this is the Stage-2 invariant).
-    assert res["mism"] == 0, f"itinerary != map on {res['mism']} cells: {res['mismatches']}"
-    assert res["match"] == res["n_sample"], (res["match"], res["n_sample"])
-    assert res["legs_bad"] == 0, f"{res['legs_bad']} cells whose legs don't sum to the total"
+    # hover == map for BOTH percentiles on EVERY sampled cell: the p50 journey (root + .typical)
+    # total == cells[c][1] AND the p5 journey (.best) total == cells[c][0].
+    assert res["p50_match"] == res["p50_total"] == res["n_sample"], (
+        res["p50_match"], res["p50_total"], res["n_sample"], res["mismatches"])
+    assert res["best_present"] == res["n_sample"], (
+        f"{res['best_present']}/{res['n_sample']} sampled cells carried a .best (p5) journey")
+    assert res["p5_match"] == res["p5_total"] == res["n_sample"], (
+        res["p5_match"], res["p5_total"], res["n_sample"], res["mismatches"])
+    assert res["legs50_bad"] == 0, f"{res['legs50_bad']} cells whose p50 legs don't sum to the total"
+    assert res["legs5_bad"] == 0, f"{res['legs5_bad']} cells whose p5 legs don't sum to the total"
     assert res["transit"] > 0, "no transit legs seen across the depart-after sample"
-    # geom (the drawn hover route) mirrors the breakdown 1:1 on the cells that returned it.
-    assert res["geom_checked"] > 0, "no geom returned on any sampled depart-after cell"
-    assert res["geom_bad"] == 0, f"{res['geom_bad']} cells whose geom != breakdown legs"
+    # geom (the drawn hover route) mirrors the breakdown 1:1 on each journey that returned it.
+    assert res["geom_checked"] > 0, "no geom returned on any sampled depart-after journey"
+    assert res["geom_bad"] == 0, f"{res['geom_bad']} journeys whose geom != breakdown legs"
     # color-by-line: a non-empty dominant line per reachable cell.
     assert res["attr_cells"] >= 100 and res["attr_bad"] == 0, (res["attr_cells"], res["attr_bad"])
-    # /variance must not crash under depart-after (Stage 3 re-bases it; for now it returns empty).
+    # ---- Stage 3: the service-noise MC overlay {frag, stuck, alt} ONLY (NO realistic) -------------
     assert res["var_status"] == 200, res["var_status"]
-    assert "realistic" in res["var_keys"], res["var_keys"]
+    assert "variance" in res["var_keys"], res["var_keys"]
+    # the depart-after typical headline is the bare p50 (cells[c][1]) the map paints — /variance must
+    # NOT surface a "realistic" number that would override it.
+    assert res["has_realistic"] is False, "depart-after /variance surfaced a 'realistic' headline"
+    assert res["n_variance"] >= 100, f"depart-after /variance returned only {res['n_variance']} cells"
+    # frag >= 0 (= p90 - the served p50, by the p50-floored draws) on every reachable cell.
+    assert res["v_frag"] == 0, f"{res['v_frag']} cells with negative fragility"
+    assert res["frag_pos"] > 0, "depart-after MC produced zero fragility everywhere (delays not applied)"
+    # alt-lines: capped at 4, never the cell's own dominant line, present on a meaningful set of cells.
+    assert res["v_altcap"] == 0, f"{res['v_altcap']} cells with > 4 alt lines"
+    assert res["v_altdom"] == 0, f"{res['v_altdom']} cells whose alt includes their own dominant line"
+    assert res["alt_cells"] > 0, "no cell carried alt-lines under depart-after"
+    # deterministic + cached: a second identical /variance GET is byte-identical.
+    assert res["var_cache_ok"], "depart-after /variance not deterministic across two GETs"
+    # /itinerary?pin=1 per-route p5/p50/frag (the compare-list metric-consistency invariant).
+    pin = res["pin"]
+    assert pin, "no depart-after cell carried alt chips -> pin per-route untested"
+    assert pin["plain_no_frag"], "a plain hover computed per-route fragility (must be pin=1 only)"
+    # the PRIMARY's p50 == the cell's served p50 (cells[c][1]); its p5 <= p50; its frag >= 0.
+    assert pin["prim_p50_ok"], "primary p50 journey total != the cell's served p50 (headline drift)"
+    assert pin["prim_p5_le_p50"], "primary p5 (best-case) > p50 (typical)"
+    assert pin["prim_frag_ok"], f"primary fragility missing/negative ({pin['prim_frag']})"
+    # RECONCILIATION (the metric-contract bug): the primary pinned strip's frag must equal the cell's
+    # served /variance frag (both = committed_p90 - the bare served p50, same per-workplace seed) so
+    # `served_p50 + frag == committed_p90` consistently. The OLD bug used committed_p90 - committed_p50
+    # for /variance, which drifted from the per-route number; this asserts they now agree.
+    assert pin["prim_frag_matches_variance"], (
+        f"primary pinned frag {pin['prim_frag']} != served /variance frag {pin['served_frag']} "
+        f"(depart-after frag derivations disagree -> headline won't reconcile)")
+    assert pin["alt_reconcile_bad"] == 0, (
+        f"{pin['alt_reconcile_bad']} alts whose served-p50 + frag bad-day is inconsistent")
+    # every alt carries BOTH percentiles, p5 <= p50 PER alt, and a non-negative frag.
+    assert pin["alt_both"] > 0, "no alt carried both a best-case and a typical journey under pin=1"
+    assert pin["alt_p5_gt_p50"] == 0, f"{pin['alt_p5_gt_p50']} alts with p5 (best-case) > p50 (typical)"
+    assert pin["alt_with_frag"] > 0, "no alt carried a per-route fragility under depart-after pin=1"
+    assert pin["alt_frag_bad"] == 0, f"{pin['alt_frag_bad']} alts with negative fragility"
 
 
 # --------------------------------------------------------------------------------------
