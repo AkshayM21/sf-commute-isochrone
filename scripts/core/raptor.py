@@ -464,6 +464,121 @@ def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, de
     return out
 
 
+def select_departafter(access_off, access_to, access_w, purewalk, arrivalW, dep_grid,
+                       cell_deps, max_min, percentile=50.0, beta=1.0, eps=60.0):
+    """Per-cell SERVED-PERCENTILE selection for the depart-after tracer (s*, D*, T*, aw, is_walk).
+
+    The selection byproduct of ``assemble_departafter`` for a SINGLE percentile: for each cell it
+    runs the IDENTICAL per-departure penalized eps-window pick, takes the same ``method='lower'``
+    percentile minute, then anchors on the LATEST departure D* achieving that painted minute and
+    returns its chosen access stop ``s*`` (-1 walk/unreach), its access-walk seconds ``aw``, the
+    representative departure ``D*``, the chosen stop's TRUE workplace arrival ``T*`` (-1 walk/unreach),
+    ``is_walk`` (pure walk won), and ``painted`` (the painted minute, == ``assemble_departafter``'s
+    column for this percentile, -1 unreachable). The tracer reads these arrays — no Python per-cell
+    loop. ``beta``/``eps`` are the same walk-reluctance multiplier + true-time cap.
+
+    Returns (painted int32[n], s_star int64[n], aw int64[n], Dstar int64[n], Tstar int64[n],
+    is_walk bool[n]). The reported MAP value is unchanged (only the discarded selection is ADDED)."""
+    n_cells = len(access_off) - 1
+    dep_grid = np.asarray(dep_grid, dtype=np.int64)
+    cell_deps = np.asarray(cell_deps, dtype=np.int64)
+    pct1 = float(percentile); beta = float(beta); eps = float(eps)
+    if _select_kernel() == "numba":
+        from . import raptor_numba
+        args = (np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
+                np.asarray(access_w, np.int64), np.asarray(purewalk, np.int64), arrivalW)
+        uniform = False
+        if len(dep_grid) >= 2 and len(cell_deps) >= 1:
+            step = int(dep_grid[1] - dep_grid[0])
+            uniform = (step > 0
+                       and bool(np.all(np.diff(dep_grid) == step))
+                       and int(dep_grid[0]) == int(cell_deps[0])
+                       and bool(np.all(np.diff(cell_deps) == step)))
+        if uniform:
+            assert args[2].size == 0 or int(args[2].min()) >= 0, \
+                "select_departafter: access_w contains negative walk seconds"
+            return raptor_numba.select_departafter_arith(
+                *args, np.int64(dep_grid[0]), np.int64(step), np.int64(len(dep_grid)),
+                cell_deps, np.int64(max_min), np.float64(pct1), np.float64(beta), np.float64(eps))
+        return raptor_numba.select_departafter(
+            *args, dep_grid, cell_deps, np.int64(max_min), np.float64(pct1),
+            np.float64(beta), np.float64(eps))
+    # ---- python reference (byte-equal to the kernels; mirrors assemble_departafter) --------
+    access_to = np.asarray(access_to, np.int64)
+    access_w = np.asarray(access_w, np.int64)
+    purewalk = np.asarray(purewalk, np.int64)
+    painted = np.full(n_cells, -1, np.int32)
+    s_star = np.full(n_cells, -1, np.int64)
+    aw_sel = np.zeros(n_cells, np.int64)
+    Dstar = np.full(n_cells, NEG, np.int64)
+    Tstar = np.full(n_cells, -1, np.int64)
+    is_walk = np.zeros(n_cells, bool)
+    nd = len(cell_deps)
+    ndg = len(dep_grid)
+    bw = beta - 1.0
+    epsi = int(round(eps))
+    for ci in range(n_cells):
+        a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
+        gids = access_to[a0:a1]
+        awalk = access_w[a0:a1]
+        pw = int(purewalk[ci])
+        ttm = np.empty(nd, np.float64)
+        d_stop = np.full(nd, -1, np.int64)
+        d_arr = np.full(nd, -1, np.int64)
+        d_walk = np.zeros(nd, bool)
+        sub = arrivalW[gids] if len(gids) else None
+        for di in range(nd):
+            D = int(cell_deps[di])
+            best = INF; bestsc = 1e18; bstop = -1
+            if sub is not None:
+                kk = np.searchsorted(dep_grid, D + awalk, side="left")
+                ok = kk < ndg
+                if ok.any():
+                    rr = np.where(ok)[0]
+                    vals = sub[rr, kk[rr]]
+                    fin = vals < INF
+                    if fin.any():
+                        ff = rr[fin]
+                        arrf = vals[fin].astype(np.int64)
+                        opt = int(arrf.min())
+                        in_eps = arrf <= opt + epsi
+                        truett = (arrf - D).astype(np.float64)
+                        score = truett + bw * awalk[ff].astype(np.float64)
+                        score = np.where(in_eps, score, np.inf)
+                        j = int(np.argmin(score))
+                        bestsc = float(score[j]); best = int(arrf[j]); bstop = int(gids[ff[j]])
+            tt = (best - D) / 60.0 if best < INF else 1e18
+            walk_won = False
+            if pw >= 0 and pw * beta < (bestsc if best < INF else 1e18):
+                tt = pw / 60.0; walk_won = True; bstop = -1; best = INF
+            ttm[di] = np.ceil(min(tt, max_min))
+            d_stop[di] = bstop
+            d_arr[di] = best if best < INF else -1
+            d_walk[di] = walk_won
+        v = int(np.percentile(ttm, pct1, method="lower"))
+        if v >= max_min:
+            continue
+        painted[ci] = v
+        Di = -1
+        for di in range(nd - 1, -1, -1):
+            if int(ttm[di]) == v:
+                Di = di; break
+        if Di < 0:
+            continue
+        Dstar[ci] = int(cell_deps[Di])
+        if d_walk[Di] or int(d_stop[Di]) < 0:
+            is_walk[ci] = True
+            aw_sel[ci] = pw if pw >= 0 else 0
+        else:
+            ss = int(d_stop[Di])
+            s_star[ci] = ss
+            Tstar[ci] = int(d_arr[Di])
+            for k in range(a0, a1):
+                if int(access_to[k]) == ss:
+                    aw_sel[ci] = int(access_w[k]); break
+    return painted, s_star, aw_sel, Dstar, Tstar, is_walk
+
+
 # --------------------------------------------------------------- kernel selection
 _NUMBA = None
 

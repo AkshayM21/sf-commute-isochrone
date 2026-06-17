@@ -861,6 +861,244 @@ class JourneyTree:
         return self.line_table[int(self.pat_line[pi])][2]
 
 
+class DepartAfterJourneyTree:
+    """Depart-after journey tracer (Stage 1 of the depart-after map migration, JVM-free).
+
+    The depart-after map value is NOT a fresh forward earliest-arrival search (that traces a
+    genuinely different journey — ~3% match). It is the percentile, over the [DEP, DEP+WINDOW]
+    departure window, of ``tt(D) = arrivalW(s, D + access_walk) - D`` where ``arrivalW`` is the
+    inverted reverse profile (``raptor.stop_arrival_profile``) — the EXACT quantity
+    ``raptor.assemble_departafter`` paints. So hover==map holds only if the tracer anchors its
+    total on the engine's own ``arrivalW``-derived value, then traces the SAME
+    ``reverse_raptor_traced`` tree the arrive-by path builds, at the cell's representative
+    arrival deadline T*.
+
+    Algorithm (proto6 / verify_prior: 14626/14626 = 100% over the 5 golden workplaces):
+      1. Per cell, over the window departures, compute ``tt(D)`` reading ``arrivalW`` with the SAME
+         penalized eps-window access-stop selection ``assemble_departafter`` uses (time-optimal
+         first, then a walk-reluctance tie-break inside the eps band — replicating it EXACTLY is
+         what avoids proto3's -1 min offsets; a plain time-optimal pick misses 11/14626). Take the
+         painted percentile (default p50). The painted value == ``engine.departafter`` by
+         construction.
+      2. Pick the representative departure ``D*`` = the LATEST departure whose ``tt(D*)`` equals the
+         painted percentile (deterministic tie-break -> one stable drawn journey). Its penalized
+         access stop ``s*`` and arrival deadline ``T* = arrivalW(s*, D*+aw)`` are exact byproducts.
+      3. Build (lazily, cached) ONE ``reverse_raptor_traced`` tree at deadline T* — the IDENTICAL
+         call ``raptor_engine.journey_tree`` makes for arrive-by, only the deadline differs — wrap
+         it in a vanilla ``JourneyTree``, and read the journey from ``s*`` via
+         ``JourneyTree._trace_from(s*, aw, latest_home=D*)`` (the existing no-overshoot final-alight
+         + clock + format + dominant machinery, reused verbatim).
+      4. Report ``total = ceil((T*-D*)/60)`` so legs reconcile to the painted minute (the same
+         reconciliation the arrive-by path uses).
+
+    Only ~15-17 distinct T* exist per workplace, so the per-T* trees are cheap and shared across
+    every cell that resolves to the same deadline. Pure numpy/numba — NO r5py.
+
+    Exposes the same caller contract the arrive-by ``JourneyTree`` does:
+      ``commute_and_dominant()`` -> (commute int32[n_cells], dominant list) for the map + color-by-line;
+      ``itinerary(ci, geom_provider=None)`` -> the per-cell breakdown (+ geom) for hover.
+    """
+
+    def __init__(self, data, access_off, access_to, access_w, purewalk, arrivalW, dep_grid,
+                 cell_deps, max_min, egress_g, egress_w, percentile=50.0,
+                 walk_reluctance=1.0, walk_prior_eps=60.0, max_rounds=8, board_slack=60):
+        self.d = data
+        self.access_off = np.asarray(access_off, np.int64)
+        self.access_to = np.asarray(access_to, np.int64)
+        self.access_w = np.asarray(access_w, np.int64)
+        self.purewalk = np.asarray(purewalk, np.int64)
+        self.arrivalW = arrivalW
+        self.dep_grid = np.asarray(dep_grid, np.int64)
+        self.cell_deps = np.asarray(cell_deps, np.int64)
+        self.max_min = int(max_min)
+        self.egress_g = np.asarray(egress_g, np.int32)
+        self.egress_w = np.asarray(egress_w, np.int64)
+        self.percentile = float(percentile)
+        self.beta = float(walk_reluctance)
+        self.eps = float(walk_prior_eps)
+        self.max_rounds = int(max_rounds)
+        self.board_slack = int(board_slack)
+        self.n_cells = len(self.access_off) - 1
+        self.line_table = data["line_table"]
+        self.pat_line = data["pat_line"]
+        self._sel = None             # lazy per-cell (s_star, aw, Dstar, Tstar, is_walk, painted_min)
+        self._trees = {}             # T* (int sec) -> JourneyTree at deadline T*
+
+    # -- per-cell painted selection: (s*, D*, T*) lockstep with assemble_departafter ------
+    def _select_arrays(self):
+        """Per-cell representative departure D*, its penalized access stop s*, arrival deadline T*,
+        and the painted minute. Delegates to the SINGLE-SOURCE selection kernel
+        ``raptor.select_departafter`` (the numba njit fast path on the engine grids; python
+        reference otherwise) — the SAME per-departure penalized eps-window pick + ``method='lower'``
+        percentile + LATEST-departure anchor that ``raptor.assemble_departafter`` runs for the VALUE,
+        only here it ADDITIONALLY emits the selection it otherwise discards. So the painted minute is
+        byte-identical to ``engine.departafter`` and the selection can never re-derive-drift from the
+        value (the triplicated python loop is gone). Cell-aligned arrays
+        (s_star int64[-1 walk/unreach], aw int64, Dstar int64, Tstar int64[-1 walk/unreach],
+        is_walk bool, painted_min int32[-1 unreachable])."""
+        if self._sel is not None:
+            return self._sel
+        from . import raptor as R
+        painted, s_star, aw_sel, Dstar, Tstar, is_walk = R.select_departafter(
+            self.access_off, self.access_to, self.access_w, self.purewalk, self.arrivalW,
+            self.dep_grid, self.cell_deps, self.max_min, percentile=self.percentile,
+            beta=self.beta, eps=self.eps)
+        self._sel = (np.asarray(s_star, np.int64), np.asarray(aw_sel, np.int64),
+                     np.asarray(Dstar, np.int64), np.asarray(Tstar, np.int64),
+                     np.asarray(is_walk, bool), np.asarray(painted, np.int32))
+        return self._sel
+
+    # -- per-T* traced tree (lazy + cached) ----------------------------------------------
+    def _tree_at(self, Tstar):
+        """A ``JourneyTree`` for the single reverse-traced tree at arrival deadline T* (cached).
+        Built with the SAME ``reverse_raptor_traced`` call the arrive-by path uses (only the
+        deadline differs), so ``_trace_from`` / ``_clock`` / ``_dominant`` / the no-overshoot
+        alight all behave identically. The access table + walk-prior knobs are passed through so
+        any incidental ``_select``-based geometry fallback stays consistent; the depart-after total
+        is anchored on T*-D*, not on the tree's own arrive-by selection."""
+        T = int(Tstar)
+        jt = self._trees.get(T)
+        if jt is None:
+            from . import raptor as R
+            par = R.reverse_raptor_traced(self.d, self.egress_g, T - self.egress_w, self.egress_w,
+                                          max_rounds=self.max_rounds, board_slack=self.board_slack)
+            jt = JourneyTree(self.d, par, self.access_off, self.access_to, self.access_w,
+                             self.purewalk, T, self.max_min,
+                             walk_reluctance=self.beta, walk_prior_eps=self.eps,
+                             egress_g=self.egress_g, egress_w=self.egress_w)
+            self._trees[T] = jt
+        return jt
+
+    def _trace_raw(self, ci):
+        """(legs_raw, latest_home=D*) for cell ``ci`` anchored on the painted (s*, D*, T*), or None
+        if unreachable. Walk-only cells return a single pure-walk leg; transit cells trace the
+        T*-deadline tree FROM s* via ``JourneyTree._trace_from`` (the existing machinery)."""
+        s_star, aw_sel, Dstar, Tstar, is_walk, painted = self._select_arrays()
+        if painted[ci] < 0:
+            return None
+        if is_walk[ci]:
+            if self.purewalk[ci] < 0:
+                return None
+            return [("walk", int(self.purewalk[ci]))], int(Dstar[ci])
+        ss = int(s_star[ci])
+        if ss < 0:
+            return None
+        jt = self._tree_at(int(Tstar[ci]))
+        return jt._trace_from(ss, int(aw_sel[ci]), int(Dstar[ci]))
+
+    # -- public: per-cell commute minutes (MAP color) -------------------------------------
+    def commute(self):
+        """commute int32[n_cells] — the depart-after MAP color (the painted percentile minute,
+        -1 unreachable), straight from the SINGLE-SOURCE selection kernel. NO trees are traced:
+        this is the engine's ``departafter`` value EXACTLY (byte-identical painted minutes), so
+        the map deliverable is served in the kernel's tens-of-ms, not seconds. The traced
+        dominant line (color-by-line) is the only thing that needs the per-T* trees — see
+        ``commute_and_dominant`` / ``dominant``."""
+        return self._select_arrays()[5].copy()
+
+    # -- public: per-cell commute minutes + dominant line (map + color-by-line) -----------
+    def commute_and_dominant(self):
+        """(commute int32[n_cells], dominant list[n_cells]) — the depart-after map color +
+        color-by-line. ``commute[ci]`` is the painted percentile minute (instant, from the
+        selection kernel); ``dominant[ci]`` the traced journey's dominant line (same ``_dominant``
+        tie-break as arrive-by). -1 / None for unreachable cells. hover==map by construction (both
+        anchor on the painted value).
+
+        Color-by-line REQUIRES the per-T* reverse-traced trees (one per distinct representative
+        deadline, ~15-21/workplace) — the same per-tree ``reverse_raptor_traced`` cost the arrive-by
+        sibling pays once. The map color alone is free: use ``commute()`` when the dominant line is
+        not wanted (the toggle is lazy in the server)."""
+        commute = self.commute()
+        return commute, self.dominant(commute)
+
+    def dominant(self, commute=None):
+        """dominant list[n_cells] — the traced journey's dominant line per reachable cell (None
+        else), the color-by-line attribution. Anchored on the kernel-selected (s*, D*, T*) and read
+        from the per-T* trees (built lazily + cached). ``commute`` (the painted array) is reused if
+        supplied, else recomputed from the kernel."""
+        if commute is None:
+            commute = self._select_arrays()[5]
+        dom = [None] * self.n_cells
+        for ci in range(self.n_cells):
+            if commute[ci] < 0:
+                continue
+            tr = self._trace_raw(ci)
+            if tr is None:
+                continue
+            legs_raw, _lh = tr
+            dom[ci] = self._dominant(legs_raw)
+        return dom
+
+    # -- public: full itinerary (hover) ---------------------------------------------------
+    def itinerary(self, ci, geom_provider=None):
+        """Breakdown dict ({"total","xfers","legs"[,"geom"]}) for cell ``ci``, or None if
+        unreachable. ``total`` == the painted depart-after minute; the legs reconcile to it (the
+        same reconciliation the arrive-by path uses). Geometry, when a ``geom_provider`` is given,
+        is traced from the SAME T*-deadline tree as the breakdown (hover==map extends to drawing).
+
+        Note the leg WALK seconds (access/egress/transfer) already carry the engine's walk-speed
+        scaling because the access/egress/pure-walk arrays passed in are walk-scalar-scaled by the
+        caller (``RaptorEngine``); the schedule legs are exact GTFS times."""
+        tr = self._trace_raw(ci)
+        if tr is None:
+            return None
+        _s, _aw, _D, _T, _w, painted = self._select_arrays()
+        total_min = int(painted[ci])
+        if total_min < 0 or total_min >= self.max_min:
+            return None
+        legs_raw, latest_home = tr
+        # Walk-only cells have no T*-tree; clock + format via a tree built at the most convenient
+        # deadline would be wasteful — fold them directly (a single walk leg reconciles trivially).
+        if len(legs_raw) == 1 and legs_raw[0][0] == "walk":
+            out = [{"mode": "walk", "line": None, "sec": int(legs_raw[0][1])}]
+            if geom_provider is not None:
+                out[0]["segs"] = [("purewalk",)]
+            res = reconcile_legs(
+                [{"mode": "walk", "line": None,
+                  "min": int(round(out[0]["sec"] / 60.0)),
+                  **({"segs": out[0]["segs"]} if geom_provider is not None else {})}],
+                total_min)
+            if geom_provider is not None:
+                res["geom"] = self._walk_geom(ci, res["legs"], geom_provider)
+                for l in res["legs"]:
+                    l.pop("segs", None)
+            return res
+        jt = self._tree_at(int(_T[ci]))
+        out, _total_sec = jt._clock(legs_raw, latest_home, segs=geom_provider is not None)
+        res = jt._format(out, total_min)        # total anchored on the painted minute
+        if geom_provider is not None:
+            res["geom"] = jt._geometry(ci, res["legs"], geom_provider, s_star=int(_s[ci]))
+            for l in res["legs"]:
+                l.pop("segs", None)
+        return res
+
+    def _walk_geom(self, ci, legs, provider):
+        geom = []
+        for l in legs:
+            pts, approx = [], False
+            for sg in l.get("segs", ()):
+                if sg[0] == "purewalk":
+                    pts, approx = provider.purewalk(ci)
+            g = {"mode": l["mode"], "name": l.get("line"), "min": l["min"], "pts": pts}
+            if approx:
+                g["approx"] = True
+            geom.append(g)
+        return geom
+
+    def _dominant(self, legs_raw):
+        rides = [l for l in legs_raw if l[0] == "ride" and (l[3] - l[2]) >= _TINY_HOP_MIN * 60]
+        if not rides:
+            return "walk only"
+        best = None; best_key = None
+        for r in rides:
+            pi, dep_sec, arr_sec = r[1], r[2], r[3]
+            feed, rid, name, _mode = self.line_table[int(self.pat_line[pi])]
+            key = (-(arr_sec - dep_sec), name, feed, rid)
+            if best_key is None or key < best_key:
+                best_key = key; best = name
+        return best
+
+
 def _push_walk(out, sec, seg=None):
     if sec <= 0:
         return

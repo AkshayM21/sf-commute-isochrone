@@ -357,6 +357,201 @@ def assemble_departafter_arith(access_off, access_to, access_w, purewalk, arriva
 
 
 @njit(cache=True, nogil=True)
+def select_departafter(access_off, access_to, access_w, purewalk, arrivalW,
+                       dep_grid, cell_deps, max_min, pct1, beta, eps):
+    """Per-cell SERVED-PERCENTILE selection (the tracer's anchor), lockstep with
+    ``assemble_departafter`` for the SINGLE percentile ``pct1``.
+
+    Re-runs the IDENTICAL per-departure penalized eps-window pick ``assemble_departafter`` does
+    (two passes: time-optimal ``opt`` first, then the walk-reluctance argmin within ``arr<=opt+eps``,
+    then pure-walk competition on ``pw*beta``), records per departure the chosen stop / its TRUE
+    arrival / whether walk won, computes the SAME ``_pct_lower`` percentile minute, then picks the
+    representative departure D* = the LATEST departure whose rounded minute equals that painted value
+    and emits its (s*, D*, T* = chosen arrivalW, aw, is_walk). Returns ``painted`` (the same minute
+    the value kernel returns for this percentile) plus the cell-aligned selection arrays. The minute
+    is byte-identical to ``assemble_departafter``'s column for ``pct1`` (same arithmetic + percentile),
+    so the value the map paints is UNCHANGED — this only ADDS the discarded selection."""
+    n_cells = access_off.shape[0] - 1
+    ndg = dep_grid.shape[0]
+    nd = cell_deps.shape[0]
+    painted = np.full(n_cells, -1, dtype=np.int32)
+    s_star = np.full(n_cells, -1, dtype=np.int64)
+    aw_sel = np.zeros(n_cells, dtype=np.int64)
+    Dstar = np.full(n_cells, NEG, dtype=np.int64)
+    Tstar = np.full(n_cells, -1, dtype=np.int64)
+    is_walk = np.zeros(n_cells, dtype=np.bool_)
+    ttm = np.empty(nd, dtype=np.float64)          # rounded minutes (percentile input)
+    d_stop = np.empty(nd, dtype=np.int64)         # chosen transit stop per di (-1 walk/unreach)
+    d_arr = np.empty(nd, dtype=np.int64)          # chosen stop's TRUE arrivalW per di
+    d_walk = np.empty(nd, dtype=np.bool_)         # pure walk won this di
+    bw = beta - 1.0
+    for ci in range(n_cells):
+        a0 = access_off[ci]
+        a1 = access_off[ci + 1]
+        pw = purewalk[ci]
+        for di in range(nd):
+            D = cell_deps[di]
+            opt = INF                             # pass 1: the time-optimal TRUE arrival
+            for a in range(a0, a1):
+                board = D + access_w[a]
+                lo = 0
+                hi = ndg
+                while lo < hi:                   # searchsorted(dep_grid, board, 'left')
+                    mid = (lo + hi) >> 1
+                    if dep_grid[mid] < board:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                if lo < ndg:
+                    v = arrivalW[access_to[a], lo]
+                    if v < opt:
+                        opt = v
+            best = INF                            # pass 2: penalized winner WITHIN the eps window
+            bestsc = 1e18
+            bstop = -1                            # chosen stop id for the winner
+            if opt < INF:
+                for a in range(a0, a1):
+                    board = D + access_w[a]
+                    lo = 0
+                    hi = ndg
+                    while lo < hi:
+                        mid = (lo + hi) >> 1
+                        if dep_grid[mid] < board:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    if lo < ndg:
+                        v = arrivalW[access_to[a], lo]
+                        if v < INF and v <= opt + eps:
+                            sc = (v - D) + bw * access_w[a]
+                            if sc < bestsc:
+                                bestsc = sc; best = v; bstop = access_to[a]
+            tt = (best - D) / 60.0 if best < INF else 1e18
+            walk_won = False
+            if pw >= 0 and pw * beta < (bestsc if best < INF else 1e18):
+                tt = pw / 60.0; walk_won = True; bstop = -1; best = INF
+            if tt > max_min:
+                tt = max_min
+            ttm[di] = np.ceil(tt)
+            d_stop[di] = bstop
+            d_arr[di] = best if best < INF else -1
+            d_walk[di] = walk_won
+        srt = np.sort(ttm)
+        v = _pct_lower(srt, pct1)
+        if v >= max_min:
+            continue                              # unreachable (painted stays -1)
+        pm = np.int32(v)
+        painted[ci] = pm
+        # representative departure = LATEST di achieving the painted minute (stable single journey)
+        Di = -1
+        for di in range(nd - 1, -1, -1):
+            if np.int32(ttm[di]) == pm:
+                Di = di; break
+        if Di < 0:
+            continue
+        Dstar[ci] = cell_deps[Di]
+        if d_walk[Di] or d_stop[Di] < 0:
+            is_walk[ci] = True
+            aw_sel[ci] = pw if pw >= 0 else 0
+        else:
+            ss = d_stop[Di]
+            s_star[ci] = ss
+            Tstar[ci] = d_arr[Di]
+            for a in range(a0, a1):               # access-walk sec of the chosen stop
+                if access_to[a] == ss:
+                    aw_sel[ci] = access_w[a]; break
+    return painted, s_star, aw_sel, Dstar, Tstar, is_walk
+
+
+@njit(cache=True, nogil=True)
+def select_departafter_arith(access_off, access_to, access_w, purewalk, arrivalW,
+                             dep0, step, ndg, cell_deps, max_min, pct1, beta, eps):
+    """``select_departafter`` specialized for a UNIFORM dep_grid (origin+step == cell_deps), lockstep
+    with ``assemble_departafter_arith``. Same kw=ceil(w/step) arithmetic indexing; emits the served-
+    percentile selection (s*, D*, T*, aw, is_walk) + the painted minute byte-identical to the arith
+    value kernel's ``pct1`` column."""
+    n_cells = access_off.shape[0] - 1
+    nd = cell_deps.shape[0]
+    painted = np.full(n_cells, -1, dtype=np.int32)
+    s_star = np.full(n_cells, -1, dtype=np.int64)
+    aw_sel = np.zeros(n_cells, dtype=np.int64)
+    Dstar = np.full(n_cells, NEG, dtype=np.int64)
+    Tstar = np.full(n_cells, -1, dtype=np.int64)
+    is_walk = np.zeros(n_cells, dtype=np.bool_)
+    ttm = np.empty(nd, dtype=np.float64)          # TRUE time (sec) of chosen stop per di
+    scm = np.empty(nd, dtype=np.float64)          # penalized score that drove the choice
+    optv = np.empty(nd, dtype=np.int64)           # time-optimal TRUE arrival per di
+    bstopv = np.empty(nd, dtype=np.int64)         # chosen stop per di (-1 if none)
+    barrv = np.empty(nd, dtype=np.int64)          # chosen stop's TRUE arrivalW per di
+    bw = beta - 1.0
+    for ci in range(n_cells):
+        a0 = access_off[ci]
+        a1 = access_off[ci + 1]
+        pw = purewalk[ci]
+        for di in range(nd):
+            ttm[di] = 1e18; scm[di] = 1e18; optv[di] = INF; bstopv[di] = -1; barrv[di] = -1
+        for a in range(a0, a1):                      # pass 1: time-optimal arrival per di
+            w = access_w[a]
+            kw = (w + step - 1) // step
+            row = arrivalW[access_to[a]]
+            for di in range(nd):
+                k = di + kw
+                if k < ndg:
+                    v = row[k]
+                    if v < optv[di]:
+                        optv[di] = v
+        for a in range(a0, a1):                      # pass 2: penalized winner within eps window
+            w = access_w[a]
+            kw = (w + step - 1) // step
+            pen = bw * w
+            stop = access_to[a]
+            row = arrivalW[stop]
+            for di in range(nd):
+                k = di + kw
+                if k < ndg:
+                    v = row[k]
+                    if v < INF and v <= optv[di] + eps:
+                        tt = (v - cell_deps[di])
+                        sc = tt + pen
+                        if sc < scm[di]:
+                            scm[di] = sc; ttm[di] = tt / 60.0; bstopv[di] = stop; barrv[di] = v
+        for di in range(nd):
+            tt = ttm[di]
+            walk_won = False
+            if pw >= 0 and pw * beta < scm[di]:
+                tt = pw / 60.0; walk_won = True; bstopv[di] = -1; barrv[di] = -1
+            if tt > max_min:
+                tt = max_min
+            ttm[di] = np.ceil(tt)
+            if walk_won:
+                bstopv[di] = -1
+        srt = np.sort(ttm)
+        v = _pct_lower(srt, pct1)
+        if v >= max_min:
+            continue
+        pm = np.int32(v)
+        painted[ci] = pm
+        Di = -1
+        for di in range(nd - 1, -1, -1):
+            if np.int32(ttm[di]) == pm:
+                Di = di; break
+        if Di < 0:
+            continue
+        Dstar[ci] = cell_deps[Di]
+        if bstopv[Di] < 0:
+            is_walk[ci] = True
+            aw_sel[ci] = pw if pw >= 0 else 0
+        else:
+            ss = bstopv[Di]
+            s_star[ci] = ss
+            Tstar[ci] = barrv[Di]
+            for a in range(a0, a1):
+                if access_to[a] == ss:
+                    aw_sel[ci] = access_w[a]; break
+    return painted, s_star, aw_sel, Dstar, Tstar, is_walk
+
+
+@njit(cache=True, nogil=True)
 def assemble_arriveby(access_off, access_to, access_w, purewalk, latest, deadlines,
                       max_min, pct, beta, eps):
     """``beta``/``eps`` = the walk-reluctance multiplier + the true-time cap (decision-only). Among

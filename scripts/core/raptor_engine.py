@@ -256,6 +256,37 @@ class RaptorEngine:
                                           walk_prior_eps=walk_prior_eps,
                                           egress_g=egress_g, egress_w=ew)
 
+    # -- depart-after traced tree -> hover==map breakdown + color-by-line ------------------
+    def journey_tree_departafter(self, egress_g, egress_w, purewalk, percentile=50.0,
+                                 max_rounds=MAX_ROUNDS, walk_scalar=1.0,
+                                 walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
+        """A ``DepartAfterJourneyTree`` for the depart-after window percentile (default p50): serves
+        the per-cell breakdown (hover), color-by-line, AND the depart-after map value, all anchored
+        on the SAME ``arrivalW`` the served depart-after map paints with — so hover == map by
+        construction (Stage 1 of the depart-after map migration).
+
+        Mirrors ``journey_tree`` (the arrive-by sibling) but is driven by the depart-after window
+        instead of a single 09:00 deadline: it reuses THIS engine's depart-after value computation
+        (the SAME ``reverse_profile`` + ``stop_arrival_profile`` + grids ``departafter`` uses), so
+        the tree's painted grid equals ``self.departafter(...)`` for that percentile EXACTLY. The
+        tracer then builds one ``reverse_raptor_traced`` tree per representative arrival deadline T*
+        (only ~15-17 distinct per workplace) and reads each cell's journey from its painted access
+        stop s*. ``walk_scalar`` is applied end-to-end (access/egress/pure-walk seconds are scaled),
+        so the depart-after breakdown honors the walk-speed toggle — unlike the legacy R5-backed
+        departafter, which did not. JVM-free.
+
+        NOTE: not yet wired into the server (Stage 2). ``RAPTOR_SEMANTIC`` default stays
+        ``arriveby`` and the arrive-by path is byte-unchanged."""
+        egress_g = np.asarray(egress_g, np.int32)
+        ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
+        latest = self._reverse(egress_g, ew, self.Tgrid, max_rounds)
+        arrivalW = R.stop_arrival_profile(latest, self.Tgrid, self.dep_grid)
+        return raptor_journey.DepartAfterJourneyTree(
+            self.data, self.access_off, self.access_to, aw, pw, arrivalW,
+            self.dep_grid, self.cell_deps, self.max_min, egress_g, ew,
+            percentile=float(percentile), walk_reluctance=walk_reluctance,
+            walk_prior_eps=walk_prior_eps, max_rounds=max_rounds, board_slack=BOARD_SLACK)
+
     # -- Phase A: service-noise Monte-Carlo (realistic + fragility + alt-lines) ------------
     def _mc_mode_params(self):
         """Per-pattern (mean initial delay sec, fractional drift slope) from mode + operator.

@@ -78,6 +78,24 @@ def trees(engine):
 
 
 @pytest.fixture(scope="module")
+def da_trees(engine):
+    """Per-workplace DEPART-AFTER traced tree (Stage 1 of the depart-after map migration) at MED
+    walk speed, built ONCE. Returns {workplace_name: (datree, painted_p50_dict, cell_ids)} where
+    painted_p50_dict is ``engine.departafter``'s p50 ({cell_id: [p5, p50]}) — the independent map
+    value the traced tree must match — and cell_ids is the engine cell order (== tree row order).
+    hover==map is the gate (test_departafter_hover_equals_map)."""
+    from core import raptor_golden
+    out = {}
+    for f in _oracles():
+        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
+        pw = raptor_golden.purewalk_aligned(engine, z)
+        datree = engine.journey_tree_departafter(z["egress_g"], z["egress_w"], pw, percentile=50)
+        painted = engine.departafter(z["egress_g"], z["egress_w"], pw, percentiles=(5, 50))
+        out[f.replace("oracle_", "").replace(".npz", "")] = (datree, painted, list(engine.cell_ids))
+    return out
+
+
+@pytest.fixture(scope="module")
 def egress(engine):
     """Per-workplace egress arrays (egress_g, egress_w) from the oracles, by workplace name —
     needed by route_typicals (the per-route committed MC scores the tail from the same egress)."""
@@ -374,3 +392,267 @@ def test_per_route_typical_honors_perfect_le_committed(engine, trees, egress):
     assert cells > 0, "no multi-line cells scanned — fixture/oracle problem"
     assert viol_floor == 0, f"{viol_floor}/{checked_routes} routes violate perfect<=committed"
     assert viol_primary == 0, f"{viol_primary} cells: primary best-case slower than an alt (> eps)"
+
+
+# ---------------------------------------------------------------------------------------------
+# 6. DEPART-AFTER hover == map (Stage 1 of the depart-after map migration)
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_departafter_hover_equals_map(da_trees):
+    """The depart-after tracer's foundational invariant: for EVERY reachable cell across ALL 5
+    workplaces, the forward-traced journey total (anchored on the painted arrivalW value, traced
+    from the painted access stop s* at the representative deadline T*) must equal the INDEPENDENT
+    depart-after p50 the map paints (``engine.departafter``) EXACTLY, AND the traced legs must
+    reconcile to that total. STRICT: 0 violations (proto6/verify_prior: 14626/14626).
+
+    Two cross-checks per cell, so this is not a tautology:
+      (a) hover==map: ``DepartAfterJourneyTree.commute_and_dominant``/``itinerary`` total ==
+          ``engine.departafter(...)[cell][p50]`` (two independently-computed code paths — the
+          assemble kernel vs. the tracer's penalized per-departure selection).
+      (b) feasible + reconciling: the traced legs (access -> rides -> egress) sum (incl. waits) to
+          the total, with >= 1 walk leg (an access leg always exists)."""
+    total_checked = total_viol = total_legbad = 0
+    for name, (datree, painted, cell_ids) in da_trees.items():
+        commute, dom = datree.commute_and_dominant()
+        checked = viol = legbad = 0
+        for ci in range(datree.n_cells):
+            pv = painted[cell_ids[ci]][1]                 # engine.departafter p50 (independent)
+            cv = int(commute[ci]) if commute[ci] >= 0 else None
+            if pv is None and cv is None:
+                continue
+            checked += 1
+            if pv != cv:
+                viol += 1
+                continue
+            it = datree.itinerary(ci)
+            if it is None or it["total"] != cv:
+                viol += 1
+                continue
+            legsum = sum(l["min"] for l in it["legs"]) + sum(l.get("wait", 0) for l in it["legs"])
+            if legsum != it["total"]:
+                legbad += 1
+        assert checked > 500, f"{name}: only {checked} reachable cells — fixture too thin"
+        assert viol == 0, f"{name}: depart-after hover!=map on {viol}/{checked} cells"
+        assert legbad == 0, f"{name}: legs don't reconcile on {legbad}/{checked} cells"
+        total_checked += checked; total_viol += viol; total_legbad += legbad
+    assert total_checked > 5000
+    assert total_viol == 0 and total_legbad == 0
+
+
+def _independent_departafter_selection(datree, percentile=50.0):
+    """A DELIBERATELY-SEPARATE numpy reimplementation of the depart-after served-percentile access-
+    stop selection — NOT the kernel under test. For each cell it replicates
+    ``raptor.assemble_departafter``'s per-departure penalized eps-window pick directly off the tree's
+    ``arrivalW`` (time-optimal first, then ``argmin true_time + (beta-1)*aw`` within ``arr<=opt+eps``,
+    then pure-walk on ``pw*beta``), takes the same ``method='lower'`` percentile minute, and anchors
+    on the LATEST departure achieving it — returning per cell the painted minute and the chosen access
+    stop ``s*`` (-1 = walk/unreachable). The hover==map test pins the VALUE; this pins the chosen
+    STOP, the thing a tautological legs-sum check can't catch (a wrong s* still reconciles to the
+    painted total). Cross-checked against ``datree._select_arrays()`` s* below."""
+    aW = datree.arrivalW
+    off = np.asarray(datree.access_off, np.int64)
+    to = np.asarray(datree.access_to, np.int64)
+    aw = np.asarray(datree.access_w, np.int64)
+    pwk = np.asarray(datree.purewalk, np.int64)
+    dep_grid = np.asarray(datree.dep_grid, np.int64)
+    cell_deps = np.asarray(datree.cell_deps, np.int64)
+    cap = int(datree.max_min); beta = float(datree.beta); bw = beta - 1.0
+    epsi = int(round(float(datree.eps)))
+    INF = 1 << 60
+    nd = len(cell_deps); ndg = len(dep_grid); n = len(off) - 1
+    painted = np.full(n, -1, np.int32)
+    s_star = np.full(n, -1, np.int64)
+    for ci in range(n):
+        a0, a1 = int(off[ci]), int(off[ci + 1])
+        gids = to[a0:a1]; awalk = aw[a0:a1]; pw = int(pwk[ci])
+        ttm = np.empty(nd, np.float64); d_stop = np.full(nd, -1, np.int64)
+        sub = aW[gids] if len(gids) else None
+        for di in range(nd):
+            D = int(cell_deps[di]); best = INF; bestsc = 1e18; bstop = -1
+            if sub is not None:
+                kk = np.searchsorted(dep_grid, D + awalk, side="left")
+                ok = kk < ndg
+                if ok.any():
+                    rr = np.where(ok)[0]; vals = sub[rr, kk[rr]]; fin = vals < INF
+                    if fin.any():
+                        ff = rr[fin]; arrf = vals[fin].astype(np.int64)
+                        opt = int(arrf.min())
+                        sc = (arrf - D).astype(np.float64) + bw * awalk[ff].astype(np.float64)
+                        sc = np.where(arrf <= opt + epsi, sc, np.inf)
+                        j = int(np.argmin(sc)); bestsc = float(sc[j]); best = int(arrf[j])
+                        bstop = int(gids[ff[j]])
+            tt = (best - D) / 60.0 if best < INF else 1e18
+            if pw >= 0 and pw * beta < (bestsc if best < INF else 1e18):
+                tt = pw / 60.0; bstop = -1
+            ttm[di] = np.ceil(min(tt, cap)); d_stop[di] = bstop
+        v = int(np.percentile(ttm, percentile, method="lower"))
+        if v >= cap:
+            continue
+        painted[ci] = v
+        Di = next((di for di in range(nd - 1, -1, -1) if int(ttm[di]) == v), -1)
+        if Di >= 0:
+            s_star[ci] = int(d_stop[Di])
+    return painted, s_star
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_departafter_selection_matches_independent(da_trees):
+    """C1 (NON-TAUTOLOGICAL): the tracer's chosen access stop ``s*`` AND traced dominant line must
+    agree with a SEPARATE recompute of the penalized-eps argmin — pinning the WRONG-STOP class.
+
+    The hover==map test forces legs to sum to the painted total (``reconcile_legs``), so it passes
+    for ANY feasible trace even from the wrong stop. Here, for every reachable cell across all 5
+    workplaces we (a) recompute the painted minute + representative-departure penalized argmin stop
+    INDEPENDENTLY in numpy (``_independent_departafter_selection``) and assert it equals the kernel's
+    emitted ``s*`` from ``datree._select_arrays()``; and (b) trace the journey from BOTH the kernel's
+    s* and the independent s* and assert the dominant line matches. A re-derivation drift in the
+    kernel (or a wrong-stop pick) flips s* (and usually the line) -> caught. STRICT: 0 mismatches.
+
+    Sanity that this is not vacuous: it also asserts a deliberately-corrupted selection (s* shifted
+    to a DIFFERENT in-cell access stop) DOES make the dominant line disagree on a real fraction of
+    cells — i.e. the check has teeth (see test_departafter_selection_catches_wrong_stop)."""
+    tot_checked = tot_smis = tot_lmis = 0
+    for name, (datree, _painted_dict, _ids) in da_trees.items():
+        s_star, _aw, _D, _T, is_walk, painted = datree._select_arrays()
+        ind_painted, ind_s = _independent_departafter_selection(datree, percentile=50)
+        checked = smis = lmis = 0
+        for ci in range(datree.n_cells):
+            if painted[ci] < 0:
+                assert ind_painted[ci] < 0, f"{name}/{ci}: kernel unreachable but independent {ind_painted[ci]}"
+                continue
+            checked += 1
+            assert int(ind_painted[ci]) == int(painted[ci]), \
+                f"{name}/{ci}: independent painted {ind_painted[ci]} != kernel {painted[ci]}"
+            if bool(is_walk[ci]):
+                # walk-only: both must agree there's no transit access stop
+                if int(ind_s[ci]) >= 0:
+                    smis += 1
+                continue
+            if int(s_star[ci]) != int(ind_s[ci]):
+                smis += 1
+                continue
+            # dominant line traced from the kernel s* must match the line traced from the indep s*
+            kern_dom = datree._dominant(datree._trace_raw(ci)[0])
+            T = int(_T[ci]); jt = datree._tree_at(T)
+            # access-walk sec of the INDEPENDENT stop
+            a0, a1 = int(datree.access_off[ci]), int(datree.access_off[ci + 1])
+            aw_ind = 0
+            for k in range(a0, a1):
+                if int(datree.access_to[k]) == int(ind_s[ci]):
+                    aw_ind = int(datree.access_w[k]); break
+            tr_ind = jt._trace_from(int(ind_s[ci]), aw_ind, int(_D[ci]))
+            ind_dom = datree._dominant(tr_ind[0]) if tr_ind else None
+            if kern_dom != ind_dom:
+                lmis += 1
+        assert checked > 500, f"{name}: only {checked} reachable cells"
+        assert smis == 0, f"{name}: kernel s* != independent s* on {smis}/{checked} cells"
+        assert lmis == 0, f"{name}: dominant line drift on {lmis}/{checked} cells"
+        tot_checked += checked; tot_smis += smis; tot_lmis += lmis
+    assert tot_checked > 5000 and tot_smis == 0 and tot_lmis == 0
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_departafter_selection_catches_wrong_stop(da_trees):
+    """Proves the C1 cross-check has TEETH (not vacuous): a deliberately-corrupted selection that
+    picks a DIFFERENT in-cell access stop than the penalized argmin must make the traced dominant
+    line disagree with the independent reference on a meaningful fraction of multi-stop cells. If
+    this can't find disagreement, the dominant-line cross-check above could never fail and would be
+    a tautology — so we assert it CAN."""
+    name, (datree, _pd, _ids) = next(iter(da_trees.items()))
+    s_star, _aw, _D, _T, is_walk, painted = datree._select_arrays()
+    flipped = 0; tried = 0
+    for ci in range(datree.n_cells):
+        if painted[ci] < 0 or bool(is_walk[ci]) or int(s_star[ci]) < 0:
+            continue
+        a0, a1 = int(datree.access_off[ci]), int(datree.access_off[ci + 1])
+        # pick a DIFFERENT in-cell access stop (the corruption), reachable at this T*
+        T = int(_T[ci]); jt = datree._tree_at(T)
+        alt_stop = alt_aw = None
+        for k in range(a0, a1):
+            g = int(datree.access_to[k])
+            if g != int(s_star[ci]) and int(jt.best[g]) > (-(1 << 50)):
+                alt_stop = g; alt_aw = int(datree.access_w[k]); break
+        if alt_stop is None:
+            continue
+        tried += 1
+        kern_dom = datree._dominant(datree._trace_raw(ci)[0])
+        tr_bad = jt._trace_from(alt_stop, alt_aw, int(_D[ci]))
+        bad_dom = datree._dominant(tr_bad[0]) if tr_bad else None
+        if bad_dom != kern_dom:
+            flipped += 1
+        if flipped >= 20 and tried >= 50:
+            break
+    assert tried >= 20, f"{name}: too few multi-stop cells to corrupt ({tried})"
+    assert flipped > 0, (f"{name}: a wrong-stop pick NEVER changed the dominant line over {tried} "
+                         f"cells — the C1 cross-check would be vacuous")
+
+
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_departafter_walkspeed_monotonicity(engine):
+    """C2: walking FASTER must never LENGTHEN the depart-after commute (a faster walk can only board
+    sooner / egress sooner). Scans the painted depart-after map across slow->med->fast over the
+    default workplace subset and asserts every reachable cell is monotone non-increasing as speed
+    rises. Mirrors the arrive-by monotonicity guard; EXPECTED true-zero for depart-after (the
+    percentile-over-window value has no single-departure 'latest run' jiggle), so STRICT == 0."""
+    from core import raptor_golden
+    order = ["slow", "med", "fast"]            # increasing speed = non-increasing commute
+    grand = viol = 0
+    for fname in _DEFAULT_SUBSET:
+        if fname not in set(_oracles()):
+            continue
+        z = np.load(os.path.join(GOLDEN, fname), allow_pickle=True)
+        pw = raptor_golden.purewalk_aligned(engine, z)
+        cm = {}
+        for sp in order:
+            datree = engine.journey_tree_departafter(z["egress_g"], z["egress_w"], pw,
+                                                     percentile=50, walk_scalar=SPEED_SCALAR[sp])
+            cm[sp] = datree.commute()
+        n = len(cm["slow"])
+        for ci in range(n):
+            for a, b in zip(order, order[1:]):
+                va, vb = int(cm[a][ci]), int(cm[b][ci])
+                if va < 0 or vb < 0:
+                    continue                    # reachability can only improve with faster walk
+                grand += 1
+                if vb > va:                     # faster walk made it LONGER -> violation
+                    viol += 1
+    assert grand > 1000, f"only {grand} comparisons — fixture too thin"
+    assert viol == 0, f"depart-after walk-speed monotonicity: {viol}/{grand} faster-walk-longer cells"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_departafter_hover_equals_map_all_speeds(engine):
+    """The depart-after hover==map invariant across slow/med/fast walk speeds (the walk-speed toggle
+    must hold end-to-end), over the default workplace subset. STRICT: 0 violations per speed."""
+    from core import raptor_golden
+    grand = 0
+    for fname in _DEFAULT_SUBSET:
+        if fname not in set(_oracles()):
+            continue
+        z = np.load(os.path.join(GOLDEN, fname), allow_pickle=True)
+        pw = raptor_golden.purewalk_aligned(engine, z)
+        ids = engine.cell_ids
+        for sp, scalar in SPEED_SCALAR.items():
+            datree = engine.journey_tree_departafter(z["egress_g"], z["egress_w"], pw,
+                                                     percentile=50, walk_scalar=scalar)
+            painted = engine.departafter(z["egress_g"], z["egress_w"], pw, percentiles=(5, 50),
+                                         walk_scalar=scalar)
+            commute, _dom = datree.commute_and_dominant()
+            checked = viol = 0
+            for ci in range(datree.n_cells):
+                pv = painted[ids[ci]][1]
+                cv = int(commute[ci]) if commute[ci] >= 0 else None
+                if pv is None and cv is None:
+                    continue
+                checked += 1
+                if pv != cv:
+                    viol += 1
+                    continue
+                it = datree.itinerary(ci)
+                if it is None or it["total"] != cv:
+                    viol += 1
+            assert checked > 500, f"{fname}/{sp}: only {checked} reachable cells"
+            assert viol == 0, f"{fname}/{sp}: depart-after hover!=map on {viol}/{checked}"
+            grand += checked
+    assert grand > 3000
