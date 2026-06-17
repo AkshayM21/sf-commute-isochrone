@@ -923,6 +923,7 @@ class DepartAfterJourneyTree:
         self.pat_line = data["pat_line"]
         self._sel = None             # lazy per-cell (s_star, aw, Dstar, Tstar, is_walk, painted_min)
         self._trees = {}             # T* (int sec) -> JourneyTree at deadline T*
+        self._dom = None             # cached full-grid dominant list (color-by-line; ~20 traced trees)
 
     # -- per-cell painted selection: (s*, D*, T*) lockstep with assemble_departafter ------
     def _select_arrays(self):
@@ -1015,7 +1016,12 @@ class DepartAfterJourneyTree:
         """dominant list[n_cells] — the traced journey's dominant line per reachable cell (None
         else), the color-by-line attribution. Anchored on the kernel-selected (s*, D*, T*) and read
         from the per-T* trees (built lazily + cached). ``commute`` (the painted array) is reused if
-        supplied, else recomputed from the kernel."""
+        supplied, else recomputed from the kernel. The full result is cached on the tree (tracing the
+        ~20 per-T* trees is the expensive part, ~0.9s); since the tree is shared by reference across
+        the server's shallow-copied cache entries, the first color-by-line read pays it and repeats
+        are free — and it stays OFF the /compute + hover path (the map color uses ``commute()``)."""
+        if self._dom is not None:
+            return self._dom
         if commute is None:
             commute = self._select_arrays()[5]
         dom = [None] * self.n_cells
@@ -1027,6 +1033,7 @@ class DepartAfterJourneyTree:
                 continue
             legs_raw, _lh = tr
             dom[ci] = self._dominant(legs_raw)
+        self._dom = dom
         return dom
 
     # -- public: full itinerary (hover) ---------------------------------------------------

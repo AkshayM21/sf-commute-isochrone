@@ -65,9 +65,11 @@ if USE_WALK_GRAPH and not USE_RAPTOR:
 if RAPTOR_SEMANTIC not in ("arriveby", "departafter"):
     raise SystemExit(f"RAPTOR_SEMANTIC must be 'arriveby' or 'departafter', "
                      f"got {RAPTOR_SEMANTIC!r}")
-# FULLY JVM-free when the map, breakdown, AND walk all come from RAPTOR arrive-by + the walk graph.
-# Otherwise R5 is still needed (fast approx / depart-after / R5 hover+color-by-line / R5 walk).
-_NEED_R5 = not (USE_RAPTOR and USE_WALK_GRAPH and RAPTOR_SEMANTIC == "arriveby")
+# FULLY JVM-free when the map, breakdown, AND walk all come from RAPTOR + the walk graph — now for
+# BOTH semantics: arrive-by traces a single 09:00 deadline tree, depart-after traces the window's
+# per-T* trees (DepartAfterJourneyTree), both pure numpy/numba. R5 is still needed only off the
+# RAPTOR path (fast approx / R5 walk matrix), i.e. USE_RAPTOR=0 or USE_WALK_GRAPH=0.
+_NEED_R5 = not (USE_RAPTOR and USE_WALK_GRAPH and RAPTOR_SEMANTIC in ("arriveby", "departafter"))
 
 network = None
 MAX_INT32 = (2 ** 31) - 1                         # R5's "unreachable" sentinel (JVM-free fallback)
@@ -798,20 +800,50 @@ class _JourneyGeomProvider:
 
 
 def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):
-    """Build (or fetch) the cached arrive-by JourneyTree + per-cell map values (actual commute)
-    + dominant lines for this workplace (the Phase-2 path layer). Tracing every cell is ~0.14s,
-    done once per workplace bucket (keyed by transfer cap + walk speed)."""
+    """Build (or fetch) the cached JourneyTree + per-cell map values + dominant lines for this
+    workplace (the Phase-2 path layer). Both semantics serve the map, hover breakdown, and
+    color-by-line from ONE cached tree so hover==map by construction and JVM-free:
+
+      arrive-by   -> a single-deadline ``JourneyTree``; ``cells[c]`` = [commute, commute] (the
+                     actual door-to-door commute, p5==p50 since there's one tree).
+      depart-after-> a ``DepartAfterJourneyTree`` over the depart-after window; ``cells[c]`` =
+                     [p5, p50] (the SAME painted percentiles ``engine.departafter`` returns), with
+                     the MAP COLOR = p50 (== ``DepartAfterJourneyTree.commute()`` -> the itinerary
+                     total, so itinerary==map). The map color uses ``commute()`` (NO trees traced);
+                     color-by-line uses ``dominant()`` (lazy per-T* trees, shared with hover).
+
+    Tracing/painting is ~0.1-0.2s, done once per workplace bucket (keyed by transfer cap + walk
+    speed). The entry shape ({tree, cells, dom, geom}) is identical for both semantics so every
+    downstream reader (compute/itinerary/attribution) is semantic-agnostic."""
     key = _coarse_key(lat, lon, max_rides, speed)
     hit = _RAPTOR_TREE_CACHE.get(key)
     if hit is not None:
         return hit
     egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
-    tree = _RAPTOR.journey_tree(egress_g, egress_w, purewalk, max_rounds=int(max_rides),
-                                walk_scalar=walk_scalar)
-    commute, dom = tree.commute_and_dominant()
-    cells = {c: ([int(commute[i]), int(commute[i])] if commute[i] >= 0 else [None, None])
-             for i, c in enumerate(_RAPTOR.cell_ids)}
-    domd = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
+    if RAPTOR_SEMANTIC == "departafter":
+        # Depart-after p50 map color comes straight from the selection kernel (commute(), no trees);
+        # p5 from a second cheap painted percentile pass. The dominant line is NOT computed here:
+        # dominant() would trace the window's ~20 per-T* trees (~0.9s), and only color-by-line needs
+        # it — so it's built lazily on the first /attribution (cached inside the tree). Keeping it off
+        # this path is what holds the /compute + hover build to ~80ms.
+        tree = _RAPTOR.journey_tree_departafter(egress_g, egress_w, purewalk, percentile=50.0,
+                                                max_rounds=int(max_rides), walk_scalar=walk_scalar)
+        commute = tree.commute()                          # p50 painted minute, == itinerary total
+        # p5 (the "best-case" of the depart-after window) — same painted-percentile source as
+        # engine.departafter's p5, so cells[c] = [p5, p50] matches the served /compute shape.
+        p5 = _RAPTOR.departafter(egress_g, egress_w, purewalk, percentiles=(5,),
+                                 max_rounds=int(max_rides), walk_scalar=walk_scalar)
+        cells = {c: ([int(p5[c][0]) if p5[c][0] is not None else int(commute[i]),
+                      int(commute[i])] if commute[i] >= 0 else [None, None])
+                 for i, c in enumerate(_RAPTOR.cell_ids)}
+        domd = None                                       # lazy; filled by _raptor_attribution
+    else:
+        tree = _RAPTOR.journey_tree(egress_g, egress_w, purewalk, max_rounds=int(max_rides),
+                                    walk_scalar=walk_scalar)
+        commute, dom = tree.commute_and_dominant()        # arrive-by: one tree, ~0.1s — eager is fine
+        cells = {c: ([int(commute[i]), int(commute[i])] if commute[i] >= 0 else [None, None])
+                 for i, c in enumerate(_RAPTOR.cell_ids)}
+        domd = {c: dom[i] for i, c in enumerate(_RAPTOR.cell_ids) if dom[i] is not None}
     # "geom": per-cell hover-route geometry responses (ci -> /itinerary dict incl. "geom"),
     # filled lazily by /itinerary under _GEOM_LOCK; shared across the LRU's shallow copies
     # so it lives exactly as long as the tree it was traced from.
@@ -822,15 +854,10 @@ def _raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, wal
 
 def compute_raptor(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):
     """Grid travel-times via the RAPTOR engine -> {id: [best, real]} (same shape as compute).
-    arrive-by uses the traced tree (actual commute, pairs with the RAPTOR breakdown so hover==map);
-    depart-after uses the R5-VALIDATED vectorized p5/p50 (Phase 1; pairs with the R5 breakdown)."""
-    if RAPTOR_SEMANTIC == "arriveby":
-        return _raptor_tree(lat, lon, max_rides, speed, walk_scalar)["cells"]
-    egress_g, egress_w, purewalk = _raptor_egress_purewalk(lat, lon)
-    # departafter already returns a fresh {cell_id: [p5, p50]} (None = unreachable) per call —
-    # exactly the /compute shape, so hand it back as-is (no identity rebuild).
-    return _RAPTOR.departafter(egress_g, egress_w, purewalk, max_rounds=int(max_rides),
-                               walk_scalar=walk_scalar)
+    BOTH semantics now serve from the cached traced tree so map==refine==hover (JVM-free):
+    arrive-by uses the single-deadline tree (actual commute); depart-after uses the
+    DepartAfterJourneyTree's painted [p5, p50] (the p50 map color == the breakdown total)."""
+    return _raptor_tree(lat, lon, max_rides, speed, walk_scalar)["cells"]
 
 
 def _nearest_raptor_cell(olat, olon):
@@ -849,11 +876,18 @@ def _nearest_raptor_cell(olat, olon):
 
 def _raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED,
                         walk_scalar=1.0):
-    """{cellId: dominant line} from the cached arrive-by tree (color-by-line, no R5).
-    ``_raptor_tree`` always populates ``dom`` (dict of cell_id -> line) at build time, so we just
-    read it. (The old lazy-fill-on-None branch was dead code AND a tripwire — it mutated the cached
-    entry without holding the cache's lock; if it ever comes back, take _RAPTOR_TREE_CACHE.lock.)"""
-    return _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)["dom"]
+    """{cellId: dominant line} from the cached tree (color-by-line, no R5). Arrive-by populates
+    ``dom`` eagerly at build time (one tree, ~0.1s). Depart-after leaves it None and traces it
+    LAZILY here on the first color-by-line request (``dominant()`` traces the window's ~20 per-T*
+    trees, ~0.9s — kept OFF the /compute + hover path); the result is cached ON THE TREE (not the
+    entry, which is a shallow copy), and the tree is shared by reference across cache copies, so
+    repeats are free."""
+    entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)
+    dom = entry["dom"]
+    if dom is None:                                       # depart-after: trace on demand (tree-cached)
+        dl = entry["tree"].dominant()
+        dom = {c: dl[i] for i, c in enumerate(_RAPTOR.cell_ids) if dl[i] is not None}
+    return dom
 
 
 # Per-workplace service-noise Monte-Carlo (realistic + fragility + alt-lines), JVM-free, lazy +
@@ -1406,10 +1440,11 @@ def _itinerary():
     # (and so it hits the SAME _dest_key-bucketed cache as the matching /compute).
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
-    # RAPTOR path (Phase 2, arrive-by only): trace the cell's journey from the cached tree ->
-    # breakdown total EQUALS the cell's map value by construction (no R5). depart-after keeps the
-    # R5-validated breakdown below. Off-grid points snap to nearest cell.
-    if USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby":
+    # RAPTOR path (Phase 2): trace the cell's journey from the cached tree -> breakdown total
+    # EQUALS the cell's map value by construction (no R5), for BOTH semantics — arrive-by from the
+    # single-deadline JourneyTree, depart-after from the DepartAfterJourneyTree's per-T* tracer.
+    # Off-grid points snap to nearest cell. (The R5 fallback below now serves only USE_RAPTOR=0.)
+    if USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter"):
         ci = _RAPTOR.cell_index.get(cid) if cid is not None else None
         if ci is None:
             ci = _nearest_raptor_cell(olat, olon)
@@ -1488,10 +1523,11 @@ def _attribution():
     dlat, dlon = _parse_ll(request.args.get("dlat"), request.args.get("dlon"))
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
-    # RAPTOR path (Phase 2, arrive-by only): dominant line per cell from the same traced tree as
-    # the map (no R5, ~0.14s, no _HEAVY_LOCK / fan spike, deterministic). depart-after keeps the
-    # R5 color-by-line below.
-    if USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby":
+    # RAPTOR path (Phase 2): dominant line per cell from the same cached tree as the map (no R5,
+    # no _HEAVY_LOCK / fan spike, deterministic), for BOTH semantics — depart-after reads the
+    # DepartAfterJourneyTree.dominant() populated into the entry by _raptor_tree. (The R5
+    # color-by-line below now serves only USE_RAPTOR=0.)
+    if USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter"):
         attr = _raptor_attribution(dlat, dlon, max_rides, speed, walk_scalar)
         print(f"[attr:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} speed={speed} "
               f"-> {len(attr)} cells")

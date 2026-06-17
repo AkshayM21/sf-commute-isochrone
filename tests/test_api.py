@@ -199,6 +199,140 @@ def test_itinerary_total_matches_map_color_and_legs_sum(client):
 
 
 # --------------------------------------------------------------------------------------
+# /itinerary == map under the DEPART-AFTER semantic (Stage 2 of the depart-after migration)
+# --------------------------------------------------------------------------------------
+# The session `server`/`client` fixtures boot ONE engine (arrive-by, the production default), so
+# the depart-after path is exercised in a child process that imports server.py with
+# RAPTOR_SEMANTIC=departafter and runs the same hover==map + geom assertions the arrive-by test
+# above does. A subprocess (not a second in-process boot) keeps the two semantics from sharing a
+# numba JIT / module-global state in the test process, and proves the depart-after boot is JVM-free.
+_DEPARTAFTER_DRIVER = r'''
+import json, sys, os
+sys.path.insert(0, %(scripts)r)
+import server
+
+# JVM-free assertion: nothing from r5py / the Conveyal JVM may have been imported.
+jvm = sorted(m for m in sys.modules
+             if m == "r5py" or m.startswith("r5py.") or m.startswith("com.conveyal")
+             or m == "jpype")
+assert server.RAPTOR_SEMANTIC == "departafter", server.RAPTOR_SEMANTIC
+assert server._NEED_R5 is False, "depart-after boot still flagged _NEED_R5 (would load the JVM)"
+assert not jvm, ("depart-after boot is NOT JVM-free: %%s" %% jvm)
+
+c = server.app.test_client()
+FLAT, FLON = %(flat)r, %(flon)r
+
+health = c.get("/healthz").get_json()
+
+r = c.get("/compute?lat=%%s&lon=%%s" %% (FLAT, FLON))
+assert r.status_code == 200, r.get_data(as_text=True)
+cells = r.get_json()["cells"]
+
+# /compute returns [p5, p50] per reachable cell with p5 <= p50.
+shape_bad = [(cid, v) for cid, v in cells.items()
+             if v[1] is not None and not (isinstance(v[0], int) and isinstance(v[1], int)
+                                          and v[0] <= v[1])]
+
+# Sample reachable cells across the time distribution; assert itinerary total == the cell's
+# p50 map value, legs reconcile, and geom (when present) mirrors the breakdown 1:1.
+reach = [(cid, v[1]) for cid, v in cells.items() if v[1] is not None and v[1] >= 8]
+reach.sort(key=lambda t: t[1])
+step = max(1, len(reach) // 30)
+sample = reach[::step][:30]
+
+match = mism = legs_bad = transit = geom_checked = geom_bad = 0
+mismatches = []
+for cid, p50 in sample:
+    it = c.get("/itinerary?id=%%s&dlat=%%s&dlon=%%s" %% (cid, FLAT, FLON)).get_json()
+    if "error" in it:
+        mism += 1; mismatches.append((cid, "error")); continue
+    if it["total"] == cells[cid][1]:
+        match += 1
+    else:
+        mism += 1; mismatches.append((cid, it["total"], cells[cid][1]))
+    legs = it["legs"]
+    ls = sum(l["min"] for l in legs) + sum(l.get("wait", 0) for l in legs)
+    if ls != it["total"]:
+        legs_bad += 1
+    for l in legs:
+        if l["mode"] == "transit" and l["line"]:
+            transit += 1
+    geom = it.get("geom")
+    if geom is not None:
+        geom_checked += 1
+        if len(geom) != len(legs):
+            geom_bad += 1
+        else:
+            for g, l in zip(geom, legs):
+                if g["mode"] != l["mode"] or g["min"] != l["min"] \
+                   or (g.get("name") or None) != (l.get("line") or None):
+                    geom_bad += 1; break
+
+attr = c.get("/attribution?dlat=%%s&dlon=%%s" %% (FLAT, FLON)).get_json()
+attr_bad = sum(1 for v in attr.values() if not (isinstance(v, str) and v.strip()))
+
+var = c.get("/variance?dlat=%%s&dlon=%%s" %% (FLAT, FLON))
+
+print(json.dumps({
+    "health": {k: health.get(k) for k in ("engine", "semantic", "walk")},
+    "n_cells": len(cells), "n_reach": len(reach), "n_sample": len(sample),
+    "shape_bad": shape_bad[:5], "match": match, "mism": mism, "mismatches": mismatches[:5],
+    "legs_bad": legs_bad, "transit": transit,
+    "geom_checked": geom_checked, "geom_bad": geom_bad,
+    "attr_cells": len(attr), "attr_bad": attr_bad,
+    "var_status": var.status_code, "var_keys": sorted(var.get_json().keys()),
+}))
+'''
+
+
+def test_itinerary_equals_map_departafter():
+    """Stage 2 regression: under RAPTOR_SEMANTIC=departafter the server serves the map, hover
+    breakdown, color-by-line, and route geometry from the JVM-free DepartAfterJourneyTree — no
+    R5 fallback. Over many reachable cells the /itinerary total must equal the cell's /compute p50
+    (itinerary == map by construction), its legs (min + wait) must reconcile to that total, the
+    geom legs must mirror the breakdown 1:1, /attribution must return a non-empty dominant line
+    per reachable cell, /variance must not crash (Stage 3 leaves it returning empty), and the
+    boot must be JVM-free."""
+    import subprocess
+    import sys as _sys
+
+    scripts = os.path.join(_HERE, "..", "scripts")
+    driver = _DEPARTAFTER_DRIVER % {"scripts": scripts, "flat": FERRY_LAT, "flon": FERRY_LON}
+    env = dict(os.environ)
+    env.update(USE_RAPTOR="1", USE_WALK_GRAPH="1", RAPTOR_SEMANTIC="departafter", RAPTOR_MC="1")
+    # Keep the child off the repo-default numba cache (the suite's gotcha): inherit an explicit
+    # NUMBA_CACHE_DIR if the parent has one, else give the child a scratch dir of its own.
+    env.setdefault("NUMBA_CACHE_DIR", os.path.join(_HERE, ".nbcache_departafter"))
+    proc = subprocess.run([_sys.executable, "-c", driver], env=env,
+                          capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, (
+        f"depart-after server boot/driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    )
+    out = proc.stdout.strip().splitlines()[-1]
+    res = json.loads(out)
+
+    assert res["health"]["semantic"] == "departafter", res["health"]
+    assert res["health"]["engine"] == "raptor" and res["health"]["walk"] == "graph", res["health"]
+    assert _approx_cell_count(res["n_cells"]), f"got {res['n_cells']} cells"
+    assert res["n_reach"] >= 100, f"only {res['n_reach']} reachable cells (depart-after)"
+    assert res["n_sample"] >= 15, f"only {res['n_sample']} sampled cells"
+    assert not res["shape_bad"], f"/compute not [p5<=p50]: {res['shape_bad']}"
+    # itinerary == map for EVERY sampled cell (this is the Stage-2 invariant).
+    assert res["mism"] == 0, f"itinerary != map on {res['mism']} cells: {res['mismatches']}"
+    assert res["match"] == res["n_sample"], (res["match"], res["n_sample"])
+    assert res["legs_bad"] == 0, f"{res['legs_bad']} cells whose legs don't sum to the total"
+    assert res["transit"] > 0, "no transit legs seen across the depart-after sample"
+    # geom (the drawn hover route) mirrors the breakdown 1:1 on the cells that returned it.
+    assert res["geom_checked"] > 0, "no geom returned on any sampled depart-after cell"
+    assert res["geom_bad"] == 0, f"{res['geom_bad']} cells whose geom != breakdown legs"
+    # color-by-line: a non-empty dominant line per reachable cell.
+    assert res["attr_cells"] >= 100 and res["attr_bad"] == 0, (res["attr_cells"], res["attr_bad"])
+    # /variance must not crash under depart-after (Stage 3 re-bases it; for now it returns empty).
+    assert res["var_status"] == 200, res["var_status"]
+    assert "realistic" in res["var_keys"], res["var_keys"]
+
+
+# --------------------------------------------------------------------------------------
 # /attribution — dominant-line-per-cell, cached + deterministic
 # --------------------------------------------------------------------------------------
 @pytest.mark.slow
