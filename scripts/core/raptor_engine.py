@@ -275,6 +275,22 @@ class RaptorEngine:
                 mu[m] = _MU[op]; sl[m] = _SLOPE[op]
         return mu, sl
 
+    def _mc_draw_arrays(self, nR, seed):
+        """Per-trip service-delay draw arrays (delta0, slope) for the committed MC, shared by
+        ``montecarlo`` and ``route_typicals`` so a per-route typical is drawn from the SAME
+        distribution as the served realistic map — with the same seed the primary's per-route
+        typical is then byte-identical to ``realistic``. One source so the two can never drift.
+        Returns (delta0_all, slope_all), each float64[nR, n_trips]."""
+        mu_pat, slope_pat = self._mc_mode_params()
+        ntrips = np.asarray(self.data["pat_ntrips"])
+        mu_trip = np.repeat(mu_pat, ntrips); slope_trip = np.repeat(slope_pat, ntrips)
+        rng = np.random.default_rng(seed)
+        k = MC_SHAPE
+        T = mu_trip.shape[0]
+        delta0_all = rng.gamma(k, mu_trip / k, size=(nR, T))
+        slope_all = rng.gamma(k, np.maximum(slope_trip, 1e-9) / k, size=(nR, T))
+        return delta0_all, slope_all
+
     def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
                    seed=None, alt_draws=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS, tree=None,
                    walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
@@ -307,14 +323,7 @@ class RaptorEngine:
         nR = MC_DRAWS if n_draws is None else int(n_draws)
         egress_g = np.asarray(egress_g, np.int32)
         ew, _pw, _aw = self._scale_walk(egress_w, purewalk, walk_scalar)   # ew feeds the committed kernel
-        mu_pat, slope_pat = self._mc_mode_params()
-        ntrips = np.asarray(self.data["pat_ntrips"])
-        mu_trip = np.repeat(mu_pat, ntrips); slope_trip = np.repeat(slope_pat, ntrips)
-        rng = np.random.default_rng(seed)
-        k = MC_SHAPE
-        T = mu_trip.shape[0]
-        delta0_all = rng.gamma(k, mu_trip / k, size=(nR, T))
-        slope_all = rng.gamma(k, np.maximum(slope_trip, 1e-9) / k, size=(nR, T))
+        delta0_all, slope_all = self._mc_draw_arrays(nR, seed)
         if tree is None:
             tree = self.journey_tree(egress_g, egress_w, purewalk, max_rounds=max_rounds,
                                      walk_scalar=walk_scalar, walk_reluctance=walk_reluctance,
@@ -393,6 +402,65 @@ class RaptorEngine:
             alt_stop[ci] = {ln: int(ms[1]) for ln, ms in d.items()}
         bundle = {"alt_stop": alt_stop, "draws": []}
         return alt, bundle
+
+    def route_typicals(self, tree, ci, stops, egress_g, egress_w, perfect_route_mins=None,
+                       n_draws=None, seed=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS):
+        """Per-ROUTE committed-plan TYPICAL (p50) + FRAGILITY (p90-p50) for ONE pinned cell ``ci``.
+
+        ``stops`` is the list of access stops (gids) of the routes to score — the PRIMARY's selected
+        stop first, then each alternative's access stop (from ``alt_lines_window`` / the MC alt
+        bundle). Each route's committed first leg is extracted from the journey traced FROM its stop
+        (``JourneyTree.committed_legs_via_stops``), so every route is scored with the SAME committed
+        Monte-Carlo as the served ``realistic`` map (catch the next trip on the committed line, ride
+        to the committed alight, re-optimize the tail from the actual late arrival).
+
+        Efficiency: all routes for the cell are ONE combined committed-leg batch -> a SINGLE
+        ``montecarlo_commute_committed`` call, so the R per-draw reverse profiles (the dominant cost,
+        cell-independent) are computed once and shared across every route. Lazy + cached by the caller
+        per pinned cell; NEVER on the hover path. Serialized under ``raptor._MC_KERNEL_LOCK`` (inside
+        ``montecarlo_commute_committed``).
+
+        ``perfect_route_mins`` (optional, aligned to ``stops``) is each route's best-case door-to-door
+        minutes; the returned typical is FLOORED at it so ``perfect <= committed`` holds PER ROUTE.
+
+        Returns list[(real_min, frag_min) | None] aligned to ``stops`` — None for a route whose stop
+        is unreachable / off-cell (so the caller falls back to that route's best-case)."""
+        stops = [int(s) for s in stops]
+        if not stops:
+            return []
+        nR = MC_DRAWS if n_draws is None else int(n_draws)
+        egress_g = np.asarray(egress_g, np.int32)
+        ew, _pw, _aw = self._scale_walk(egress_w, np.zeros(1, np.int64), walk_scalar)
+        legs = tree.committed_legs_via_stops(ci, stops)             # one row per route
+        # per-route best-case floor (so committed >= perfect PER route); -1 where unknown/unreachable
+        n = len(stops)
+        if perfect_route_mins is None:
+            perfect = np.full(n, -1, np.int64)
+        else:
+            perfect = np.array([int(p) if p is not None else -1 for p in perfect_route_mins],
+                               np.int64)
+        # same per-pattern delay model + RNG as montecarlo() (shared helper) so the alt numbers are
+        # drawn from the SAME distribution as the served realistic map, not a fresh ad-hoc noise
+        delta0_all, slope_all = self._mc_draw_arrays(nR, seed)
+        cm = R.montecarlo_commute_committed(self.data, egress_g, ew, self.Tgrid_mc, legs,
+                                            perfect, self.max_min,
+                                            delta0_all, slope_all, board_slack=BOARD_SLACK,
+                                            max_rounds=max_rounds)
+        # floor the draws at each route's own best-case BEFORE the percentile, mirroring montecarlo()
+        floor = np.where(perfect >= 0, perfect, 0).astype(np.float64)
+        cm = np.maximum(cm, floor[:, None])
+        p50 = np.percentile(cm, 50, axis=1)
+        p90 = np.percentile(cm, 90, axis=1)
+        real = np.ceil(p50).astype(np.int32)
+        frag = np.maximum(0, np.round(p90 - p50)).astype(np.int32)
+        kind = np.asarray(legs["commit_kind"])
+        out = []
+        for row in range(n):
+            if kind[row] == 0:                # stop unreachable / off-cell -> no typical
+                out.append(None)
+            else:
+                out.append((int(real[row]), int(frag[row])))
+        return out
 
 
 def _assemble_arriveby_window(access_off, access_to, access_w, purewalk, latest, deadlines,

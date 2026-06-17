@@ -608,6 +608,78 @@ def test_itinerary_alts_lines_subset_chips_and_geometry_contract(client, server)
     assert resp2.get_json()["alts"] == alts, "alts differ across two identical requests"
 
 
+@pytest.mark.slow
+def test_itinerary_pin_per_route_typicals(client, server):
+    """/itinerary?pin=1 for a cell with alts carries a per-ROUTE committed-plan TYPICAL: the
+    PRIMARY gains ``real``/``frag`` and EACH alt gains its OWN ``real``/``frag`` (the consistency
+    fix so the compare card can show every strip on the same metric). Asserts:
+      * the primary's ``real`` == that cell's served /variance ``realistic`` (same committed MC,
+        same per-workplace seed -> the primary strip matches the headline);
+      * every route honors ``perfect <= committed`` (``real >= best-case``) PER route, primary + alts;
+      * frag >= 0 and the typicals are sane ints;
+      * a PLAIN hover (no pin=1) does NOT compute them (alts carry no ``real``), and the pin typicals
+        are cached (a second pin=1 request is byte-identical + the typ cache is populated)."""
+    _skip_unless_mc(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    rv = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert rv.status_code == 200, rv.get_data(as_text=True)
+    realistic = rv.get_json()["realistic"]
+    cid, _chips = _cell_with_alt_chips(server, FERRY_LAT, FERRY_LON)
+    assert cid is not None, "MC surfaced no alt chips on any cell"
+
+    # PLAIN hover first: alts must NOT carry per-route typicals (the gate keeps them off hover).
+    hov = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}").get_json()
+    assert hov["alts"], f"{cid}: expected alts on the cell"
+    assert all("real" not in a for a in hov["alts"]), (
+        f"{cid}: a plain hover computed per-alt typicals (should be pin=1 only): {hov['alts']}")
+    # And the typ cache is still empty for this cell (the hover never touched route_typicals).
+    mc = server._mc_peek(FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    ci = server._RAPTOR.cell_index[cid]
+    assert ci not in mc["typ"], f"{cid}: plain hover populated the typ cache"
+
+    # PINNED: every route gains its own typical + fragility.
+    t0 = time.time()
+    body = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}&pin=1").get_json()
+    dt_ms = (time.time() - t0) * 1000.0
+    alts = body["alts"]
+    assert alts, f"{cid}: pinned itinerary lost its alts"
+
+    # Primary's real == the served realistic for this cell (same committed MC + seed).
+    assert "real" in body and "frag" in body, f"{cid}: pinned primary lacks real/frag: {body.keys()}"
+    assert isinstance(body["real"], int) and isinstance(body["frag"], int)
+    assert body["frag"] >= 0, f"{cid}: negative primary fragility {body['frag']}"
+    assert body["real"] == realistic[cid], (
+        f"{cid}: primary typical {body['real']} != served realistic {realistic[cid]} "
+        f"(seed/model drift between route_typicals and /variance)")
+    assert body["real"] >= body["total"], (
+        f"{cid}: primary typical {body['real']} < best-case {body['total']} (perfect<=committed lost)")
+
+    # Each alt: its OWN typical, honoring perfect<=committed per route.
+    saw = 0
+    for a in alts:
+        if "real" not in a:                          # an unreachable-via-its-stop alt: allowed None
+            continue
+        assert isinstance(a["real"], int) and isinstance(a.get("frag"), int), a
+        assert a["frag"] >= 0, f"{cid}/{a['line']}: negative fragility {a['frag']}"
+        assert a["real"] >= a["min"], (
+            f"{cid}/{a['line']}: alt typical {a['real']} < its best-case {a['min']} "
+            f"(perfect<=committed lost per route)")
+        saw += 1
+    assert saw > 0, f"{cid}: no alt carried a per-route typical"
+
+    # Cached per pinned cell: the typ cache is now populated, and a repeat pin=1 is byte-identical.
+    assert ci in mc["typ"], f"{cid}: pin=1 did not cache the per-route typicals"
+    body2 = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}&pin=1").get_json()
+    assert body2["alts"] == alts and body2.get("real") == body["real"], (
+        f"{cid}: pinned typicals not stable across two identical pin=1 requests")
+    # Timing: a pinned cell with a few alts resolves its typicals well under a second.
+    assert dt_ms < 900, f"{cid}: pin=1 typicals took {dt_ms:.0f}ms (> 900ms budget)"
+
+
 def test_itinerary_alts_empty_before_variance_built(client, server):
     """A fresh workplace whose MC has NOT been requested yet returns ``alts: []`` — /itinerary
     must NEVER trigger the ~1s MC build on the hover path (the frontend re-hovers after

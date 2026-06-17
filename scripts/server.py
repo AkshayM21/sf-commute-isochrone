@@ -887,6 +887,10 @@ _MC_BUSY = threading.Lock()
 # so writes go through this lock (the documented rule for mutating a cached entry's values,
 # mirroring _GEOM_LOCK for the primary route geometry).
 _ALT_LOCK = threading.Lock()
+# Per-route TYPICAL (committed-plan p50/frag) for a PINNED cell mutates the cached MC entry's shared
+# value (typ) — same locked-mutation rule as _ALT_LOCK/_GEOM_LOCK. Only the /itinerary?pin=1 path
+# touches it (never a plain hover), so the compare card's numbers all follow the metric selector.
+_TYP_LOCK = threading.Lock()
 
 
 def _raptor_mc(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED, walk_scalar=1.0):
@@ -970,7 +974,7 @@ def _raptor_mc_build(key, dlat, dlon, max_rides, speed, walk_scalar):
     # first alt hover (under _ALT_LOCK).
     out = {"realistic": realistic, "variance": variance,
            "alt_bundle": mc.get("alt_bundle"), "alt_chips": alt_chips,
-           "alt_geom": {}, "dlat": float(dlat), "dlon": float(dlon)}
+           "alt_geom": {}, "typ": {}, "dlat": float(dlat), "dlon": float(dlon)}
     _RAPTOR_MC_CACHE.put(key, out)
     return out
 
@@ -1033,6 +1037,59 @@ def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None):
         out.append({"line": line, "min": it["total"], "legs": it["geom"]})
     with _ALT_LOCK:                                      # cache the assembled alts for this cell
         geom_cache[ci] = out
+    return out
+
+
+def _itinerary_alt_typicals(ci, dlat, dlon, max_rides, speed, alts):
+    """Per-ROUTE committed-plan TYPICAL (p50 minutes) + FRAGILITY (p90-p50) for a PINNED cell ``ci``,
+    one (real, frag) per route: the PRIMARY (the cell's selected journey) then each alt in ``alts``
+    (the /itinerary drawn alternatives, closest-first). Every route is scored by the SAME committed
+    Monte-Carlo as the served ``realistic`` map (``RaptorEngine.route_typicals`` -> one shared kernel
+    call), so the compare-list numbers are directly comparable and the alt's typical never reads
+    faster than the primary's just because it sat on the best-case metric.
+
+    Returns {"prim": (real, frag) | None, "alts": [(real, frag) | None, ...]} aligned to ``alts``;
+    None for an unreachable route (the frontend then falls back to that route's best-case). Lazy +
+    cached per pinned cell in the MC entry (``typ``) under _TYP_LOCK; ONLY reached on /itinerary?pin=1
+    (never a plain hover), and only AFTER /variance has built the MC for this workplace."""
+    mc = _mc_peek(dlat, dlon, max_rides, speed)
+    if mc is None:
+        return None                                     # variance not built yet -> no typicals
+    typ_cache = mc["typ"]
+    cached = typ_cache.get(ci)
+    if cached is not None:
+        return cached
+    walk_scalar = config.WALK_KMH / WALK_SPEEDS.get(speed, config.WALK_KMH)
+    entry = _raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)   # cache hit (same tree)
+    tree = entry["tree"]
+    s_star, _aw, _lh, is_walk = tree._select(ci)
+    # PRIMARY first, then each alt's access stop (from the MC alt bundle, by line name). A walk-only
+    # primary has no transit access stop -> we feed a stop=-1 row (committed_legs_via_stops yields
+    # kind 0 -> route_typicals returns None for it); the frontend then shows the authoritative
+    # REAL[id] for the primary, so the row only keeps the alt alignment.
+    bundle = mc.get("alt_bundle") or {}
+    alt_stop = bundle.get("alt_stop")
+    cell_alt_stop = (alt_stop[ci] if alt_stop and ci < len(alt_stop) else None) or {}
+    cells = entry["cells"]
+    prim_best = cells.get(_RAPTOR.cell_ids[ci], [None, None])[0]
+    stops = [int(s_star) if (not is_walk and s_star >= 0) else -1]
+    floors = [prim_best]
+    for a in alts:
+        stops.append(int(cell_alt_stop.get(a["line"], -1)))
+        floors.append(a.get("min"))
+    egress_g, egress_w, _purewalk = _raptor_egress_purewalk(dlat, dlon)
+    import hashlib as _hl
+    # SAME per-workplace seed as _raptor_mc_build's /variance MC: route_typicals draws the same-shaped
+    # (nR, T) delta arrays, so the PRIMARY route's committed p50 here is byte-identical to that cell's
+    # served `realistic` (REAL[id]) -> the primary compare strip matches the headline exactly.
+    seed = int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)},{speed}"
+                          .encode()).hexdigest()[:8], 16)
+    pairs = _RAPTOR.route_typicals(tree, ci, stops, egress_g, egress_w,
+                                   perfect_route_mins=floors, seed=seed,
+                                   walk_scalar=walk_scalar, max_rounds=int(max_rides))
+    out = {"prim": pairs[0] if pairs else None, "alts": pairs[1:] if len(pairs) > 1 else []}
+    with _TYP_LOCK:                                      # cache the typicals for this pinned cell
+        typ_cache[ci] = out
     return out
 
 
@@ -1378,6 +1435,20 @@ def _itinerary():
         # memoized, so the alt routes for the same cell don't redo it (warm walk legs).
         res["alts"] = (_itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=provider)
                        if ci is not None and "error" not in res else [])
+        # PINNED cells (?pin=1) also get a per-ROUTE committed-plan typical + fragility so the
+        # compare card can show every strip on the SAME metric as the selector (the primary's typical
+        # was already best-case-vs-typical; the alts now carry their own). Lazy + cached per pinned
+        # cell, scored by the same committed MC; NEVER computed on a plain hover (the gate below).
+        if (request.args.get("pin") == "1" and ci is not None and "error" not in res
+                and res.get("alts") is not None):
+            typ = _itinerary_alt_typicals(ci, dlat, dlon, max_rides, speed, res["alts"])
+            if typ is not None:
+                prim = typ.get("prim")
+                if prim is not None:
+                    res["real"], res["frag"] = prim[0], prim[1]
+                for a, p in zip(res["alts"], typ.get("alts", [])):
+                    if p is not None:
+                        a["real"], a["frag"] = p[0], p[1]
         res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
         return jsonify(res)
     dkey = _dest_key(dlat, dlon, max_rides)

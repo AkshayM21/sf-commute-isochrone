@@ -77,6 +77,17 @@ def trees(engine):
     return out
 
 
+@pytest.fixture(scope="module")
+def egress(engine):
+    """Per-workplace egress arrays (egress_g, egress_w) from the oracles, by workplace name —
+    needed by route_typicals (the per-route committed MC scores the tail from the same egress)."""
+    out = {}
+    for f in _oracles():
+        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
+        out[f.replace("oracle_", "").replace(".npz", "")] = (z["egress_g"], z["egress_w"])
+    return out
+
+
 # ---------------------------------------------------------------------------------------------
 # 1. hover == map (the foundational invariant)
 # ---------------------------------------------------------------------------------------------
@@ -305,3 +316,61 @@ def test_walkspeed_monotonicity_all(engine):
         if name not in _MONO_BASELINE:
             pytest.skip(f"no recorded monotonicity baseline for workplace {name!r}")
         _assert_mono_ratchet(name, _mono_one(engine, fname))
+
+
+# ---------------------------------------------------------------------------------------------
+# 5. per-route TYPICAL (committed-plan p50) — the compare-list consistency fix
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
+def test_per_route_typical_honors_perfect_le_committed(engine, trees, egress):
+    """``RaptorEngine.route_typicals`` scores the PRIMARY + each alt of a cell with the SAME
+    committed-plan MC as the served realistic map. Two invariants, scanned over cells with alts
+    across the default workplace subset:
+
+      1. perfect <= committed PER ROUTE: every route's typical (real) >= its OWN best-case minutes
+         (the primary and each alt), so the compare card never shows a typical FASTER than the
+         route's perfect-timing number. STRICT == 0 violations.
+      2. internal consistency in BEST-CASE terms: the primary's best-case <= every alt's best-case
+         + the walk-prior eps (1 min), i.e. the shown route is the fastest in its own window (the
+         engine fix that motivated this display change). STRICT (allow the 1-min eps).
+
+    Each cell's routes are ONE shared kernel call; the seed mirrors the server's per-workplace seed
+    shape so this exercises the exact code path /itinerary?pin=1 hits."""
+    from core import raptor_engine
+    checked_routes = viol_floor = viol_primary = cells = 0
+    for name in _DEFAULT_SUBSET:
+        key = name.replace("oracle_", "").replace(".npz", "")
+        if key not in trees:
+            continue
+        tree, commute, dom, win = trees[key]
+        eg_g, eg_w = egress[key]
+        # cells with >=2 windowed transit lines (a primary + >=1 alt), capped for runtime
+        cand = [ci for ci, w in enumerate(win) if w and len(w) >= 2 and commute[ci] >= 0]
+        for ci in cand[:60]:
+            s_star, _aw, _lh, is_walk = tree._select(ci)
+            if is_walk or s_star < 0:
+                continue                                 # walk-only primary: no transit typical
+            prim_line = dom[ci]
+            alt_items = [(ln, mk) for ln, mk in win[ci].items() if ln != prim_line][:4]
+            if not alt_items:
+                continue
+            stops = [int(s_star)] + [int(mk[1]) for _ln, mk in alt_items]
+            floors = [int(commute[ci])] + [int(mk[0]) for _ln, mk in alt_items]
+            pairs = engine.route_typicals(tree, ci, stops, eg_g, eg_w,
+                                          perfect_route_mins=floors, seed=12345)
+            cells += 1
+            # 1. perfect <= committed per route
+            for p, fl in zip(pairs, floors):
+                if p is None:
+                    continue
+                checked_routes += 1
+                if p[0] < fl:
+                    viol_floor += 1
+                assert p[1] >= 0, f"{key}/{ci}: negative fragility {p[1]}"
+            # 2. primary best-case <= every alt best-case + eps (the engine consistency fix)
+            for _ln, mk in alt_items:
+                if int(commute[ci]) > int(mk[0]) + 1:
+                    viol_primary += 1
+    assert cells > 0, "no multi-line cells scanned — fixture/oracle problem"
+    assert viol_floor == 0, f"{viol_floor}/{checked_routes} routes violate perfect<=committed"
+    assert viol_primary == 0, f"{viol_primary} cells: primary best-case slower than an alt (> eps)"

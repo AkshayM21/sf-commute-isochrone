@@ -733,36 +733,79 @@ class JourneyTree:
         Reuses the memoized traces (``_trace_all`` — the same per-cell journeys the map/hover show)
         and just reads the FIRST ride + the walk leading up to it, so the committed plan is the
         displayed plan by construction."""
-        n = self.n_cells
-        out = dict(
+        out = self._empty_committed(self.n_cells)
+        for ci, tr in enumerate(self._trace_all()):
+            if tr is None:
+                continue                                 # unreachable (kind stays 0)
+            self._fill_committed_leg(out, ci, tr)
+        return out
+
+    @staticmethod
+    def _fill_committed_leg(out, idx, tr):
+        """Write the committed first leg of one traced journey ``tr`` (= (legs_raw, latest_home))
+        into the cell-aligned committed-leg arrays ``out`` at row ``idx``. Shared by
+        ``committed_first_legs`` (the full-grid primary plan) AND ``committed_legs_via_stops`` (the
+        per-route ALT plans for one pinned cell), so an alt's committed plan is extracted by the EXACT
+        same rule the primary uses."""
+        legs_raw, latest_home = tr
+        out["commit_home"][idx] = latest_home
+        # Find the first SIGNIFICANT ride (mirroring _clock's _TINY_HOP_MIN fold), so the plan
+        # the MC scores is the plan the breakdown DISPLAYS. A sub-2-min hop is shown as walk in
+        # the hover; treating it as transit here would attach delay-variance to a chip the user
+        # can't see — and on cells whose displayed first ride is a LATER, real leg, it would
+        # attribute fragility to the wrong line entirely.
+        ride = None
+        for leg in legs_raw:
+            if leg[0] == "ride" and (leg[3] - leg[2]) >= _TINY_HOP_MIN * 60:
+                ride = leg; break
+        if ride is None:                                 # walk-only (incl. all-tiny-rides) -> deterministic
+            out["commit_kind"][idx] = 1
+            return
+        _, pi, dep_sec, _arr, bpos, apos, alight_stop = ride
+        # walk0 = total seconds from home to the board stop on the unperturbed plan, which is
+        # exactly dep_sec - latest_home (the perfect plan boards with 0 slack). Naturally
+        # absorbs leading walks AND any tiny rides folded by the loop above — no manual sum.
+        out["commit_kind"][idx] = 2; out["commit_pi"][idx] = pi
+        out["commit_walk0"][idx] = int(dep_sec) - int(latest_home)
+        out["commit_bpos"][idx] = bpos; out["commit_apos"][idx] = apos; out["commit_as"][idx] = alight_stop
+
+    @staticmethod
+    def _empty_committed(n):
+        """A committed-leg dict (the arrays ``committed_first_legs`` returns) sized for ``n`` rows,
+        all defaulting to "unreachable" (commit_kind 0). Filled by ``_fill_committed_leg``."""
+        return dict(
             commit_home=np.full(n, NEG, np.int64), commit_kind=np.zeros(n, np.int8),
             commit_walk0=np.zeros(n, np.int64), commit_pi=np.full(n, -1, np.int32),
             commit_bpos=np.full(n, -1, np.int32), commit_apos=np.full(n, -1, np.int32),
             commit_as=np.full(n, -1, np.int32))
-        for ci, tr in enumerate(self._trace_all()):
+
+    def committed_legs_via_stops(self, ci, stops):
+        """Per-ROUTE committed first legs for ONE cell ``ci``, one row per access stop in ``stops``
+        (a list of stop gids surfaced by ``alt_lines_window`` for this cell). Each row is the
+        committed plan of the journey traced FROM that access stop (``_trace_from`` via
+        ``itinerary_via_stop``'s machinery) — the same extraction ``committed_first_legs`` applies to
+        the cell's primary. Lets the committed-plan MC score each alternative route's typical with the
+        SAME model as the primary, so the compare-list numbers are directly comparable.
+
+        Returns the committed-leg dict (``_empty_committed`` arrays, len == len(stops)); a stop that
+        is unreachable / off-cell keeps kind 0 (the kernel takes it as the cap)."""
+        off = np.asarray(self.access_off, np.int64)
+        to = np.asarray(self.access_to, np.int64)
+        a0, a1 = int(off[ci]), int(off[ci + 1])
+        out = self._empty_committed(len(stops))
+        for row, s_star in enumerate(stops):
+            s_star = int(s_star)
+            awk = None
+            for k in range(a0, a1):
+                if int(to[k]) == s_star:
+                    awk = int(self.access_w[k]); break
+            if awk is None or s_star < 0:
+                continue                                 # off-cell / unreachable -> kind 0 (cap)
+            latest_home = int(self.best[s_star]) - awk
+            tr = self._trace_from(s_star, awk, latest_home)
             if tr is None:
-                continue                                 # unreachable (kind stays 0)
-            legs_raw, latest_home = tr
-            out["commit_home"][ci] = latest_home
-            # Find the first SIGNIFICANT ride (mirroring _clock's _TINY_HOP_MIN fold), so the plan
-            # the MC scores is the plan the breakdown DISPLAYS. A sub-2-min hop is shown as walk in
-            # the hover; treating it as transit here would attach delay-variance to a chip the user
-            # can't see — and on cells whose displayed first ride is a LATER, real leg, it would
-            # attribute fragility to the wrong line entirely.
-            ride = None
-            for leg in legs_raw:
-                if leg[0] == "ride" and (leg[3] - leg[2]) >= _TINY_HOP_MIN * 60:
-                    ride = leg; break
-            if ride is None:                             # walk-only (incl. all-tiny-rides) -> deterministic
-                out["commit_kind"][ci] = 1
                 continue
-            _, pi, dep_sec, _arr, bpos, apos, alight_stop = ride
-            # walk0 = total seconds from home to the board stop on the unperturbed plan, which is
-            # exactly dep_sec - latest_home (the perfect plan boards with 0 slack). Naturally
-            # absorbs leading walks AND any tiny rides folded by the loop above — no manual sum.
-            out["commit_kind"][ci] = 2; out["commit_pi"][ci] = pi
-            out["commit_walk0"][ci] = int(dep_sec) - int(latest_home)
-            out["commit_bpos"][ci] = bpos; out["commit_apos"][ci] = apos; out["commit_as"][ci] = alight_stop
+            self._fill_committed_leg(out, row, tr)
         return out
 
     # -- public: per-cell commute minutes + dominant line (map + color-by-line) -----------

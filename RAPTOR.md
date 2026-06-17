@@ -314,6 +314,23 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   MC build, so `alts: []` until `/variance` lands (then the frontend re-hovers). `server._itinerary_alts`
   + `_mc_peek`. The alt geom legs sum to the alt total and honor `max_rounds` (the node-chain trace,
   same as the primary).
+- **Per-route TYPICAL for the compare card** (2026-06-16): each alt also gets its OWN committed-plan
+  typical (`real`) + fragility (`frag`), scored by the SAME committed MC as the primary so the pinned
+  compare list can show every strip on the metric the user selected (the old bug: primary on Typical
+  vs alts on Best-case made an alt look faster). `RaptorEngine.route_typicals(tree, ci, stops, …)`
+  builds, per route, the committed first leg from the journey traced via that route's access stop
+  (`JourneyTree.committed_legs_via_stops` → the SAME `_fill_committed_leg` rule as
+  `committed_first_legs`), then runs **one** `montecarlo_commute_committed` over the combined
+  primary+alts batch FOR ONE CELL — the R per-draw reverse profiles (the dominant, cell-independent
+  cost) are computed once and shared across all routes, so a 3-4-route pin resolves in ~130-190 ms.
+  `perfect ≤ committed` is floored PER route (each at its own best-case). Served on `/itinerary?pin=1`
+  ONLY (never a plain hover), cached per pinned cell in the MC entry's `typ` dict under `_TYP_LOCK`
+  (`server._itinerary_alt_typicals`); the seed mirrors `/variance`'s per-workplace seed so the PRIMARY
+  route's typical is byte-identical to that cell's served `realistic` (the primary strip == the
+  headline). Frontend (`compareHTML`/`optRead`/`drawSelected`): every strip's number + badge follow
+  the selector, the legs+"typical wait" reconciliation is per strip, and the list is sorted by the
+  displayed metric. Guards: `test_api.py::test_itinerary_pin_per_route_typicals`,
+  `test_route_quality.py::test_per_route_typical_honors_perfect_le_committed`.
 - **Serving:** lazy `/variance` endpoint (`server._raptor_mc`, cached per workplace, deterministic
   per-workplace seed, reuses the cached arrive-by tree → no re-trace), fetched by the frontend AFTER
   `/compute` paints the perfect map (progressive refinement, like `/compute_exact`). NEVER on the

@@ -590,25 +590,36 @@ function bdHTML(d){
 function compareHTML(d){
   if(!compareList.length)return "";
   const drawnKey=previewKey!=null?previewKey:selKey;
-  // Realistic: the PRIMARY strip follows the selector (total=real, legs + "typical wait +Nm" sum to
-  // it) so it matches the headline + cell color + map badge. ALT strips are alternative routes within
-  // the door-to-door dominance window — each has its own window-best number (a.min) with a.legs
-  // summing to a.min, so they keep total=a.min and NO typical-wait line. Non-compact so each row's
-  // actually sum to the strip's displayed total (the user's "legs add up to the number" rule).
-  const primExtra=metricRead(d).waitExtra;                 // 0 in best-case (and before /variance)
-  const rows=compareList.map(o=>{
+  // CONSISTENCY RULE (the user's "the numbers always agree with the selector"): EVERY strip — primary
+  // AND each alt — shows the metric-selected number. Best-case → the route's best-case total; Typical
+  // → the route's OWN committed-plan typical (o.real, scored by the same MC as the primary). The legs
+  // always sum to best-case, so in Typical mode we append a "typical wait +Nm" segment per strip
+  // (optRead.waitExtra = real − best-case ≥ 0) so each row's legs+wait sum to ITS displayed number
+  // (the "legs add up to the number" rule), applied to every strip, not just the primary.
+  // SORT by the displayed metric so the order matches the numbers (typical when Typical is selected,
+  // best-case otherwise); the primary keeps its identity slot color but can move within the list.
+  const reads=compareList.map(o=>({o,r:optRead(o)}));
+  reads.sort((a,b)=>a.r.head-b.r.head);
+  const rows=reads.map(({o,r})=>{
     const sel=o.key===drawnKey;
-    const realToggle=(o.isPrimary && metric=="r" && d.real!=null);
-    const total=realToggle?d.real:o.total;                 // primary follows the selector; alts = a.min
-    const seq=legsRowHTML(o.legs,false,realToggle?primExtra:0);
+    const seq=legsRowHTML(o.legs,false,r.waitExtra);
     return `<div class="strip${sel?" sel":""}" data-key="${escapeHTML(o.key)}" role="button" tabindex="0" aria-pressed="${sel}">`+
       `<span class="mark">${sel?"●":"○"}</span>`+
       `<span class="dot" style="background:${o.identityColor}"></span>`+
       `<span class="seq">${seq}</span>`+
-      `<span class="tot">${total}m</span></div>`;
+      `<span class="tot">${r.head}m`+
+      (r.frag>0?` <span style="color:var(--mut);font-weight:400;font-size:10px" title="bad-day delta (p90−p50)">+${r.frag}</span>`:``)+
+      `</span></div>`;
   }).join("");
-  const loading=(d&&(d.alts||[]).length===0&&!varianceReady())?
-    `<div class="cmploading">loading alternatives…</div>`:"";
+  // Loading line covers BOTH "alternatives still loading" (before /variance) AND "typicals still
+  // loading" (Typical selected, but the per-alt typicals from /itinerary?pin=1 haven't landed yet —
+  // strips show best-case until they do, then the card re-renders). varianceReady() gates the former;
+  // the latter is "Typical mode AND no alt carries a real yet AND we have alts to score".
+  const noAlts=(d&&(d.alts||[]).length===0);
+  const typsPending=(metric=="r" && (d.alts||[]).length>0 && !(d.alts||[]).some(a=>a.real!=null));
+  const loadMsg=noAlts ? (varianceReady()?"":"loading alternatives…")
+                       : (typsPending?"loading typical times…":"");
+  const loading=loadMsg?`<div class="cmploading">${loadMsg}</div>`:"";
   return `<div class="cmp"><div class="cmphdr">Compare routes</div>${rows}${loading}</div>`;
 }
 // True once /variance has landed (so the absence of alts is real, not "still loading").
@@ -943,16 +954,34 @@ let previewKey=null;    // a strip being hovered (overrides selKey for what's dr
 function buildCompare(d){
   const out=[];
   if(d&&d.geom){
+    // `real`/`frag` are the PRIMARY's committed-plan TYPICAL (from /variance's REAL/VAR, mirrored
+    // onto d before render); `total` is its best-case. Every strip carries BOTH metrics so the
+    // compare list can follow the selector consistently (see compareHTML).
     out.push({key:PRIMARY_KEY,line:dominantLine(d.geom),identityColor:primaryCasing(),
-      legs:d.geom,total:d.total,isPrimary:true});
+      legs:d.geom,total:d.total,real:(d.real!=null?d.real:null),
+      frag:(d.var?d.var.frag:null),isPrimary:true});
   }
   (d&&d.alts||[]).forEach((a,k)=>{
     // key is the row's stable slot ("alt0"…), NOT the line name — two alts could share a line
     // name (rare, but server-dependent), which would collide select/preview if keyed by line.
+    // a.real/a.frag = this alt's OWN committed-plan typical (served on /itinerary?pin=1, the same
+    // committed MC as the primary) — null until that lands (then the card re-renders).
     out.push({key:"alt"+k,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],
-      legs:a.legs,total:a.min,isPrimary:false});
+      legs:a.legs,total:a.min,real:(a.real!=null?a.real:null),
+      frag:(a.frag!=null?a.frag:null),isPrimary:false});
   });
   return out;
+}
+// Per-OPTION metric read for a compare strip (mirrors metricRead for a breakdown d): resolve the
+// displayed minutes + the "typical wait +Nm" reconciliation for ONE route option. Realistic → the
+// route's OWN typical (o.real) when known, with waitExtra = real − best-case (the perfect ≤ committed
+// invariant holds PER route); Best-case (or before the typical lands) → o.total, waitExtra 0.
+function optRead(o){
+  const real=(o&&o.real!=null)?o.real:null;
+  const showR=(metric=="r" && real!=null);
+  const head=showR?real:o.total;
+  // per-route bad-day (p90−p50), shown only in Typical mode where it's meaningful
+  return {showR,head,waitExtra:showR?Math.max(0,real-o.total):0,frag:(showR&&o.frag!=null)?o.frag:0};
 }
 // The dominant transit line of a geom leg list (the longest in-vehicle leg) — labels the primary
 // strip when there's no single "line" field. Falls back to "walk only".
@@ -970,7 +999,10 @@ function drawSelected(){
   const key=previewKey!=null?previewKey:selKey;
   const opt=findOpt(key)||compareList[0];
   if(!opt){clearRoute();return;}
-  const badge=opt.isPrimary?badgeFor(routePin,opt.total):opt.total;
+  // The badge follows the selector for EVERY route (consistency rule): the drawn strip's displayed
+  // metric number = optRead.head (typical when Typical & this route has its own typical, else
+  // best-case). The structural total stays opt.total (used for the casing/geometry + zoom re-render).
+  const badge=optRead(opt).head;
   drawOne(opt.legs,opt.identityColor,opt.total,badge);
   DRAWN={id:routePin,legs:opt.legs,identityColor:opt.identityColor,total:opt.total,badge,isPrimary:opt.isPrimary};
 }
@@ -1383,7 +1415,11 @@ function refreshDrawnRoute(){
   if(id==null||!DESTLL)return;
   const f = pinFeature || (hoverCell!=null ? _featureById(hoverCell) : null);
   const tok=++bdToken;
-  fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`)
+  // PINNED → request per-alt typicals too (pin=1): the compare card needs every strip's own
+  // committed-plan typical so the Typical metric is consistent across strips. A plain hover never
+  // sets pin=1, so it never pays the per-route MC cost.
+  const pinParam = (routePin!=null && id===routePin) ? "&pin=1" : "";
+  fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}${pinParam}`)
     .then(r=>r.ok?r.json():null)
     .then(d=>{
       if(!d||d.error||tok!==bdToken)return;
@@ -1499,7 +1535,9 @@ async function refreshPinForParams(id,gen){
   }
   const tok=++bdToken;
   try{
-    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
+    // pin=1: this is the pinned cell -> fetch its per-alt typicals too (the compare card needs them
+    // for a consistent Typical metric). Only the pinned cell ever sends pin=1.
+    const r=await fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}&pin=1`);
     if(gen!==GEN||routePin!==id||tok!==bdToken)return;     // a newer param change / unpin took over
     const d=r.ok?await r.json():{error:"http "+r.status};
     if(gen!==GEN||routePin!==id||tok!==bdToken)return;
