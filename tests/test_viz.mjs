@@ -92,22 +92,18 @@ test("ramp: a different ideal moves the pivot and hi", () => {
 // --------------------------------------------------------------------------- //
 // gmapsURL                                                                     //
 // --------------------------------------------------------------------------- //
-test("gmapsURL: builds the expected Google Maps transit directions link", () => {
+test("gmapsURL: builds a Google Maps transit deep link with a depart-at time", () => {
+  // viz.js uses Google's UNOFFICIAL data= format (the ?api=1 form can't set a depart time):
+  //   /dir/<origin>/<dest>/@<dest>,14z/data=...!7e2(depart-at)!8j<epoch>!3e3(transit)
   const url = gmapsURL(37.78, -122.41, 37.7955, -122.3937);
-  assert.equal(
-    url,
-    "https://www.google.com/maps/dir/?api=1" +
-      "&origin=37.78,-122.41" +
-      "&destination=37.7955,-122.3937" +
-      "&travelmode=transit"
-  );
+  assert.match(url, /^https:\/\/www\.google\.com\/maps\/dir\/37\.78,-122\.41\/37\.7955,-122\.3937\//);
+  assert.match(url, /!7e2!8j\d+!3e3$/);   // depart-at + epoch + transit mode
 });
 
 test("gmapsURL: always requests the transit travel mode", () => {
   const url = gmapsURL(1, 2, 3, 4);
-  assert.match(url, /travelmode=transit$/);
-  assert.match(url, /origin=1,2/);
-  assert.match(url, /destination=3,4/);
+  assert.match(url, /!3e3$/);             // transit
+  assert.match(url, /\/dir\/1,2\/3,4\//); // origin / destination in the path
 });
 
 // --------------------------------------------------------------------------- //
@@ -118,4 +114,136 @@ test("MODECOLOR: has bart/metro/bus/cable keys", () => {
     assert.ok(key in MODECOLOR, `MODECOLOR missing key: ${key}`);
     assert.match(MODECOLOR[key], /^#[0-9a-fA-F]{6}$/, `${key} not a hex color`);
   }
+});
+
+// --------------------------------------------------------------------------- //
+// DEPART-AFTER rendering: active-journey normalization (Stage 4)               //
+// --------------------------------------------------------------------------- //
+// The depart-after /itinerary contract carries TWO distinct journeys per cell —
+// `best` (p5) and `typical` (p50), each with its OWN legs that sum to its OWN total
+// (no "+wait" reconciliation). The frontend NORMALIZES that both-journey response
+// into the ACTIVE journey the existing renderers expect, RE-PICKED on the metric
+// toggle. These pure pick/normalize helpers live in scripts/templates/index.html
+// (no browser deps), so we slice them out of the template and exercise them with
+// synthetic data — deterministic, no server needed.
+//
+// We build the helpers under DEPARTAFTER=true (a depart-after page) so normalizeBD
+// is active, and assert: Best-case picks `best`, Typical picks `typical`, each with
+// real=null (no reconciliation) + the carried frag; alts + compare options re-pick
+// by the live metric too.
+const TEMPLATE_PATH = join(__dirname, "..", "scripts", "templates", "index.html");
+function _daHelpers() {
+  const tsrc = readFileSync(TEMPLATE_PATH, "utf8");
+  const fn = (name) => {
+    const sig = "function " + name + "(";
+    const i = tsrc.indexOf(sig);
+    if (i < 0) throw new Error("template fn not found: " + name);
+    let depth = 0, started = false;
+    for (let k = i; k < tsrc.length; k++) {
+      const c = tsrc[k];
+      if (c === "{") { depth++; started = true; }
+      else if (c === "}") { depth--; if (started && depth === 0) return tsrc.slice(i, k + 1); }
+    }
+    throw new Error("template fn unterminated: " + name);
+  };
+  const defs = ["bdFrag", "_daPick", "normalizeBD", "optDA", "optLegs", "optTotal",
+    "optRead", "buildCompare"].map(fn).join("\n");
+  const harness = `
+"use strict";
+let metric="b";
+const REAL={}, VAR={};
+const PRIMARY_KEY="__primary__";
+const ALT_CASING=["#ff3db4","#11c7c7","#f59000","#a16bff"];
+const DEPARTAFTER=true;            /* exercise the depart-after branch */
+function dominantLine(legs){let b=null,m=-1;(legs||[]).forEach(g=>{if(g.mode==="transit"&&g.name&&g.min>m){m=g.min;b=g.name;}});return b||"walk only";}
+function primaryCasing(){return "#fff";}
+${defs}
+return {set metric(v){metric=v;}, get metric(){return metric;},
+        bdFrag, normalizeBD, optRead, optLegs, optTotal, buildCompare};`;
+  return new Function(harness)();
+}
+
+// A synthetic depart-after /itinerary?pin=1 breakdown: best (p5=20) and typical (p50=26)
+// are DIFFERENT journeys (different legs that sum to their own totals), plus a primary
+// frag and two alts each carrying both journeys + its own frag.
+function _daFixture() {
+  return {
+    name: "Test NB", olat: 37.7, olon: -122.4,
+    total: 26, xfers: 1,
+    legs: [{ mode: "walk", line: null, min: 3 },
+           { mode: "transit", line: "N", min: 18, wait: 5 }],         // sums to 26
+    geom: [{ mode: "walk", min: 3 }, { mode: "transit", name: "N", min: 18 }],
+    typical: { total: 26, xfers: 1,
+      legs: [{ mode: "walk", min: 3 }, { mode: "transit", name: "N", min: 18 }],
+      geom: [{ mode: "walk", min: 3 }, { mode: "transit", name: "N", min: 18 }] },
+    best: { total: 20, xfers: 1,
+      legs: [{ mode: "walk", min: 2 }, { mode: "transit", name: "N", min: 16 }],
+      geom: [{ mode: "walk", min: 2 }, { mode: "transit", name: "N", min: 16 }] },
+    frag: 6,
+    alts: [
+      { line: "K", best: { total: 22, legs: [{ mode: "transit", name: "K", min: 20 }] },
+                    typical: { total: 28, legs: [{ mode: "transit", name: "K", min: 24 }] }, frag: 4 },
+      { line: "J", best: { total: 24, legs: [{ mode: "transit", name: "J", min: 22 }] },
+                    typical: { total: 30, legs: [{ mode: "transit", name: "J", min: 26 }] }, frag: 2 },
+    ],
+  };
+}
+
+test("depart-after: normalizeBD picks best (p5) in Best-case, typical (p50) in Typical", () => {
+  const H = _daHelpers();
+  const d = _daFixture();
+  H.metric = "b";
+  let n = H.normalizeBD(d);
+  assert.equal(n.total, 20, "Best-case total = best.total (p5)");
+  assert.equal(n.legs, d.best.legs, "Best-case legs = best journey legs");
+  assert.equal(n.real, null, "no reconciliation under depart-after (real=null)");
+  H.metric = "r";
+  n = H.normalizeBD(d);
+  assert.equal(n.total, 26, "Typical total = typical.total (p50)");
+  assert.equal(n.legs, d.typical.legs, "Typical legs = typical journey legs");
+  assert.equal(n.real, null, "no reconciliation under depart-after (real=null)");
+});
+
+test("depart-after: normalizeBD carries primary frag for the bad-day chip (both modes)", () => {
+  const H = _daHelpers();
+  const d = _daFixture();
+  for (const m of ["b", "r"]) {
+    H.metric = m;
+    assert.equal(H.normalizeBD(d).frag, 6, `frag carried in metric=${m}`);
+  }
+});
+
+test("depart-after: normalizeBD flattens each alt to the active metric's {line,min,legs}", () => {
+  const H = _daHelpers();
+  const d = _daFixture();
+  H.metric = "b";
+  let alts = H.normalizeBD(d).alts;
+  assert.deepEqual(alts.map((a) => [a.line, a.min]), [["K", 22], ["J", 24]], "alts -> best totals");
+  H.metric = "r";
+  alts = H.normalizeBD(d).alts;
+  assert.deepEqual(alts.map((a) => [a.line, a.min]), [["K", 28], ["J", 30]], "alts -> typical totals");
+});
+
+test("depart-after: optRead/optLegs/optTotal re-pick by the live metric (compare strips)", () => {
+  const H = _daHelpers();
+  const d = _daFixture();
+  // Build the compare list ONCE (under Best-case) — like renderPin — then toggle the metric and
+  // confirm a STALE list still resolves the active journey (drawSelected re-picks at draw time).
+  H.metric = "b";
+  const list = H.buildCompare(d);
+  const prim = list[0], altK = list[1];
+  assert.equal(H.optTotal(prim), 20, "primary best-case total");
+  assert.equal(H.optTotal(altK), 22, "alt K best-case total");
+  assert.equal(H.optRead(prim).head, 20, "optRead head = best-case");
+  assert.equal(H.optRead(prim).waitExtra, 0, "no +wait reconciliation");
+  assert.equal(H.optRead(prim).frag, 0, "no per-route frag in Best-case");
+  // Toggle to Typical — the SAME (stale) list must now resolve the typical journeys + per-route frag.
+  H.metric = "r";
+  assert.equal(H.optTotal(prim), 26, "primary typical total after toggle (no re-fetch)");
+  assert.equal(H.optTotal(altK), 28, "alt K typical total after toggle");
+  assert.equal(H.optRead(prim).head, 26, "optRead head = typical");
+  assert.equal(H.optRead(prim).frag, 6, "per-route frag shown in Typical");
+  assert.equal(H.optRead(altK).frag, 4, "alt K per-route frag in Typical");
+  // legs flip to the active journey too (distinct geometry per metric).
+  assert.equal(H.optLegs(prim), d.typical.legs, "primary legs = typical journey legs in Typical");
 });

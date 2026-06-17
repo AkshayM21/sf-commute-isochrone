@@ -356,7 +356,7 @@
   (Muni / BART / Caltrain) — no driving or biking — on real weekday schedules,
   <b><span id="howtime"></span></b>. Each area is colored by how long it takes to reach your
   workplace; <b>hover or tap</b> any area for the route behind the number.</p>
-  <p><b>Best-case</b> assumes perfect timing — you leave to the second and never wait.
+  <p id="howmetric"><b>Best-case</b> assumes perfect timing — you leave to the second and never wait.
   <b>Realistic</b> is a Monte-Carlo "committed-plan" estimate: you commit to a departure and a
   first line, then service noise (a late vehicle, a missed transfer) adds a typical wait.</p>
   <p>Walking is <b>hill-aware</b> — uphill is slower than downhill (Tobler walking speeds over an
@@ -455,8 +455,12 @@ function legend(){const sc=document.querySelector("#legend .sc"),bar=document.qu
   sc.innerHTML=`<span>0</span><span>${ideal} (ideal)</span><span>${hi}+</span>`;
   document.getElementById("legtitle").textContent=(metric=="r"?"Realistic":"Best-case")+" door-to-door (min)";}
 function val(id){
-  // Realistic prefers the MC overlay (REAL) when loaded; else falls back to TT[1] (= the
-  // depart-after p50, or the perfect map until /variance lands). Best-case is always TT[0].
+  // Best-case is always TT[0] (p5). Typical:
+  //   ARRIVE-BY: the committed-MC overlay (REAL) IS the typical headline — prefer it when loaded;
+  //     else TT[1] (the perfect-timing map until /variance lands).
+  //   DEPART-AFTER: the typical IS the bare p50 = TT[1] (the served /compute map). /variance carries
+  //     NO realistic under depart-after (REAL stays empty), so this naturally resolves to TT[1].
+  // REAL is empty under depart-after, so the REAL fallback is a no-op there — guarded by rv!=null.
   if(metric=="r"){const rv=REAL[id];if(rv!=null)return rv;}
   const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
 function style(f){const id=f.properties.id,v=val(id);
@@ -482,6 +486,68 @@ function fragChip(frag,stuck){
   else if(frag<=6){label="some risk";c="#f6a04d";}
   else{label="fragile";c="#ff6b6b";}
   return `<span style="font-size:10px;padding:1px 6px;border-radius:6px;background:${c}22;color:${c};border:1px solid ${c}55;white-space:nowrap">${label}</span>`;}
+// ===== DEPART-AFTER normalization ============================================================
+// The two semantics deliver DIFFERENT /itinerary shapes:
+//   ARRIVE-BY: ONE traced journey (total == best-case) + a separate `real` (the committed-plan
+//     TYPICAL, from /variance's REAL) reconciled into the legs via a "+wait" segment. d.legs sum to
+//     d.total; d.real is the typical headline; the per-cell fragility lives in d.var.frag.
+//   DEPART-AFTER: TWO distinct journeys — d.best (p5) and d.typical (p50) — each with its OWN legs
+//     that sum to its OWN total (NO wait reconciliation). Per-route fragility is d.frag (on ?pin=1),
+//     and the cell's frag/std/stuck overlay still lands in VAR[id] from /variance.
+// To keep the existing renderers (summaryHTML/metricRead/bdHTML/optRead/compareHTML) byte-identical
+// for arrive-by, we NORMALIZE a depart-after breakdown into the ACTIVE-journey shape those renderers
+// already expect, RE-PICKED on every render (so a metric toggle re-picks best vs typical with no
+// re-fetch). The active journey's legs/total/xfers/geom are flattened onto the object, real=null
+// (each journey's legs already sum to its own total → no "+wait"), and frag is carried for the chip.
+// Arrive-by is a PASSTHROUGH (returns d unchanged) — its rendering path is untouched.
+const DEPARTAFTER=!!(CFG&&CFG.departafter);
+// Breakdown FOOTER copy — semantic-aware. ARRIVE-BY: the reverse latest-departure tree assumes you
+// leave to the second (~0 wait), so best-case = perfect timing and typical = your planned trip with a
+// committed first leg + service delays. DEPART-AFTER: you leave at a fixed time and ride the published
+// schedule, so best-case = the luckiest departure in the window and typical = the median departure;
+// bad-day = the same trip when service runs late.
+const BD_FOOT=DEPARTAFTER
+  ? "best-case = the luckiest departure in the morning window; typical = the median departure — bad-day adds service delays (a late vehicle, a missed transfer)"
+  : "best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait";
+// The per-cell fragility for a breakdown d's summary chip. ARRIVE-BY (passthrough): the cell overlay
+// from /variance (VAR[id].frag mirrored onto d.var) — byte-identical to the prior `d.var?d.var.frag:0`.
+// DEPART-AFTER: the PRIMARY's per-route value served on ?pin=1 (d.frag) wins (it's the primary route's
+// own p90-p50), else the cell overlay (d.var.frag from /variance). 0 when no MC signal yet.
+function bdFrag(d){
+  if(DEPARTAFTER && d && d.frag!=null)return d.frag;
+  return (d&&d.var&&d.var.frag!=null)?d.var.frag:0;
+}
+// Pick the active-metric journey of a depart-after journey-PAIR carrier (the breakdown root, or an
+// alt {line,best,typical,frag?}) and FLATTEN it to the arrive-by alt/leg shape the renderers expect:
+//   {total, min, legs[, geom], real:null}. Best-case → o.best, Typical → o.typical. real=null because
+//   each journey's legs already sum to its own total (no "+wait" reconciliation under depart-after).
+function _daPick(o,fallback){
+  const j=(metric=="r")?(o&&o.typical):(o&&o.best);
+  const sel=j||fallback||{};
+  const out={total:sel.total, min:sel.total, legs:sel.legs, real:null};
+  if("geom" in sel||"geom" in (fallback||{}))out.geom=("geom" in sel)?sel.geom:fallback.geom;
+  return out;
+}
+// Return the breakdown object the existing renderers should consume for the current metric.
+// ARRIVE-BY: unchanged (passthrough). DEPART-AFTER: pick d.best (Best-case) / d.typical (Typical) and
+// FLATTEN its journey onto a shallow copy; real=null (no reconciliation); carry frag + var; normalize
+// each alt to the {line,min,legs,real,frag} shape too so the alt chips + compare strips follow suit.
+function normalizeBD(d){
+  if(!DEPARTAFTER||!d||d.error)return d;
+  // Root journey (best/typical) — fall back to the response root, which already mirrors the typical.
+  const j=_daPick(d,{total:d.total,xfers:d.xfers,legs:d.legs,geom:d.geom});
+  const out=Object.assign({},d,{
+    total:j.total, xfers:((metric=="r")?(d.typical&&d.typical.xfers):(d.best&&d.best.xfers))!=null
+            ?((metric=="r")?d.typical.xfers:d.best.xfers):d.xfers,
+    legs:j.legs, geom:j.geom,
+    real:null,                              // legs sum to this journey's own total — no "+wait" line
+    frag:bdFrag(d),                         // surface frag for the bad-day chip in BOTH metric modes
+  });
+  out.alts=(d.alts||[]).map(a=>{const p=_daPick(a);
+    return {line:a.line, min:p.min, total:p.total, legs:p.legs, real:null,
+            frag:(a.frag!=null?a.frag:null)};});
+  return out;
+}
 // Leg-sequence renderer reused by the hover breakdown AND each compare-list strip: build the
 // per-leg chip list (walk / wait / transit-in-its-mode-color), then pair every subsequent chip
 // with its leading ▸ arrow as a nowrap unit so the arrow can't orphan to the next wrapped line.
@@ -522,31 +588,51 @@ function metricRead(d){
   const waitExtra=showR?Math.max(0,real-d.total):0;
   return {showR,head,waitExtra,real};
 }
-// Map route BADGE number for a DRAWN cell (id) given its structural best-case total: follows the
-// selector exactly like the headline + cell color. Realistic → REAL[id] (the typical) when loaded,
-// else the best-case total so the badge is never blank; Best-case → always the total.
+// Map route BADGE number for a DRAWN cell (id) given the ACTIVE journey's total: follows the
+// selector exactly like the headline + cell color (== val(id)).
+//   ARRIVE-BY: Realistic → REAL[id] (the committed typical) when loaded, else the best-case total
+//     so the badge is never blank; Best-case → the total.
+//   DEPART-AFTER: the drawn route IS the active journey (best in Best-case, typical in Typical), so
+//     `total` is already the active total and equals val(id) — REAL is empty, so the fallback to
+//     `total` is exactly right (Best-case=TT[0]=best journey total, Typical=TT[1]=typical journey total).
 function badgeFor(id,total){
   if(metric=="r"){const rv=REAL[id];if(rv!=null)return rv;}
   return total;
 }
 // Shared header summary (name + headline minutes + transfers/best-case context + bad-day chip),
 // reused by the hover tooltip (bdHTML) AND the pinned compare card (pinHTML). One source so the
-// summary can't drift between the two.
+// summary can't drift between the two. Consumes a NORMALIZED breakdown (active journey flattened):
 //   headBig   the metric-matched headline number (typical OR best-case)
 //   ctxLine   "N transfers · {other-metric Xm}" — context, never the prominent number
-//   vline     "bad-day +Y · {chip}" — only when there's signal (skipped for fully robust cells)
+//   vline     "bad-day +Y · {chip}" — only when there's MC signal (skipped for fully robust cells)
+// ARRIVE-BY (passthrough): head/other come from d.total (best-case) vs d.real (typical); the chip is
+//   gated on the realistic having landed. DEPART-AFTER: head = the active journey total (already
+//   flattened, real=null), other = the OTHER journey's total (d.best/d.typical), and the chip shows
+//   whenever frag>0 in EITHER metric mode (no realistic headline to gate on).
 function summaryHTML(d){
-  const real=d.real, frag=d.var?d.var.frag:0, stuck=d.var?d.var.stuck:0;
-  const showR=(metric=="r" && real!=null);
-  const head=showR?real:d.total, headLab=showR?"typical":"best-case";
-  const otherVal=showR?d.total:real, otherLab=showR?"best-case":"typical", otherTilde=showR?"":"~";
-  const headBig=`<div style="margin:0 0 4px"><b style="font-size:14px">${showR?"~":""}${head} min</b>`+
+  const frag=bdFrag(d), stuck=d.var?d.var.stuck:0;
+  let head,headLab,otherVal,otherLab,otherTilde,showSig;
+  if(DEPARTAFTER){
+    showSig=true;                                     // chip shows in BOTH modes (frag-gated below)
+    const showR=(metric=="r");
+    head=d.total; headLab=showR?"typical":"best-case";
+    // The OTHER journey's total (each has its own legs/total — no reconciliation).
+    const other=showR?(d.best||null):(d.typical||null);
+    otherVal=other?other.total:null; otherLab=showR?"best-case":"typical"; otherTilde="";
+  } else {
+    const real=d.real;
+    const showR=(metric=="r" && real!=null);
+    showSig=(real!=null);                             // arrive-by: chip only once realistic landed
+    head=showR?real:d.total; headLab=showR?"typical":"best-case";
+    otherVal=showR?d.total:real; otherLab=showR?"best-case":"typical"; otherTilde=showR?"":"~";
+  }
+  const headBig=`<div style="margin:0 0 4px"><b style="font-size:14px">${(!DEPARTAFTER&&headLab=="typical")?"~":""}${head} min</b>`+
     ` <span style="color:var(--mut);font-size:12px">${headLab}</span></div>`;
   const otherTxt=(otherVal!=null && otherVal!=head) ? ` · ${otherLab} ${otherTilde}${otherVal}m` : ``;
   const ctxLine=`<div style="margin:0 0 6px;color:var(--mut);font-size:11.5px">`+
     `${d.xfers} transfer${d.xfers==1?"":"s"}${otherTxt}</div>`;
   let vline="";
-  if(real!=null && (frag>0 || (stuck||0)>=0.05)){
+  if(showSig && (frag>0 || (stuck||0)>=0.05)){
     vline=`<div style="margin:0 0 8px;color:var(--mut);font-size:11.5px;white-space:nowrap">`+
       (frag>0?`bad-day <b style="color:var(--ink)">+${frag}</b> · `:``)+
       fragChip(frag,stuck)+`</div>`;
@@ -555,8 +641,13 @@ function summaryHTML(d){
 }
 function bdHTML(d){
   if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
-  // Realistic: append the "typical wait +Nm" reconciliation so legs(best-case)+wait = the typical
-  // headline (summaryHTML's `head`). Best-case: waitExtra=0 → no wait line (legs already sum to head).
+  // DEPART-AFTER: normalize the both-journey response to the ACTIVE-journey shape (best/typical picked
+  // by the selector), re-picked on every render so a metric toggle re-renders with no re-fetch.
+  // ARRIVE-BY: passthrough (byte-identical).
+  d=normalizeBD(d);
+  // Realistic (arrive-by): append the "typical wait +Nm" reconciliation so legs(best-case)+wait = the
+  // typical headline. Best-case (or depart-after, where each journey's legs sum to its own total):
+  // waitExtra=0 → no wait line.
   const legsHTML = legsRowHTML(d.legs,false,metricRead(d).waitExtra);
   // Hover tooltip: SURFACE the alternative lines right here (read-only) so you can see multiple
   // routes exist WITHOUT clicking — but the map still draws ONLY the primary on hover (these chips
@@ -582,7 +673,7 @@ function bdHTML(d){
     `<div class="legs">${legsHTML}</div>`+
     altfoot+
     `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
-    `<div class="foot">best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait</div></div>`;}
+    `<div class="foot">${BD_FOOT}</div></div>`;}
 // Pinned compare card: the shared summary, THEN a vertical compare list (primary + each alt as a
 // selectable strip), THEN the Google Maps link. The strip list is built from compareList (set by
 // openPin/refresh via buildCompare). The currently-DRAWN strip (previewKey ?? selKey) is marked
@@ -602,7 +693,9 @@ function compareHTML(d){
   reads.sort((a,b)=>a.r.head-b.r.head);
   const rows=reads.map(({o,r})=>{
     const sel=o.key===drawnKey;
-    const seq=legsRowHTML(o.legs,false,r.waitExtra);
+    // legs are the ACTIVE journey's legs (depart-after re-picks by metric via optLegs; arrive-by
+    // uses the option's single traced legs). waitExtra is 0 under depart-after (no reconciliation).
+    const seq=legsRowHTML(optLegs(o),false,r.waitExtra);
     return `<div class="strip${sel?" sel":""}" data-key="${escapeHTML(o.key)}" role="button" tabindex="0" aria-pressed="${sel}">`+
       `<span class="mark">${sel?"●":"○"}</span>`+
       `<span class="dot" style="background:${o.identityColor}"></span>`+
@@ -612,11 +705,12 @@ function compareHTML(d){
       `</span></div>`;
   }).join("");
   // Loading line covers BOTH "alternatives still loading" (before /variance) AND "typicals still
-  // loading" (Typical selected, but the per-alt typicals from /itinerary?pin=1 haven't landed yet —
-  // strips show best-case until they do, then the card re-renders). varianceReady() gates the former;
-  // the latter is "Typical mode AND no alt carries a real yet AND we have alts to score".
+  // loading" (arrive-by only: Typical selected, but the per-alt typicals from /itinerary?pin=1 haven't
+  // landed yet — strips show best-case until they do, then the card re-renders). varianceReady() gates
+  // the former. DEPART-AFTER: each alt's typical journey arrives WITH the alt (pin=1 only adds frag),
+  // so typicals are NEVER pending — only the alt SET waits on /variance.
   const noAlts=(d&&(d.alts||[]).length===0);
-  const typsPending=(metric=="r" && (d.alts||[]).length>0 && !(d.alts||[]).some(a=>a.real!=null));
+  const typsPending=(!DEPARTAFTER && metric=="r" && (d.alts||[]).length>0 && !(d.alts||[]).some(a=>a.real!=null));
   const loadMsg=noAlts ? (varianceReady()?"":"loading alternatives…")
                        : (typsPending?"loading typical times…":"");
   const loading=loadMsg?`<div class="cmploading">${loadMsg}</div>`:"";
@@ -626,9 +720,11 @@ function compareHTML(d){
 function varianceReady(){return Object.keys(VAR).length>0||Object.keys(REAL).length>0;}
 function pinHTML(d){
   if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
-  return `<div class="bd">`+summaryHTML(d)+compareHTML(d)+
+  // summaryHTML reads the ACTIVE journey (normalize); compareHTML reads compareList (built from raw d
+  // so both journeys survive) + raw d.alts for its loading gate, so it gets the raw d.
+  return `<div class="bd">`+summaryHTML(normalizeBD(d))+compareHTML(d)+
     `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
-    `<div class="foot">best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait</div></div>`;}
+    `<div class="foot">${BD_FOOT}</div></div>`;}
 /* ============ single drawn route + compare mode ============ */
 // MODEL: the map NEVER shows more than ONE route. On HOVER (not pinned) we draw the cell's
 // PRIMARY route, clean. On CLICK (pin) we enter COMPARE MODE: the corner card lists the primary
@@ -951,32 +1047,68 @@ let selKey=PRIMARY_KEY; // the LOCKED selection (a strip key); default = primary
 let previewKey=null;    // a strip being hovered (overrides selKey for what's drawn); null otherwise
 // Build the compare list from a breakdown d: primary first, then each alt. Each option carries the
 // geom legs to draw + its identity color (white primary / ALT_CASING slot) + total minutes.
+// DEPART-AFTER: an option additionally carries `da:{best:{total,legs}, typical:{total,legs}, frag}` —
+// BOTH journeys — so optRead/optLegs/optTotal RE-PICK the active one by the live metric at call time
+// (a metric toggle re-renders with no re-fetch, and a stale compareList still draws the right journey).
+// Built from the RAW d (NOT the normalized one) so both journeys survive on each option.
 function buildCompare(d){
   const out=[];
+  const da=DEPARTAFTER&&d&&!d.error;
   if(d&&d.geom){
-    // `real`/`frag` are the PRIMARY's committed-plan TYPICAL (from /variance's REAL/VAR, mirrored
-    // onto d before render); `total` is its best-case. Every strip carries BOTH metrics so the
-    // compare list can follow the selector consistently (see compareHTML).
-    out.push({key:PRIMARY_KEY,line:dominantLine(d.geom),identityColor:primaryCasing(),
-      legs:d.geom,total:d.total,real:(d.real!=null?d.real:null),
-      frag:(d.var?d.var.frag:null),isPrimary:true});
+    if(da){
+      // depart-after primary: store both journeys; legs/total are picked live (see optLegs/optTotal).
+      out.push({key:PRIMARY_KEY,line:dominantLine((d.typical||d.best||{geom:d.geom}).geom||d.geom),
+        identityColor:primaryCasing(),isPrimary:true,
+        da:{best:(d.best||null), typical:(d.typical||{total:d.total,legs:d.geom}),
+            frag:(d.frag!=null?d.frag:(d.var&&d.var.frag!=null?d.var.frag:null))}});
+    } else {
+      // arrive-by: `real`/`frag` are the PRIMARY's committed-plan TYPICAL (from /variance's REAL/VAR,
+      // mirrored onto d before render); `total` is its best-case. Every strip carries BOTH metrics so
+      // the compare list can follow the selector consistently (see compareHTML).
+      out.push({key:PRIMARY_KEY,line:dominantLine(d.geom),identityColor:primaryCasing(),
+        legs:d.geom,total:d.total,real:(d.real!=null?d.real:null),
+        frag:(d.var?d.var.frag:null),isPrimary:true});
+    }
   }
   (d&&d.alts||[]).forEach((a,k)=>{
     // key is the row's stable slot ("alt0"…), NOT the line name — two alts could share a line
     // name (rare, but server-dependent), which would collide select/preview if keyed by line.
-    // a.real/a.frag = this alt's OWN committed-plan typical (served on /itinerary?pin=1, the same
-    // committed MC as the primary) — null until that lands (then the card re-renders).
-    out.push({key:"alt"+k,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],
-      legs:a.legs,total:a.min,real:(a.real!=null?a.real:null),
-      frag:(a.frag!=null?a.frag:null),isPrimary:false});
+    if(da){
+      // depart-after alt: BOTH journeys ({line,best:{total,legs},typical:{total,legs}[,frag]}).
+      out.push({key:"alt"+k,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],isPrimary:false,
+        da:{best:(a.best||null), typical:(a.typical||null), frag:(a.frag!=null?a.frag:null)}});
+    } else {
+      // arrive-by alt: a.real/a.frag = this alt's OWN committed-plan typical (served on
+      // /itinerary?pin=1, the same committed MC as the primary) — null until that lands (re-render).
+      out.push({key:"alt"+k,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],
+        legs:a.legs,total:a.min,real:(a.real!=null?a.real:null),
+        frag:(a.frag!=null?a.frag:null),isPrimary:false});
+    }
   });
   return out;
 }
+// The active-journey {total,legs} for a depart-after option (re-picked by the live metric). Falls
+// back to the other journey if one is missing (a one-sided alt shouldn't blank a strip).
+function optDA(o){
+  if(!o||!o.da)return null;
+  const j=(metric=="r")?(o.da.typical||o.da.best):(o.da.best||o.da.typical);
+  return j||null;
+}
+function optLegs(o){const j=optDA(o);return j?(j.legs||[]):(o&&o.legs||[]);}
+function optTotal(o){const j=optDA(o);return j?j.total:(o&&o.total);}
 // Per-OPTION metric read for a compare strip (mirrors metricRead for a breakdown d): resolve the
-// displayed minutes + the "typical wait +Nm" reconciliation for ONE route option. Realistic → the
-// route's OWN typical (o.real) when known, with waitExtra = real − best-case (the perfect ≤ committed
-// invariant holds PER route); Best-case (or before the typical lands) → o.total, waitExtra 0.
+// displayed minutes + the "typical wait +Nm" reconciliation + the per-route bad-day frag for ONE
+// route option, by the live metric.
+//   ARRIVE-BY: Realistic → the route's OWN typical (o.real) when known, waitExtra = real − best-case
+//     (perfect ≤ committed holds PER route); Best-case (or before typical lands) → o.total, waitExtra 0.
+//   DEPART-AFTER: head = the ACTIVE journey's total (best/typical), waitExtra 0 (each journey's legs
+//     sum to its own total — no reconciliation); the per-route frag shows in Typical mode.
 function optRead(o){
+  if(o&&o.da){
+    const head=optTotal(o);
+    const frag=(metric=="r" && o.da.frag!=null)?o.da.frag:0;
+    return {showR:(metric=="r"),head,waitExtra:0,frag};
+  }
   const real=(o&&o.real!=null)?o.real:null;
   const showR=(metric=="r" && real!=null);
   const head=showR?real:o.total;
@@ -1000,15 +1132,19 @@ function drawSelected(){
   const opt=findOpt(key)||compareList[0];
   if(!opt){clearRoute();return;}
   // The badge follows the selector for EVERY route (consistency rule): the drawn strip's displayed
-  // metric number = optRead.head (typical when Typical & this route has its own typical, else
-  // best-case). The structural total stays opt.total (used for the casing/geometry + zoom re-render).
-  const badge=optRead(opt).head;
-  drawOne(opt.legs,opt.identityColor,opt.total,badge);
-  DRAWN={id:routePin,legs:opt.legs,identityColor:opt.identityColor,total:opt.total,badge,isPrimary:opt.isPrimary};
+  // metric number = optRead.head. legs/total are the ACTIVE journey's — arrive-by has one traced
+  // journey (opt.legs/opt.total); depart-after re-picks best/typical by the live metric (optLegs/
+  // optTotal), so toggling the metric re-draws the OTHER journey (different legs + geometry).
+  const legs=optLegs(opt), total=optTotal(opt), badge=optRead(opt).head;
+  drawOne(legs,opt.identityColor,total,badge);
+  DRAWN={id:routePin,legs,identityColor:opt.identityColor,total,badge,isPrimary:opt.isPrimary};
 }
 // HOVER-MODE draw (not pinned): always the PRIMARY route, clean. Called by maybeRoute/drawJourney.
 // The badge follows the selector (badgeFor) so it matches the hover card headline + the cell color.
+// DEPART-AFTER: normalize first so the drawn geom/total is the ACTIVE journey (best in Best-case,
+// typical in Typical) — toggling the metric on a hovered cell re-draws the other journey.
 function drawPrimary(id,d){
+  d=normalizeBD(d);
   if(!d||d.error||!d.geom){clearRoute();return;}
   const badge=badgeFor(id,d.total);
   drawOne(d.geom,primaryCasing(),d.total,badge);
@@ -1047,8 +1183,14 @@ function redrawCurrentRoute(){
     drawSelected();
     return;
   }
-  // hover mode: the only theme-aware casing is the primary (white). Re-resolve it. The hover route is
-  // always the primary, so recompute its badge from the current selector (== headline + cell color).
+  // hover mode: the hover route is always the PRIMARY. DEPART-AFTER toggling the metric must re-draw
+  // the OTHER journey (best<->typical = different legs + geometry), so re-derive from the cached
+  // breakdown via drawPrimary (which normalizes to the active journey). The cell id is on DRAWN.
+  if(DEPARTAFTER && DRAWN.isPrimary!==false && DRAWN.id!=null && BDCACHE[DRAWN.id]){
+    drawPrimary(DRAWN.id, BDCACHE[DRAWN.id]); return;
+  }
+  // The only theme-aware casing is the primary (white). Re-resolve it. Recompute the badge from the
+  // current selector (== headline + cell color).
   const isAlt=DRAWN.identityColor&&ALT_CASING.indexOf(DRAWN.identityColor)>=0;
   const col=isAlt?DRAWN.identityColor:primaryCasing();
   const badge=DRAWN.isPrimary===false?DRAWN.total:badgeFor(DRAWN.id,DRAWN.total);
@@ -1856,10 +1998,20 @@ function applyHash(o){
   return false;}
 
 // Apply CFG: with the RAPTOR stack the map IS the engine result, so drop the R5 "Refine" button
-// and frame the panel as arrive-by-09:00 estimates (CFG.timephrase).
+// and frame the panel from CFG.timephrase (arrive-by-09:00, or depart-after "leaving ~8am — typical").
 (function applyCfg(){
   document.getElementById("howtime").textContent=CFG.timephrase;
   document.getElementById("estphrase").textContent=CFG.timephrase;
+  // DEPART-AFTER reframes the metric explanation in the How-it-works modal: best-case = luckiest
+  // departure in the window, typical = median departure on the published schedule, bad-day = the same
+  // trip when service runs late. (Arrive-by keeps its "perfect timing ~0 wait / committed-plan" copy.)
+  if(DEPARTAFTER){
+    document.getElementById("howmetric").innerHTML=
+      "<b>Best-case</b> is the luckiest departure in the morning window — the schedule lines up for the "+
+      "fastest possible trip. <b>Realistic</b> (typical) is the median departure: the time you'd usually "+
+      "see leaving around then. The <b>bad-day</b> chip adds the delay when service runs late (a late "+
+      "vehicle, a missed transfer).";
+  }
   if(CFG.raptor){
     document.getElementById("refinebox").style.display="none";
     document.getElementById("estnote").style.display="block";

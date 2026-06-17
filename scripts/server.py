@@ -1915,12 +1915,17 @@ def _build_page():
     # affordance and frame everything as an arrive-by-09:00 estimate. arrive-by => map == the
     # engine result, there is no separate exact pass to refine to.
     _arriveby = USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby"
-    # speedtoggle: the walk-speed control is only fully wired under RAPTOR arrive-by (map AND
-    # breakdown both apply the scalar). Under departafter the map would shift but the R5
-    # breakdown routes at fixed 4.8 km/h — inconsistent numbers — so the frontend hides it.
-    cfg = {"raptor": USE_RAPTOR, "arriveby": _arriveby, "speedtoggle": _arriveby,
+    _departafter = USE_RAPTOR and RAPTOR_SEMANTIC == "departafter"
+    # speedtoggle: the walk-speed control is fully wired under BOTH RAPTOR semantics now —
+    # arrive-by (map AND R5-free breakdown apply the scalar) and depart-after (the JVM-free
+    # forward tracer honors walk_scalar end-to-end, map + breakdown both). It stays OFF only
+    # for the legacy R5 stack (USE_RAPTOR=0 / USE_WALK_GRAPH=0), where the R5 breakdown would
+    # route at fixed 4.8 km/h while the map shifts — inconsistent numbers.
+    cfg = {"raptor": USE_RAPTOR, "arriveby": _arriveby, "departafter": _departafter,
+           "speedtoggle": USE_RAPTOR and USE_WALK_GRAPH,
            "timephrase": ("arriving by ~9:00am" if _arriveby
-                          else f"leaving ~{DEP:%-I:%M%p}".lower())}
+                          else (f"leaving ~{DEP:%-I:%M%p} — typical door-to-door".lower()
+                                if _departafter else f"leaving ~{DEP:%-I:%M%p}".lower()))}
     # No default workplace is EVER injected into the page (privacy invariant): the .env
     # DEFAULT_ADDRESS / DEST_LAT/LON would otherwise put a real personal address into the
     # served HTML. A first-time visitor sees the onboarding prompt and types their own; a
