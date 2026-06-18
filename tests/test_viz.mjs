@@ -247,3 +247,87 @@ test("depart-after: optRead/optLegs/optTotal re-pick by the live metric (compare
   // legs flip to the active journey too (distinct geometry per metric).
   assert.equal(H.optLegs(prim), d.typical.legs, "primary legs = typical journey legs in Typical");
 });
+
+// --------------------------------------------------------------------------- //
+// summaryVM: the ONE active-journey view-model for the header (both semantics)  //
+// --------------------------------------------------------------------------- //
+// The arrive-by/depart-after split in summaryHTML was unified into a single view-model, summaryVM,
+// that resolves {head, headLab, headTilde, otherVal, otherLab, otherTilde, frag, stuck, showSig}
+// once per metric so summaryHTML carries NO if(DEPARTAFTER) branch. The KEY semantic difference is
+// encoded in the VM: ARRIVE-BY best-case+typical are the SAME journey (typical = +wait, so it's
+// APPROXIMATE → "~" tilde, and the chip is gated on `real` landing); DEPART-AFTER are DISTINCT
+// journeys (each exact, no "~", chip shows in both modes). These pure helpers live in the template;
+// slice them out and assert the resolved fields per semantic × metric. (bdFrag is a dependency.)
+function _summaryVM(departafter) {
+  const tsrc = readFileSync(TEMPLATE_PATH, "utf8");
+  const fn = (name) => {
+    const sig = "function " + name + "(";
+    const i = tsrc.indexOf(sig);
+    if (i < 0) throw new Error("template fn not found: " + name);
+    let depth = 0, started = false;
+    for (let k = i; k < tsrc.length; k++) {
+      const c = tsrc[k];
+      if (c === "{") { depth++; started = true; }
+      else if (c === "}") { depth--; if (started && depth === 0) return tsrc.slice(i, k + 1); }
+    }
+    throw new Error("template fn unterminated: " + name);
+  };
+  const defs = ["bdFrag", "summaryVM"].map(fn).join("\n");
+  const harness = `
+"use strict";
+let metric="b";
+const DEPARTAFTER=${departafter ? "true" : "false"};
+${defs}
+return {set metric(v){metric=v;}, get metric(){return metric;}, summaryVM};`;
+  return new Function(harness)();
+}
+
+test("summaryVM (arrive-by): same journey — typical gets the ~ tilde, chip gated on real", () => {
+  const H = _summaryVM(false);
+  // Before /variance: real undefined → typical headline NOT shown; Best-case headline, chip hidden.
+  const pre = { total: 22, xfers: 1 };
+  H.metric = "r";
+  let vm = H.summaryVM(pre);
+  assert.equal(vm.head, 22, "no real → headline stays best-case total");
+  assert.equal(vm.headLab, "best-case");
+  assert.equal(vm.headTilde, "", "best-case headline never gets ~");
+  assert.equal(vm.showSig, false, "chip hidden until realistic lands");
+  // After /variance: real=28 (committed typical), var carries frag/stuck.
+  const post = { total: 22, xfers: 1, real: 28, var: { frag: 6, stuck: 0.03 } };
+  vm = H.summaryVM(post);                          // Typical
+  assert.equal(vm.head, 28, "Typical headline = real (committed typical)");
+  assert.equal(vm.headLab, "typical");
+  assert.equal(vm.headTilde, "~", "arrive-by typical is approximate → ~");
+  assert.equal(vm.otherVal, 22, "other = best-case total");
+  assert.equal(vm.otherLab, "best-case");
+  assert.equal(vm.otherTilde, "");
+  assert.equal(vm.frag, 6); assert.equal(vm.stuck, 0.03); assert.equal(vm.showSig, true);
+  H.metric = "b";                                  // Best-case: other = typical, gets ~
+  vm = H.summaryVM(post);
+  assert.equal(vm.head, 22); assert.equal(vm.headLab, "best-case"); assert.equal(vm.headTilde, "");
+  assert.equal(vm.otherVal, 28); assert.equal(vm.otherLab, "typical"); assert.equal(vm.otherTilde, "~");
+});
+
+test("summaryVM (depart-after): distinct journeys — no ~, chip shows in both modes", () => {
+  const H = _summaryVM(true);
+  // normalizeBD flattens the active journey onto d.total; raw best/typical pair stays for `other`.
+  const dTyp = { total: 26, xfers: 1, best: { total: 20 }, typical: { total: 26 }, frag: 6,
+    var: { frag: 5, stuck: 0.04 } };
+  H.metric = "r";
+  let vm = H.summaryVM(dTyp);
+  assert.equal(vm.head, 26, "Typical head = active (flattened) total");
+  assert.equal(vm.headLab, "typical");
+  assert.equal(vm.headTilde, "", "depart-after typical is exact → no ~");
+  assert.equal(vm.otherVal, 20, "other = best journey total");
+  assert.equal(vm.otherLab, "best-case"); assert.equal(vm.otherTilde, "");
+  assert.equal(vm.frag, 6, "primary per-route frag wins over cell overlay");
+  assert.equal(vm.showSig, true, "depart-after chip shows in both modes");
+  // Best-case: active flattened total is the best journey; other = typical (still no ~).
+  const dBest = { total: 20, xfers: 2, best: { total: 20 }, typical: { total: 26 }, frag: 6,
+    var: { frag: 5, stuck: 0.04 } };
+  H.metric = "b";
+  vm = H.summaryVM(dBest);
+  assert.equal(vm.head, 20); assert.equal(vm.headLab, "best-case"); assert.equal(vm.headTilde, "");
+  assert.equal(vm.otherVal, 26); assert.equal(vm.otherLab, "typical"); assert.equal(vm.otherTilde, "");
+  assert.equal(vm.showSig, true);
+});

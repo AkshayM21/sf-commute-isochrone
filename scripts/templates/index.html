@@ -599,34 +599,46 @@ function badgeFor(id,total){
   if(metric=="r"){const rv=REAL[id];if(rv!=null)return rv;}
   return total;
 }
+// ===== active-journey VIEW-MODEL ============================================================
+// ONE shape both semantics resolve into so the renderers carry NO `if(DEPARTAFTER)` branch. A
+// breakdown is a best-case/typical journey PAIR; this picks the ACTIVE (selected-metric) journey and
+// the OTHER for context, plus the bad-day signal. The KEY semantic difference is encoded here, not
+// in the renderers:
+//   ARRIVE-BY  — best-case and typical are the SAME journey: best={total:d.total}, typical={total:
+//     d.real} (the committed-plan typical from /variance), so the typical is APPROXIMATE (tilde "~")
+//     and the chip only shows once `real` landed (showSig). showR additionally gates on real!=null
+//     (no typical headline until /variance), so before it lands the headline stays best-case.
+//   DEPART-AFTER — best and typical are DISTINCT journeys (d.best p5 / d.typical p50), each exact
+//     (no "~"); the chip shows in BOTH modes (frag-gated downstream), so showSig=true.
+// Returns the resolved summary fields; xfers is the ACTIVE journey's (constant under arrive-by, where
+// normalizeBD already flattened d.xfers onto the active journey, real=null).
+function summaryVM(d){
+  const tilde=!DEPARTAFTER;                            // is the "typical" value approximate?
+  const showR=DEPARTAFTER ? (metric=="r") : (metric=="r" && d.real!=null);
+  // ACTIVE journey number = the flattened d.total under depart-after (fallback-safe), or the metric
+  // pick (d.real typical / d.total best-case) under arrive-by. OTHER journey number = the opposite:
+  //   ARRIVE-BY  — same journey, so other = d.real (in Best-case) / d.total (in Typical).
+  //   DEPART-AFTER — the OTHER raw journey's total (d.best in Typical, d.typical in Best-case).
+  const head=DEPARTAFTER ? d.total : (showR?d.real:d.total);
+  const otherJ=DEPARTAFTER ? (showR?d.best:d.typical) : null;
+  const other=DEPARTAFTER ? (otherJ?otherJ.total:null) : (showR?d.total:d.real);
+  const headLab=showR?"typical":"best-case", otherLab=showR?"best-case":"typical";
+  const lab=l=>(l=="typical"&&tilde)?"~":"";          // approximate-typical gets the "~"
+  return {head, headLab, headTilde:lab(headLab), otherVal:other, otherLab, otherTilde:lab(otherLab),
+    xfers:d.xfers, frag:bdFrag(d), stuck:d.var?d.var.stuck:0,
+    showSig:DEPARTAFTER ? true : (d.real!=null)};
+}
 // Shared header summary (name + headline minutes + transfers/best-case context + bad-day chip),
 // reused by the hover tooltip (bdHTML) AND the pinned compare card (pinHTML). One source so the
-// summary can't drift between the two. Consumes a NORMALIZED breakdown (active journey flattened):
+// summary can't drift between the two. Consumes a NORMALIZED breakdown via the ONE active-journey
+// view-model (summaryVM) — no per-semantic branch here:
 //   headBig   the metric-matched headline number (typical OR best-case)
 //   ctxLine   "N transfers · {other-metric Xm}" — context, never the prominent number
 //   vline     "bad-day +Y · {chip}" — only when there's MC signal (skipped for fully robust cells)
-// ARRIVE-BY (passthrough): head/other come from d.total (best-case) vs d.real (typical); the chip is
-//   gated on the realistic having landed. DEPART-AFTER: head = the active journey total (already
-//   flattened, real=null), other = the OTHER journey's total (d.best/d.typical), and the chip shows
-//   whenever frag>0 in EITHER metric mode (no realistic headline to gate on).
 function summaryHTML(d){
-  const frag=bdFrag(d), stuck=d.var?d.var.stuck:0;
-  let head,headLab,otherVal,otherLab,otherTilde,showSig;
-  if(DEPARTAFTER){
-    showSig=true;                                     // chip shows in BOTH modes (frag-gated below)
-    const showR=(metric=="r");
-    head=d.total; headLab=showR?"typical":"best-case";
-    // The OTHER journey's total (each has its own legs/total — no reconciliation).
-    const other=showR?(d.best||null):(d.typical||null);
-    otherVal=other?other.total:null; otherLab=showR?"best-case":"typical"; otherTilde="";
-  } else {
-    const real=d.real;
-    const showR=(metric=="r" && real!=null);
-    showSig=(real!=null);                             // arrive-by: chip only once realistic landed
-    head=showR?real:d.total; headLab=showR?"typical":"best-case";
-    otherVal=showR?d.total:real; otherLab=showR?"best-case":"typical"; otherTilde=showR?"":"~";
-  }
-  const headBig=`<div style="margin:0 0 4px"><b style="font-size:14px">${(!DEPARTAFTER&&headLab=="typical")?"~":""}${head} min</b>`+
+  const vm=summaryVM(d);
+  const {head,headLab,headTilde,otherVal,otherLab,otherTilde,frag,stuck,showSig}=vm;
+  const headBig=`<div style="margin:0 0 4px"><b style="font-size:14px">${headTilde}${head} min</b>`+
     ` <span style="color:var(--mut);font-size:12px">${headLab}</span></div>`;
   const otherTxt=(otherVal!=null && otherVal!=head) ? ` · ${otherLab} ${otherTilde}${otherVal}m` : ``;
   const ctxLine=`<div style="margin:0 0 6px;color:var(--mut);font-size:11.5px">`+
