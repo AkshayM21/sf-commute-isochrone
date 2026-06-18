@@ -6,7 +6,9 @@ workplace **in one reverse search + a precomputed walk-access table**, near-exac
 ~200–700× faster, with no heavy per-visitor compute. R5 stays in-process only for the on-demand
 hover breakdown (Phase 2 moves that to RAPTOR too).
 
-Flag-gated: `USE_RAPTOR=1` (default **OFF** — the live app is byte-identical until flipped).
+Flag-gated: `USE_RAPTOR=1` is the **DEFAULT** (since 2026-05-25). The default SEMANTIC is
+**`departafter`** (since 2026-06-17 — flipped from `arriveby`; see "Default semantic" below);
+opt into arrive-by with `RAPTOR_SEMANTIC=arriveby`.
 
 ## How it works
 1. **Build** (`core/raptor_build.py`, JVM-free, ~2 s, disk-cached by feed fingerprint): parse
@@ -21,7 +23,44 @@ Flag-gated: `USE_RAPTOR=1` (default **OFF** — the live app is byte-identical u
    using the **baked cell→stop walk-access table** (`scripts/raptor_oracle.py`, the one-time R5
    walk-matrix precompute; the grid is fixed). Two semantics off the same profile:
    - **depart-after** p5/p50 over [08:35, 09:05] — bit-comparable to R5's window model (validated);
-   - **arrive-by-09:00** — the product semantic ("where can you live and reach work by 9").
+     **THE DEFAULT** (since 2026-06-17).
+   - **arrive-by-09:00** — the best-case perfect-timing read; opt-in (`RAPTOR_SEMANTIC=arriveby`).
+
+## Default semantic: depart-after (the 2026-06-17 flip)
+The served default flipped `arriveby` → `departafter`. WHY: depart-after is the **R5-validated**
+read (MAE 0.75 vs R5's window model) and is **TRUE-ZERO walk-speed monotone** — the
+percentile-over-window value has no single-departure "latest run before 09:00" jiggle, so a
+faster walk can NEVER lengthen the commute (measured 0/11449 faster-walk-longer cells over the
+default workplace subset; `test_departafter_walkspeed_monotonicity` asserts STRICT 0). The map is
+best-case (p5) / typical (p50) over the window with no deadline buffer. Both semantics stay
+**JVM-free** (`_NEED_R5` False) and serve map + hover + color-by-line from RAPTOR back-pointers;
+depart-after traces the window's per-T* trees (`DepartAfterJourneyTree`, ~15-17 distinct T* per
+workplace), so **hover==map holds PER PERCENTILE** (p5 journey total == map p5, p50 journey total
+== map p50). Color-by-line under depart-after builds those per-T* trees lazily (~0.9 s the first
+toggle), the multi-tree cost vs arrive-by's single 09:00 tree.
+
+**Metric model (depart-after):** best-case (p5) and typical (p50) are DIFFERENT percentiles →
+DIFFERENT journeys → possibly DIFFERENT routes; `/itinerary` returns both. The map/headline shows
+the bare percentile the map paints (selector-driven). The **service-noise MC is a bad-day chip +
+alt-lines ONLY** — `/variance` carries `{frag, stuck, alt}`, NO `realistic` headline (the typical
+headline IS the served p50, never the committed MC value). Fragility reconciles: a route's `frag`
+= `committed_p90 − the served p50` (same per-workplace seed), so `served_p50 + frag` is the
+consistent bad-day clock; the primary pinned strip's frag == that cell's `/variance` frag. (Under
+`arriveby`, `/variance` keeps the committed `realistic` headline — the split doesn't apply.)
+
+**Arrive-by vs depart-after fragility can't be unified:** arrive-by floors/measures with `ceil`
+on the perfect-timing base while depart-after rounds the served p50, so the two derivations
+differ by a sub-minute rounding and are deliberately kept separate per semantic.
+
+The opt-in **arrive-by** is the best-case PERFECT-TIMING commute (~6 min rosier, ~1.7%
+non-monotone, ~46% dominant-route match to R5's depart-after) — inherent, not a bug. The arrive-by
+path is byte-unchanged by the flip (the in-process test suite pins `arriveby` to keep it covered).
+
+**Goldens (one per semantic):** `tests/make_golden.py` writes BOTH
+`golden_exact_ferry.json` (arrive-by, the opt-in / in-process suite path) AND
+`golden_exact_ferry_departafter.json` (depart-after, the served default). The depart-after golden
+is tested by a child-process boot (`test_compute_exact_matches_golden_departafter`) so the DEFAULT
+path has real golden coverage that does not skip under the arrive-by-pinned in-process fixture.
 
 Per request the server computes the workplace's egress (W→stops) + pure-walk (W→cells) via **one
 light R5 walk matrix**, then runs the engine. The only R5 use on the map path; no per-cell pass.

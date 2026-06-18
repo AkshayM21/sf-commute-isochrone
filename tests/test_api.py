@@ -117,11 +117,18 @@ def test_compute_exact_shape_and_determinism(client, server):
 
 @pytest.mark.slow
 def test_compute_exact_matches_golden(client, server):
-    """Regression snapshot. If this fails after a GTFS refresh (pick_service_date shifted)
-    or an engine-default change, regenerate:  .venv/bin/python tests/make_golden.py"""
+    """Regression snapshot for the ARRIVE-BY engine (the OPT-IN path since the 2026-06-17
+    default flip). The in-process `server` fixture is pinned to arrive-by by conftest.py
+    (setdefault RAPTOR_SEMANTIC=arriveby), so this compares against the arrive-by golden
+    (tests/golden_exact_ferry.json). The SERVED DEFAULT (depart-after) has its own,
+    non-skipping golden coverage in test_compute_exact_matches_golden_departafter below.
+
+    If this fails after a GTFS refresh (pick_service_date shifted) or an engine change,
+    regenerate:  .venv/bin/python tests/make_golden.py arriveby"""
     if not os.path.exists(GOLDEN_PATH):
         pytest.skip(
-            "golden missing — generate with `.venv/bin/python tests/make_golden.py`"
+            "arrive-by golden missing — generate with "
+            "`.venv/bin/python tests/make_golden.py arriveby`"
         )
     with open(GOLDEN_PATH) as f:
         golden = json.load(f)
@@ -146,6 +153,89 @@ def test_compute_exact_matches_golden(client, server):
     assert current == g_cells, (
         "compute_exact output drifted from the golden snapshot. If GTFS feeds were "
         "refreshed this is expected — regenerate with tests/make_golden.py."
+    )
+
+
+# Depart-after golden — the SERVED DEFAULT path (since the 2026-06-17 flip). The in-process
+# `server` fixture is arrive-by-pinned, so the depart-after served map is snapshotted in a
+# CHILD process booted with RAPTOR_SEMANTIC=departafter (mirrors the _DEPARTAFTER_DRIVER
+# pattern). This gives the default path REAL golden coverage that does not depend on, and does
+# not skip under, the in-process arrive-by pin.
+GOLDEN_PATH_DEPARTAFTER = os.path.join(_HERE, "golden_exact_ferry_departafter.json")
+_GOLDEN_DA_DRIVER = r'''
+import json, sys, os
+sys.path.insert(0, %(scripts)r)
+import server
+assert server.RAPTOR_SEMANTIC == "departafter", server.RAPTOR_SEMANTIC
+assert server._NEED_R5 is False, "depart-after golden boot flagged _NEED_R5 (would load the JVM)"
+jvm = sorted(m for m in sys.modules
+             if m == "r5py" or m.startswith("r5py.") or m.startswith("com.conveyal")
+             or m == "jpype")
+assert not jvm, "depart-after golden boot is NOT JVM-free: %%s" %% jvm
+c = server.app.test_client()
+with server._RESULT_CACHE_LOCK:
+    server._EXACT_RESULT_CACHE.clear()
+r = c.get("/compute_exact?lat=%(flat)s&lon=%(flon)s")
+assert r.status_code == 200, r.get_data(as_text=True)
+print(json.dumps({
+    "service_date": str(server._SVC_DATE),
+    "engine": {"use_raptor": bool(server.USE_RAPTOR),
+               "raptor_semantic": str(server.RAPTOR_SEMANTIC),
+               "use_walk_graph": bool(server.USE_WALK_GRAPH),
+               "gtfs_fp": server._gtfs_fp()},
+    "cells": r.get_json()["cells"],
+}))
+'''
+
+
+def test_compute_exact_matches_golden_departafter():
+    """Regression snapshot for the DEPART-AFTER engine — the SERVED DEFAULT since 2026-06-17.
+    Boots a child server pinned to RAPTOR_SEMANTIC=departafter and asserts /compute_exact ==
+    the depart-after golden (tests/golden_exact_ferry_departafter.json). This is the default
+    path's golden guard: it does NOT skip just because the in-process suite pins arrive-by
+    (the served default and the in-process fixture are deliberately different engines).
+    It also re-asserts the depart-after boot is JVM-free.
+
+    If this fails after a GTFS refresh or an engine change, regenerate:
+        .venv/bin/python tests/make_golden.py departafter"""
+    import subprocess
+    import sys as _sys
+    if not os.path.exists(GOLDEN_PATH_DEPARTAFTER):
+        pytest.skip(
+            "depart-after golden missing — generate with "
+            "`.venv/bin/python tests/make_golden.py departafter`"
+        )
+    with open(GOLDEN_PATH_DEPARTAFTER) as f:
+        golden = json.load(f)
+
+    scripts = os.path.join(_HERE, "..", "scripts")
+    driver = _GOLDEN_DA_DRIVER % {"scripts": scripts, "flat": FERRY_LAT, "flon": FERRY_LON}
+    env = dict(os.environ)
+    env.update(USE_RAPTOR="1", USE_WALK_GRAPH="1", RAPTOR_SEMANTIC="departafter", RAPTOR_MC="1")
+    # Keep the child off the repo-default numba cache (the suite's .nbc gotcha) — share the
+    # depart-after child cache used by test_itinerary_equals_map_departafter when present.
+    env.setdefault("NUMBA_CACHE_DIR", os.path.join(_HERE, ".nbcache_departafter"))
+    proc = subprocess.run([_sys.executable, "-c", driver], env=env,
+                          capture_output=True, text=True, timeout=600)
+    assert proc.returncode == 0, (
+        f"depart-after golden boot/driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    )
+    res = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # Skip-on-mismatch (mirrors the arrive-by golden) so a GTFS repull or engine change is a
+    # regenerate signal, not a red test — but the engine HERE is the served default, so on the
+    # default config this runs (does not skip).
+    if golden.get("service_date") != res["service_date"]:
+        pytest.skip(
+            f"depart-after golden service_date {golden.get('service_date')} != current "
+            f"{res['service_date']}; regenerate via tests/make_golden.py departafter")
+    if golden.get("engine") != res["engine"]:
+        pytest.skip(
+            f"depart-after golden engine {golden.get('engine')} != booted {res['engine']}; "
+            "regenerate via tests/make_golden.py departafter")
+    assert res["cells"] == golden["cells"], (
+        "depart-after compute_exact output drifted from the golden snapshot. If GTFS feeds "
+        "were refreshed this is expected — regenerate with `tests/make_golden.py departafter`."
     )
 
 

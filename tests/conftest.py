@@ -1,18 +1,22 @@
 """Shared fixtures for the Flask API integration suite (tests/test_api.py).
 
-The app's scripts/server.py boots the JVM-FREE RAPTOR stack by default (since 2026-05-25):
-RAPTOR arrive-by engine + hill-aware walk router + lean static bundle — import takes ~1s,
-no R5/JVM. We import the module exactly ONCE per test session via a session-scoped fixture
-and expose both the module (so tests can poke its locks/caches/globals directly) and a
-Flask `app.test_client()`. We never bind a port, so the suite is independent of any live
-server on :8000 — but do NOT run it beside a server that is still BOOTING (concurrent
-numba JIT corrupts the shared .nbc cache; see CLAUDE.md).
+The app's scripts/server.py boots the JVM-FREE RAPTOR stack (since 2026-05-25): RAPTOR engine
++ hill-aware walk router + lean static bundle — import takes ~1s, no R5/JVM. We import the
+module exactly ONCE per test session via a session-scoped fixture and expose both the module
+(so tests can poke its locks/caches/globals directly) and a Flask `app.test_client()`. We
+never bind a port, so the suite is independent of any live server on :8000 — but do NOT run
+it beside a server that is still BOOTING (concurrent numba JIT corrupts the shared .nbc
+cache; see CLAUDE.md).
 
-ENGINE PINNING: the setdefaults below match server.py's production defaults, so behavior
-is unchanged on a clean env — but they make the config under test explicit and shield the
-suite from ambient/.env leakage (e.g. an exported USE_RAPTOR=0 silently swapping the
-engine under every test). The legacy R5 path (USE_RAPTOR=0, ~30s JVM boot) is only
-exercised if you opt in by exporting USE_RAPTOR=0 before pytest.
+ENGINE PINNING (post 2026-06-17 default flip): the served DEFAULT semantic is now
+DEPART-AFTER (RAPTOR_SEMANTIC=departafter), but this in-process fixture is DELIBERATELY
+pinned to ARRIVE-BY (the OPT-IN path) via the setdefault below — that pin is what keeps the
+arrive-by engine, its MC/variance/per-route-typical/geom tests, and its golden under test
+after the default moved. The depart-after SERVED DEFAULT is covered by CHILD-process tests
+that boot RAPTOR_SEMANTIC=departafter (test_itinerary_equals_map_departafter,
+test_compute_exact_matches_golden_departafter). The setdefaults also shield the suite from
+ambient/.env leakage (e.g. an exported USE_RAPTOR=0 silently swapping the engine). The
+legacy R5 path (USE_RAPTOR=0, ~30s JVM boot) is only exercised if you export USE_RAPTOR=0.
 
 PRIVACY: tests use a neutral public SF coordinate (the Ferry Building) as the workplace.
 The user's real saved address/coords are NEVER imported or hardcoded here.
@@ -28,11 +32,13 @@ _SCRIPTS = os.path.join(_REPO_ROOT, "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
-# Pin the engine config the suite tests to the production defaults (see module docstring).
-# Must be set BEFORE server.py is imported (it reads these at import time).
+# Pin the in-process engine under test (see module docstring). Must be set BEFORE server.py is
+# imported (it reads these at import time). RAPTOR_SEMANTIC is pinned to ARRIVE-BY on PURPOSE:
+# the server default is now depart-after, so without this pin the arrive-by tests would all
+# either run depart-after or skip. The depart-after default is covered by child-process tests.
 os.environ.setdefault("USE_RAPTOR", "1")
 os.environ.setdefault("USE_WALK_GRAPH", "1")
-os.environ.setdefault("RAPTOR_SEMANTIC", "arriveby")
+os.environ.setdefault("RAPTOR_SEMANTIC", "arriveby")  # OPT-IN path, pinned for the in-process suite
 os.environ.setdefault("RAPTOR_MC", "1")
 # Only read on the legacy _NEED_R5 path (USE_RAPTOR=0 / missing walk bakes): keep that
 # JVM modest so it coexists with another agent's live server / pytest JVM.

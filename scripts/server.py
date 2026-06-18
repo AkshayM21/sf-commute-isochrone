@@ -37,11 +37,15 @@ config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the g
 # geo/pandas stack. They become module globals there, used by the R5 branches (unreachable lean).
 
 # ---- Flags (parsed EARLY: they decide whether the in-process JVM starts at all) --------
-# THE DEFAULT IS NOW THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + arrive-by-09:00 + the
-# service-noise overlay. R5/the JVM is no longer loaded by default. Opt back into the legacy R5
-# path with USE_RAPTOR=0 (and/or USE_WALK_GRAPH=0 for the R5 walk matrix, RAPTOR_SEMANTIC=departafter).
+# THE DEFAULT IS NOW THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + DEPART-AFTER p5/p50 + the
+# service-noise overlay. R5/the JVM is no longer loaded by default. The default SEMANTIC flipped
+# arrive-by -> depart-after on 2026-06-17: depart-after is R5-validated (MAE 0.75) and TRUE-ZERO
+# walk-speed monotone (no single-departure "latest run" jiggle), so the served map is best-case
+# (p5) / typical (p50) over the [08:35, 09:05] window. Opt INTO arrive-by-09:00 (the best-case
+# perfect-timing read) with RAPTOR_SEMANTIC=arriveby. Opt back into the legacy R5 path with
+# USE_RAPTOR=0 (and/or USE_WALK_GRAPH=0 for the R5 walk matrix).
 USE_RAPTOR = os.environ.get("USE_RAPTOR", "1").lower() in ("1", "true", "yes", "on")
-RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "arriveby").lower()
+RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "departafter").lower()
 RAPTOR_MC = os.environ.get("RAPTOR_MC", "1").lower() in ("1", "true", "yes", "on")
 USE_WALK_GRAPH = os.environ.get("USE_WALK_GRAPH", "1").lower() in ("1", "true", "yes", "on")
 # Safety net: the JVM-free walk stack needs its one-time bakes (walk graph + access_walk table).
