@@ -1069,9 +1069,14 @@ function buildCompare(d){
   if(d&&d.geom){
     if(da){
       // depart-after primary: store both journeys; legs/total are picked live (see optLegs/optTotal).
+      // The strip's `legs` MUST be the GEOM legs (carry `pts`) — like the alts (server ships their
+      // legs == geom) and like arrive-by — so optLegs(prim) returns a DRAWABLE leg list and
+      // drawSelected paints the primary route on click. d.best/d.typical carry a SEPARATE text `legs`
+      // (no pts) + `geom` (with pts); using `.legs` here drew nothing (the click-no-route bug).
       out.push({key:PRIMARY_KEY,line:dominantLine((d.typical||d.best||{geom:d.geom}).geom||d.geom),
         identityColor:primaryCasing(),isPrimary:true,
-        da:{best:(d.best||null), typical:(d.typical||{total:d.total,legs:d.geom}),
+        da:{best:(d.best?{total:d.best.total,legs:d.best.geom}:null),
+            typical:(d.typical?{total:d.typical.total,legs:d.typical.geom}:{total:d.total,legs:d.geom}),
             frag:(d.frag!=null?d.frag:(d.var&&d.var.frag!=null?d.var.frag:null))}});
     } else {
       // arrive-by: `real`/`frag` are the PRIMARY's committed-plan TYPICAL (from /variance's REAL/VAR,
@@ -1082,7 +1087,17 @@ function buildCompare(d){
         frag:(d.var?d.var.frag:null),isPrimary:true});
     }
   }
-  (d&&d.alts||[]).forEach((a,k)=>{
+  // Drop WALK-ONLY alternatives (a line-labeled journey with no actual ride): they're just slower
+  // walking paths and carry no information (the reported "walk 26/27/27/30m" pointless alts). The
+  // server already filters these (server_raptor._legs_have_transit), so this is a belt-and-suspenders
+  // guard that also covers any pre-fix cached /itinerary. An alt is kept iff one of its journeys
+  // (best/typical for depart-after, the single legs for arrive-by) contains a transit leg. The
+  // PRIMARY may legitimately be walk-only (a very close cell) — this filters only the alt list.
+  const altHasTransit=a=>{
+    const lists=da?[(a.best||{}).legs,(a.typical||{}).legs]:[a.legs];
+    return lists.some(legs=>(legs||[]).some(g=>g&&g.mode==="transit"));
+  };
+  (d&&d.alts||[]).filter(altHasTransit).forEach((a,k)=>{
     // key is the row's stable slot ("alt0"…), NOT the line name — two alts could share a line
     // name (rare, but server-dependent), which would collide select/preview if keyed by line.
     if(da){
@@ -1403,10 +1418,12 @@ let bdTimer;
 //   mouseover, so the tooltip appears instantly in place.
 function loadBreak(f,setHTML,onReady){const id=f.properties.id,v=val(id);
   const ready=d=>{if(onReady)onReady(d);};
-  // A cell with no value OR one HIDDEN by the Max-commute filter (v>thr → opacity 0 in style())
-  // shouldn't hover/draw: treat a filtered cell exactly like an unreachable one (no tooltip, no
-  // route, no breakdown). Gating here covers both the hover path and a programmatic pin.
-  if(v==null||v>thr){setHTML("—");ready(null);return;}
+  // A genuinely UNREACHABLE cell (v==null → [None,None] in TT, no journey within the ~75 min cap)
+  // shows a clear "no route" breakdown, NOT a silent "—". We already know it's unreachable from the
+  // /compute map, so render the message directly (no /itinerary round-trip) — no route to draw.
+  // A cell hidden ONLY by the Max-commute slider (v>thr) is still REACHABLE and falls through to the
+  // full breakdown below: the slider controls the heatmap coloring, NOT whether a cell is inspectable.
+  if(v==null){setHTML(bdHTML({error:"no route"}));ready(null);return;}
   if(!EXACT){   // map still on the fast estimate — show the SAME value (no contradicting exact breakdown yet)
     setHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b> · ~${v} min <span style="color:var(--mut);font-weight:400">estimate</span></div><div style="color:var(--mut)">refining to exact times + route…</div></div>`);
     ready(null);                                    // no route yet, but show the estimate placeholder in place
@@ -1444,10 +1461,12 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
       // outline highlight, no route change). The only interaction is the corner card's strips.
       // Unpin (Esc / × / map-background click) restores normal hover.
       if(routePin!=null)return;
-      // Max-commute filter: a cell hidden by `thr` (opacity 0, or unreachable v==null) is inert —
-      // no outline highlight, no tooltip, no route. Mirrors the loadBreak gate so a hidden cell is
-      // fully non-interactive (a hidden cell shouldn't hover or draw its route).
-      {const v=val(f.properties.id);if(v==null||v>thr)return;}
+      // HOVER works on EVERY cell in the grid (the user's "uncolored cells should still work"):
+      // - reachable cells, INCLUDING those above the Max-commute slider (v>thr, dimmed in the heatmap
+      //   but still inspectable — the slider only controls coloring), show their full breakdown + route;
+      // - genuinely unreachable cells (v==null) show a "No transit route within ~75 min." tooltip
+      //   (loadBreak renders the message; no route to draw).
+      // So there is NO early-return here on a dimmed/unreachable cell — only the no-destination guard.
       hoverCell=f.properties.id;hoverLayer=l;
       // INSTANT feedback: highlight the cell outline on hover (the canvas outline can't read CSS
       // vars, so resolve THEME here). This is the only immediate visual — the TOOLTIP is held back.
@@ -1477,9 +1496,10 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
   // popup), so it never covers the drawn route. The map-background click handler unpins; this
   // cell click must not be read as a background click, so flag it for that handler.
   l.on("click",ev=>{if(!DESTLL)return;
-    // Max-commute filter: a hidden (v>thr) or unreachable (v==null) cell is inert — clicking it must
-    // not pin an empty card. Treat it like a background click (let the map handler unpin if pinned).
-    {const v=val(f.properties.id);if(v==null||v>thr)return;}
+    // Only a genuinely UNREACHABLE cell (v==null) is inert on click — pinning a "no route" card
+    // carries nothing to compare/draw, so treat it like a background click (let the map handler unpin
+    // if pinned). A cell dimmed only by the Max-commute slider (v>thr) is REACHABLE and pins normally.
+    {const v=val(f.properties.id);if(v==null)return;}
     justPinned=true;                            // suppress the map-background closePin this tick
     // …but if stopPropagation prevents the map click entirely, justPinned would never be consumed
     // and stick true, eating the NEXT real background unpin-click. Clear it after this tick so a
@@ -1676,12 +1696,13 @@ async function setWorkplace(lat,lon,label,opts){
 }
 // Re-fetch the pinned cell with the current params + re-render the pinned card and its drawn route
 // in place (keep-pin path). Gen-guarded against a newer param change. Handles the UNREACHABLE edge:
-// if the cell is now hidden (val>thr / unreachable) OR /itinerary returns an error, keep the card
-// PINNED but show the no-route state and clear the drawn route (no broken/empty card, no crash).
+// if the cell becomes unreachable (val==null) under the new cap/pace OR /itinerary returns an error,
+// keep the card PINNED but show the no-route state and clear the drawn route (no broken card, no
+// crash). A cell above the Max-commute slider (val>thr) stays REACHABLE and refreshes normally.
 async function refreshPinForParams(id,gen){
   if(routePin!==id||!pinFeature||!DESTLL){setPinLoading(false);return;}
   const f=pinFeature;
-  // Cell now filtered/unreachable under the new params -> no route to draw. Keep it PINNED with a
+  // Cell now unreachable under the new params -> no route to draw. Keep it PINNED with a
   // settings-specific message (the user can close it) rather than a broken/empty card or a crash.
   if(val(id)==null){
     if(gen!==GEN||routePin!==id)return;

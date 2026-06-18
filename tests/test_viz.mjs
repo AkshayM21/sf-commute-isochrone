@@ -244,8 +244,114 @@ test("depart-after: optRead/optLegs/optTotal re-pick by the live metric (compare
   assert.equal(H.optRead(prim).head, 26, "optRead head = typical");
   assert.equal(H.optRead(prim).frag, 6, "per-route frag shown in Typical");
   assert.equal(H.optRead(altK).frag, 4, "alt K per-route frag in Typical");
-  // legs flip to the active journey too (distinct geometry per metric).
-  assert.equal(H.optLegs(prim), d.typical.legs, "primary legs = typical journey legs in Typical");
+  // legs flip to the active journey too (distinct geometry per metric). The primary strip's legs
+  // are the GEOM legs (drawable: carry `pts`), NOT the text legs — see the drawable test below.
+  assert.equal(H.optLegs(prim), d.typical.geom, "primary legs = typical journey GEOM legs in Typical");
+});
+
+// --------------------------------------------------------------------------- //
+// BUG 1 regression: the depart-after PRIMARY strip's legs must be DRAWABLE      //
+// --------------------------------------------------------------------------- //
+// The compare card showed the primary strip selected but drew NO route on the map, because the
+// primary's da.best/da.typical used d.best.legs / d.typical.legs (the TEXT legs: {mode,line,min,wait}
+// — NO `pts`), while alts correctly used geom (legs == geom, with `pts`). drawSelected draws
+// optLegs(opt); text legs have no points -> nothing renders. The fix builds the primary from the
+// GEOM legs (matching the alts + arrive-by), so optLegs(primary) returns legs that carry `pts`.
+// This test FAILS on the pre-fix code (text legs lack `pts`) and PASSES after.
+function _daFixtureWithPts() {
+  // A depart-after /itinerary?pin=1 breakdown shaped like the real server response: best (p5) and
+  // typical (p50) journeys each carry SEPARATE `legs` (text, NO pts) and `geom` (with pts).
+  const txtBest = [{ mode: "walk", line: null, min: 2 },
+                   { mode: "transit", line: "N", min: 16, wait: 4 }];
+  const geomBest = [{ mode: "walk", name: null, min: 2, pts: [[37.70, -122.40], [37.71, -122.40]] },
+                    { mode: "transit", name: "N", min: 16, wait: 4, tmode: "metro",
+                      pts: [[37.71, -122.40], [37.78, -122.41]] }];
+  const txtTyp = [{ mode: "walk", line: null, min: 3 },
+                  { mode: "transit", line: "N", min: 18, wait: 5 }];
+  const geomTyp = [{ mode: "walk", name: null, min: 3, pts: [[37.70, -122.40], [37.715, -122.40]] },
+                   { mode: "transit", name: "N", min: 18, wait: 5, tmode: "metro",
+                     pts: [[37.715, -122.40], [37.78, -122.41]] }];
+  return {
+    name: "Test NB", olat: 37.7, olon: -122.4,
+    total: 26, xfers: 1, legs: txtTyp, geom: geomTyp,
+    typical: { total: 26, xfers: 1, legs: txtTyp, geom: geomTyp },
+    best: { total: 20, xfers: 1, legs: txtBest, geom: geomBest },
+    frag: 6,
+    alts: [
+      { line: "K",
+        best: { total: 22, legs: [{ mode: "transit", name: "K", min: 20, pts: [[37.70, -122.40], [37.79, -122.41]] }] },
+        typical: { total: 28, legs: [{ mode: "transit", name: "K", min: 24, pts: [[37.70, -122.40], [37.79, -122.41]] }] },
+        frag: 4 },
+    ],
+  };
+}
+function _legsDrawable(legs) {
+  // A drawable leg list: non-empty, and every leg carries a non-empty `pts` polyline.
+  return Array.isArray(legs) && legs.length > 0 &&
+    legs.every((g) => Array.isArray(g.pts) && g.pts.length > 0);
+}
+test("BUG1 depart-after: primary strip legs are DRAWABLE (carry pts) in BOTH metric modes", () => {
+  const H = _daHelpers();
+  const d = _daFixtureWithPts();
+  const prim = H.buildCompare(d)[0];
+  for (const m of ["b", "r"]) {
+    H.metric = m;
+    const legs = H.optLegs(prim);
+    assert.ok(_legsDrawable(legs),
+      `primary legs must carry pts (drawable) in metric=${m}; got ` + JSON.stringify(legs));
+  }
+});
+test("BUG1 depart-after: a transit alt strip is also drawable (unchanged by the fix)", () => {
+  const H = _daHelpers();
+  const d = _daFixtureWithPts();
+  const altK = H.buildCompare(d)[1];
+  for (const m of ["b", "r"]) {
+    H.metric = m;
+    assert.ok(_legsDrawable(H.optLegs(altK)), `alt legs drawable in metric=${m}`);
+  }
+});
+
+// --------------------------------------------------------------------------- //
+// BUG 3 regression: an "uncolored" cell must still be interactive             //
+// --------------------------------------------------------------------------- //
+// A user reported that hovering a cell that isn't lit up (above the Max-commute slider `thr`, OR
+// genuinely unreachable) does nothing. The old code gated the hover/click/loadBreak paths on
+// `v==null||v>thr` — so a cell DIMMED only by the slider (still reachable, has a real journey) was
+// fully non-interactive. The fix gates interactivity ONLY on genuine unreachability (`v==null`):
+// the slider controls heatmap COLORING, not whether a reachable cell can be inspected; an
+// unreachable cell shows a clear "No transit route" breakdown instead of a silent "—".
+// These are SOURCE-SCAN guards (the gates live inline in Leaflet event handlers, not as exported
+// functions): they FAIL on the pre-fix template (which had the `v>thr` interactivity gates) and
+// pass after. The server-side contract these rely on is in tests/test_api.py
+// (test_itinerary_works_for_uncolored_cells).
+test("BUG3: interactivity gates no longer block dimmed-but-reachable cells (no `v>thr` early-return)", () => {
+  const tsrc = readFileSync(TEMPLATE_PATH, "utf8");
+  // The three buggy gates were:
+  //   loadBreak:  if(v==null||v>thr){setHTML("—");ready(null);return;}
+  //   mouseover:  {const v=val(f.properties.id);if(v==null||v>thr)return;}
+  //   click:      {const v=val(f.properties.id);if(v==null||v>thr)return;}
+  // None of these `||v>thr` interactivity early-returns may survive (the heatmap `style()` keeps its
+  // own `v>thr` test — that DIMS the cell and is correct, so we only forbid the INTERACTIVITY forms).
+  assert.ok(!tsrc.includes('if(v==null||v>thr)return;'),
+    "found a leftover `if(v==null||v>thr)return;` interactivity gate — a dimmed reachable cell would be inert");
+  assert.ok(!tsrc.includes('if(v==null||v>thr){setHTML("—")'),
+    "found the leftover loadBreak `v>thr` gate that showed a bare '—' for a reachable dimmed cell");
+});
+test("BUG3: an unreachable cell renders the clear no-route message (not a silent '—')", () => {
+  const tsrc = readFileSync(TEMPLATE_PATH, "utf8");
+  // bdHTML renders the user-facing no-route copy; loadBreak must route an unreachable (v==null) cell
+  // INTO it (we render directly from TT — no /itinerary round-trip), so the hover shows the message.
+  assert.match(tsrc, /No transit route within ~75 min\./,
+    "the no-route user message must exist in the template");
+  assert.match(tsrc, /if\(v==null\)\{setHTML\(bdHTML\(\{error:"no route"\}\)\)/,
+    "loadBreak must render the no-route breakdown for an unreachable (v==null) cell");
+});
+test("BUG3: the heatmap style() still dims above-thr cells (slider behavior preserved)", () => {
+  const tsrc = readFileSync(TEMPLATE_PATH, "utf8");
+  // The Max-commute slider must STILL hide above-thr cells in the heatmap — only INTERACTIVITY was
+  // decoupled. style() keeps its `v>thr` fillOpacity:0 test.
+  assert.match(tsrc, /function style\(f\)\{[^}]*if\(v==null\|\|v>thr\)return\{fillOpacity:0/,
+    "style() must keep dimming above-thr cells (the slider still controls coloring)");
 });
 
 // --------------------------------------------------------------------------- //

@@ -673,6 +673,17 @@ def mc_peek(dlat, dlon, max_rides, speed):
     return _RAPTOR_MC_CACHE.get(coarse_key(dlat, dlon, max_rides, speed))
 
 
+def _legs_have_transit(legs):
+    """True iff a traced journey's leg list contains a real TRANSIT leg. Used to drop WALK-ONLY
+    "alternatives" — an alt enumerated by ``alt_lines_window`` whose access-stop journey degenerates
+    to pure walking (e.g. the line's hop is a sub-2-min ride folded into walk by ``_TINY_HOP_MIN``,
+    or the via-stop trace is just a longer walk). Such an alt is labeled with a line name yet has no
+    ride: it offers the user nothing but a slower walking path (the reported "walk 26/27/27/30m"
+    pointless alternatives), so it must never be served as an alternative route. The PRIMARY itself
+    may legitimately be walk-only (a very close cell) — this guard applies ONLY to the alt list."""
+    return any((l or {}).get("mode") == "transit" for l in (legs or ()))
+
+
 def _alt_route_preamble(ci, dlat, dlon, max_rides, speed):
     """Shared front-half of BOTH ``_itinerary_alts`` variants (arrive-by + depart-after): resolve
     the cell's MC alt chips/bundle, the per-cell geom cache, and the per-line access-stop map. The
@@ -739,6 +750,8 @@ def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None):
         it = tree.itinerary_via_stop(ci, int(s), geom_provider=provider)
         if it is None:
             continue
+        if not _legs_have_transit(it["geom"]):
+            continue                                     # walk-only alt: pointless, drop it
         out.append({"line": line, "min": it["total"], "legs": it["geom"]})
     with _ALT_LOCK:                                      # cache the assembled alts for this cell
         geom_cache[ci] = out
@@ -859,6 +872,13 @@ def _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed, prov50,
         it50 = tree50.itinerary_via_stop(ci, int(s), geom_provider=prov50, percentile=50)
         it5 = tree50.itinerary_via_stop(ci, int(s), geom_provider=prov5, percentile=5)
         if it50 is None and it5 is None:
+            continue
+        # Walk-only alt: BOTH percentiles' journeys degenerate to pure walking (no ride) -> pointless,
+        # drop it (a line-labeled slower walk path; see _legs_have_transit). Keep it only if at least
+        # one percentile traces a real transit leg (an alt where p5 rides but p50 walks still informs).
+        has5 = it5 is not None and _legs_have_transit(it5["geom"])
+        has50 = it50 is not None and _legs_have_transit(it50["geom"])
+        if not (has5 or has50):
             continue
         d = {"line": line}
         if it50 is not None:

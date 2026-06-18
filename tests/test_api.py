@@ -289,6 +289,54 @@ def test_itinerary_total_matches_map_color_and_legs_sum(client):
 
 
 # --------------------------------------------------------------------------------------
+# BUG 3 regression: "uncolored" cells must still be inspectable / give clear feedback.
+# --------------------------------------------------------------------------------------
+# A user reported that hovering a cell that isn't lit up (outside the Max-commute time band, or
+# genuinely unreachable) shows nothing. The Max-commute slider (`thr`, default 40) only DIMS the
+# heatmap — it must NOT make a reachable cell un-inspectable — and a genuinely unreachable cell must
+# return a clean "no route" error the frontend can render as "No transit route within ~75 min."
+# (not a silent failure). This test pins the SERVER contract those two frontend behaviors rely on:
+#   (a) a reachable cell with a HIGH commute (above any reasonable thr) STILL returns a full
+#       /itinerary breakdown — proof the cell is inspectable even when dimmed; and
+#   (b) an unreachable cell ([None,None] in /compute, no journey within the ~75 min cap) returns
+#       {"error": ...} (no total/legs) — proof the no-route message path has real data behind it.
+def test_itinerary_works_for_uncolored_cells(client):
+    cells = _get_exact_cells(client)
+    # (a) Find a REACHABLE cell whose realistic minutes are well above the default thr (40), i.e. a
+    # cell that the heatmap leaves dimmed but that has a genuine commute. Pick the SLOWEST such cell
+    # so it's unambiguously above any reasonable slider value.
+    above_thr = sorted(
+        ((cid, real) for cid, (best, real) in cells.items()
+         if real is not None and real > 50),
+        key=lambda t: t[1],
+    )
+    assert above_thr, "no reachable cell above 50 min — can't exercise the dimmed-but-reachable case"
+    cid_hi, real_hi = above_thr[-1]                       # the slowest reachable cell
+    resp = client.get(f"/itinerary?id={cid_hi}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    itin = resp.get_json()
+    assert "error" not in itin, (
+        f"dimmed-but-reachable cell {cid_hi} ({real_hi} min) must be inspectable, got {itin}"
+    )
+    assert itin.get("total") == real_hi, f"{cid_hi}: itinerary total {itin.get('total')} != {real_hi}"
+    assert itin.get("legs"), f"{cid_hi}: reachable cell with empty legs: {itin}"
+    assert itin.get("geom"), f"{cid_hi}: reachable cell with no geom to draw: {itin}"
+
+    # (b) Find a genuinely UNREACHABLE cell ([None, None] in /compute) and assert /itinerary returns
+    # a clean error (no total/legs), so the frontend can show the "no route" message rather than fail
+    # silently. Some workplaces reach every cell; skip cleanly if none are unreachable here.
+    unreachable = [cid for cid, (best, real) in cells.items() if best is None and real is None]
+    if unreachable:
+        cid_un = unreachable[0]
+        resp = client.get(f"/itinerary?id={cid_un}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        itin = resp.get_json()
+        assert "error" in itin, f"unreachable cell {cid_un} must return an error, got {itin}"
+        assert itin.get("total") is None, f"unreachable cell {cid_un} carried a total: {itin}"
+        assert not itin.get("legs"), f"unreachable cell {cid_un} carried legs: {itin}"
+
+
+# --------------------------------------------------------------------------------------
 # /itinerary == map under the DEPART-AFTER semantic (Stage 2 of the depart-after migration)
 # --------------------------------------------------------------------------------------
 # The session `server`/`client` fixtures boot ONE engine (arrive-by, the production default), so
@@ -437,6 +485,31 @@ if cell_alt is not None:
                alt_both=alt_both, alt_p5_gt_p50=alt_p5_gt_p50,
                alt_with_frag=alt_with_frag, alt_frag_bad=alt_frag_bad)
 
+# BUG 2 (depart-after): walk-only "alternatives" are pointless. Sweep the WALKABLE alt-cells (the
+# closest by best-case minutes, where a line's hop is most likely a sub-2-min ride folded into walk)
+# and assert NO served alt is transit-less. depart-after alts nest legs under best/typical.
+def _alt_has_transit(a):
+    for jk in ("best", "typical"):
+        for l in (a.get(jk) or {}).get("legs", []):
+            if (l or {}).get("mode") == "transit":
+                return True
+    return False
+alt_cids = [cid for cid, vv in variance.items() if vv.get("alt")]
+alt_cids.sort(key=lambda cid: (cells[cid][0] if cells.get(cid) and cells[cid][0] is not None else 10**6))
+wo_scan_cells = 0; wo_alts = 0; wo_examples = []; transit_alts = 0
+for cid in alt_cids[:90]:                                # walkable-first, bounded for the rate limit
+    it = c.get("/itinerary?id=%%s&dlat=%%s&dlon=%%s" %% (cid, FLAT, FLON)).get_json()
+    if "error" in it:
+        continue
+    wo_scan_cells += 1
+    for a in it.get("alts", []):
+        if _alt_has_transit(a):
+            transit_alts += 1
+        else:
+            wo_alts += 1
+            if len(wo_examples) < 5:
+                wo_examples.append([cid, a.get("line")])
+
 print(json.dumps({
     "health": {k: health.get(k) for k in ("engine", "semantic", "walk")},
     "n_cells": len(cells), "n_reach": len(reach), "n_sample": len(sample),
@@ -449,6 +522,8 @@ print(json.dumps({
     "n_variance": len(variance), "v_frag": v_frag,
     "v_altcap": v_altcap, "v_altdom": v_altdom, "alt_cells": alt_cells,
     "frag_pos": frag_pos, "var_cache_ok": var_cache_ok, "pin": pin,
+    "wo_scan_cells": wo_scan_cells, "wo_alts": wo_alts, "wo_examples": wo_examples,
+    "transit_alts": transit_alts,
 }))
 '''
 
@@ -547,6 +622,15 @@ def test_itinerary_equals_map_departafter():
     assert pin["alt_p5_gt_p50"] == 0, f"{pin['alt_p5_gt_p50']} alts with p5 (best-case) > p50 (typical)"
     assert pin["alt_with_frag"] > 0, "no alt carried a per-route fragility under depart-after pin=1"
     assert pin["alt_frag_bad"] == 0, f"{pin['alt_frag_bad']} alts with negative fragility"
+    # BUG 2: walk-only "alternatives" are pointless and must never be served. Sweep the walkable
+    # alt-cells (closest by best-case minutes) and assert ZERO transit-less alts, while a transit
+    # alt is still served (the filter didn't nuke every alternative).
+    assert res["wo_scan_cells"] > 0, "BUG2 scan found no alt-cells to check under depart-after"
+    assert res["wo_alts"] == 0, (
+        f"BUG2: {res['wo_alts']} walk-only (transit-less) alts served across "
+        f"{res['wo_scan_cells']} depart-after cells, e.g. {res['wo_examples']}")
+    assert res["transit_alts"] > 0, (
+        "BUG2: no transit alternatives served under depart-after — filter is over-aggressive")
 
 
 # --------------------------------------------------------------------------------------
@@ -957,6 +1041,67 @@ def test_itinerary_alts_lines_subset_chips_and_geometry_contract(client, server)
     resp2 = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
     assert resp2.status_code == 200
     assert resp2.get_json()["alts"] == alts, "alts differ across two identical requests"
+
+
+# --------------------------------------------------------------------------------------
+# BUG 2 regression: WALK-ONLY "alternatives" are pointless — never serve a transit-less alt.
+# --------------------------------------------------------------------------------------
+# A user reported that a walkable cell's compare card showed multiple pure-walk "routes" (e.g.
+# walk 26/27/27/30m) — different walking paths labeled with a bus line you don't actually ride. They
+# come from alt_lines_window enumerating a line by an access stop whose journey degenerates to pure
+# walking (a sub-2-min ride folded into walk by _TINY_HOP_MIN, or a longer via-stop walk). Such an
+# alt has no transit leg → no information. The fix (server_raptor._legs_have_transit) drops any alt
+# whose traced journey carries no ride, in BOTH semantics. This is a SCANNING test (user policy):
+# it sweeps EVERY cell the MC surfaced alt chips for and asserts NO served alt is walk-only, AND that
+# a transit cell still gets its real (transit) alternatives.
+@pytest.mark.slow
+def test_no_walk_only_alternatives(client, server):
+    _skip_unless_mc(server)
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+    client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    rv = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert rv.status_code == 200, rv.get_data(as_text=True)
+    mc = server._mc_peek(FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    assert mc is not None, "MC not built"
+
+    def _legs_transit(legs):
+        return any((l or {}).get("mode") == "transit" for l in (legs or ()))
+
+    # Sweep cells with alt chips and assert each SERVED alt rides a real transit leg. The walk-only-
+    # alt bug lives on WALKABLE (low-time) cells near the workplace, so bias the sample toward those:
+    # take the closest 90 chip-cells by best-case minutes (then bounded under the /itinerary 120/min
+    # rate limit). The whole grid's chip cells number ~1k+, so this is a broad-but-bounded scan.
+    cells = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}").get_json()["cells"]
+    chip_cids = [server._RAPTOR.cell_ids[ci]
+                 for ci, lines in mc.get("alt_chips", {}).items() if lines]
+    assert chip_cids, "no cell surfaced alt chips — can't exercise the alt path"
+
+    def _best(cid):
+        v = cells.get(str(cid)) or cells.get(cid)
+        return v[0] if (v and v[0] is not None) else 10 ** 6
+    sample = sorted(chip_cids, key=_best)[:90]             # walkable-first, bounded for the rate limit
+    checked_cells = 0
+    walk_only_alts = []                                   # (cell, line, legs) offenders, if any
+    transit_alts_seen = 0
+    for cid in sample:
+        resp = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+        assert resp.status_code == 200, resp.get_data(as_text=True)
+        for a in resp.get_json().get("alts", []):
+            legs = a.get("legs", [])
+            if _legs_transit(legs):
+                transit_alts_seen += 1
+            else:
+                walk_only_alts.append((cid, a.get("line"), legs))
+        checked_cells += 1
+    assert not walk_only_alts, (
+        f"served {len(walk_only_alts)} walk-only (transit-less) alts across {checked_cells} cells: "
+        f"{walk_only_alts[:5]}")
+    # A transit cell must still get its real alts (the filter didn't nuke every alternative).
+    assert transit_alts_seen > 0, (
+        "no transit alternatives served across any cell — the filter is over-aggressive")
 
 
 @pytest.mark.slow
