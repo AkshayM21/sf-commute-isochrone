@@ -7,8 +7,9 @@ This is the same math the live server runs for grid cells, but for off-grid orig
 tiny CSR access table (origin -> nearby stops walk seconds) for our origins via the walk graph,
 compute the workplace egress (stops -> W) the way the server does, and hand both to the engine's
 public ``commute_for_access`` — which roots the reverse range-RAPTOR at the workplace and
-assembles either the depart-after p50 (the R5-validated "realistic median, typical wait
-included") or the arrive-by perfect-timing commute per origin. Output: minutes int per origin id.
+assembles the served planned scheduled commute by default. The legacy depart-after percentile and
+arrive-by perfect-timing semantics remain available explicitly for validation/comparison. Output:
+minutes int per origin id.
 """
 import sys, json, argparse
 from pathlib import Path
@@ -20,8 +21,9 @@ from core import config
 from core.raptor_engine import RaptorEngine, ARRIVE_BY_HM
 from core.walk import WalkGraph
 
-# walk-speed toggle, mirroring server.WALK_SPEEDS (scalar = reference 4.8 / pace)
-WALK_SPEEDS = {"slow": 4.0, "med": config.WALK_KMH, "fast": 5.6}
+# Walk-speed toggle: one source of truth with the live server. The graph remains baked at the
+# reference pace; requests rescale it by reference / selected product pace.
+WALK_SPEEDS = config.WALK_SPEEDS
 
 
 def build_origin_access(wg, valid_gids, stop_nodes, stop_conn, origins_ll, cap_min):
@@ -52,13 +54,19 @@ def _method(engine, semantic, speed_kmh):
     """Human-readable provenance string, built from the LIVE model constants (config + engine)
     so it can never drift from what was actually computed."""
     common = (f"walk+Muni+BART+Caltrain to the workplace passed via --dest-lat/--dest-lon; "
-              f"walk speed {speed_kmh:g} km/h; access cap {engine.access_cap_min} min.")
+              f"walk speed {speed_kmh:g} km/h; reference access cap {engine.access_cap_min} min "
+              f"(rescaled at the selected pace).")
+    if semantic == "planned":
+        return (f"served planned scheduled commute (JVM-free reverse range-RAPTOR + hill-aware "
+                f"walk graph); one first-boarding-anchored scheduled value matching the live map "
+                f"(not a percentile); " + common)
     if semantic == "departafter":
         dep0 = config.DEP_HM[0] * 3600 + config.DEP_HM[1] * 60
         win = int(config.window().total_seconds())
-        return (f"real RAPTOR routing (JVM-free reverse range-RAPTOR + hill-aware walk graph); "
-                f"depart-after p50 (realistic median, typical wait included; R5-validated "
-                f"MAE 0.75) over the {_hm(dep0)}-{_hm(dep0 + win)} departure window; " + common)
+        return (f"legacy RAPTOR validation routing (JVM-free reverse range-RAPTOR + hill-aware "
+                f"walk graph); depart-after p50 (realistic median, typical wait included) over "
+                f"the {_hm(dep0)}-{_hm(dep0 + win)} departure window; not the live-map metric; "
+                + common)
     target = ARRIVE_BY_HM[0] * 3600 + ARRIVE_BY_HM[1] * 60
     return (f"real RAPTOR routing (arrive-by-{_hm(target)} perfect-timing, JVM-free); "
             f"optimistic; " + common)
@@ -70,9 +78,10 @@ def main():
     ap.add_argument("--dest-lon", type=float, required=True)
     ap.add_argument("--origins", required=True, help="JSON file: list of {id,lat,lon}")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--semantic", default="departafter", choices=["departafter", "arriveby"])
+    ap.add_argument("--semantic", default="planned", choices=["planned", "departafter", "arriveby"],
+                    help="routing metric: planned matches the live map; the others are legacy comparison modes")
     ap.add_argument("--speed", default="med", choices=sorted(WALK_SPEEDS),
-                    help="walk pace (mirrors the server toggle): slow 4.0 / med 4.8 / fast 5.6 km/h")
+                    help="walk pace (mirrors the server toggle): slow 3.4 / med 4.2 / fast 5.2 km/h")
     args = ap.parse_args()
 
     origins = json.load(open(args.origins))
@@ -121,9 +130,15 @@ def main():
     result["_method"] = _method(engine, args.semantic, speed_kmh)
     json.dump(result, open(args.out, "w"), indent=1)
     reachable = [v for v in vals if v is not None]
-    print(f"[commute] wrote {args.out}: {len(reachable)}/{len(ids)} reachable, "
-          f"range {min(reachable)}-{max(reachable)} min, "
-          f"null ids: {[ids[i] for i in range(len(ids)) if vals[i] is None]}", flush=True)
+    if reachable:
+        print(f"[commute] wrote {args.out}: {len(reachable)}/{len(ids)} reachable, "
+              f"range {min(reachable)}-{max(reachable)} min, "
+              f"null ids: {[ids[i] for i in range(len(ids)) if vals[i] is None]}", flush=True)
+    else:
+        # min()/max() would raise on an empty list AFTER the output file was written,
+        # making a valid all-null run look like a crash. Summarize honestly instead.
+        print(f"[commute] wrote {args.out}: 0/{len(ids)} reachable "
+              f"(no origin reaches the workplace within the caps; all values null)", flush=True)
 
 
 if __name__ == "__main__":

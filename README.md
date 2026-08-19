@@ -12,23 +12,26 @@ choose within N minutes** by **walking + Muni + BART + Caltrain**, arriving on a
 weekday morning — rendered as an interactive map.
 
 For a 200m grid of origin points across SF, the tool routes door-to-door
-(walk → wait → transit incl. transfers → walk) to your chosen destination using
-real GTFS schedules and the OpenStreetMap walking network, via the Conveyal
-**R5** routing engine (`r5py`). Results are aggregated to the 117 SF "Find
-Neighborhoods" and ranked by travel time.
+(walk → transit incl. transfers → walk) to your chosen destination using real GTFS
+schedules and the OpenStreetMap walking network. The live application uses its own
+JVM-free reverse range-RAPTOR transit router plus a hill-aware walking graph. Results
+are aggregated to the 117 SF "Find Neighborhoods" and ranked by travel time.
 
 > **Note (2026-05-25): the live server now defaults to a JVM-free stack** — a self-built reverse
 > RAPTOR transit router + a hill-aware (Tobler) walk router — so **Java/R5 is no longer required to
-> run it** (~245 MB RSS, no JVM). The map is now an **arrive-by-9:00am** estimate with a
-> realistic-vs-best-case toggle, a service-noise fragility overlay, and a slow/med/fast walk-speed
-> control. R5 is kept only for offline oracle/validation and as a fallback. See **RAPTOR.md** for the
-> engine + the one-time bakes (`fetch_dem.sh` → `build_walk_graph.py` → `bake_walk_access.py`); the
+> run it** (~245 MB RSS, no JVM). The map answers **depart-after** ("leave during a ~8am window —
+> how long to work?"), colored by door-to-door commute DURATION (so "arrive ~9am" is implicit). It
+> has a scheduled/best-case toggle, a "bad-day" service-delay chip, and a slow/med/fast walk-speed
+> control. The scheduled depart-after read is timed to the first vehicle, so controllable starting
+> wait is not counted. **Walking faster can never increase the commute** (true-zero monotonicity,
+> guaranteed).
+> R5 is kept only for offline oracle/validation and as a fallback. See **RAPTOR.md** for the engine
+> + the one-time bakes (`fetch_dem.sh` → `build_walk_graph.py` → `bake_walk_access.py`); the
 > prereqs/quick-start below still describe the original R5 build and are being updated.
 
 Two numbers per location:
-- **best-case** — 5th percentile over the morning departure window (you time
-  departures well; transfers still modeled)
-- **realistic** — median (50th percentile), i.e. typical wait included
+- **scheduled** — timed to the first vehicle you choose to board; starting wait is not counted
+- **bad-day** — the p90 service-delay tail for that committed plan
 
 ## Prerequisites
 
@@ -47,13 +50,13 @@ Two numbers per location:
 git clone <this-repo> sf-commute-isochrone
 cd sf-commute-isochrone
 
-# 1. Configure your destination + token (this file is gitignored)
+# 1. Configure API access (this file is gitignored)
 cp .env.example .env
 #    then edit .env and set:
-#      DEFAULT_ADDRESS=...      (an address in SF to geocode),
 #      API511_TOKEN=...         (your free 511.org token), and
 #      GEOAPIFY_KEY=...         (free key for address search + autocomplete;
 #                                omit to fall back to keyless Photon)
+#    The live page does not inject a default workplace; visitors enter their own.
 
 # 2. Install the environment and download all input data
 bash scripts/setup.sh
@@ -156,14 +159,18 @@ All inputs are downloaded by `setup.sh` into `data/` (gitignored):
 
 ## Methodology
 
-Routing uses the Conveyal **R5** engine via
-[`r5py`](https://r5py.readthedocs.io/). Each origin's travel time is a full
-door-to-door trip: walk to stop → wait → transit (including transfers) → walk to
-the destination, evaluated against the real GTFS schedule over a morning
-departure window. The **best-case** number is the 5th-percentile time across that
-window (favorable departure timing) and the **realistic** number is the median
-(typical wait included) — so they bracket the experience rather than promise a
-single figure.
+The live route metric is a full scheduled door-to-door trip: physical walk to the
+boarding stop → transit (including transfers) → physical walk to the destination.
+It is anchored to the first scheduled vehicle, so controllable time spent arriving
+early for that first boarding is reported separately as schedule allowance rather
+than mislabeled as walking. A service-delay simulation supplies the bad-day impact.
+
+Walking uses fixed Slow (3.4 km/h), Medium (4.2 km/h), and Fast/Brisk (5.2 km/h)
+presets. Access, transfer, egress, and pure-walk legs all use the selected pace. See
+[`WALK_SPEED_CALIBRATION_2026-08-09.md`](WALK_SPEED_CALIBRATION_2026-08-09.md) for
+the bounded San Francisco calibration corpus and [`RAPTOR.md`](RAPTOR.md) for the
+routing model. Conveyal R5 remains an offline validation oracle and fallback, not
+the normal map or itinerary path.
 
 ## Notes
 

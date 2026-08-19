@@ -119,7 +119,8 @@ def test_compute_exact_shape_and_determinism(client, server):
 def test_compute_exact_matches_golden(client, server):
     """Regression snapshot for the ARRIVE-BY engine (the OPT-IN path since the 2026-06-17
     default flip). The in-process `server` fixture is pinned to arrive-by by conftest.py
-    (setdefault RAPTOR_SEMANTIC=arriveby), so this compares against the arrive-by golden
+    (hard pin: os.environ["RAPTOR_SEMANTIC"]="arriveby" — exported env cannot override),
+    so this compares against the arrive-by golden
     (tests/golden_exact_ferry.json). The SERVED DEFAULT (depart-after) has its own,
     non-skipping golden coverage in test_compute_exact_matches_golden_departafter below.
 
@@ -182,7 +183,11 @@ print(json.dumps({
     "engine": {"use_raptor": bool(server.USE_RAPTOR),
                "raptor_semantic": str(server.RAPTOR_SEMANTIC),
                "use_walk_graph": bool(server.USE_WALK_GRAPH),
-               "gtfs_fp": server._gtfs_fp()},
+               "gtfs_fp": server._gtfs_fp(),
+               "walk_reference_kmh": float(server.config.WALK_KMH),
+               "walk_speeds": {key: float(value)
+                               for key, value in sorted(server.WALK_SPEEDS.items())},
+               "default_walk_speed": str(server.DEFAULT_SPEED)},
     "cells": r.get_json()["cells"],
 }))
 '''
@@ -348,6 +353,7 @@ _DEPARTAFTER_DRIVER = r'''
 import json, sys, os
 sys.path.insert(0, %(scripts)r)
 import server
+ALT_CAP = getattr(server.sr, "RAPTOR_ALT_CHIP_CAP", 6)
 
 # JVM-free assertion: nothing from r5py / the Conveyal JVM may have been imported.
 jvm = sorted(m for m in sys.modules
@@ -362,39 +368,69 @@ FLAT, FLON = %(flat)r, %(flon)r
 
 health = c.get("/healthz").get_json()
 
+def route_sig(legs):
+    return tuple((g.get("mode"), g.get("name") or g.get("line") or "",
+                  int(g.get("min") or 0), int(g.get("wait") or 0))
+                 for g in (legs or []))
+
+def alt_total(a):
+    for jk in ("typical", "best"):
+        v = (a.get(jk) or {}).get("total")
+        if isinstance(v, int):
+            return v
+    v = a.get("total")
+    return v if isinstance(v, int) else None
+
+def has_route_structure(route):
+    family = route.get("family") or {}
+    branch = route.get("branch") or {}
+    return bool(family.get("key") and branch.get("key")
+                and branch.get("kind") in ("walk", "transit"))
+
+def family_branch_kinds(routes):
+    out = {}
+    for route in routes:
+        family = route.get("family") or {}
+        branch = route.get("branch") or {}
+        family_key, kind = family.get("key"), branch.get("kind")
+        if family_key and kind in ("walk", "transit"):
+            out.setdefault(family_key, set()).add(kind)
+    return {key: sorted(kinds) for key, kinds in out.items()}
+
 r = c.get("/compute?lat=%%s&lon=%%s" %% (FLAT, FLON))
 assert r.status_code == 200, r.get_data(as_text=True)
 cells = r.get_json()["cells"]
 
-# /compute returns [p5, p50] per reachable cell with p5 <= p50.
+# /compute returns [scheduled, scheduled] per reachable cell under planned depart-after.
 shape_bad = [(cid, v) for cid, v in cells.items()
              if v[1] is not None and not (isinstance(v[0], int) and isinstance(v[1], int)
                                           and v[0] <= v[1])]
+same_bad = [(cid, v) for cid, v in cells.items()
+            if v[1] is not None and v[0] != v[1]]
 
-# Sample reachable cells across the time distribution. Stage-3 target model: /itinerary returns
-# BOTH the best-case (p5) and typical (p50) journeys; hover==map must hold for BOTH percentiles —
-# the p50 journey total == cells[c][1] (root + .typical), the p5 journey total == cells[c][0]
-# (.best). Each journey's legs reconcile to its own total and its geom mirrors its legs 1:1.
+# Sample reachable cells across the time distribution. /itinerary still returns both `.best` and
+# `.typical` for compatibility, but planned depart-after mirrors the same scheduled journey into
+# both slots. Each journey's legs reconcile to its own total and its geom mirrors its legs 1:1.
 reach = [(cid, v[1]) for cid, v in cells.items() if v[1] is not None and v[1] >= 8]
 reach.sort(key=lambda t: t[1])
 step = max(1, len(reach) // 30)
 sample = reach[::step][:30]
 
 p50_match = p50_total = p5_match = p5_total = best_present = 0
-legs50_bad = legs5_bad = transit = geom_checked = geom_bad = 0
+legs50_bad = legs5_bad = first_wait_bad = transit = geom_checked = geom_bad = 0
 mismatches = []
 for cid, p50 in sample:
     it = c.get("/itinerary?id=%%s&dlat=%%s&dlon=%%s" %% (cid, FLAT, FLON)).get_json()
     if "error" in it:
         mismatches.append((cid, "error")); continue
     p5_exp, p50_exp = cells[cid][0], cells[cid][1]
-    # TYPICAL (p50): root total + .typical.total both == cells[c][1]
+    # Scheduled root/.typical total == cells[c][1].
     p50_total += 1
     if it["total"] == p50_exp and it.get("typical", {}).get("total") == p50_exp:
         p50_match += 1
     else:
         mismatches.append((cid, "p50", it["total"], it.get("typical", {}).get("total"), p50_exp))
-    # BEST-CASE (p5): .best.total == cells[c][0]
+    # Compatibility .best total == cells[c][0] (same scheduled value in planned mode).
     if "best" in it:
         best_present += 1; p5_total += 1
         if it["best"]["total"] == p5_exp:
@@ -414,6 +450,9 @@ for cid, p50 in sample:
         for l in legs:
             if l["mode"] == "transit" and l["line"]:
                 transit += 1
+                if l.get("wait", 0) != 0:
+                    first_wait_bad += 1
+                break
         geom = j.get("geom")
         if geom is not None:
             geom_checked += 1
@@ -430,7 +469,8 @@ attr_bad = sum(1 for v in attr.values() if not (isinstance(v, str) and v.strip()
 
 # Stage 3 target model: /variance under depart-after carries the service-noise overlay
 # {frag, stuck, alt} ONLY — NO "realistic" headline (the typical headline is the bare p50 the map
-# already paints, cells[c][1]). frag >= 0 per reachable cell; alt cap 4, never the cell's own line.
+# already paints, cells[c][1]). frag >= 0 per reachable cell; alts respect the configured cap
+# and never include the cell's own line.
 var = c.get("/variance?dlat=%%s&dlon=%%s" %% (FLAT, FLON))
 vb = var.get_json()
 has_realistic = "realistic" in vb
@@ -442,7 +482,7 @@ for cid, vv in variance.items():
     a = vv.get("alt")
     if a:
         alt_cells += 1
-        if len(a) > 4: v_altcap += 1
+        if len(a) > ALT_CAP: v_altcap += 1
         if attr.get(cid) in a: v_altdom += 1
 # determinism: a second identical GET is byte-identical (LRU cache + per-workplace seed)
 vb2 = c.get("/variance?dlat=%%s&dlon=%%s" %% (FLAT, FLON)).get_json()
@@ -510,12 +550,124 @@ for cid in alt_cids[:90]:                                # walkable-first, bound
             if len(wo_examples) < 5:
                 wo_examples.append([cid, a.get("line")])
 
+# Concrete regression for a short-hop route that used to fold its transit leg into walking and
+# reconcile the whole scheduled value into one fake walk leg. It must expose the transit leg, and
+# its alternatives must retain a genuinely different boarding corridor even when the primary is
+# faster. Family identity comes from server-discovered structure, never a concrete line label.
+try:
+    server.limiter.reset()
+except Exception:
+    pass
+M_OLAT, M_OLON = 37.7664, -122.4267
+M_DLAT, M_DLON = 37.7750, -122.4194
+m_compute = c.get("/compute?lat=%%s&lon=%%s" %% (M_DLAT, M_DLON))
+m_var = c.get("/variance?dlat=%%s&dlon=%%s" %% (M_DLAT, M_DLON))
+m_it = c.get("/itinerary?olat=%%s&olon=%%s&dlat=%%s&dlon=%%s&pin=1" %%
+             (M_OLAT, M_OLON, M_DLAT, M_DLON))
+mission = {"compute_status": m_compute.status_code, "var_status": m_var.status_code,
+           "it_status": m_it.status_code}
+if m_it.status_code == 200:
+    mj = m_it.get_json()
+    m_geom = mj.get("geom", [])
+    m_alts = mj.get("alts", [])
+    m_psig = route_sig(m_geom)
+    m_family_key = (mj.get("family") or {}).get("key")
+    m_alt_family_keys = sorted({(a.get("family") or {}).get("key") for a in m_alts
+                                if (a.get("family") or {}).get("key")})
+    mission.update({
+        "total": mj.get("total"),
+        "legs": mj.get("legs", []),
+        "has_primary_transit": any(g.get("mode") == "transit" and g.get("name") for g in m_geom),
+        "single_walk": (len(mj.get("legs", [])) == 1 and mj.get("legs", [{}])[0].get("mode") == "walk"),
+        "alt_labels": [a.get("line") for a in m_alts],
+        "primary_family_key": m_family_key,
+        "alt_family_keys": m_alt_family_keys,
+        "structure_complete": has_route_structure(mj)
+                              and bool(m_alts)
+                              and all(has_route_structure(a) for a in m_alts),
+        "has_distinct_boarding_family": bool(
+            m_family_key and any(key != m_family_key for key in m_alt_family_keys)),
+        "alt_dup_primary": sum(1 for a in m_alts
+                               if route_sig((a.get("typical") or {}).get("legs") or a.get("legs"))
+                               == m_psig),
+    })
+
+# Screenshot regression: this origin/destination used to serve the exact primary journey again as
+# alt #1, wasting one capped route slot and showing duplicate compare rows. Its useful optionality
+# is structural: one boarding-corridor family offers both walk-finish and transit-tail branches.
+T_DLAT, T_DLON = 37.7714154, -122.4030885
+t_compute = c.get("/compute?lat=%%s&lon=%%s" %% (T_DLAT, T_DLON))
+t_var = c.get("/variance?dlat=%%s&dlon=%%s" %% (T_DLAT, T_DLON))
+t_it = c.get("/itinerary?olat=%%s&olon=%%s&dlat=%%s&dlon=%%s&pin=1" %%
+             (M_OLAT, M_OLON, T_DLAT, T_DLON))
+townsend = {"compute_status": t_compute.status_code, "var_status": t_var.status_code,
+            "it_status": t_it.status_code}
+if t_it.status_code == 200:
+    tj = t_it.get_json()
+    t_alts = tj.get("alts", [])
+    t_psig = route_sig(tj.get("geom", []))
+    t_alt_totals = [x for x in (alt_total(a) for a in t_alts) if x is not None]
+    t_family_branches = family_branch_kinds(t_alts)
+    townsend.update({
+        "total": tj.get("total"),
+        "alt_labels": [a.get("line") for a in t_alts],
+        "min_alt_total": min(t_alt_totals) if t_alt_totals else None,
+        "structure_complete": bool(t_alts) and all(has_route_structure(a) for a in t_alts),
+        "family_branch_kinds": t_family_branches,
+        "has_walk_transit_siblings": any(
+            set(kinds) == {"walk", "transit"} for kinds in t_family_branches.values()),
+        "alt_dup_primary": sum(1 for a in t_alts
+                               if route_sig((a.get("typical") or {}).get("legs") or a.get("legs"))
+                               == t_psig),
+    })
+
+# Same cell at slow walk speed, without priming /variance. Planned branch expansion must still
+# recover both structural siblings: stay on the boarding corridor and walk, or transfer to a
+# transit tail toward the destination. This protects the walk-speed-dependent branch-loss failure
+# without assigning special policy to either observed line name.
+t_slow_it = c.get("/itinerary?olat=%%s&olon=%%s&dlat=%%s&dlon=%%s&speed=slow&pin=1" %%
+                  (M_OLAT, M_OLON, T_DLAT, T_DLON))
+townsend_slow = {"it_status": t_slow_it.status_code}
+if t_slow_it.status_code == 200:
+    tsj = t_slow_it.get_json()
+    ts_alts = tsj.get("alts", [])
+    ts_alt_totals = [x for x in (alt_total(a) for a in ts_alts) if x is not None]
+    ts_family_branches = family_branch_kinds(ts_alts)
+    townsend_slow.update({
+        "total": tsj.get("total"),
+        "alt_labels": [a.get("line") for a in ts_alts],
+        "min_alt_total": min(ts_alt_totals) if ts_alt_totals else None,
+        "structure_complete": bool(ts_alts) and all(has_route_structure(a) for a in ts_alts),
+        "family_branch_kinds": ts_family_branches,
+        "has_walk_transit_siblings": any(
+            set(kinds) == {"walk", "transit"} for kinds in ts_family_branches.values()),
+    })
+
+t_fast_it = c.get("/itinerary?olat=%%s&olon=%%s&dlat=%%s&dlon=%%s&speed=fast&pin=1" %%
+                  (M_OLAT, M_OLON, T_DLAT, T_DLON))
+townsend_fast = {"it_status": t_fast_it.status_code}
+if t_fast_it.status_code == 200:
+    tfj = t_fast_it.get_json()
+    tf_alts = tfj.get("alts", [])
+    tf_alt_totals = [x for x in (alt_total(a) for a in tf_alts) if x is not None]
+    tf_family_branches = family_branch_kinds(tf_alts)
+    townsend_fast.update({
+        "total": tfj.get("total"),
+        "alt_labels": [a.get("line") for a in tf_alts],
+        "min_alt_total": min(tf_alt_totals) if tf_alt_totals else None,
+        "structure_complete": bool(tf_alts) and all(has_route_structure(a) for a in tf_alts),
+        "family_branch_kinds": tf_family_branches,
+        "has_walk_branch": any("walk" in kinds for kinds in tf_family_branches.values()),
+    })
+
 print(json.dumps({
     "health": {k: health.get(k) for k in ("engine", "semantic", "walk")},
     "n_cells": len(cells), "n_reach": len(reach), "n_sample": len(sample),
-    "shape_bad": shape_bad[:5], "p50_match": p50_match, "p50_total": p50_total,
+    "shape_bad": shape_bad[:5], "same_bad": same_bad[:5],
+    "p50_match": p50_match, "p50_total": p50_total,
     "p5_match": p5_match, "p5_total": p5_total, "best_present": best_present,
     "mismatches": mismatches[:5], "legs50_bad": legs50_bad, "legs5_bad": legs5_bad,
+    "first_wait_bad": first_wait_bad,
     "transit": transit, "geom_checked": geom_checked, "geom_bad": geom_bad,
     "attr_cells": len(attr), "attr_bad": attr_bad,
     "var_status": var.status_code, "var_keys": sorted(vb.keys()), "has_realistic": has_realistic,
@@ -523,7 +675,8 @@ print(json.dumps({
     "v_altcap": v_altcap, "v_altdom": v_altdom, "alt_cells": alt_cells,
     "frag_pos": frag_pos, "var_cache_ok": var_cache_ok, "pin": pin,
     "wo_scan_cells": wo_scan_cells, "wo_alts": wo_alts, "wo_examples": wo_examples,
-    "transit_alts": transit_alts,
+    "transit_alts": transit_alts, "mission": mission, "townsend": townsend,
+    "townsend_slow": townsend_slow, "townsend_fast": townsend_fast,
 }))
 '''
 
@@ -567,9 +720,9 @@ def test_itinerary_equals_map_departafter():
     assert _approx_cell_count(res["n_cells"]), f"got {res['n_cells']} cells"
     assert res["n_reach"] >= 100, f"only {res['n_reach']} reachable cells (depart-after)"
     assert res["n_sample"] >= 15, f"only {res['n_sample']} sampled cells"
-    assert not res["shape_bad"], f"/compute not [p5<=p50]: {res['shape_bad']}"
-    # hover == map for BOTH percentiles on EVERY sampled cell: the p50 journey (root + .typical)
-    # total == cells[c][1] AND the p5 journey (.best) total == cells[c][0].
+    assert not res["shape_bad"], f"/compute not [best<=scheduled]: {res['shape_bad']}"
+    assert not res["same_bad"], f"/compute depart-after should be [scheduled, scheduled]: {res['same_bad']}"
+    # hover == map for BOTH compatibility slots: root/.typical == cells[c][1] and .best == cells[c][0].
     assert res["p50_match"] == res["p50_total"] == res["n_sample"], (
         res["p50_match"], res["p50_total"], res["n_sample"], res["mismatches"])
     assert res["best_present"] == res["n_sample"], (
@@ -578,6 +731,8 @@ def test_itinerary_equals_map_departafter():
         res["p5_match"], res["p5_total"], res["n_sample"], res["mismatches"])
     assert res["legs50_bad"] == 0, f"{res['legs50_bad']} cells whose p50 legs don't sum to the total"
     assert res["legs5_bad"] == 0, f"{res['legs5_bad']} cells whose p5 legs don't sum to the total"
+    assert res["first_wait_bad"] == 0, (
+        f"{res['first_wait_bad']} sampled depart-after journeys showed a first transit wait")
     assert res["transit"] > 0, "no transit legs seen across the depart-after sample"
     # geom (the drawn hover route) mirrors the breakdown 1:1 on each journey that returned it.
     assert res["geom_checked"] > 0, "no geom returned on any sampled depart-after journey"
@@ -594,8 +749,9 @@ def test_itinerary_equals_map_departafter():
     # frag >= 0 (= p90 - the served p50, by the p50-floored draws) on every reachable cell.
     assert res["v_frag"] == 0, f"{res['v_frag']} cells with negative fragility"
     assert res["frag_pos"] > 0, "depart-after MC produced zero fragility everywhere (delays not applied)"
-    # alt-lines: capped at 4, never the cell's own dominant line, present on a meaningful set of cells.
-    assert res["v_altcap"] == 0, f"{res['v_altcap']} cells with > 4 alt lines"
+    # alt-lines: capped by the configured display cap, never the cell's own dominant line, present on
+    # a meaningful set of cells.
+    assert res["v_altcap"] == 0, f"{res['v_altcap']} cells exceeded the configured alt-line cap"
     assert res["v_altdom"] == 0, f"{res['v_altdom']} cells whose alt includes their own dominant line"
     assert res["alt_cells"] > 0, "no cell carried alt-lines under depart-after"
     # deterministic + cached: a second identical /variance GET is byte-identical.
@@ -631,6 +787,48 @@ def test_itinerary_equals_map_departafter():
         f"{res['wo_scan_cells']} depart-after cells, e.g. {res['wo_examples']}")
     assert res["transit_alts"] > 0, (
         "BUG2: no transit alternatives served under depart-after — filter is over-aggressive")
+    mission = res["mission"]
+    assert mission["compute_status"] == 200 and mission["var_status"] == 200, mission
+    assert mission["it_status"] == 200, mission
+    assert mission["has_primary_transit"], (
+        f"Mission Dolores route collapsed to fake walking: {mission}")
+    assert not mission["single_walk"], (
+        f"Mission Dolores route served as one walk leg again: {mission}")
+    assert mission["structure_complete"], (
+        f"Mission Dolores route omitted structural family/branch metadata: {mission}")
+    assert mission["has_distinct_boarding_family"], (
+        f"Mission Dolores route lost its distinct boarding-corridor alternative: {mission}")
+    assert mission["alt_dup_primary"] == 0, (
+        f"Mission Dolores served primary route again as an alt: {mission}")
+    townsend = res["townsend"]
+    assert townsend["compute_status"] == 200 and townsend["var_status"] == 200, townsend
+    assert townsend["it_status"] == 200, townsend
+    assert townsend["alt_dup_primary"] == 0, (
+        f"15th/Dolores -> 650 Townsend served primary route again as an alt: {townsend}")
+    # The tree's primary is the planner's committed route, not a promise that every separately
+    # traced structural alternative is slower. A valid faster alternative must survive dominance;
+    # the frontend labels the anchor "Planner route" instead of falsely calling it recommended.
+    assert townsend["structure_complete"], (
+        f"15th/Dolores -> 650 Townsend omitted structural route metadata: {townsend}")
+    assert townsend["has_walk_transit_siblings"], (
+        "15th/Dolores -> 650 Townsend lost walk-vs-transit-tail sibling optionality: "
+        f"{townsend}")
+    townsend_slow = res["townsend_slow"]
+    assert townsend_slow["it_status"] == 200, townsend_slow
+    assert townsend_slow["structure_complete"], (
+        "slow-walk Townsend response omitted structural route metadata: "
+        f"{townsend_slow}")
+    assert townsend_slow["has_walk_transit_siblings"], (
+        "15th/Dolores -> 650 Townsend slow walk lost deterministic walk-vs-transit-tail "
+        f"branch optionality without /variance priming: {townsend_slow}")
+    townsend_fast = res["townsend_fast"]
+    assert townsend_fast["it_status"] == 200, townsend_fast
+    assert townsend_fast["structure_complete"], (
+        "fast-walk Townsend response omitted structural route metadata: "
+        f"{townsend_fast}")
+    assert townsend_fast["has_walk_branch"], (
+        "15th/Dolores -> 650 Townsend fast walk lost its boarding-corridor walk branch: "
+        f"{townsend_fast}")
 
 
 # --------------------------------------------------------------------------------------
@@ -638,7 +836,7 @@ def test_itinerary_equals_map_departafter():
 # --------------------------------------------------------------------------------------
 @pytest.mark.slow
 def test_attribution_shape_caching_and_count(client, server):
-    # Use a fresh coarse key (Twin Peaks) to avoid colliding with any cached Ferry result,
+    # Use a fresh destination key (Twin Peaks) to avoid colliding with any cached Ferry result,
     # but keep the comparison against THIS dest's reachable count.
     dlat, dlon = FERRY_LAT, FERRY_LON
     with server._RESULT_CACHE_LOCK:
@@ -678,10 +876,11 @@ def _skip_unless_mc(server):
 def test_variance_realistic_floor_bounds_alt_and_cache(client, server):
     """The MC overlay's served contract: every realistic >= the perfect map's best minutes
     (the asserted perfect <= committed invariant, floored server-side), frag >= 0,
-    0 <= stuck <= 1, alt-lines are capped at 4 and never include the cell's own dominant
+    0 <= stuck <= 1, alt-lines respect the configured cap and never include the cell's own dominant
     line, and a second identical GET returns the identical payload (LRU cache + the
     deterministic per-workplace sha256 seed)."""
     _skip_unless_mc(server)
+    alt_cap = getattr(server.sr, "RAPTOR_ALT_CHIP_CAP", 6)
     try:
         server.limiter.reset()
     except Exception:
@@ -718,7 +917,7 @@ def test_variance_realistic_floor_bounds_alt_and_cache(client, server):
         assert 0.0 <= v["stuck"] <= 1.0, f"{cid}: stuck {v['stuck']} out of [0,1]"
         alt = v.get("alt")
         if alt:
-            assert len(alt) <= 4, f"{cid}: alt has {len(alt)} entries (> 4 cap)"
+            assert len(alt) <= alt_cap, f"{cid}: alt has {len(alt)} entries (> {alt_cap} cap)"
             assert dom.get(cid) not in alt, (
                 f"{cid}: alt {alt} includes the cell's own dominant line {dom.get(cid)!r}"
             )
@@ -765,6 +964,68 @@ def test_variance_speed_slow_shifts_payload(client, server):
     assert mean_s > mean_m, (
         f"slow-walk mean realistic {mean_s:.1f} not above medium {mean_m:.1f}"
     )
+
+
+def test_missing_walk_speed_uses_calibrated_medium_scalar(server):
+    """The product default is Medium, not the graph's 4.8 km/h bake reference."""
+    with server.app.test_request_context("/compute"):
+        speed, scalar = server._req_speed()
+    expected = server.config.WALK_KMH / server.WALK_SPEEDS[server.DEFAULT_SPEED]
+    assert speed == server.DEFAULT_SPEED == "med"
+    assert scalar == pytest.approx(expected)
+    assert scalar != 1.0
+
+    with server.app.test_request_context("/compute?speed=not-a-preset"):
+        invalid_speed, invalid_scalar = server._req_speed()
+    assert invalid_speed == speed
+    assert invalid_scalar == pytest.approx(scalar)
+
+
+def test_omitted_walk_speed_matches_explicit_medium_across_product_endpoints(client, server):
+    """The HTTP product default and ``speed=med`` are one routing/cache identity end to end."""
+    try:
+        server.limiter.reset()
+    except Exception:
+        pass
+
+    def get(path, *, explicit=False):
+        separator = "&" if "?" in path else "?"
+        suffix = f"{separator}speed=med" if explicit else ""
+        response = client.get(path + suffix)
+        assert response.status_code == 200, response.get_data(as_text=True)
+        body = response.get_json()
+        if isinstance(body, dict):
+            body.pop("ms", None)  # cache-hit timing is intentionally not response identity
+        return body
+
+    compute_path = f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}"
+    exact_path = f"/compute_exact?lat={FERRY_LAT}&lon={FERRY_LON}"
+    attribution_path = f"/attribution?dlat={FERRY_LAT}&dlon={FERRY_LON}"
+    variance_path = f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}"
+
+    default_compute = get(compute_path)
+    assert get(compute_path, explicit=True) == default_compute
+    assert get(exact_path, explicit=True) == get(exact_path)
+    assert get(attribution_path, explicit=True) == get(attribution_path)
+    default_variance = get(variance_path)
+    assert get(variance_path, explicit=True) == default_variance
+
+    variance = default_variance.get("variance") or {}
+    candidate = next((cid for cid, value in variance.items() if (value or {}).get("alt")), None)
+    if candidate is None:
+        candidate = next(
+            cid for cid, pair in default_compute["cells"].items()
+            if isinstance(pair, list) and len(pair) == 2 and pair[1] is not None
+        )
+    itinerary_path = (
+        f"/itinerary?id={candidate}&dlat={FERRY_LAT}&dlon={FERRY_LON}&pin=1"
+    )
+    default_itinerary = get(itinerary_path)
+    explicit_itinerary = get(itinerary_path, explicit=True)
+    assert explicit_itinerary == default_itinerary
+    options = [default_itinerary, *(default_itinerary.get("alts") or [])]
+    choice_keys = [option.get("choice_key") for option in options]
+    assert all(choice_keys) and len(choice_keys) == len(set(choice_keys))
 
 
 # --------------------------------------------------------------------------------------
@@ -971,7 +1232,8 @@ def test_itinerary_alts_lines_subset_chips_and_geometry_contract(client, server)
     assert "alts" in body, "/itinerary missing the alts field"
     alts = body["alts"]
     assert isinstance(alts, list) and alts, f"{cid}: expected drawn alts, got {alts!r}"
-    assert len(alts) <= 4, f"{cid}: {len(alts)} alts (> 4 cap)"
+    alt_cap = getattr(server.sr, "RAPTOR_ALT_CHIP_CAP", 6)
+    assert len(alts) <= alt_cap, f"{cid}: {len(alts)} alts (> {alt_cap} cap)"
 
     data = server._RAPTOR.data
     olat, olon = server.ORIGIN_LL[cid]
@@ -1105,7 +1367,7 @@ def test_no_walk_only_alternatives(client, server):
 
 
 @pytest.mark.slow
-def test_itinerary_pin_per_route_typicals(client, server):
+def test_itinerary_pin_per_route_typicals(client, server, monkeypatch):
     """/itinerary?pin=1 for a cell with alts carries a per-ROUTE committed-plan TYPICAL: the
     PRIMARY gains ``real``/``frag`` and EACH alt gains its OWN ``real``/``frag`` (the consistency
     fix so the compare card can show every strip on the same metric). Asserts:
@@ -1120,10 +1382,19 @@ def test_itinerary_pin_per_route_typicals(client, server):
         server.limiter.reset()
     except Exception:
         pass
+    # Other tests may have left this bounded MC result cached after its deliberately single retained
+    # lossless scenario was replaced by a newer workplace. Force this test's /variance call through
+    # the capture path; a stale token is expected to fall back exactly, but is not what this test is
+    # exercising.
+    mc_key = server._coarse_key(
+        FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    server._RAPTOR_MC_CACHE.pop(mc_key)
     client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
     rv = client.get(f"/variance?dlat={FERRY_LAT}&dlon={FERRY_LON}")
     assert rv.status_code == 200, rv.get_data(as_text=True)
     realistic = rv.get_json()["realistic"]
+    assert "scenario" not in rv.get_data(as_text=True).lower(), \
+        "private MC scenario/token leaked through the /variance JSON boundary"
     cid, _chips = _cell_with_alt_chips(server, FERRY_LAT, FERRY_LON)
     assert cid is not None, "MC surfaced no alt chips on any cell"
 
@@ -1136,8 +1407,19 @@ def test_itinerary_pin_per_route_typicals(client, server):
     mc = server._mc_peek(FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
     ci = server._RAPTOR.cell_index[cid]
     assert ci not in mc["typ"], f"{cid}: plain hover populated the typ cache"
+    token = mc.get("_scenario_token")
+    assert token, "production /variance failed to retain its lossless pin accelerator"
+    scenario = server.sr._mc_scenario_for(
+        token, server._coarse_key(FERRY_LAT, FERRY_LON,
+                                  server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED))
+    assert scenario is not None and scenario.nbytes <= server.sr._MC_SCENARIO_MAX_BYTES
 
     # PINNED: every route gains its own typical + fragility.
+    # A warm pin must consume the retained tail: rebuilding even one reverse profile is a failure.
+    from core import raptor as _raptor
+    monkeypatch.setattr(
+        _raptor, "montecarlo_commute_committed",
+        lambda *a, **k: pytest.fail("warm pin rebuilt the full committed reverse profiles"))
     t0 = time.time()
     body = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}&pin=1").get_json()
     dt_ms = (time.time() - t0) * 1000.0
@@ -1176,6 +1458,33 @@ def test_itinerary_pin_per_route_typicals(client, server):
     assert dt_ms < 900, f"{cid}: pin=1 typicals took {dt_ms:.0f}ms (> 900ms budget)"
 
 
+def test_mc_scenario_token_eviction_and_budget_fall_back(server, monkeypatch):
+    """Only one opaque scenario is retained; stale/wrong-key/oversize tokens resolve to None."""
+    sr = server.sr
+
+    class Scenario:
+        def __init__(self, nbytes, name):
+            self.nbytes = nbytes
+            self.name = name
+
+    monkeypatch.setattr(sr, "_MC_SCENARIO_ACTIVE", None)
+    monkeypatch.setattr(sr, "_MC_SCENARIO_SEQ", 0)
+    one = Scenario(1024, "one")
+    two = Scenario(2048, "two")
+    token1 = sr._retain_mc_scenario(("workplace-1",), one)
+    assert sr._mc_scenario_for(token1, ("workplace-1",)) is one
+    assert sr._mc_scenario_for(token1, ("wrong-key",)) is None
+
+    token2 = sr._retain_mc_scenario(("workplace-2",), two)
+    assert token2 != token1
+    assert sr._mc_scenario_for(token1, ("workplace-1",)) is None   # evicted -> exact fallback
+    assert sr._mc_scenario_for(token2, ("workplace-2",)) is two
+
+    oversized = Scenario(sr._MC_SCENARIO_MAX_BYTES + 1, "too-large")
+    assert sr._retain_mc_scenario(("workplace-3",), oversized) is None
+    assert sr._mc_scenario_for(token2, ("workplace-2",)) is two    # rejected build didn't evict
+
+
 def test_itinerary_alts_empty_before_variance_built(client, server):
     """A fresh workplace whose MC has NOT been requested yet returns ``alts: []`` — /itinerary
     must NEVER trigger the ~1s MC build on the hover path (the frontend re-hovers after
@@ -1207,7 +1516,10 @@ def test_itinerary_alts_empty_before_variance_built(client, server):
 # --------------------------------------------------------------------------------------
 # /geocode
 # --------------------------------------------------------------------------------------
-def test_geocode_ferry_building(client):
+def test_geocode_ferry_building(client, server, monkeypatch):
+    monkeypatch.setattr(
+        server.geo, "geocode",
+        lambda q, cache=False: (37.7955, -122.3937, "Ferry Building, San Francisco"))
     resp = client.get("/geocode?q=ferry building")
     assert resp.status_code == 200, resp.get_data(as_text=True)
     body = resp.get_json()
@@ -1224,7 +1536,11 @@ def test_geocode_blank_is_400(client):
 # --------------------------------------------------------------------------------------
 # /autocomplete
 # --------------------------------------------------------------------------------------
-def test_autocomplete_results_are_sf_bounded(client):
+def test_autocomplete_results_are_sf_bounded(client, server, monkeypatch):
+    monkeypatch.setattr(server.geo, "autocomplete", lambda q, limit=6: [
+        {"label": "Ferry Building, San Francisco", "lat": 37.7955, "lon": -122.3937},
+        {"label": "Ferry Plaza, San Francisco", "lat": 37.7951, "lon": -122.3935},
+    ])
     resp = client.get("/autocomplete?q=ferry")
     assert resp.status_code == 200
     results = resp.get_json()["results"]
@@ -1338,7 +1654,7 @@ def test_cell_cache_warms_and_resets_on_new_dest(client, server):
     breakdown cache; repeating the SAME coords keeps it.
 
     The cache LAYER differs by engine: under RAPTOR arrive-by (the pinned default)
-    breakdowns come from _RAPTOR_TREE_CACHE (a bounded LRU keyed by ~110m bucket + rides
+    breakdowns come from _RAPTOR_TREE_CACHE (a bounded LRU keyed by destination + rides
     + speed; new-dest hygiene is LRU eviction, not _reset_caches) and the legacy
     _CELL_CACHE must stay EMPTY on that path. Under legacy R5 (USE_RAPTOR=0), /itinerary
     warms _CELL_CACHE and a DIFFERENT coord clears it (new _LAST_DEST_KEY)."""

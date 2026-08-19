@@ -23,12 +23,15 @@ DEP_HM = (8, 35)           # model departure time of day (hour, minute), local
 WINDOW_MIN = 30            # departure-time window (min) the percentiles span
 MAX_MIN = 75               # routing cap (min) — trips longer than this are unreachable
 PERCENTILES = [5, 50]      # 5th = best-case (you time it well), 50th = realistic (median)
-WALK_KMH = 4.8             # walking speed (r5py's 3.6 default is too slow)
-# Walk-speed toggle presets (the server's ?speed= param; the RAPTOR engine applies the
-# scalar WALK_KMH / WALK_SPEEDS[speed] to its reference-second walk tables). 'med' IS the
-# canonical WALK_KMH (scalar 1.0), so the baked access/egress tables need no rescaling at
-# the default.
-WALK_SPEEDS = {"slow": 4.0, "med": WALK_KMH, "fast": 5.6}   # km/h
+# The OSM walk graph and access bake are stored in reference seconds at 4.8 km/h. This is a
+# *bake reference*, not the product's default walking pace: the engine rescales every walk leg by
+# ``WALK_KMH / WALK_SPEEDS[speed]`` at request time.
+WALK_KMH = 4.8
+# Product walking presets, calibrated against the bounded SF Google-walking corpus documented in
+# WALK_SPEED_CALIBRATION_2026-08-09.md. Medium reflects a typical SF city pace; Fast is genuinely
+# brisk rather than merely the graph's bake reference. Fixed values keep results deterministic and
+# monotonic (slow time >= medium time >= fast time).
+WALK_SPEEDS = {"slow": 3.4, "med": 4.2, "fast": 5.2}   # km/h
 DEFAULT_SPEED = "med"
 
 # --- Mild walk-reluctance prior ("transit slightly preferred over walking") -----------

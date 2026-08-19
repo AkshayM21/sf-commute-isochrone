@@ -1,9 +1,9 @@
 """
 Ad-hoc verification specs for the new work items (run against PORT=8765, RAPTOR engine):
   1. Pinned corner card replaces the on-cell popup (+ fitBounds, no leaflet popup on map).
-  2. SINGLE-route-on-map + COMPARE-list-in-card model: hover draws ONE clean primary; pin opens a
-     compare list (primary + alts as selectable strips); hovering a strip swaps the single drawn
-     route; while pinned, hovering OTHER cells does NOTHING.
+  2. Route-family diagram model: hover draws ONE clean primary; pin opens authoritative family +
+     branch cards and draws every returned route; focusing a card dims unrelated routes while
+     hovering OTHER map cells does NOTHING.
   3. Footer About + How-it-works modals.
 
 Drives the running server at $E2E_BASE_URL. Screenshots land in tests/e2e/screens/.
@@ -93,9 +93,8 @@ def _cp_of(page, lat, lon):
         " return {x: r.x+p.x, y: r.y+p.y}; }", [lat, lon])
 
 
-def test_compare_list_row_swap(page):
-    """Pin a multi-alt cell -> the compare list shows >=2 strips; hovering a second strip swaps the
-    SINGLE drawn route (DRAWN.identityColor changes); the map never draws more than one route."""
+def test_compare_family_focus(page):
+    """Pin an alt-rich cell, then focus and lock an authoritative family/branch card."""
     fresh_load(page)
     set_addr_raptor(page, ADDR_MARKET)
     wait_variance(page)
@@ -110,31 +109,36 @@ def test_compare_list_row_swap(page):
     shot(page, "nf_02b_hover_primary_with_hint")
 
     page.mouse.click(cp["x"] + 1, cp["y"] + 1)
-    page.wait_for_selector("#pincard.open .cmp .strip", timeout=COMPUTE_TIMEOUT)
+    page.wait_for_selector("#pincard.open .cmp .family", timeout=COMPUTE_TIMEOUT)
     page.wait_for_timeout(500)
-    strips = page.query_selector_all("#pincard .cmp .strip")
-    assert len(strips) >= 2, f"expected >=2 compare strips, got {len(strips)}"
-    # the primary strip is marked by default
-    assert strips[0].evaluate("el => el.classList.contains('sel')"), "primary strip should be selected by default"
+    families = page.query_selector_all("#pincard .cmp .family")
+    branches = page.query_selector_all("#pincard .cmp .branch")
+    options = page.evaluate("() => compareList.length")
+    assert options >= 2, f"expected >=2 route options, got {options}"
+    assert families and branches, "family diagram omitted its family/branch controls"
+    assert page.query_selector("#pincard .cmp .strip") is None, "retired route strips returned"
+    drawn0 = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
+    assert drawn0, "pin should draw the multi-route family diagram"
     shot(page, "nf_03_pinned_compare_list")
 
-    drawn0 = page.evaluate("() => (typeof DRAWN!=='undefined'&&DRAWN)?DRAWN.identityColor:null")
-    strips[1].hover()
+    target = branches[-1]
+    expected_family = target.get_attribute("data-family")
+    expected_branch = target.get_attribute("data-branch")
+    target.hover()
     page.wait_for_timeout(400)
-    drawn1 = page.evaluate("() => (typeof DRAWN!=='undefined'&&DRAWN)?DRAWN.identityColor:null")
-    assert drawn1 and drawn1 != drawn0, f"row hover should swap the drawn route ({drawn0!r} -> {drawn1!r})"
-    marked = strips[1].evaluate("el => el.classList.contains('sel')")
-    assert marked, "hovered strip should be marked .sel"
+    drawn1 = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
+    assert drawn1 == {"f": expected_family, "b": expected_branch}, drawn1
+    assert target.evaluate("el => el.classList.contains('foc')"), "hovered branch should be focused"
     shot(page, "nf_04_row_hover_swap")
 
-    # CLICK row 1 -> locks it; moving the cursor to the lower-left map keeps it locked.
-    strips[1].click()
+    # Click the branch to lock the lens; moving away from the card keeps that lens locked.
+    target.click()
     page.wait_for_timeout(250)
     box = page.eval_on_selector("#map", "el => { const r = el.getBoundingClientRect(); return {x:r.x,y:r.y,w:r.width,h:r.height}; }")
     page.mouse.move(int(box["x"] + 160), int(box["y"] + box["h"] - 160))
     page.wait_for_timeout(400)
-    locked = page.evaluate("() => (typeof DRAWN!=='undefined'&&DRAWN)?DRAWN.identityColor:null")
-    assert locked == drawn1, f"locked selection should persist after mouse-away ({drawn1!r} -> {locked!r})"
+    locked = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
+    assert locked == drawn1, f"locked family lens should persist after mouse-away ({drawn1!r} -> {locked!r})"
 
 
 def test_no_hover_while_pinned(page):

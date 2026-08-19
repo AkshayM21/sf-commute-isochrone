@@ -98,8 +98,12 @@ else
 fi
 
 echo "  installing/updating Python dependencies..."
+# flask-limiter: server.py imports it unconditionally; numba: the default RAPTOR engine
+# (USE_RAPTOR=1); scipy: the hill-aware walk router (USE_WALK_GRAPH=1). All three are
+# needed by the DEFAULT server boot, not just the legacy R5 path.
 uv pip install --python "$PY" \
-  r5py geopandas folium mapclassify shapely requests pandas numpy branca contextily flask
+  r5py geopandas folium mapclassify shapely requests pandas numpy branca contextily \
+  flask flask-limiter scipy numba
 ok "dependencies installed"
 
 # ---------------------------------------------------------------------------
@@ -263,6 +267,14 @@ Next steps:
        $PY scripts/isochrone.py --tag full
        $PY scripts/isochrone.py --gtfs muni_current.zip --tag munionly
        $PY scripts/make_interactive.py     # builds out/commute_explorer.html
+
+  4. (Optional) Rebuild the hill-aware walk-graph bakes yourself
+     (data/walk_graph.npz + the walk access table). These steps need two extra
+     packages this script does NOT install:
+       uv pip install --python $PY esy-osm-pbf rasterio
+       bash scripts/fetch_dem.sh
+       $PY scripts/build_walk_graph.py
+       $PY scripts/bake_walk_access.py
 
 See README.md for full usage and CLI flags.
 EOF

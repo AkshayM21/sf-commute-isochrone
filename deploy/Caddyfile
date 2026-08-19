@@ -40,10 +40,9 @@ sfcommutemap.com, www.sfcommutemap.com {
 	}
 
 	log {
-		output file /var/log/caddy/access.log {
-			roll_size 10mb
-			roll_keep 5
-		}
+		# Let systemd-journald retain access records. Caddy's file rotation renames the
+		# active log, which SELinux denies for the packaged service on Oracle Linux.
+		output stdout
 		format json
 	}
 }

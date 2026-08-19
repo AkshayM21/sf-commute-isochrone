@@ -110,9 +110,11 @@ class TestConfig:
         assert config.GRID_M == 200
         assert config.MAX_MIN == 75
         assert config.PERCENTILES == [5, 50]       # best-case + median
-        # Walking speed must beat r5py's slow 3.6 km/h default but stay human.
+        # This remains the graph/bake reference speed; product presets are separately calibrated.
         assert 4.0 <= config.WALK_KMH <= 6.0
         assert config.WALK_KMH == 4.8
+        assert config.WALK_SPEEDS == {"slow": 3.4, "med": 4.2, "fast": 5.2}
+        assert config.WALK_SPEEDS["slow"] < config.WALK_SPEEDS["med"] < config.WALK_SPEEDS["fast"]
 
     def test_path_helpers_point_under_data(self):
         assert config.osm_path() == config.DATA / config.OSM_FILE
@@ -432,6 +434,38 @@ class TestPhotonLabel:
     def test_empty_props_yields_empty_string(self):
         assert geo._photon_label({}) == ""
         assert geo._photon_label(None) == ""
+
+
+class TestNominatimSFBias:
+    """_nominatim_sf_query must use WORD-BOUNDARY matching, not substrings: the old
+    `"sf" in low` fired inside words ("500 Transfer St") and `", ca" in low` matched
+    any comma-then-ca word ("123 Main St, Castro"), silently skipping the SF bias."""
+
+    SUFFIX = ", San Francisco, CA"
+
+    # Plain local addresses -> bias APPLIED (including the old substring false-positives).
+    @pytest.mark.parametrize("q", [
+        "500 Transfer St",          # "sf" inside "Transfer" must NOT count as an SF hint
+        "123 Main St, Castro",      # ", ca" inside ", Castro" must NOT count as ", CA"
+        "1 Sansome St",
+        "Golden Gate Park",
+    ])
+    def test_bias_applied_to_bare_local_address(self, q):
+        assert geo._nominatim_sf_query(q) == q + self.SUFFIX
+
+    # Queries that already name the place -> returned UNCHANGED.
+    @pytest.mark.parametrize("q", [
+        "123 Main St, SF",                        # standalone SF token
+        "123 Main St SF",
+        "sf ferry building",
+        "1 Market St, San Francisco",
+        "1 Market St, san francisco, ca",
+        "123 Main St, CA",                        # state suffix token
+        "123 Main St, CA 94105",
+        "123 Main St, California",
+    ])
+    def test_place_named_query_passes_through(self, q):
+        assert geo._nominatim_sf_query(q) == q
 
 
 class TestGeocode:

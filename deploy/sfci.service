@@ -19,6 +19,7 @@ EnvironmentFile=/etc/sfci.env
 # re-JIT (~10s for the parallel MC kernel) on every restart. Point it at a systemd-managed
 # CacheDirectory so the warmup pays off across restarts.
 Environment=NUMBA_CACHE_DIR=/var/cache/sfci/numba
+Environment=NUMBA_NUM_THREADS=2
 # Flask is behind Caddy + Cloudflare -- tell _client_ip it can also fall back to X-Forwarded-For.
 Environment=TRUST_PROXY=1
 # Persistent geocoder cache: live in the systemd-managed CacheDirectory so ProtectSystem=strict
@@ -26,6 +27,10 @@ Environment=TRUST_PROXY=1
 Environment=DEST_CACHE_FILE=/var/cache/sfci/dest_cache.json
 # Don't buffer print() output (so journalctl -f shows logs live).
 Environment=PYTHONUNBUFFERED=1
+# Precompile the real progressive request signatures on EVERY restart. This covers ordinary
+# push+restart deploys as well as first install, so changed Numba source is never compiled by the
+# first visitor. The child exits before the serving process starts and shares NUMBA_CACHE_DIR.
+ExecStartPre=/opt/sfci/.venv/bin/python scripts/warm_numba.py
 ExecStart=/opt/sfci/.venv/bin/python scripts/server.py
 
 # Restart on any exit; the StartLimit{IntervalSec,Burst} pair in [Unit] above caps the loop.

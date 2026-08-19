@@ -17,6 +17,7 @@ REPORT.md
 # test artifacts
 tests/e2e/screens/
 tests/**/__pycache__/
+tests/.nbcache_departafter/
 .pytest_cache/
 
 # precompute prototype build artifacts

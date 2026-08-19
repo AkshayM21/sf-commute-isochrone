@@ -7,8 +7,9 @@ wait -> transfer -> ... -> egress walk, feed-aware names) AND the color-by-line 
 INVARIANT (the whole point of Phase 2): the breakdown legs sum to the cell's map value, because
 both come from THIS engine. The arrive-by map value is the *actual commute* of the latest-feasible
 journey = (workplace arrival) - (latest home departure), which equals the sum of the traced legs
-exactly (pre-rounding). Rounding is reconciled into the egress walk (mirroring server.py's
-_build_itin) so the displayed integer legs sum to the integer map minutes.
+exactly (pre-rounding). Rounding is distributed across leg components before a final reconciliation
+guard, so the displayed integer legs sum to the integer map minutes without overstating the last
+walk leg.
 
 Determinism: the traced tree already breaks ties deterministically (sorted pattern scan, first
 writer wins); the dominant-line pick breaks ride-time ties by (route name, feed, route_id) so
@@ -502,7 +503,7 @@ class JourneyTree:
             nid = int(nd_next[nid])
         return None                             # exceeded guard (shouldn't happen)
 
-    def _clock(self, legs_raw, latest_home, segs=False):
+    def _clock(self, legs_raw, latest_home, segs=False, fold_tiny=True):
         """Forward-simulate the clock through legs_raw -> (out, total_sec) where out is the
         folded walk/transit list with exact seconds and total_sec = sum of all leg durations
         (= the journey's actual commute, arrival - latest home departure). With ``segs=True``
@@ -526,7 +527,7 @@ class JourneyTree:
                 pi, dep_sec, arr_sec = leg[1], leg[2], leg[3]
                 wait = max(0, dep_sec - t)
                 ride = arr_sec - dep_sec
-                if ride < _TINY_HOP_MIN * 60:            # fold a fluke 1-stop hop into walk
+                if fold_tiny and ride < _TINY_HOP_MIN * 60:  # fold a fluke 1-stop hop into walk
                     _push_walk(out, wait + ride,
                                ("ridefold", int(pi), int(leg[4]), int(leg[5])) if segs else None)
                 else:
@@ -688,13 +689,28 @@ class JourneyTree:
         geom = []
         for l in legs:
             pts, approx = [], False
-            feed = tmode = None
+            feed = route_id = tmode = None
+            ride_meta = []
             for sg in l.get("segs", ()):
                 kind = sg[0]
                 if kind in ("ride", "ridefold"):
                     seg_pts, seg_ap = self._ride_pts(sg[1], sg[2], sg[3]), False
                     if kind == "ride":
-                        feed, _rid, _name, tmode = self.line_table[int(self.pat_line[sg[1]])]
+                        feed, route_id, _name, tmode = self.line_table[int(self.pat_line[sg[1]])]
+                        pi, bpos, apos = (int(sg[1]), int(sg[2]), int(sg[3]))
+                        base = int(self.d["pat_stop_off"][pi])
+                        stops = self.d["pat_stops"]
+                        board_gid = int(stops[base + bpos])
+                        alight_gid = int(stops[base + apos])
+                        pat_nstops = self.d.get("pat_nstops")
+                        if pat_nstops is not None:
+                            ns = int(pat_nstops[pi])
+                        else:
+                            offsets = self.d["pat_stop_off"]
+                            ns = ((int(offsets[pi + 1]) if pi + 1 < len(offsets) else len(stops))
+                                  - base)
+                        terminal_gid = int(stops[base + ns - 1])
+                        ride_meta.append((board_gid, alight_gid, terminal_gid))
                 elif kind == "access":
                     seg_pts, seg_ap = provider.access(ci, s_star)
                 elif kind == "purewalk":
@@ -710,7 +726,40 @@ class JourneyTree:
             g = {"mode": l["mode"], "name": l.get("line"), "min": l["min"], "pts": pts}
             if l["mode"] == "transit":
                 g["feed"] = feed
+                g["route_id"] = route_id
                 g["tmode"] = tmode                       # bart|metro|bus|cable (color key)
+                # GTFS-derived journey actions. Sparse fixtures and old callers may omit the v4
+                # stop-name table; in that case the geometry remains valid and these optional
+                # fields simply stay absent.
+                names = self.d.get("stop_name")
+                if names is None:
+                    names = ()
+                lat = self.d.get("stop_lat")
+                lon = self.d.get("stop_lon")
+                if ride_meta:
+                    board_gid = ride_meta[0][0]
+                    alight_gid = ride_meta[-1][1]
+                    terminal_gid = ride_meta[0][2]
+
+                    def stop_meta(gid):
+                        name = str(names[gid] or "").strip() if gid < len(names) else ""
+                        item = {"name": name} if name else {}
+                        if lat is not None and lon is not None:
+                            la, lo = float(lat[gid]), float(lon[gid])
+                            if not np.isnan(la) and not np.isnan(lo):
+                                item.update({"lat": round(la, 6), "lon": round(lo, 6)})
+                        return item
+
+                    board = stop_meta(board_gid)
+                    alight = stop_meta(alight_gid)
+                    toward = (str(names[terminal_gid] or "").strip()
+                              if terminal_gid < len(names) else "")
+                    if board:
+                        g["board"] = board
+                    if alight:
+                        g["alight"] = alight
+                    if toward:
+                        g["toward"] = toward
                 if l.get("wait"):
                     g["wait"] = l["wait"]
             if approx:
@@ -748,22 +797,31 @@ class JourneyTree:
         return out
 
     @staticmethod
-    def _fill_committed_leg(out, idx, tr):
+    def _fill_committed_leg(out, idx, tr, include_tiny=False):
         """Write the committed first leg of one traced journey ``tr`` (= (legs_raw, latest_home))
         into the cell-aligned committed-leg arrays ``out`` at row ``idx``. Shared by
         ``committed_first_legs`` (the full-grid primary plan) AND ``committed_legs_via_stops`` (the
         per-route ALT plans for one pinned cell), so an alt's committed plan is extracted by the EXACT
-        same rule the primary uses."""
+        same rule the primary uses.
+
+        ``include_tiny`` selects the first-ride rule so it always matches the DISPLAY's:
+          * False (arrive-by/legacy default, byte-identical to the old behavior): skip sub-2-min
+            hops, mirroring ``_clock``'s ``fold_tiny=True`` fold — the displayed first ride is the
+            first SIGNIFICANT ride.
+          * True (planned depart-after): the planned display does NOT fold tiny hops
+            (``fold_tiny=False``), so its first displayed ride can be a sub-2-min hop; committing to
+            the first ride REGARDLESS of tininess keeps the MC's committed boarding identical to the
+            boarding the breakdown shows (B4)."""
         legs_raw, latest_home = tr
         out["commit_home"][idx] = latest_home
-        # Find the first SIGNIFICANT ride (mirroring _clock's _TINY_HOP_MIN fold), so the plan
-        # the MC scores is the plan the breakdown DISPLAYS. A sub-2-min hop is shown as walk in
-        # the hover; treating it as transit here would attach delay-variance to a chip the user
-        # can't see — and on cells whose displayed first ride is a LATER, real leg, it would
-        # attribute fragility to the wrong line entirely.
+        # Find the first ride under the DISPLAY's fold rule (see ``include_tiny`` above), so the
+        # plan the MC scores is the plan the breakdown DISPLAYS. Under the legacy rule a sub-2-min
+        # hop is shown as walk in the hover; treating it as transit here would attach
+        # delay-variance to a chip the user can't see — and on cells whose displayed first ride is
+        # a LATER, real leg, it would attribute fragility to the wrong line entirely.
         ride = None
         for leg in legs_raw:
-            if leg[0] == "ride" and (leg[3] - leg[2]) >= _TINY_HOP_MIN * 60:
+            if leg[0] == "ride" and (include_tiny or (leg[3] - leg[2]) >= _TINY_HOP_MIN * 60):
                 ride = leg; break
         if ride is None:                                 # walk-only (incl. all-tiny-rides) -> deterministic
             out["commit_kind"][idx] = 1
@@ -833,21 +891,46 @@ class JourneyTree:
 
     # -- leg formatting + rounding reconciliation (hover == map) ---------------------------
     def _format(self, out, total_min):
-        # to minutes, then reconcile residual into the last walk leg so legs sum to total_min.
+        # Round to minutes while keeping the displayed components close to their real seconds.
+        # Older code rounded every component independently, then dumped any residual into the last
+        # walk leg. That kept the sum invariant but could label a short egress walk as several
+        # minutes on multi-leg routes. Use largest-remainder rounding first; reconcile_legs remains
+        # as a final guard for callers whose target minute is not just ceil(total seconds).
         # The geometry-source "segs" (when _clock collected them) ride along on each leg dict
         # — reconcile_legs filters/patches the SAME dicts, so a dropped zero-minute walk leg
         # drops its geometry too (geom stays 1:1 with the DISPLAYED legs).
         legs = []
+        comps = []
         for l in out:
             if l["mode"] == "walk":
-                d = {"mode": "walk", "line": None, "min": int(round(l["sec"] / 60.0))}
+                d = {"mode": "walk", "line": None, "min": 0}
+                # Planned depart-after traces split the first walk into actual street time and
+                # controllable pre-board allowance. Keep that identity on the formatted dict:
+                # a zero-rounded access walk may be dropped while a later egress survives, so
+                # ordinal matching back to ``out`` is not reliable.
+                if "schedule_allowance_sec" in l:
+                    d["physical_min"] = int(l.get("physical_sec", 0)) / 60.0
+                    d["schedule_allowance_min"] = int(l["schedule_allowance_sec"]) / 60.0
+                comps.append((d, "min", float(l["sec"]) / 60.0))
             else:
                 d = {"mode": "transit", "line": l["line"],
-                     "min": int(round(l["sec"] / 60.0)),
-                     "wait": int(round(l["wait_sec"] / 60.0))}
+                     "min": 0, "wait": 0}
+                comps.append((d, "min", float(l["sec"]) / 60.0))
+                comps.append((d, "wait", float(l["wait_sec"]) / 60.0))
             if "segs" in l:
                 d["segs"] = l["segs"]
             legs.append(d)
+        base_sum = 0
+        ranked = []
+        for idx, (d, field, exact) in enumerate(comps):
+            base = int(np.floor(exact))
+            d[field] = base
+            base_sum += base
+            if exact > 1e-9:
+                ranked.append((-(exact - base), idx, d, field))
+        remaining = max(0, int(total_min) - base_sum)
+        for _frac, _idx, d, field in sorted(ranked)[:min(remaining, len(ranked))]:
+            d[field] += 1
         return reconcile_legs(legs, total_min)
 
     def _dominant(self, legs_raw):
@@ -915,6 +998,6 @@ def _min_overshoot_alight(pat_arr, pat_stops, eg_sec, trow, sbase, bpos, ns, apo
         if w >= EGRESS_INF:
             continue
         cand = int(pat_arr[trow + p]) + w
-        if cand < best_arrW:
+        if cand < best_arrW or (cand == best_arrW and (w < best_w or (w == best_w and p > best_p))):
             best_arrW = cand; best_p = p; best_w = w
     return best_p, best_w

@@ -65,8 +65,9 @@ sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet --upgrade pip whe
 if [[ -f "$REPO_DIR/requirements.txt" ]]; then
   sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
 else
-  # Fallback: the core minimum to run the JVM-free server. (Should already be in requirements.txt;
-  # this is a safety net so install.sh succeeds even on a slimmed-down checkout.)
+  # The repo ships no requirements.txt (deps are documented in scripts/setup.sh), so this
+  # baseline set is the NORMAL install path, not a fallback. Keep it in sync with what the
+  # JVM-free server boot actually imports.
   log "  (no requirements.txt -- installing baseline set)"
   sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet \
     flask flask-limiter numpy scipy numba esy-osm-pbf rasterio python-dotenv
@@ -84,8 +85,10 @@ if [[ ! -f /etc/sfci.env ]]; then
 # Engine flags (all default ON; flip to 0 to fall back to legacy R5 path -- requires JVM)
 USE_RAPTOR=1
 USE_WALK_GRAPH=1
-RAPTOR_SEMANTIC=arriveby
 RAPTOR_MC=1
+# RAPTOR_SEMANTIC is deliberately NOT set: the code default rules (departafter since
+# 2026-06-17, the R5-validated served map). Set RAPTOR_SEMANTIC=arriveby only to opt
+# into the legacy best-case arrive-by-09:00 read.
 
 # Server
 PORT=8000
@@ -93,13 +96,18 @@ PORT=8000
 # Numba threading -- 1 OCPU box; cap to avoid oversubscription
 NUMBA_NUM_THREADS=2
 
-# Secrets -- paste from your laptop's .env
+# Production geocoder: Oracle currently reaches Photon/Nominatim but not api.geoapify.com.
+# Keep GEOAPIFY_KEY if desired, but explicitly select Photon so its presence cannot select
+# Geoapify by default. Local development may choose a different provider in its own .env.
+GEOCODER=photon
+
+# API credentials -- paste from your laptop's .env (GEOAPIFY_KEY is optional with Photon)
 API511_TOKEN=
 GEOAPIFY_KEY=
 
-# Default workplace shown to first-time visitors (server injects it as CFG.default_wp)
-# Paste from your laptop's .env -- never commit a real address to the repo.
-DEFAULT_ADDRESS=
+# NB: do NOT add DEFAULT_ADDRESS here. The served page never injects a default
+# workplace (privacy invariant, 2026-06-13) -- first-time visitors type their own
+# address. Setting it on a public box would have zero effect on the page.
 EOF
   chmod 600 /etc/sfci.env
   chown root:root /etc/sfci.env
@@ -109,9 +117,8 @@ fi
 # ---- 5. runtime-writable dirs -------------------------------------------------------------
 # /var/cache/sfci is the NUMBA_CACHE_DIR (CacheDirectory= in the unit, but pre-create so the
 # pre-warm script below can use it before systemd touches it).
-mkdir -p /var/log/sfci /var/log/caddy /var/cache/sfci/numba "$REPO_DIR/data"
+mkdir -p /var/log/sfci /var/cache/sfci/numba "$REPO_DIR/data"
 chown -R "$USER_NAME:$USER_NAME" /var/log/sfci /var/cache/sfci "$REPO_DIR/data"
-chown -R caddy:caddy /var/log/caddy 2>/dev/null || true
 
 # ---- 6. systemd units --------------------------------------------------------------------
 log "installing systemd units..."
@@ -122,8 +129,47 @@ install -m 644 "$REPO_DIR/deploy/cloudflare-ufw.service"  /etc/systemd/system/cl
 install -m 644 "$REPO_DIR/deploy/cloudflare-ufw.timer"    /etc/systemd/system/cloudflare-ufw.timer
 
 # ---- 7. Caddy config ---------------------------------------------------------------------
+# A co-hosted app may append its own fenced vhost to the active Caddyfile. Preserve that block
+# when refreshing the sfci-owned base config so an sfci reinstall cannot silently route or remove
+# bus.sfcommutemap.com. The bus deploy remains responsible for creating/updating the block.
 mkdir -p /etc/caddy
-install -m 644 "$REPO_DIR/deploy/Caddyfile" /etc/caddy/Caddyfile
+CADDYFILE=/etc/caddy/Caddyfile
+CADDY_CANDIDATE="$(mktemp)"
+BUS_VHOST_TMP="$(mktemp)"
+cleanup_caddy_temps() { rm -f "$CADDY_CANDIDATE" "$BUS_VHOST_TMP"; }
+trap cleanup_caddy_temps EXIT
+
+if [[ -f "$CADDYFILE" ]]; then
+  BUS_MARKER_STARTS="$(grep -c 'BUS-MARKER START (sf-muni-commute)' "$CADDYFILE" || true)"
+  BUS_MARKER_ENDS="$(grep -c 'BUS-MARKER END (sf-muni-commute)' "$CADDYFILE" || true)"
+  if [[ "$BUS_MARKER_STARTS" != "$BUS_MARKER_ENDS" || "$BUS_MARKER_STARTS" -gt 1 ]]; then
+    echo "ERROR: malformed or duplicate sf-muni-commute block in $CADDYFILE; refusing to overwrite it."
+    exit 1
+  fi
+  sed -n '/BUS-MARKER START (sf-muni-commute)/,/BUS-MARKER END (sf-muni-commute)/p' \
+    "$CADDYFILE" > "$BUS_VHOST_TMP"
+fi
+
+install -m 644 "$REPO_DIR/deploy/Caddyfile" "$CADDY_CANDIDATE"
+if [[ -s "$BUS_VHOST_TMP" ]]; then
+  {
+    printf '\n'
+    cat "$BUS_VHOST_TMP"
+    printf '\n'
+  } >> "$CADDY_CANDIDATE"
+fi
+
+# A first install does not have the Origin CA files yet, so validation is deferred until the
+# documented certificate step. Existing boxes have them and must validate before live replacement.
+if [[ -f /etc/caddy/origin-cert.pem && -f /etc/caddy/origin-key.pem ]]; then
+  caddy validate --adapter caddyfile --config "$CADDY_CANDIDATE"
+fi
+if [[ -f "$CADDYFILE" ]]; then
+  cp -p "$CADDYFILE" "$CADDYFILE.bak.sfci.$(date +%Y%m%d%H%M%S)"
+fi
+install -m 644 "$CADDY_CANDIDATE" "$CADDYFILE"
+cleanup_caddy_temps
+trap - EXIT
 
 # ---- 8. firewalld bootstrap (cloudflare-ufw.timer narrows 80/443 to CF zone after first run) ----
 # OL9 ships firewalld active with SSH allowed in the public zone by default. FIRST INSTALL ONLY:
@@ -180,7 +226,8 @@ systemctl --no-pager --plain status sfci sfci-keepalive.timer cloudflare-ufw.tim
 cat <<'EOF'
 
 [install] Next steps:
-  1. Edit /etc/sfci.env to paste API511_TOKEN + GEOAPIFY_KEY, then:
+  1. Edit /etc/sfci.env to paste API511_TOKEN (and optional GEOAPIFY_KEY). Keep
+     GEOCODER=photon for Oracle production, then:
        sudo systemctl restart sfci
   2. Install Cloudflare Origin CA cert at /etc/caddy/origin-cert.pem + origin-key.pem
        (see deploy/DEPLOY.md section 4)

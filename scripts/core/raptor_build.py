@@ -49,8 +49,9 @@ def _pd():
         pd = _p
     return pd
 
-BUILD_VERSION = 3            # bump when the struct schema/invariants change (v2: + pat_feed/
-                             # line/mode; v3: FIFO split enforces ARR-column sortedness too);
+BUILD_VERSION = 4            # bump when the struct schema/invariants change (v2: + pat_feed/
+                             # line/mode; v3: FIFO split enforces ARR-column sortedness too;
+                             # v4: retain GTFS stop names for journey-action copy);
                              # a cached pkl with a different version is rebuilt in place (the
                              # filename is unchanged, so the gid-keyed access table stays valid).
 FOOTPATH_M = float(os.environ.get("RAPTOR_FOOTPATH_M", "250"))  # synthesized-transfer radius (m)
@@ -103,15 +104,15 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
     [band_start_sec, band_end_sec]. Returns a dict of numpy arrays (see module docstring)."""
     _pd()
     stop_key_to_gid = {}
-    stop_lat, stop_lon = [], []
+    stop_lat, stop_lon, stop_name = [], [], []
 
-    def get_gid(feed, sid, lat, lon):
+    def get_gid(feed, sid, lat, lon, name):
         key = (feed, sid)
         g = stop_key_to_gid.get(key)
         if g is None:
             g = len(stop_lat)
             stop_key_to_gid[key] = g
-            stop_lat.append(lat); stop_lon.append(lon)
+            stop_lat.append(lat); stop_lon.append(lon); stop_name.append(str(name or "").strip())
         return g
 
     # group trips by (feed, route_id, stop-sequence) -> >=1 FIFO pattern. Keying on route_id
@@ -130,6 +131,7 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
             sdf = pd.read_csv(io.BytesIO(z.read("stops.txt")), dtype=str)
             slat = dict(zip(sdf.stop_id, pd.to_numeric(sdf.stop_lat, errors="coerce")))
             slon = dict(zip(sdf.stop_id, pd.to_numeric(sdf.stop_lon, errors="coerce")))
+            sname = dict(zip(sdf.stop_id, sdf.stop_name.fillna("") if "stop_name" in sdf else [""] * len(sdf)))
             rdf = pd.read_csv(io.BytesIO(z.read("routes.txt")), dtype=str)
             for _, r in rdf.iterrows():
                 rid = str(r["route_id"])
@@ -158,7 +160,8 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
                 st = st[~st.trip_id.isin(bad)]
             kept = 0
             for tid, g in st.sort_values(["trip_id", "seq"]).groupby("trip_id", sort=False):
-                gids = tuple(get_gid(feed, sid, slat.get(sid, np.nan), slon.get(sid, np.nan))
+                gids = tuple(get_gid(feed, sid, slat.get(sid, np.nan), slon.get(sid, np.nan),
+                                     sname.get(sid, ""))
                              for sid in g.stop_id)
                 deps = g["dep"].to_numpy(); arrs = g["arr"].to_numpy()
                 if deps[0] > band_end_sec or arrs[-1] < band_start_sec:
@@ -253,7 +256,7 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
          f"ras {len(ras_pat)}  footpaths {len(tr_to)}")
     return dict(
         build_version=BUILD_VERSION,
-        n_stops=n_stops, stop_lat=stop_lat, stop_lon=stop_lon,
+        n_stops=n_stops, stop_lat=stop_lat, stop_lon=stop_lon, stop_name=stop_name,
         pat_nstops=pat_nstops, pat_ntrips=pat_ntrips,
         pat_stop_off=pat_stop_off, pat_mat_off=pat_mat_off,
         pat_stops=pat_stops, pat_dep=pat_dep, pat_arr=pat_arr,

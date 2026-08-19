@@ -20,6 +20,7 @@ Public API:
 import json
 import os
 import pathlib
+import re
 import time
 import threading
 import urllib.request
@@ -216,10 +217,22 @@ def _photon_results(q, limit):
 
 
 # ---- Nominatim (fallback) --------------------------------------------------------------
+# The query already names a place if it contains "san francisco", the standalone token
+# "sf", or a ", ca"/", california" state suffix. WORD-BOUNDARY matches only: the old
+# substring check ("sf" in low) fired inside words ("500 TranSFer St", "CraySFord Ave")
+# and ", ca" matched any comma-then-ca word ("123 Main St, Castro"), silently skipping
+# the SF bias for plain local addresses.
+_SF_HINT_RE = re.compile(
+    r"\bsan\s+francisco\b"      # explicit city name
+    r"|\bsf\b"                  # standalone SF token ("123 Main St SF", "SF, 94105")
+    r"|,\s*ca\b"                # state suffix token: ", CA" / ", CA 94105"
+    r"|,\s*california\b",
+    re.IGNORECASE)
+
+
 def _nominatim_sf_query(q):
     """Bias an SF-local address toward San Francisco unless it already names a place."""
-    low = q.lower()
-    if "san francisco" in low or "sf" in low or ", ca" in low:
+    if _SF_HINT_RE.search(q):
         return q
     return q + ", San Francisco, CA"
 

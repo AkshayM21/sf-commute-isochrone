@@ -148,6 +148,7 @@ class PathTree:
     def __init__(self, wg, src_lonlat, cap_ref_sec, flat=False, reverse=False):
         self.wg = wg
         self.reverse = bool(reverse)
+        self.cap_ref_sec = float(cap_ref_sec)
         snodes, sconn = wg.snap([src_lonlat])             # [1,k] each
         self._snodes = snodes[0]
         dist, pred = dijkstra(wg._graph(flat, reverse), directed=True,
@@ -155,6 +156,35 @@ class PathTree:
                               return_predecessors=True)
         self._dist = dist + sconn[0][:, None]             # [k, n_nodes] incl. root connector
         self._pred = pred                                 # -9999 sentinel = no predecessor
+
+    def distances_to(self, target_nodes, target_conn, cap_ref_sec=None):
+        """Vectorized REFERENCE seconds to pre-snapped targets.
+
+        This is the PathTree equivalent of :meth:`WalkGraph.one_to_many` for the tree's
+        already-routed root.  ``target_nodes`` and ``target_conn`` have the same ``[n, k]``
+        contract as ``WalkGraph.snap``.  A caller may apply any cap no larger than the cap used
+        to build the tree; values outside it are returned as ``np.inf`` exactly as
+        ``one_to_many`` does.
+
+        Keeping the per-root-snap distance rows (rather than collapsing them in the tree) is
+        required by ``path_points``.  The projection below takes their minimum only at the
+        requested target nodes, avoiding another graph-sized distance array.
+        """
+        cap = self.cap_ref_sec if cap_ref_sec is None else float(cap_ref_sec)
+        if cap > self.cap_ref_sec:
+            raise ValueError(
+                f"requested cap {cap:g}s exceeds PathTree build cap {self.cap_ref_sec:g}s")
+        nodes = np.asarray(target_nodes)
+        conn = np.asarray(target_conn)
+        if nodes.ndim != 2 or conn.shape != nodes.shape:
+            raise ValueError("target_nodes and target_conn must have matching [n, k] shapes")
+        # This is the same reduction order as WalkGraph.one_to_many: first choose the best root
+        # snap for each graph node, then choose the best target snap after adding its connector.
+        base_at_targets = self._dist[:, nodes].min(axis=0)
+        ref = (base_at_targets + conn).min(axis=1)
+        ref[~np.isfinite(ref)] = np.inf
+        ref[ref > cap] = np.inf
+        return ref
 
     def path_points(self, tgt_lonlat):
         """[[lat, lon], ...] node path to/from ``tgt_lonlat`` (lon, lat — same convention

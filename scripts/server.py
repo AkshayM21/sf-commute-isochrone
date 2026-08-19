@@ -37,12 +37,10 @@ config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the g
 # geo/pandas stack. They become module globals there, used by the R5 branches (unreachable lean).
 
 # ---- Flags (parsed EARLY: they decide whether the in-process JVM starts at all) --------
-# THE DEFAULT IS NOW THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + DEPART-AFTER p5/p50 + the
-# service-noise overlay. R5/the JVM is no longer loaded by default. The default SEMANTIC flipped
-# arrive-by -> depart-after on 2026-06-17: depart-after is R5-validated (MAE 0.75) and TRUE-ZERO
-# walk-speed monotone (no single-departure "latest run" jiggle), so the served map is best-case
-# (p5) / typical (p50) over the [08:35, 09:05] window. Opt INTO arrive-by-09:00 (the best-case
-# perfect-timing read) with RAPTOR_SEMANTIC=arriveby. Opt back into the legacy R5 path with
+# THE DEFAULT IS NOW THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + DEPART-AFTER scheduled + the
+# service-noise overlay. R5/the JVM is no longer loaded by default. The served depart-after value is
+# first-boarding-anchored, so controllable starting wait is not counted and walk speed is monotone.
+# Opt INTO arrive-by-09:00 with RAPTOR_SEMANTIC=arriveby. Opt back into the legacy R5 path with
 # USE_RAPTOR=0 (and/or USE_WALK_GRAPH=0 for the R5 walk matrix).
 # The flags are parsed ONCE in core.server_raptor (the single source); we mirror them here as
 # module globals for the boot logic + the tests that read server.X. Boot-time toggles below are
@@ -446,10 +444,10 @@ def _attribution_from_cache(dlat, dlon, *, nonblock=False, max_rides=DEFAULT_MAX
     return {cid: _dominant_line(it) for cid, it in itins.items()}
 
 
-# ---- Coarse-coords RESULT cache for the heavy endpoints (A4) ---------------------------
+# ---- Destination RESULT cache for the heavy endpoints (A4) -----------------------------
 # A bounded LRU caching the FINAL JSON-able results of /compute_exact and /attribution,
-# keyed by (round(lat,3), round(lon,3)) (~110m). A hit returns the same result with no R5
-# work and without taking _HEAVY_LOCK — so a repeated/nearby workplace (e.g. localStorage
+# keyed at the same five-decimal precision as itinerary + MC seeds. A hit returns the same result
+# with no R5 work and without taking _HEAVY_LOCK — so a repeated workplace (e.g. localStorage
 # auto-restore, or panning back) is instant. This is SEPARATE from the per-workplace
 # itinerary caches (_ITIN_CACHE/_CELL_CACHE), which key on the finer _dest_key and back
 # /itinerary. copy_mode='deep' (put AND get) so callers can never mutate the store.
@@ -481,15 +479,14 @@ def _req_max_rides():
     return max(1, min(DEFAULT_MAX_RIDES, v))
 
 
-# Walk-speed toggle (RAPTOR only): scalar = 4.8 / pace. The engine multiplies every WALK
-# reference-second (access/egress/pure-walk, baked @4.8) by it. Default medium (the user is a
-# fast walker but most aren't); the access table / egress stay reference seconds + cached once.
+# Walk-speed toggle (RAPTOR only): scalar = bake reference / selected pace. The engine multiplies
+# every WALK reference-second by it. Medium is the calibrated typical pace; Fast is brisk.
 # The presets live in core.config (WALK_SPEEDS / DEFAULT_SPEED), re-exported via core.server_raptor.
 def _req_speed():
-    """(speed_name, walk_scalar) from ?speed=slow|med|fast; default medium (scalar 1.0)."""
+    """(speed_name, walk_scalar) from ?speed=slow|med|fast; missing/invalid uses Medium."""
     s = (request.args.get("speed") or "").lower()
     if s not in WALK_SPEEDS:
-        return DEFAULT_SPEED, 1.0
+        s = DEFAULT_SPEED
     return s, config.WALK_KMH / WALK_SPEEDS[s]
 
 
@@ -568,6 +565,41 @@ def _no_cache(resp):
     if request.path in _NO_STORE_PATHS:
         resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+def _perf_benchmark_enabled():
+    """Whether to expose request-local phase data for the offline benchmark harness only."""
+    return os.environ.get("PERF_BENCHMARK_STATS", "").lower() in ("1", "true", "yes", "on")
+
+
+def _phase_response(body, phases):
+    """Attach opt-in standard timing headers without changing a product JSON payload.
+
+    ``phases`` is created by a single handler and passed explicitly through the routing seams; it
+    never outlives the request.  Keep counts in X-Perf-Phases, while Server-Timing receives only
+    duration values so browser tooling can render it correctly.  Normal production requests take
+    the plain jsonify path and have no timer/header work.
+    """
+    response = jsonify(body)
+    if not phases:
+        return response
+    clean = {}
+    for name, value in phases.items():
+        if isinstance(name, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
+            if math.isfinite(float(value)) and float(value) >= 0:
+                clean[name] = round(float(value), 3)
+    if not clean:
+        return response
+    durations = [
+        # A period is valid in an HTTP token, so retain the same names in both headers.  The
+        # benchmark parser can then merge them without creating a misleading duplicate phase.
+        f"{name};dur={value:.3f}"
+        for name, value in clean.items() if name.endswith("_ms")
+    ]
+    if durations:
+        response.headers["Server-Timing"] = ", ".join(durations)
+    response.headers["X-Perf-Phases"] = json.dumps(clean, separators=(",", ":"), sort_keys=True)
+    return response
 
 
 @app.errorhandler(429)
@@ -695,7 +727,7 @@ def _compute_exact():
         cells = sr.compute_raptor(lat, lon, max_rides, speed, walk_scalar)
         return jsonify({"dest": [lat, lon], "cells": cells, "ms": 0})
     ckey = _coarse_key(lat, lon, max_rides)
-    # CACHE HIT (~110m): return the same result instantly — no R5 work, no lock, and the
+    # CACHE HIT (same meter-scale destination): return instantly — no R5 work, no lock, and the
     # generation/supersede dance is irrelevant since there's nothing to cancel.
     cached = _EXACT_RESULT_CACHE.get(ckey)
     if cached is not None:
@@ -906,11 +938,16 @@ def _itinerary():
         # R5). ?pin=1 adds the per-route committed typicals/fragility (the gate keeps them off the
         # plain-hover path). Off-grid points snap to the nearest cell inside the assembler.
         _pin = request.args.get("pin") == "1"
+        # Benchmark-only request-local phase dict.  Plain hovers intentionally avoid even the
+        # timer calls; detailed pin instrumentation is enabled only with both ?pin=1 and the
+        # explicit server flag.
+        _perf = {} if (_pin and _perf_benchmark_enabled()) else None
         assemble = (sr.itinerary_departafter if RAPTOR_SEMANTIC == "departafter"
                     else sr.itinerary_arriveby)
-        res = assemble(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scalar, pin=_pin)
+        res = assemble(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scalar, pin=_pin,
+                       perf=_perf)
         res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
-        return jsonify(res)
+        return _phase_response(res, _perf) if _perf is not None else jsonify(res)
     dkey = _dest_key(dlat, dlon, max_rides)
     res = None
     # FAST PATH 1: the full-grid cache (present once color-by-line has been triggered).
@@ -958,7 +995,7 @@ def _attribution():
               f"-> {len(attr)} cells")
         return jsonify(attr)
     ckey = _coarse_key(dlat, dlon, max_rides)
-    # CACHE HIT (~110m): return the same attribution dict instantly — no R5 work, no lock.
+    # CACHE HIT (same meter-scale destination): return the attribution instantly, no R5/lock.
     cached_res = _ATTR_RESULT_CACHE.get(ckey)
     if cached_res is not None:
         print(f"[attr] ({dlat:.4f},{dlon:.4f}) rides={max_rides} cached -> {len(cached_res)} cells")
@@ -973,7 +1010,7 @@ def _attribution():
         print(f"[attr] ({dlat:.4f},{dlon:.4f}) busy -> 503")
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
     # Only cache a real result. A superseded build (workplace changed mid-build) returns {};
-    # caching that would poison this ~110m bucket and make color-by-line return {} forever.
+    # caching that would poison this destination key and make color-by-line return {} forever.
     if attr:
         _ATTR_RESULT_CACHE.put(ckey, attr)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
@@ -1007,10 +1044,11 @@ def _variance():
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
     t0 = dt.datetime.now()
+    perf = {} if _perf_benchmark_enabled() else None
     # Non-blocking like /compute_exact: another workplace's MC running -> retryable 503
     # (the frontend's loadVariance retries once and otherwise keeps the perfect map).
     try:
-        out = sr.raptor_mc(dlat, dlon, max_rides, speed, walk_scalar)
+        out = sr.raptor_mc(dlat, dlon, max_rides, speed, walk_scalar, perf=perf)
     except _Busy:
         print(f"[variance:raptor] ({dlat:.4f},{dlon:.4f}) busy -> 503")
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
@@ -1020,12 +1058,17 @@ def _variance():
     # Pick the JSON-able keys explicitly: the MC entry also carries the internal alt-route
     # plumbing (alt_bundle's numpy arrays, the lazy JourneyTree cache) that backs /itinerary's
     # drawn alternatives — never serialize those.
+    t_assembly = time.perf_counter() if perf is not None else None
     body = {"dest": [dlat, dlon], "variance": out["variance"], "ms": round(ms)}
     if RAPTOR_SEMANTIC == "arriveby":
         # arrive-by: the committed realistic IS the headline typical -> serve it (byte-unchanged).
         body["realistic"] = out["realistic"]
     # depart-after: NO realistic — the headline typical is the bare p50 the map paints (cells[c][1]).
-    return jsonify(body)
+    if perf is None:
+        return jsonify(body)
+    perf["variance.response_assembly_ms"] = round((time.perf_counter() - t_assembly) * 1000.0, 3)
+    perf["variance.request_ms"] = round((dt.datetime.now() - t0).total_seconds() * 1000.0, 3)
+    return _phase_response(body, perf)
 
 
 @app.route("/geocode")
@@ -1117,14 +1160,328 @@ def _healthz():
     + the modeled service date, so a monitor can alarm on (a) the engine never initializing or
     (b) the GTFS feed having drifted past its validity window (svc_date won't update until the
     server restarts after a feed re-pull)."""
-    return jsonify({
+    body = {
         "ok": _RAPTOR is not None or USE_RAPTOR is False,
         "engine": "raptor" if USE_RAPTOR else "r5",
         "semantic": RAPTOR_SEMANTIC,
         "walk": "graph" if USE_WALK_GRAPH else "r5",
         "svc_date": _SVC_DATE.isoformat() if _SVC_DATE else None,
         "uptime_s": int(time.time() - _BOOT_TS),
-    })
+    }
+    # Benchmark-only aggregate telemetry. This is deliberately absent unless the process was
+    # explicitly booted with PERF_BENCHMARK_STATS=1: production health responses and attack
+    # surface stay unchanged, while a controlled latency run can correlate endpoint timings with
+    # current RSS and cache growth. Only aggregate counts/byte estimates/caps are exposed — never
+    # workplace keys/coordinates, route bodies, or labels. Deep byte walks are health-only and
+    # happen after cache roots have been snapshotted, so they never tax endpoint hot paths or hold
+    # an outer cache lock while traversing a large journey tree.
+    if os.environ.get("PERF_BENCHMARK_STATS", "").lower() in ("1", "true", "yes", "on"):
+        body["benchmark"] = {
+            "pid": os.getpid(),
+            "rss_bytes": _benchmark_rss_bytes(),
+            "cache_counts": _benchmark_cache_counts(),
+            "cache_memory": _benchmark_cache_memory(),
+        }
+    return jsonify(body)
+
+
+def _benchmark_lru_values(cache):
+    """Snapshot an internal BoundedLRU's values for opt-in aggregate telemetry only.
+
+    The cache lock makes the snapshot internally consistent. Values themselves are not copied:
+    callers immediately count nested containers while the public health payload receives only
+    integers. This helper must never return keys because cache keys contain workplace buckets.
+    """
+    with cache.lock:
+        return list(cache._od.values())
+
+
+def _benchmark_cache_counts():
+    """Aggregate cache occupancy for PERF_BENCHMARK_STATS; never expose cache keys or values."""
+    tree_entries = _benchmark_lru_values(sr._RAPTOR_TREE_CACHE)
+    mc_entries = _benchmark_lru_values(sr._RAPTOR_MC_CACHE)
+    with _ITIN_CACHE_LOCK:
+        legacy_full_destinations = len(_ITIN_CACHE)
+        legacy_full_cells = sum(len(v) for v in _ITIN_CACHE.values())
+    with _CELL_CACHE_LOCK:
+        legacy_cell_destinations = len(_CELL_CACHE)
+        legacy_cell_entries = sum(len(v) for v in _CELL_CACHE.values())
+
+    def _nested_count(entries, name):
+        return sum(len((entry or {}).get(name) or {}) for entry in entries)
+
+    return {
+        "raptor_egress_workplaces": len(sr._RAPTOR_EGRESS_CACHE),
+        "raptor_tree_workplaces": len(tree_entries),
+        "raptor_mc_workplaces": len(mc_entries),
+        "walk_path_workplaces": len(sr._WALKPATH_TREE_CACHE),
+        "transfer_paths": len(sr._TRANSFER_PATH_CACHE),
+        "egress_payload_bytes": sr._RAPTOR_EGRESS_CACHE.nbytes,
+        "walk_path_payload_bytes": sr._WALKPATH_TREE_CACHE.nbytes,
+        "transfer_path_payload_bytes": sr._TRANSFER_PATH_CACHE.nbytes,
+        "route_geometry_cells": _nested_count(tree_entries, "geom"),
+        "best_route_geometry_cells": _nested_count(tree_entries, "geom5"),
+        "planned_branch_cells": _nested_count(tree_entries, "branch_geom"),
+        # Depart-after trees populate their child-deadline mapping lazily.  Take each tree's
+        # own snapshot instead of iterating the live mapping while a pin request extends it.
+        "deadline_trees": sum(len(_benchmark_deadline_tree_snapshot(
+            (entry or {}).get("tree"))) for entry in tree_entries),
+        "mc_alt_geometry_cells": _nested_count(mc_entries, "alt_geom"),
+        "mc_typical_cells": _nested_count(mc_entries, "typ"),
+        "exact_result_workplaces": len(_EXACT_RESULT_CACHE),
+        "attribution_result_workplaces": len(_ATTR_RESULT_CACHE),
+        "legacy_full_itinerary_workplaces": legacy_full_destinations,
+        "legacy_full_itinerary_cells": legacy_full_cells,
+        "legacy_cell_itinerary_workplaces": legacy_cell_destinations,
+        "legacy_cell_itinerary_cells": legacy_cell_entries,
+    }
+
+
+def _benchmark_cell_cache_snapshot(entries, name, lock):
+    """Snapshot nested ``BoundedCellCache`` payload roots without measuring under ``lock``."""
+    snapshots = {}
+    cache_instances = entries_count = max_entries = 0
+    with lock:
+        for entry in entries:
+            cache = (entry or {}).get(name)
+            if cache is None:
+                continue
+            values = dict(cache)
+            snapshots[id(cache)] = values
+            cache_instances += 1
+            entries_count += len(values)
+            max_entries += int(getattr(cache, "maxsize", len(values)))
+    return snapshots, {
+        "cache_instances": cache_instances,
+        "entries": entries_count,
+        "max_entries": max_entries,
+        "max_bytes": None,                         # shadow phase: no nested byte cap is enforced
+    }
+
+
+def _benchmark_deadline_tree_snapshot(tree):
+    """Return a lock-consistent tuple of a JourneyTree's lazy deadline children.
+
+    This deliberately retains values only: cache keys can encode a workplace and must never
+    reach benchmark telemetry.  A few lightweight test doubles do not expose the private lock;
+    for those, a best-effort tuple is still safer than leaking a live mapping into the estimator.
+    """
+    if tree is None:
+        return ()
+    trees = getattr(tree, "_trees", None)
+    if trees is None:
+        return ()
+    trees_lock = getattr(tree, "_trees_lock", None)
+    try:
+        if trees_lock is not None:
+            with trees_lock:
+                return tuple(trees.values())
+        return tuple(trees.values())
+    except RuntimeError:
+        # Health telemetry is best-effort; a concurrent mutation can be measured on the next
+        # poll without holding a request-owned tree lock across a deep traversal.
+        return ()
+
+
+def _benchmark_tree_shadow(tree, memo):
+    """Stable-ish attribute snapshot for a JourneyTree used only by shadow byte telemetry.
+
+    Depart-after deadline trees mutate behind their own lock. Copy that mapping's values while the
+    lock is held, then traverse the ordinary snapshot after release. Other lazy tree fields are
+    assigned atomically; a health poll may observe either the before or after value, both safe.
+    """
+    if tree is None:
+        return None
+    ident = id(tree)
+    if ident in memo:
+        return memo[ident]
+    try:
+        shadow = dict(vars(tree))
+    except (TypeError, RuntimeError):
+        return tree
+    memo[ident] = shadow
+    # Do not leave the live deadline mapping inside the outer shadow.  It mutates behind a
+    # per-tree lock, whereas the expensive ownership traversal deliberately happens unlocked.
+    if getattr(tree, "_trees", None) is not None:
+        shadow["_trees"] = _benchmark_deadline_tree_snapshot(tree)
+    return shadow
+
+
+def _benchmark_outer_shadow(entries, nested, *, trees=False):
+    """Replace live nested mappings/tree LRUs with snapshots before a deep estimate."""
+    out = []
+    tree_memo = {}
+    for entry in entries:
+        shadow = dict(entry or {})
+        for name, cache_snapshots in nested.items():
+            cache = shadow.get(name)
+            if cache is not None:
+                shadow[name] = cache_snapshots.get(id(cache), ())
+        if trees:
+            shadow["tree"] = _benchmark_tree_shadow(shadow.get("tree"), tree_memo)
+            shadow["tree5"] = _benchmark_tree_shadow(shadow.get("tree5"), tree_memo)
+        out.append(shadow)
+    return tuple(out)
+
+
+def _benchmark_mapping_values(mapping, lock):
+    """Snapshot ordinary cache values while holding their owner lock; never return keys."""
+    with lock:
+        return tuple(mapping.values())
+
+
+def _benchmark_cache_memory():
+    """Opt-in shadow byte accounting for request-owned RAPTOR cache payloads.
+
+    This deliberately does not change eviction. It supplies the evidence needed to choose safe
+    byte caps later: outer tree/MC estimates include their nested payloads; nested categories are
+    also broken out so lazy geometry/pin growth is visible. All figures are aggregate integers.
+    """
+    tree_entries = _benchmark_lru_values(sr._RAPTOR_TREE_CACHE)
+    mc_entries = _benchmark_lru_values(sr._RAPTOR_MC_CACHE)
+    borrowed = sr._benchmark_borrowed_root_ids()
+
+    tree_nested = {}
+    tree_nested_meta = {}
+    for name, lock in (("geom", sr._GEOM_LOCK), ("geom5", sr._GEOM_LOCK),
+                       ("branch_geom", sr._ALT_LOCK)):
+        snapshots, meta = _benchmark_cell_cache_snapshot(tree_entries, name, lock)
+        tree_nested[name] = snapshots
+        tree_nested_meta[name] = meta
+    mc_nested = {}
+    mc_nested_meta = {}
+    for name, lock in (("alt_geom", sr._ALT_LOCK), ("typ", sr._TYP_LOCK)):
+        snapshots, meta = _benchmark_cell_cache_snapshot(mc_entries, name, lock)
+        mc_nested[name] = snapshots
+        mc_nested_meta[name] = meta
+
+    tree_shadow = _benchmark_outer_shadow(tree_entries, tree_nested, trees=True)
+    mc_shadow = _benchmark_outer_shadow(mc_entries, mc_nested)
+    tree_bytes = sr._owned_payload_nbytes(tree_shadow, borrowed_root_ids=borrowed)
+    mc_bytes = sr._owned_payload_nbytes(mc_shadow, borrowed_root_ids=borrowed)
+
+    for name, snapshots in tree_nested.items():
+        roots = tuple(snapshots.values())
+        tree_nested_meta[name]["estimated_owned_bytes"] = sr._owned_payload_nbytes(
+            roots, borrowed_root_ids=borrowed)
+    for name, snapshots in mc_nested.items():
+        roots = tuple(snapshots.values())
+        mc_nested_meta[name]["estimated_owned_bytes"] = sr._owned_payload_nbytes(
+            roots, borrowed_root_ids=borrowed)
+
+    with sr._MC_SCENARIO_LOCK:
+        active = sr._MC_SCENARIO_ACTIVE
+        scenario = active[2] if active is not None else None
+    scenario_bytes = sr._owned_payload_nbytes(scenario, borrowed_root_ids=borrowed)
+
+    # These roots are retained by independent caches, not just bookkeeping weights.  Snapshot
+    # their stored values before measuring so a single aggregate can identity-de-duplicate aliases
+    # shared with RAPTOR entries or one another.  The LRU helper never exposes cache keys.
+    egress_values = _benchmark_lru_values(sr._RAPTOR_EGRESS_CACHE)
+    workplace_walk_values = _benchmark_lru_values(sr._WALKPATH_TREE_CACHE)
+    cell_walk_values = _benchmark_lru_values(sr._CELL_WALKPATH_TREE_CACHE)
+    transfer_values = _benchmark_lru_values(sr._TRANSFER_PATH_CACHE)
+    exact_result_values = _benchmark_lru_values(_EXACT_RESULT_CACHE)
+    attribution_result_values = _benchmark_lru_values(_ATTR_RESULT_CACHE)
+    legacy_full_values = _benchmark_mapping_values(_ITIN_CACHE, _ITIN_CACHE_LOCK)
+    legacy_cell_values = _benchmark_mapping_values(_CELL_CACHE, _CELL_CACHE_LOCK)
+
+    retained_roots = (
+        tree_shadow, mc_shadow, scenario,
+        egress_values, workplace_walk_values, cell_walk_values, transfer_values,
+        exact_result_values, attribution_result_values,
+        legacy_full_values, legacy_cell_values,
+    )
+    request_owned_retained_bytes = sr._owned_payload_nbytes(
+        retained_roots, borrowed_root_ids=borrowed)
+
+    def weighted(cache, values):
+        return {
+            "entries": len(values),
+            "max_entries": int(cache.maxsize),
+            "accounted_payload_bytes": int(cache.nbytes),
+            "max_bytes": cache.maxbytes,
+            "estimated_owned_bytes": sr._owned_payload_nbytes(
+                values, borrowed_root_ids=borrowed),
+        }
+
+    def retained_result(cache, values):
+        return {
+            "entries": len(values),
+            "max_entries": int(cache.maxsize),
+            "estimated_owned_bytes": sr._owned_payload_nbytes(
+                values, borrowed_root_ids=borrowed),
+        }
+
+    def retained_mapping(values):
+        return {
+            "entries": len(values),
+            "estimated_owned_bytes": sr._owned_payload_nbytes(
+                values, borrowed_root_ids=borrowed),
+        }
+
+    return {
+        # This is the only additive retained-memory number.  Every category below is diagnostic
+        # attribution and can share object identities (for example, an egress/path object can be
+        # reachable through a tree), so consumers must not sum category estimates.
+        "request_owned_retained_bytes": request_owned_retained_bytes,
+        "category_estimates_non_additive": 1,
+        "raptor_tree": {
+            "entries": len(tree_entries),
+            "max_entries": int(sr._RAPTOR_TREE_CACHE.maxsize),
+            "estimated_owned_bytes": tree_bytes,
+            "max_bytes": sr._RAPTOR_TREE_CACHE.maxbytes,
+            "nested": tree_nested_meta,
+        },
+        "raptor_mc": {
+            "entries": len(mc_entries),
+            "max_entries": int(sr._RAPTOR_MC_CACHE.maxsize),
+            "estimated_owned_bytes": mc_bytes,
+            "max_bytes": sr._RAPTOR_MC_CACHE.maxbytes,
+            "nested": mc_nested_meta,
+        },
+        "mc_scenario": {
+            "retained": scenario is not None,
+            "estimated_owned_bytes": scenario_bytes,
+            "max_bytes": int(sr._MC_SCENARIO_MAX_BYTES),
+        },
+        "known_weighted": {
+            "raptor_egress": weighted(sr._RAPTOR_EGRESS_CACHE, egress_values),
+            "workplace_walk_path": weighted(sr._WALKPATH_TREE_CACHE, workplace_walk_values),
+            "cell_walk_path": weighted(sr._CELL_WALKPATH_TREE_CACHE, cell_walk_values),
+            "transfer_path": weighted(sr._TRANSFER_PATH_CACHE, transfer_values),
+        },
+        "result_cache": {
+            "exact": retained_result(_EXACT_RESULT_CACHE, exact_result_values),
+            "attribution": retained_result(_ATTR_RESULT_CACHE, attribution_result_values),
+        },
+        "legacy_itinerary_cache": {
+            "full": retained_mapping(legacy_full_values),
+            "cell": retained_mapping(legacy_cell_values),
+        },
+        # Tree/MC estimates include their nested payloads. Scenario is retained out-of-band and
+        # therefore added separately. Weighted-cache totals stay separate to avoid implying that
+        # this first shadow slice is already a global enforced budget.
+        "estimated_tree_mc_scenario_bytes": tree_bytes + mc_bytes + scenario_bytes,
+    }
+
+
+def _benchmark_rss_bytes():
+    """Best-effort current resident bytes for opt-in benchmark telemetry."""
+    try:                                             # Linux: current RSS, no subprocess/dependency
+        fields = Path("/proc/self/statm").read_text().split()
+        return int(fields[1]) * int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, ValueError, IndexError, AttributeError):
+        pass
+    try:                                             # macOS and other POSIX hosts
+        import subprocess
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            check=True, capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        return int(out) * 1024
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 if __name__ == "__main__":

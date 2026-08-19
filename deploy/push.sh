@@ -5,8 +5,10 @@
 # Usage:
 #   deploy/push.sh opc@<oracle-public-ip>            # Oracle Linux uses opc; Ubuntu uses ubuntu
 #
-# Excludes the venv, the numba cache (rebuilt on the box), the personal .dest_cache, the test
-# golden oracles, and out/ — everything the box doesn't need or shouldn't have.
+# Excludes the venv, the numba caches (rebuilt on the box; includes tests/.nbcache_*), the
+# personal .dest_cache, the test golden oracles, out/, and the big OSM source extracts
+# (osm_sf.pbf + the ~640 MB norcal.osm.pbf setup.sh downloads) — everything the box doesn't
+# need or shouldn't have (the box consumes the baked walk_graph.npz, not raw OSM).
 #
 # PRIVACY/SECRETS INVARIANT: .env, REPORT.md, Progress.md, Issues.md, REVIEW_REPORT.md AND
 # deploy/cf/ are excluded (the .md session notes are operator-personal). deploy/cf/ holds the
@@ -44,10 +46,12 @@ rsync -avzP --delete-after \
   --exclude '.dest_cache.json' \
   --exclude '.nbc' \
   --exclude '.numba_cache' \
+  --exclude '.nbcache*' \
   --exclude '/out/' \
   --exclude '/tests/raptor_golden/' \
   --exclude '/tests/__pycache__/' \
   --exclude '/data/osm_sf.pbf' \
+  --exclude '/data/norcal.osm.pbf' \
   ./ "$TARGET:/opt/sfci/"
 
 # Restore service-user ownership so the documented redeploy flow (push + restart, NO install.sh
@@ -68,5 +72,5 @@ Next steps on the box:
 
 To redeploy after code changes later:
   deploy/push.sh $TARGET
-  ssh $TARGET 'sudo systemctl restart sfci'
+  ssh $TARGET 'sudo systemctl restart sfci'  # ExecStartPre warms changed Numba signatures
 EOF

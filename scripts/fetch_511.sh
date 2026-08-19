@@ -43,9 +43,18 @@ fetch_op () {
   echo "=== 511 operator=$op -> $out ==="
   # 511 returns a zip of GTFS for the operator. Download to a temp .part and
   # rename only on success so an interrupted download never masquerades as done.
-  curl -fsSL --retry 4 --retry-delay 3 --retry-all-errors --connect-timeout 25 --max-time 240 \
-       -o "$DATA/$out.part" \
-       "https://api.511.org/transit/datafeeds?api_key=${TOKEN}&operator_id=${op}" \
+  # The URL (which carries api_key) is fed via a stdin config file (`curl -K -`)
+  # so the token never appears on the curl argv (visible to any user via ps).
+  # Inside curl-config double quotes, `"` and `\` are meta — reject tokens carrying
+  # them (511 tokens are UUIDs; anything else means a paste error) instead of
+  # silently mangling the URL.
+  case "$TOKEN" in *[\"\\]*)
+    echo "ERROR: API511_TOKEN contains a quote/backslash — check .env" >&2; exit 2;;
+  esac
+  printf 'url = "https://api.511.org/transit/datafeeds?api_key=%s&operator_id=%s"\n' \
+         "$TOKEN" "$op" \
+    | curl -fsSL --retry 4 --retry-delay 3 --retry-all-errors --connect-timeout 25 --max-time 240 \
+           -o "$DATA/$out.part" -K - \
     && mv "$DATA/$out.part" "$DATA/$out"
   # 511 sometimes wraps zip with BOM; validate
   if valid_gtfs_zip "$DATA/$out"; then

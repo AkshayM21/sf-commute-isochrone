@@ -207,9 +207,15 @@ off, access_to, access_w = build_access()
 fp = raptor_build._fingerprint(gtfs, svc.strftime("%Y%m%d"),
                                raptor_build.band_seconds(), raptor_build.FOOTPATH_M)
 acc_path = CACHE / f"access_{GRID_M}m_{fp}.npz"
-np.savez(acc_path, cell_ids=np.array(CELL_IDS), access_off=off, access_to=access_to,
+# write tmp + verify + atomic rename so an interrupted bake can't leave a truncated zip at
+# the canonical (fingerprinted) path consumers trust by existence (same pattern as
+# bake_walk_access.py). Tmp name must end in .npz — np.savez silently appends it otherwise.
+_tmp = acc_path.with_name(acc_path.stem + ".tmp.npz")
+np.savez(_tmp, cell_ids=np.array(CELL_IDS), access_off=off, access_to=access_to,
          access_w=access_w, grid_m=GRID_M, n_stops=RDATA["n_stops"], raptor_fp=fp,
          service_date=svc.strftime("%Y%m%d"))
+np.load(_tmp, allow_pickle=True).close()      # cheap zip-integrity check before publish
+os.replace(_tmp, acc_path)
 log(f"[access] saved {acc_path.name} ({acc_path.stat().st_size/1e6:.1f} MB)")
 
 if os.environ.get("ONLY_ACCESS"):
@@ -222,9 +228,17 @@ for name, (lat, lon) in WORKPLACES.items():
     eg, ew, pw = egress_purewalk(lat, lon)
     nreach = int((p50 >= 0).sum())
     out = GOLDEN / f"oracle_{name}.npz"
-    np.savez(out, name=name, lat=lat, lon=lon, cell_ids=np.array(CELL_IDS),
+    # same tmp + verify + atomic-rename discipline as the access table above: the validator
+    # trusts oracle_*.npz by existence, so a truncated write must never land at `out`.
+    # The tmp must NOT match the consumers' `oracle_*.npz` discovery globs
+    # (raptor_validate.py / test_raptor.py), or an interrupted bake re-poisons discovery
+    # under the tmp name — hence the `tmp_` prefix (still .npz so np.savez doesn't append).
+    _tmp = out.with_name("tmp_" + out.name)
+    np.savez(_tmp, name=name, lat=lat, lon=lon, cell_ids=np.array(CELL_IDS),
              best=best, p50=p50, egress_g=eg, egress_w=ew, purewalk=pw,
              service_date=svc.strftime("%Y%m%d"))
+    np.load(_tmp, allow_pickle=True).close()   # zip-integrity check before publish
+    os.replace(_tmp, out)
     log(f"[oracle {name}] ({lat},{lon}) {time.time()-t:.1f}s  reachable {nreach}/{len(CELL_IDS)} "
         f"egress-stops {len(eg)} -> {out.name}")
 

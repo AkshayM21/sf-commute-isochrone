@@ -4,23 +4,30 @@ Loads the RAPTOR structures (raptor_build) + the baked cell->stop walk-access ta
 (raptor_oracle), and turns a workplace's egress/pure-walk (computed by the caller, e.g. one
 R5 walk matrix, or any walk router) into per-cell door-to-door times. No r5py here.
 
-Two semantics from the SAME reverse range-RAPTOR profile:
-  * depart-after p5/p50 over the [DEP, DEP+WINDOW] departure window — bit-for-bit comparable to
-    R5's departure-window percentile model, so this is what we validate against the R5 oracle.
-  * arrive-by over an arrival window ending at the target (default [TARGET-WINDOW, TARGET]) —
-    the product semantic ("where can you live and reach work by 9:00"), read off the same
-    profile. Single-deadline arrive-by is the WINDOW=0 case.
+Three semantics from the SAME reverse range-RAPTOR inputs:
+  * planned scheduled depart-after — the served, first-boarding-anchored product metric.
+  * legacy depart-after p5/p50 over [DEP, DEP+WINDOW] — R5-comparable validation output.
+  * legacy arrive-by over an arrival window ending at the target (default [TARGET-WINDOW, TARGET]);
+    single-deadline arrive-by is the WINDOW=0 case.
 
 The hot reverse sweep runs in the numba kernel automatically when available; assembly is numpy.
 """
 import os
+import time
 import numpy as np
 
 from . import config, raptor_build, raptor as R, raptor_journey
 
+
+def _perf_add(perf, name, started):
+    """Record one request-local benchmark phase without affecting normal calls."""
+    if perf is not None and started is not None:
+        perf[name] = round((time.perf_counter() - started) * 1000.0, 3)
+
 ACCESS_CAP_MIN = int(os.environ.get("RAPTOR_ACCESS_CAP", "25"))  # 25 cleared the worst access-starved periphery (max err 15->7, mism 20->5) vs 20
 DEADLINE_STEP = int(os.environ.get("RAPTOR_DEADLINE_STEP", "180"))
 MC_DEADLINE_STEP = int(os.environ.get("RAPTOR_MC_DEADLINE_STEP", "60"))  # MC tail readout (finer; see _make_grids)
+PLANNED_DEADLINE_STEP = int(os.environ.get("RAPTOR_PLANNED_DEADLINE_STEP", "60"))
 DEP_STEP = 60
 BOARD_SLACK = int(os.environ.get("RAPTOR_BOARD_SLACK", "60"))
 MAX_ROUNDS = 8                                    # rides = transfers + 1 (R5 default cap)
@@ -39,6 +46,7 @@ MC_DRAWS = int(os.environ.get("RAPTOR_MC_DRAWS", "24"))       # draws for realis
 # drives any perturbed traces; the realistic/fragility MC keeps its own RAPTOR_MC_DRAWS.
 MC_ALT_DRAWS = int(os.environ.get("RAPTOR_MC_ALT_DRAWS", "12"))  # >0 enables the alt-lines window
 ALT_WINDOW_MIN = float(os.environ.get("RAPTOR_ALT_WINDOW_MIN", "5"))  # alt = within this of the cell best
+PLANNED_ALT_WINDOW_MIN = float(os.environ.get("RAPTOR_PLANNED_ALT_WINDOW_MIN", "10"))
 MC_SHAPE = float(os.environ.get("RAPTOR_MC_SHAPE", "2.0"))   # Gamma shape (spread); mean=shape*scale
 WALK_RELUCTANCE = config.WALK_RELUCTANCE          # mild walk prior (decision-only; see config.py)
 WALK_PRIOR_EPS = config.WALK_PRIOR_EPS_SEC        # hard cap (sec) on the prior's true-time change
@@ -56,6 +64,166 @@ _MU = dict(bus=float(os.environ.get("RAPTOR_MC_MU_BUS", "70")),
 _SLOPE = dict(bus=0.035, metro=0.025, cable=0.03, bart=0.012, caltrain=0.02)
 
 
+def _committed_deadline_prefix(deadlines, legs, max_min):
+    """Losslessly trim a committed-MC deadline grid to the rows' useful horizon.
+
+    A transit row's raw result is capped at ``max_min``.  Therefore every deadline strictly
+    after ``commit_home + max_min * 60`` can only produce the same cap, regardless of the
+    perturbed schedule.  Keep the inclusive prefix through the latest such bound across transit
+    rows.  Rows without transit are deadline-independent in the committed kernel, so a single
+    deadline is sufficient when the batch contains no transit at all.
+
+    The helper is deliberately conservative: malformed/mismatched leg arrays, an invalid transit
+    home, a negative cap, or a non-increasing grid return the full grid.  Production callers pass
+    the engine's non-empty ascending ``Tgrid_mc``; keeping the fallback here makes this optimization
+    incapable of changing results if a future caller violates those assumptions.
+    """
+    grid = np.asarray(deadlines, dtype=np.int64)
+    if grid.ndim != 1 or grid.size == 0:
+        return grid
+    if grid.size > 1 and not bool(np.all(np.diff(grid) > 0)):
+        return grid
+    try:
+        kind = np.asarray(legs["commit_kind"])
+        home = np.asarray(legs["commit_home"], dtype=np.int64)
+        cap_sec = int(max_min) * 60
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return grid
+    if kind.ndim != 1 or home.ndim != 1 or kind.shape != home.shape or cap_sec < 0:
+        return grid
+    transit = kind == 2
+    if not bool(np.any(transit)):
+        return grid[:1]
+    transit_home = home[transit]
+    # A kind-2 row must carry a real time-of-day home departure.  NEG belongs only to unreachable
+    # kind-0 rows; treating it as a bound would incorrectly collapse the grid.
+    if transit_home.size == 0 or bool(np.any(transit_home < 0)):
+        return grid
+    bound = int(transit_home.max()) + cap_sec
+    # side="right" is load-bearing: a deadline exactly at home+cap can still be the first feasible
+    # readout and must remain.  If even the first grid point lies beyond the bound, one column still
+    # suffices: every transit result is necessarily capped, and the kernel requires a non-empty grid.
+    end = max(1, int(np.searchsorted(grid, bound, side="right")))
+    return grid[:end]
+
+
+def _mc_summary_from_draws(commute_draws, perfect, max_min):
+    """Return the public MC statistics with one ordering pass per cell.
+
+    ``numpy.percentile`` was previously called three times over the same tiny draw axis: once on
+    raw draws for the diagnostic p50, then twice more after applying the per-cell best-case
+    floor.  Flooring every draw by one scalar is monotone, so the raw sorted order stays sorted
+    after that floor.  Sort once, read the exact ``method='linear'`` order statistics before and
+    after flooring, and keep NumPy reductions for standard deviation and stuck probability.
+
+    The explicit NaN propagation matches ``np.percentile`` rather than letting ``np.sort`` place
+    a NaN at the end and accidentally hide it from a median whose ranks precede that position.
+    Inputs are only produced by the float64 committed kernel in production; accepting every
+    numeric dtype here keeps this seam independently testable and preserves NumPy's float64
+    percentile promotion for smaller input dtypes.
+    """
+    draws = np.asarray(commute_draws)
+    # ``np.percentile`` promotes integer and low-precision float inputs to float64.  Retain a
+    # wider input (notably longdouble) if present, while production's float64 kernel stays
+    # allocation-free before the single sort.
+    stat_dtype = np.result_type(draws.dtype, np.float64)
+    ordered = np.sort(draws.astype(stat_dtype, copy=False), axis=1)
+    n_draws = ordered.shape[1]
+
+    # NumPy's default percentile method is linear: h=(n-1)q, then a + (b-a) * fractional(h).
+    # The draw count is normally 24, but test and diagnostic callers use smaller values too.
+    has_nan = np.isnan(ordered).any(axis=1)
+
+    def linear_percentile(q):
+        h = (n_draws - 1) * (float(q) / 100.0)
+        lo = int(np.floor(h))
+        hi = int(np.ceil(h))
+        out = ordered[:, lo].copy()
+        if hi != lo:
+            out += (ordered[:, hi] - out) * (h - lo)
+        if bool(np.any(has_nan)):
+            out[has_nan] = np.nan
+        return out
+
+    raw_p50 = linear_percentile(50.0)
+    # Keep the historical floor semantics exactly: non-positive/sentinel perfect values floor
+    # to zero, and the floor applies before every served distribution statistic.
+    floor = np.where(np.asarray(perfect) >= 0, perfect, 0).astype(np.float64)[:, None]
+    floored = np.maximum(draws, floor)
+    # Applying the scalar row floor preserves ordering, so no second sort is needed.
+    np.maximum(ordered, floor, out=ordered)
+    p50 = linear_percentile(50.0)
+    p90 = linear_percentile(90.0)
+
+    return (np.ceil(raw_p50).astype(np.int32),
+            np.ceil(p50).astype(np.int32),
+            np.maximum(0, np.round(p90 - p50)).astype(np.int32),
+            np.round(p90).astype(np.int32),
+            np.round(np.std(floored, axis=1)).astype(np.int32),
+            np.mean(floored >= float(max_min) - 1e-9, axis=1))
+
+
+class MonteCarloScenario:
+    """Private, lossless reverse-profile snapshot used only to accelerate a later route pin.
+
+    The public Monte-Carlo result remains ordinary JSON-shaped arrays/dicts.  A server may retain
+    one instance out-of-band and hand it back to ``route_typicals``; every routing/model input that
+    affects the profile is checked before reuse, otherwise the normal full kernel runs.
+    """
+    VERSION = 2
+    __slots__ = ("version", "tail_lag", "deadlines", "delta0_all", "slope_all", "seed",
+                 "n_draws", "max_rounds", "board_slack", "max_min", "walk_scalar",
+                 "data", "egress_g", "egress_w")
+
+    def __init__(self, *, tail_lag, deadlines, delta0_all, slope_all, seed, max_rounds,
+                 board_slack, max_min, walk_scalar, data, egress_g, egress_w):
+        self.version = self.VERSION
+        self.tail_lag = np.ascontiguousarray(tail_lag, np.uint16)
+        self.deadlines = np.ascontiguousarray(deadlines, np.int64)
+        self.delta0_all = np.ascontiguousarray(delta0_all, np.float64)
+        self.slope_all = np.ascontiguousarray(slope_all, np.float64)
+        self.seed = seed
+        self.n_draws = int(self.delta0_all.shape[0])
+        self.max_rounds = int(max_rounds)
+        self.board_slack = int(board_slack)
+        self.max_min = int(max_min)
+        self.walk_scalar = float(walk_scalar)
+        # Keep the exact graph object rather than only its numeric id.  CPython may recycle an
+        # id after an in-process rebuild; identity makes a retained profile ineligible for an
+        # equivalent-looking but different graph even in that pathological lifecycle.
+        self.data = data
+        self.egress_g = np.ascontiguousarray(egress_g, np.int32)
+        self.egress_w = np.ascontiguousarray(egress_w, np.int64)
+        for a in (self.tail_lag, self.deadlines, self.delta0_all, self.slope_all,
+                  self.egress_g, self.egress_w):
+            a.flags.writeable = False
+
+    @property
+    def nbytes(self):
+        return sum(a.nbytes for a in (self.tail_lag, self.deadlines, self.delta0_all,
+                                      self.slope_all, self.egress_g, self.egress_w))
+
+    def compatible(self, *, data, deadlines, egress_g, egress_w, seed, n_draws, max_rounds,
+                   board_slack, max_min, walk_scalar):
+        deadlines = np.asarray(deadlines, np.int64)
+        return bool(
+            self.version == self.VERSION
+            and seed is not None and self.seed == seed
+            and self.n_draws == int(n_draws)
+            and self.max_rounds == int(max_rounds)
+            and self.board_slack == int(board_slack)
+            and self.max_min == int(max_min)
+            and self.walk_scalar == float(walk_scalar)
+            and self.data is data
+            and np.array_equal(self.egress_g, np.asarray(egress_g, np.int32))
+            and np.array_equal(self.egress_w, np.asarray(egress_w, np.int64))
+            and deadlines.size <= self.deadlines.size
+            and np.array_equal(deadlines, self.deadlines[:deadlines.size])
+            and self.tail_lag.shape == (self.n_draws, int(data["n_stops"]),
+                                        self.deadlines.size)
+            and self.delta0_all.shape == self.slope_all.shape)
+
+
 class RaptorEngine:
     def __init__(self, gtfs_paths=None, service_date=None, access_path=None,
                  access_cap_min=ACCESS_CAP_MIN, verbose=True):
@@ -63,6 +231,8 @@ class RaptorEngine:
         from . import feeds
         self.service_date = service_date or feeds.pick_service_date(gtfs_paths)
         self.data = raptor_build.load_or_build(gtfs_paths, self.service_date, verbose=verbose)
+        self._walk_scaled_data = {}
+        self._walk_grid_cache = {}
         self.access_cap_min = access_cap_min
         self._load_access(access_path, verbose)
         self._make_grids()
@@ -125,6 +295,9 @@ class RaptorEngine:
         self.Tgrid = np.arange(dep, self.dep_grid[-1] + maxsec + 1, DEADLINE_STEP)
         # arrive-by: arrival-window deadlines (fine grid ending at the target)
         self.target_sec = ARRIVE_BY_HM[0] * 3600 + ARRIVE_BY_HM[1] * 60
+        # Planned/free-departure display grid: the pinned card compares concrete scheduled branches,
+        # so keep planned map/hover scoring at minute resolution without coupling it to MC tuning.
+        self.Tgrid_planned = np.arange(dep, self.Tgrid[-1] + 1, PLANNED_DEADLINE_STEP)
         # MC tail-readout grid: the committed kernel returns the first GRID deadline reachable
         # from the actual (late) arrival, so the step size rounds every draw up by U(0, step)s
         # before the percentile — at 180s that's a systematic ~+1.5 min baked into `realistic`.
@@ -145,10 +318,12 @@ class RaptorEngine:
     # -- walk-speed scalar ----------------------------------------------------------------
     def _scale_walk(self, egress_w, purewalk, walk_scalar, access_w=None):
         """Scale all WALK reference-seconds (access/egress/pure-walk, baked at 4.8 km/h) to the
-        user's pace: walk_scalar = 4.8/v (slow 1.20, med 1.00, fast 0.857). ``access_w`` None
+        user's pace: walk_scalar = 4.8/v (slow 1.412, med 1.143, fast 0.923). ``access_w`` None
         scales the engine's baked grid access table; callers with their own access CSR
-        (``commute_for_access``) pass theirs. Returns (egress_w, purewalk, access_w) as int64
-        at the user's pace."""
+        (``commute_for_access``) pass theirs. A public API default of ``walk_scalar=1.0`` means
+        the 4.8 km/h bake/reference pace, *not* the served Medium preset (which passes its
+        calibrated scalar explicitly). Returns (egress_w, purewalk, access_w) as int64 at the
+        user's pace."""
         ew = np.asarray(egress_w, np.int64); pw = np.asarray(purewalk, np.int64)
         aw = self.access_w if access_w is None else np.asarray(access_w, np.int64)
         if walk_scalar != 1.0:
@@ -158,62 +333,162 @@ class RaptorEngine:
             aw = np.rint(aw.astype(np.float64) * walk_scalar).astype(np.int64)
         return ew, pw, aw
 
+    def _data_for_walk_scalar(self, walk_scalar):
+        """RAPTOR data with transfer footpath seconds scaled to the user's walking pace."""
+        scalar = float(walk_scalar)
+        if abs(scalar - 1.0) < 1e-9:
+            return self.data
+        key = round(scalar, 6)
+        cached = self._walk_scaled_data.get(key)
+        if cached is not None:
+            return cached
+        data = dict(self.data)
+        base = np.asarray(self.data["tr_time"])
+        scaled64 = np.rint(base.astype(np.float64) * scalar).astype(np.int64)
+        scaled64 = np.where((base > 0) & (scaled64 < 1), 1, scaled64)
+        data["tr_time"] = scaled64.astype(base.dtype, copy=False)
+        self._walk_scaled_data[key] = data
+        return data
+
+    def _departafter_grids(self, walk_scalar, *, planned=False):
+        """Return profile grids wide enough for the selected access-walk pace.
+
+        The access table is capped in *reference* seconds.  A slower selected pace can therefore
+        make its outermost allowed access leg longer than the reference ``dep_grid`` tail.  Extend
+        both grids in that case so ``D + access_w`` remains representable; scalar 1.0 returns the
+        original objects byte-for-byte for the reference/oracle path.
+        """
+        scalar = float(walk_scalar)
+        if scalar <= 1.0:
+            return self.dep_grid, self.Tgrid_planned if planned else self.Tgrid
+        key = (round(scalar, 6), bool(planned))
+        cached = getattr(self, "_walk_grid_cache", {}).get(key)
+        if cached is not None:
+            return cached
+        access_tail = int(np.ceil(self.access_cap_min * 60 * scalar / DEP_STEP)) * DEP_STEP
+        dep_grid = np.arange(self.dep_sec, self.dep_sec + self.win_sec + access_tail + 1,
+                             DEP_STEP, dtype=np.int64)
+        deadline_step = PLANNED_DEADLINE_STEP if planned else DEADLINE_STEP
+        deadline_end = int(dep_grid[-1]) + self.max_min * 60
+        deadlines = np.arange(self.dep_sec, deadline_end + deadline_step, deadline_step,
+                              dtype=np.int64)
+        cache = getattr(self, "_walk_grid_cache", None)
+        if cache is None:
+            cache = self._walk_grid_cache = {}
+        cache[key] = (dep_grid, deadlines)
+        return cache[key]
+
     # -- compute -------------------------------------------------------------------------
-    def _reverse(self, egress_g, egress_w, deadlines, max_rounds=MAX_ROUNDS):
-        return R.reverse_profile(self.data, egress_g, egress_w, deadlines,
+    def _reverse(self, egress_g, egress_w, deadlines, max_rounds=MAX_ROUNDS, data=None):
+        data = self.data if data is None else data
+        return R.reverse_profile(data, egress_g, egress_w, deadlines,
                                  board_slack=BOARD_SLACK, max_rounds=max_rounds)
 
     def commute_for_access(self, access_off, access_to, access_w, egress_g, egress_w, purewalk,
                            semantic="departafter", percentiles=(5, 50), max_rounds=MAX_ROUNDS,
                            walk_scalar=1.0, target_sec=None, window_sec=None,
                            walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
-        """Door-to-door commute minutes for a CALLER-SUPPLIED origin set (both semantics).
+        """Door-to-door commute minutes for a CALLER-SUPPLIED origin set (all three semantics).
 
         The public API for off-grid origins (e.g. scripts/commute_origins.py): the caller builds
         its own CSR access table (origin -> stop walk REFERENCE seconds at config.WALK_KMH,
         capped like the baked table at ``self.access_cap_min`` so the engine's departure grids
         cover every boarding) + per-origin ``purewalk`` (origin->W reference seconds, -1 if
-        unwalkable), and the engine runs the SAME grids/steps/assembly the served map uses —
-        so external callers can never drift from the product model.
+        unwalkable). Only ``semantic='planned'`` runs the SERVED PRODUCT MODEL on this branch;
+        the other two are the legacy/validation models (see below) — callers that must match the
+        live map must ask for 'planned' explicitly.
 
-          semantic   'departafter' — p-percentiles over the [DEP, DEP+WINDOW] departure window
-                     (the R5-validated realistic model);
+          semantic   'planned'     — THE SERVED PRODUCT MODEL (this branch): the first-boarding-
+                     anchored scheduled depart-after value (``raptor.select_planned_departafter``
+                     over the SAME inputs the served map uses — walk-scalar-scaled transfer
+                     footpaths via ``_data_for_walk_scalar``, the minute-resolution
+                     ``Tgrid_planned`` sweep, ``stop_arrival_profile`` on the 60s ``dep_grid``,
+                     mirroring ``journey_tree_departafter(planned=True)``). ONE scheduled value
+                     per origin, broadcast into every requested percentile column exactly like the
+                     served ``[scheduled, scheduled]`` cells; ``percentiles`` selects only the
+                     column count and ``walk_reluctance``/``walk_prior_eps`` are inert (the
+                     planned selection takes no walk prior).
+                     'departafter' — p-percentiles over the [DEP, DEP+WINDOW] departure window:
+                     the LEGACY R5-VALIDATED comparison model (MAE 0.75 vs the oracles), NOT
+                     what the map serves on this branch;
                      'arriveby'    — perfect-timing arrive-by window ending at ``target_sec``
                      (default 09:00; ``window_sec`` None -> config.window(), 0 -> single deadline).
-          walk_scalar  4.8/pace scalar applied to ALL walk legs (access/egress/pure-walk).
+          walk_scalar  4.8/pace scalar applied to ALL walk legs, including transfer footpaths.
+                     ``1.0`` deliberately denotes the 4.8 km/h bake/reference pace, not the
+                     served Medium preset; product callers pass Medium's calibrated scalar.
 
         Returns int32[n_origins, n_pct] minutes, -1 = unreachable."""
         access_off = np.asarray(access_off, np.int64)
         access_to = np.asarray(access_to, np.int32)
         egress_g = np.asarray(egress_g, np.int32)
         ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar, access_w=access_w)
+        if semantic == "planned":
+            # The served product model. Build the same truthful traced tree the map uses instead
+            # of returning the profile kernel's deadline-rounded provisional values. Planned
+            # publication validates boardability and ranks concrete chains by their exact raw
+            # clock seconds; using that single source here keeps public off-grid callers in
+            # lockstep with map/hover even when a profile deadline contains sub-minute slack.
+            data = self._data_for_walk_scalar(walk_scalar)
+            dep_grid, deadlines = self._departafter_grids(walk_scalar, planned=True)
+            latest = self._reverse(egress_g, ew, deadlines, max_rounds, data=data)
+            arrivalW = R.stop_arrival_profile(latest, deadlines, dep_grid)
+            tree = raptor_journey.DepartAfterJourneyTree(
+                data, access_off, access_to, aw, pw, arrivalW,
+                dep_grid, self.cell_deps, self.max_min, egress_g, ew,
+                percentile=50.0, walk_reluctance=walk_reluctance,
+                walk_prior_eps=walk_prior_eps, max_rounds=max_rounds,
+                board_slack=BOARD_SLACK, planned=True)
+            painted = tree.commute()
+            # one scheduled value; broadcast across the requested percentile columns exactly like
+            # the served map's [scheduled, scheduled] cells (return contract: int32[n, n_pct]).
+            npct = max(1, np.atleast_1d(np.asarray(percentiles)).shape[0])
+            return np.repeat(np.asarray(painted, np.int32)[:, None], npct, axis=1)
         if semantic == "departafter":
-            latest = self._reverse(egress_g, ew, self.Tgrid, max_rounds)
-            arrivalW = R.stop_arrival_profile(latest, self.Tgrid, self.dep_grid)
+            data = self._data_for_walk_scalar(walk_scalar)
+            dep_grid, deadlines = self._departafter_grids(walk_scalar)
+            latest = self._reverse(egress_g, ew, deadlines, max_rounds, data=data)
+            arrivalW = R.stop_arrival_profile(latest, deadlines, dep_grid)
             return R.assemble_departafter(access_off, access_to, aw, pw, arrivalW,
-                                          self.dep_grid, self.cell_deps, self.max_min,
+                                          dep_grid, self.cell_deps, self.max_min,
                                           percentiles=percentiles, beta=walk_reluctance,
                                           eps=walk_prior_eps)
         if semantic != "arriveby":
-            raise ValueError(f"semantic must be 'departafter' or 'arriveby', got {semantic!r}")
+            raise ValueError(
+                f"semantic must be 'planned', 'departafter' or 'arriveby', got {semantic!r}")
         target = self.target_sec if target_sec is None else int(target_sec)
         win = int(config.window().total_seconds()) if window_sec is None else int(window_sec)
         deadlines = (np.array([target], np.int64) if win <= 0
                      else np.arange(target - win, target + 1, DEP_STEP, dtype=np.int64))
-        latest = self._reverse(egress_g, ew, deadlines, max_rounds)
+        data = self._data_for_walk_scalar(walk_scalar)
+        latest = self._reverse(egress_g, ew, deadlines, max_rounds, data=data)
         return _assemble_arriveby_window(access_off, access_to, aw, pw, latest, deadlines,
                                          self.max_min, np.asarray(percentiles, np.float64),
                                          beta=walk_reluctance, eps=walk_prior_eps)
 
     def departafter(self, egress_g, egress_w, purewalk, percentiles=(5, 50),
                     max_rounds=MAX_ROUNDS, walk_scalar=1.0, walk_reluctance=WALK_RELUCTANCE,
-                    walk_prior_eps=WALK_PRIOR_EPS):
-        """{cell_id: [p5, p50]} minutes, depart-after window (R5-comparable). ``purewalk`` is
-        cell->W walk seconds aligned to self.cell_ids (-1 if > cap). ``max_rounds`` caps
-        public-transport rides (rides = transfers + 1). ``walk_scalar`` sets the walk pace;
-        ``walk_reluctance``/``walk_prior_eps`` the mild walk prior (decision-only)."""
+                    walk_prior_eps=WALK_PRIOR_EPS, planned=False):
+        """{cell_id: [p5, p50]} minutes over the depart-after window.
+
+        Default (``planned=False``) = the LEGACY percentile model: p5/p50 over the
+        [DEP, DEP+WINDOW] departure window. This is the R5-VALIDATED path (MAE 0.75 vs the
+        committed oracles). At its reference ``walk_scalar=1.0`` it stays byte-identical for
+        validation/existing callers; other scalars now correctly scale every walk leg. It is no
+        longer what the map serves on this branch.
+
+        ``planned=True`` = THE SERVED PRODUCT MODEL on this branch: the first-boarding-anchored
+        scheduled value (``semantic='planned'`` in ``commute_for_access`` — the SAME grids/inputs
+        ``journey_tree_departafter(planned=True)``/the served map use), broadcast into every
+        percentile slot exactly like the served ``[scheduled, scheduled]`` cells;
+        ``walk_reluctance``/``walk_prior_eps`` are inert under it.
+
+        ``purewalk`` is cell->W walk seconds aligned to self.cell_ids (-1 if > cap).
+        ``max_rounds`` caps public-transport rides (rides = transfers + 1). ``walk_scalar`` sets
+        the walk pace; ``walk_reluctance``/``walk_prior_eps`` the mild walk prior (decision-only,
+        legacy path)."""
         out = self.commute_for_access(self.access_off, self.access_to, self.access_w,
-                                      egress_g, egress_w, purewalk, semantic="departafter",
+                                      egress_g, egress_w, purewalk,
+                                      semantic="planned" if planned else "departafter",
                                       percentiles=percentiles, max_rounds=max_rounds,
                                       walk_scalar=walk_scalar, walk_reluctance=walk_reluctance,
                                       walk_prior_eps=walk_prior_eps)
@@ -248,9 +523,11 @@ class RaptorEngine:
         target = self.target_sec if target_sec is None else int(target_sec)
         egress_g = np.asarray(egress_g, np.int32)
         ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
-        par = R.reverse_raptor_traced(self.data, egress_g, target - ew, ew,
-                                      max_rounds=max_rounds, board_slack=BOARD_SLACK)
-        return raptor_journey.JourneyTree(self.data, par, self.access_off, self.access_to,
+        data = self._data_for_walk_scalar(walk_scalar)
+        par = R.reverse_raptor_traced_fast(
+            data, egress_g, target - ew, ew,
+            max_rounds=max_rounds, board_slack=BOARD_SLACK)
+        return raptor_journey.JourneyTree(data, par, self.access_off, self.access_to,
                                           aw, pw, target, self.max_min,
                                           walk_reluctance=walk_reluctance,
                                           walk_prior_eps=walk_prior_eps,
@@ -259,11 +536,11 @@ class RaptorEngine:
     # -- depart-after traced tree -> hover==map breakdown + color-by-line ------------------
     def journey_tree_departafter(self, egress_g, egress_w, purewalk, percentile=50.0,
                                  max_rounds=MAX_ROUNDS, walk_scalar=1.0,
-                                 walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
-        """A ``DepartAfterJourneyTree`` for the depart-after window percentile (default p50): serves
-        the per-cell breakdown (hover), color-by-line, AND the depart-after map value, all anchored
-        on the SAME ``arrivalW`` the served depart-after map paints with — so hover == map by
-        construction (Stage 1 of the depart-after map migration).
+                                 walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS,
+                                 planned=False):
+        """A ``DepartAfterJourneyTree`` for the depart-after window. With ``planned=True`` it serves
+        the first-boarding-anchored scheduled value used by the product; otherwise it preserves the
+        legacy percentile mode used by validation tests.
 
         Mirrors ``journey_tree`` (the arrive-by sibling) but is driven by the depart-after window
         instead of a single 09:00 deadline: it reuses THIS engine's depart-after value computation
@@ -271,21 +548,24 @@ class RaptorEngine:
         the tree's painted grid equals ``self.departafter(...)`` for that percentile EXACTLY. The
         tracer then builds one ``reverse_raptor_traced`` tree per representative arrival deadline T*
         (only ~15-17 distinct per workplace) and reads each cell's journey from its painted access
-        stop s*. ``walk_scalar`` is applied end-to-end (access/egress/pure-walk seconds are scaled),
-        so the depart-after breakdown honors the walk-speed toggle — unlike the legacy R5-backed
-        departafter, which did not. JVM-free.
-
-        NOTE: not yet wired into the server (Stage 2). ``RAPTOR_SEMANTIC`` default stays
-        ``arriveby`` and the arrive-by path is byte-unchanged."""
+        stop s*. ``walk_scalar`` is applied end-to-end, including transfer footpaths, so access,
+        transfer, egress, and pure walking follow the same pace. JVM-free."""
         egress_g = np.asarray(egress_g, np.int32)
         ew, pw, aw = self._scale_walk(egress_w, purewalk, walk_scalar)
-        latest = self._reverse(egress_g, ew, self.Tgrid, max_rounds)
-        arrivalW = R.stop_arrival_profile(latest, self.Tgrid, self.dep_grid)
+        data = self._data_for_walk_scalar(walk_scalar)
+        # Planned/free-departure displays compare concrete scheduled branches in the pinned card.
+        # Use the minute grid here so the map-selected primary and branch enumeration score against
+        # the same resolution as the displayed leg times; the legacy percentile mode keeps the
+        # coarser validated grid.
+        dep_grid, deadlines = self._departafter_grids(walk_scalar, planned=planned)
+        latest = self._reverse(egress_g, ew, deadlines, max_rounds, data=data)
+        arrivalW = R.stop_arrival_profile(latest, deadlines, dep_grid)
         return raptor_journey.DepartAfterJourneyTree(
-            self.data, self.access_off, self.access_to, aw, pw, arrivalW,
-            self.dep_grid, self.cell_deps, self.max_min, egress_g, ew,
+            data, self.access_off, self.access_to, aw, pw, arrivalW,
+            dep_grid, self.cell_deps, self.max_min, egress_g, ew,
             percentile=float(percentile), walk_reluctance=walk_reluctance,
-            walk_prior_eps=walk_prior_eps, max_rounds=max_rounds, board_slack=BOARD_SLACK)
+            walk_prior_eps=walk_prior_eps, max_rounds=max_rounds, board_slack=BOARD_SLACK,
+            planned=planned)
 
     # -- Phase A: service-noise Monte-Carlo (realistic + fragility + alt-lines) ------------
     def _mc_mode_params(self):
@@ -313,8 +593,9 @@ class RaptorEngine:
         typical is then byte-identical to ``realistic``. One source so the two can never drift.
         Returns (delta0_all, slope_all), each float64[nR, n_trips]."""
         mu_pat, slope_pat = self._mc_mode_params()
-        ntrips = np.asarray(self.data["pat_ntrips"])
-        mu_trip = np.repeat(mu_pat, ntrips); slope_trip = np.repeat(slope_pat, ntrips)
+        ntrips = np.asarray(self.data["pat_ntrips"], dtype=np.int64)
+        mu_trip = np.repeat(mu_pat, ntrips)
+        slope_trip = np.repeat(slope_pat, ntrips)
         rng = np.random.default_rng(seed)
         k = MC_SHAPE
         T = mu_trip.shape[0]
@@ -324,7 +605,8 @@ class RaptorEngine:
 
     def montecarlo(self, egress_g, egress_w, purewalk, perfect=None, n_draws=None,
                    seed=None, alt_draws=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS, tree=None,
-                   walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS):
+                   walk_reluctance=WALK_RELUCTANCE, walk_prior_eps=WALK_PRIOR_EPS,
+                   capture_scenario=False, perf=None):
         """Committed-plan service-noise MC for a workplace. Returns dict of cell-aligned arrays:
           realistic int32  p50 door-to-door commute over draws FLOORED at ``perfect`` (so
                            realistic/frag/std/stuck all describe one consistent distribution
@@ -355,6 +637,7 @@ class RaptorEngine:
         + ``perfect`` map come from the SAME unperturbed arrive-by tree; the caller can pass an
         already-built one (the server reuses its cached tree -> no re-trace). Lazy + cached per
         workplace by the caller; never on the hover path. ``seed`` makes it reproducible."""
+        t_phase = time.perf_counter() if perf is not None else None
         nR = MC_DRAWS if n_draws is None else int(n_draws)
         egress_g = np.asarray(egress_g, np.int32)
         ew, _pw, _aw = self._scale_walk(egress_w, purewalk, walk_scalar)   # ew feeds the committed kernel
@@ -367,6 +650,8 @@ class RaptorEngine:
         if perfect is None:
             perfect, _ = tree.commute_and_dominant()
         perfect = np.asarray(perfect, np.int32)          # always materialized (tree fallback above)
+        _perf_add(perf, "variance.committed_ms", t_phase)
+        t_phase = time.perf_counter() if perf is not None else None
         # Truncate the MC tail-readout grid: any deadline beyond max(commit_home) + cap yields
         # tt > cap -> capf for EVERY cell regardless of the draw, so dropping those deadlines is
         # provably output-identical (including `stuck`) and trims the kernel's dominant cost (the
@@ -374,50 +659,54 @@ class RaptorEngine:
         # departures keep more of the grid). Computed HERE, after committed_first_legs(), so the
         # bound sees the walk-scalar-scaled legs; _make_grids' Tgrid_mc is untouched (tests pass
         # engine.Tgrid_mc straight to the kernel). Only transit cells (commit_kind == 2) carry a
-        # real commit_home (kind 0 holds NEG); no transit cells -> no bound -> keep the full grid.
-        Tmc = self.Tgrid_mc
-        kind_c = np.asarray(legs["commit_kind"])
-        if (kind_c == 2).any():
-            bound = int(np.asarray(legs["commit_home"])[kind_c == 2].max()) + self.max_min * 60
-            trunc = Tmc[Tmc <= bound]                    # INCLUSIVE: keep deadlines <= bound
-            if trunc.size:
-                Tmc = trunc
+        # real commit_home (kind 0 holds NEG); deterministic-only batches need one non-empty column.
+        Tmc = _committed_deadline_prefix(self.Tgrid_mc, legs, self.max_min)
         # the kernel's cummax + _first_ge readout require an ascending grid (np.arange +
         # prefix mask preserve this; assert in case a future caller breaks the invariant)
         assert Tmc.size and np.all(np.diff(Tmc) > 0), "MC deadline grid must be ascending"
-        cm = R.montecarlo_commute_committed(self.data, egress_g, ew, Tmc, legs,
-                                            perfect, self.max_min,
-                                            delta0_all, slope_all, board_slack=BOARD_SLACK,
-                                            max_rounds=max_rounds)
-        # pre-floor p50: the regression signal tests/validators assert on (the floored stats
-        # below satisfy perfect <= realistic by construction, so they carry no signal).
-        realistic_raw = np.ceil(np.percentile(cm, 50, axis=1)).astype(np.int32)
-        # Floor the DRAWS at perfect once, BEFORE any statistic, so the served quartet
-        # (realistic, frag, std, stuck) describes one self-consistent distribution and a frontend
-        # "bad day = realistic + frag" read matches p90. (The old post-hoc clamp lifted only
-        # realistic, so frag was measured from the lower unclamped p50 and overstated the bad day
-        # wherever the clamp fired.) Draws can legitimately dip below perfect: the tail
-        # re-optimizes earliest-arrival over the deadline grid where the traced tree optimized
-        # latest-departure — small + two-sided, see the zero-perturbation test.
-        cm = np.maximum(cm, np.where(perfect >= 0, perfect, 0).astype(np.float64)[:, None])
-        p50 = np.percentile(cm, 50, axis=1)
-        p90 = np.percentile(cm, 90, axis=1)
-        realistic = np.ceil(p50).astype(np.int32)
-        frag = np.maximum(0, np.round(p90 - p50)).astype(np.int32)
+        data = getattr(tree, "d", self.data)
+        captured = R.montecarlo_commute_committed(
+            data, egress_g, ew, Tmc, legs, perfect, self.max_min, delta0_all, slope_all,
+            board_slack=BOARD_SLACK, max_rounds=max_rounds, capture_tail=capture_scenario)
+        _perf_add(perf, "variance.kernel_ms", t_phase)
+        t_phase = time.perf_counter() if perf is not None else None
+        scenario = None
+        if capture_scenario:
+            cm, tail_lag, tail_valid = captured
+            if bool(np.all(np.asarray(tail_valid) == 1)):
+                scenario = MonteCarloScenario(
+                    tail_lag=tail_lag, deadlines=Tmc, delta0_all=delta0_all,
+                    slope_all=slope_all, seed=seed, max_rounds=max_rounds,
+                    board_slack=BOARD_SLACK, max_min=self.max_min,
+                    walk_scalar=walk_scalar, data=data, egress_g=egress_g, egress_w=ew)
+        else:
+            cm = captured
+        # The helper makes ONE sorted pass over each row, then uses monotonicity of the perfect
+        # floor to read both the raw diagnostic p50 and floored public stats exactly.  The floored
+        # quartet remains self-consistent: "bad day = realistic + frag" reads the floored p90.
+        # Draws can legitimately dip below perfect: the tail re-optimizes earliest-arrival over
+        # the deadline grid where the traced tree optimized latest-departure — small + two-sided,
+        # see the zero-perturbation test.
+        (realistic_raw, realistic, frag, committed_p90, std,
+         stuck) = _mc_summary_from_draws(cm, perfect, self.max_min)
+        _perf_add(perf, "variance.stats_ms", t_phase)
+        t_phase = time.perf_counter() if perf is not None else None
         # committed_p90 (rounded) — the committed bad-day ABSOLUTE minute. Arrive-by reconciles its
         # chip as headline(=realistic=committed_p50)+frag; depart-after's headline is the BARE served
         # p50 (the painted floor, != committed_p50 wherever committed_p50 drifted above the floor), so
         # it can't use frag=p90-p50 — it derives frag = committed_p90 - served_p50 off this absolute
         # so served_p50 + frag == committed_p90 exactly. Exposed for that depart-after caller;
         # arrive-by ignores it and keeps `frag` byte-identical.
-        committed_p90 = np.round(p90).astype(np.int32)
-        std = np.round(np.std(cm, axis=1)).astype(np.int32)
-        stuck = np.mean(cm >= self.max_min - 1e-9, axis=1)
         alt, alt_bundle = self._alt_window(tree, perfect,
                                            MC_ALT_DRAWS if alt_draws is None else int(alt_draws))
-        return dict(realistic=realistic, realistic_raw=realistic_raw, frag=frag,
-                    committed_p90=committed_p90, std=std,
-                    stuck=stuck, alt=alt, alt_bundle=alt_bundle)
+        _perf_add(perf, "variance.planned_alts_ms", t_phase)
+        if perf is not None:
+            perf["variance.draws"] = nR
+            perf["variance.deadlines"] = int(Tmc.size)
+        result = dict(realistic=realistic, realistic_raw=realistic_raw, frag=frag,
+                      committed_p90=committed_p90, std=std,
+                      stuck=stuck, alt=alt, alt_bundle=alt_bundle)
+        return (result, scenario) if capture_scenario else result
 
     def _alt_window(self, tree, perfect, alt_draws):
         """Alternatives by a DOMINANCE WINDOW over the UNPERTURBED arrive-by tree (NOT a draw-vote).
@@ -435,7 +724,11 @@ class RaptorEngine:
         is K-free and deterministic; the realistic/fragility MC keeps its own draws.)"""
         if alt_draws <= 0:
             return None, None
-        win = tree.alt_lines_window(perfect, ALT_WINDOW_MIN)   # per cell {line: (min, stop)}
+        # Planned depart-after intentionally uses a wider "also useful" window. The headline can
+        # be a timed walk or walk-heavy route, but riders still expect nearby transit options to
+        # stay visible for orientation and choice.
+        window = PLANNED_ALT_WINDOW_MIN if getattr(tree, "planned", False) else ALT_WINDOW_MIN
+        win = tree.alt_lines_window(perfect, window)   # per cell {line/signature: (min, stop)}
         alt = [None] * len(win)
         alt_stop = [None] * len(win)
         for ci, d in enumerate(win):
@@ -448,7 +741,7 @@ class RaptorEngine:
 
     def route_typicals(self, tree, ci, stops, egress_g, egress_w, perfect_route_mins=None,
                        n_draws=None, seed=None, walk_scalar=1.0, max_rounds=MAX_ROUNDS,
-                       return_committed_p90=False):
+                       return_committed_p90=False, scenario=None):
         """Per-ROUTE committed-plan TYPICAL (p50) + FRAGILITY (p90-p50) for ONE pinned cell ``ci``.
 
         ``stops`` is the list of access stops (gids) of the routes to score — the PRIMARY's selected
@@ -487,13 +780,28 @@ class RaptorEngine:
         else:
             perfect = np.array([int(p) if p is not None else -1 for p in perfect_route_mins],
                                np.int64)
-        # same per-pattern delay model + RNG as montecarlo() (shared helper) so the alt numbers are
-        # drawn from the SAME distribution as the served realistic map, not a fresh ad-hoc noise
-        delta0_all, slope_all = self._mc_draw_arrays(nR, seed)
-        cm = R.montecarlo_commute_committed(self.data, egress_g, ew, self.Tgrid_mc, legs,
-                                            perfect, self.max_min,
-                                            delta0_all, slope_all, board_slack=BOARD_SLACK,
-                                            max_rounds=max_rounds)
+        data = getattr(tree, "d", self.data)
+        Tmc = _committed_deadline_prefix(self.Tgrid_mc, legs, self.max_min)
+        reuse = (isinstance(scenario, MonteCarloScenario)
+                 and scenario.compatible(
+                     data=data, deadlines=Tmc, egress_g=egress_g, egress_w=ew, seed=seed,
+                     n_draws=nR, max_rounds=max_rounds, board_slack=BOARD_SLACK,
+                     max_min=self.max_min, walk_scalar=walk_scalar))
+        if reuse:
+            # The retained profile may cover a longer horizon than this small route batch. The
+            # replay kernel uses ``len(Tmc)`` as its read bound, so pass the already-contiguous full
+            # tensor and let it ignore the suffix. Materializing ``[:, :, :len(Tmc)]`` made an
+            # 8-12MiB non-contiguous prefix copy on every first pin for no semantic benefit.
+            cm = R.montecarlo_commute_committed_from_tail(
+                data, Tmc, scenario.tail_lag, legs, perfect, self.max_min,
+                scenario.delta0_all, scenario.slope_all, board_slack=BOARD_SLACK)
+        else:
+            # Same per-pattern delay model + RNG as montecarlo() (shared helper) so a compatible
+            # seed remains byte-identical even when reuse is unavailable or deliberately rejected.
+            delta0_all, slope_all = self._mc_draw_arrays(nR, seed)
+            cm = R.montecarlo_commute_committed(
+                data, egress_g, ew, Tmc, legs, perfect, self.max_min, delta0_all, slope_all,
+                board_slack=BOARD_SLACK, max_rounds=max_rounds)
         # floor the draws at each route's own best-case BEFORE the percentile, mirroring montecarlo()
         floor = np.where(perfect >= 0, perfect, 0).astype(np.float64)
         cm = np.maximum(cm, floor[:, None])

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SF Commute Explorer — set your own workplace</title>
 <script>
 /* First-paint theming: set data-theme synchronously BEFORE any CSS applies so a
@@ -15,6 +15,7 @@
   /* Theme tokens. All visible chrome reads through these vars so the only thing that
      differs between light/dark is the palette block — no hardcoded hex past this point. */
   :root{
+    --heat-opacity:.65;--heat-pinned-opacity:.195;
     --panel:#171a21;--ink:#e8eaed;--mut:#9aa3af;--line:#272b34;--accent:#5ab0ff;
     --ink-on-accent:#06121f;
     --bg-map:#0b0d10;--bg-input:#0e1116;--bg-hover:#1f2530;--bg-row-line:#1c2027;
@@ -48,19 +49,47 @@
        still reads as a halo against light tiles while keeping the colored stroke dominant. */
     --route-casing:#ffffff;
   }
-  *{box-sizing:border-box} html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  *{box-sizing:border-box} html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg-map);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  button,a,input,summary,[tabindex]{font:inherit}
+  button,a,input[type=range],summary{touch-action:manipulation}
+  button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible,[tabindex]:focus-visible{
+    outline:2px solid var(--accent);outline-offset:2px}
+  .skip-link{position:fixed;top:10px;left:10px;z-index:3000;transform:translateY(-180%);background:var(--panel);
+    color:var(--ink);border:1px solid var(--accent);border-radius:8px;box-shadow:var(--shadow);padding:9px 12px;
+    font-size:13px;font-weight:700;text-decoration:none;transition:transform .16s cubic-bezier(.25,1,.5,1)}
+  .skip-link:focus-visible{transform:translateY(0)}
   #map{position:absolute;inset:0;background:var(--bg-map)}.leaflet-container{background:var(--bg-map)}
   #panel{position:absolute;top:0;right:0;width:330px;height:100%;background:var(--panel);color:var(--ink);
-    z-index:1000;display:flex;flex-direction:column;overflow-y:auto;border-left:1px solid var(--line)}
+    z-index:1000;display:flex;flex-direction:column;overflow-y:auto;border-left:1px solid var(--line);
+    transition:opacity .18s cubic-bezier(.25,1,.5,1),visibility 0s linear 0s}
+  @media (min-width:720px){
+    body.route-pinned:not(.route-adjusting) #panel{opacity:0;visibility:hidden;pointer-events:none;
+      transition:opacity .18s cubic-bezier(.25,1,.5,1),visibility 0s linear .18s}
+    body.route-pinned:not(.route-adjusting) #pincard{right:18px}
+    body.route-pinned.route-adjusting #pincard{right:344px}
+  }
   h1{font-size:15px;margin:0;padding:14px 16px 3px}.sub{color:var(--mut);font-size:12px;padding:0 16px 10px;line-height:1.45}
   .ctl{padding:9px 16px;border-top:1px solid var(--line)}
-  .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-bottom:7px}
+  .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-bottom:7px;
+    display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;
+    border-radius:50%;border:1px solid var(--line);background:var(--bg-button);color:var(--mut);
+    font-size:10px;font-weight:700;line-height:1;cursor:help;padding:0;font-family:inherit;text-transform:none;letter-spacing:0}
+  .help:hover,.help:focus-visible{color:var(--ink);border-color:var(--accent)}
+  #helptip{position:fixed;z-index:2600;display:none;width:240px;max-width:calc(100vw - 16px);
+    padding:8px 9px;border-radius:8px;background:var(--bg-toast);color:var(--ink);
+    border:1px solid var(--line);box-shadow:var(--shadow-toast);font-size:11.5px;font-weight:500;
+    line-height:1.35;text-align:left;pointer-events:none}
+  #helptip.open{display:block}
   .addr{display:flex;gap:6px}.addr input{flex:1;background:var(--bg-input);border:1px solid var(--line);color:var(--ink);
     padding:8px;border-radius:8px;font-size:13px}.addr button{background:var(--accent);color:var(--ink-on-accent);border:0;
     padding:0 12px;border-radius:8px;font-weight:600;cursor:pointer}
   .seg{display:flex;gap:6px}.seg button{flex:1;background:var(--bg-button);color:var(--ink);border:1px solid var(--line);
     padding:7px;border-radius:8px;font-size:12.5px;cursor:pointer}.seg button.on{background:var(--accent);color:var(--ink-on-accent);font-weight:600;border-color:var(--accent)}
   input[type=range]{width:100%;accent-color:var(--accent)} .val{color:var(--accent);font-weight:600}
+  .range-meta{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .range-meta output{color:var(--accent);font-weight:700;font-variant-numeric:tabular-nums}
   #list{border-top:1px solid var(--line)}   /* flows; the whole #panel scrolls */
   .nb{display:flex;justify-content:space-between;padding:7px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--bg-row-line)}
   .nb:hover{background:var(--bg-hover)}.nb .t{font-variant-numeric:tabular-nums;font-weight:600}.nb small{color:var(--mut)}
@@ -84,16 +113,24 @@
   .bd .h{font-size:15px;margin-bottom:3px;letter-spacing:.1px}
   /* --- pinned route card: a fixed corner panel (replaces the on-map popup) so the pinned
          breakdown never sits on top of the drawn route. Same .bd content, panel chrome. --- */
-  #pincard{position:absolute;top:78px;right:344px;z-index:1200;background:var(--panel);color:var(--ink);
+  /* The CARD is a non-scrolling shell (flex column, overflow clipped to the rounded corners);
+     only #pinbody scrolls. That keeps the absolutely-positioned × in the shell's corner — it can
+     never scroll away with the content (the old overflow-y:auto-on-#pincard bug). */
+  /* Viewport-anchored: opening a route after the mobile controls have scrolled must not place the
+     card (including its persistent close control) above the visible page. */
+  #pincard{position:fixed;top:18px;right:344px;z-index:1200;background:var(--panel);color:var(--ink);
     border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-pop);display:none;
-    max-width:262px;animation:pincard-in .14s ease}
-  #pincard.open{display:block}
+    width:min(430px,calc(100vw - 36px));max-height:calc(100dvh - 36px);overflow:hidden;
+    animation:pincard-in .18s cubic-bezier(.25,1,.5,1);transition:right .22s cubic-bezier(.25,1,.5,1)}
+  #pincard.open{display:flex;flex-direction:column}
+  body.route-pinned #legend{display:none}
+  #pinbody{overflow-y:auto;overscroll-behavior:contain;min-height:0}
   @keyframes pincard-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
-  #pincard .pinx{position:absolute;top:6px;right:8px;cursor:pointer;color:var(--mut);font-size:18px;
-    line-height:1;width:20px;height:20px;display:flex;align-items:center;justify-content:center;
-    border-radius:6px;z-index:1}
+  #pincard .pinx{position:absolute;top:6px;right:6px;cursor:pointer;color:var(--mut);font-size:22px;
+    line-height:1;width:44px;height:44px;display:flex;align-items:center;justify-content:center;
+    border:0;background:transparent;border-radius:9px;z-index:4}
   #pincard .pinx:hover{color:var(--ink);background:var(--bg-hover)}
-  #pincard .bd{width:auto;min-width:200px;max-width:262px;padding-right:26px}
+  #pincard .bd{width:100%;min-width:0;max-width:none;padding:0}
   .bd .legs{display:flex;flex-wrap:wrap;gap:5px 5px;align-items:center}
   .bd .leg{padding:1px 7px;border-radius:7px;white-space:nowrap;font-size:11.5px;font-weight:600}
   .bd .walk{background:var(--bg-walk);color:var(--ink-walk);font-weight:500}
@@ -139,27 +176,93 @@
     border:1px solid rgba(0,0,0,.35);box-shadow:0 0 0 1px rgba(255,255,255,.18)}
   .bd .altfoot .altchip .amin{color:var(--mut);font-weight:500}
   .bd .altfoot .ahint{display:block}
-  /* --- compare list (pinned card): one selectable strip per route (primary + alts) ----------
-         The strip ties to the SINGLE route drawn on the map: its color dot = the drawn line's
-         identity casing color, its leg sequence reuses the .leg chip formatting, total right-
-         aligned. The locked/previewed row is marked (● + highlighted bg). Only one route draws
-         at a time, so the dot is the only cross-reference needed. --- */
-  .cmp{margin-top:9px;border-top:1px solid var(--line);padding-top:8px}
-  .cmp .cmphdr{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-bottom:6px}
-  .cmp .strip{display:flex;align-items:flex-start;gap:8px;padding:7px 8px;border-radius:9px;cursor:pointer;
-    border:1px solid transparent;transition:background .1s,border-color .1s}
-  .cmp .strip:hover{background:var(--bg-hover)}
-  .cmp .strip.sel{background:var(--bg-hover);border-color:var(--line)}
-  .cmp .strip .mark{flex:0 0 auto;width:13px;text-align:center;font-size:12px;color:var(--mut);line-height:1.4;margin-top:1px}
-  .cmp .strip.sel .mark{color:var(--ink)}
-  .cmp .strip .dot{flex:0 0 auto;width:10px;height:10px;border-radius:50%;margin-top:4px;
-    border:1px solid rgba(0,0,0,.35);box-shadow:0 0 0 1px rgba(255,255,255,.18)}
-  .cmp .strip .seq{flex:1 1 auto;min-width:0;display:flex;flex-wrap:wrap;gap:4px 4px;align-items:center}
-  .cmp .strip .seq .leg{font-size:10.5px;padding:1px 6px}
-  .cmp .strip .seq .arr{color:var(--ink-arr);font-size:9px}
-  .cmp .strip .tot{flex:0 0 auto;font-variant-numeric:tabular-nums;font-weight:700;font-size:12px;
-    margin-top:1px;white-space:nowrap}
-  .cmp .cmploading{font-size:11px;color:var(--mut);padding:4px 2px}
+  /* Recommendation-first route inspector. Rows are the only route controls: family headings and
+     expert disclosures are plain structure, so interactive elements never nest. */
+  .pin-head{position:sticky;top:0;z-index:3;background:rgb(var(--panel-rgb) / .97);
+    border-bottom:1px solid var(--line);padding:16px 54px 12px 16px;backdrop-filter:blur(10px)}
+  .pin-place{font-size:1.05rem;font-weight:750;line-height:1.25;letter-spacing:-.01em}
+  .pin-dest{margin-top:3px;color:var(--mut);font-size:.8125rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pin-stats{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;margin-top:10px;color:var(--mut);font-size:.75rem}
+  .pin-stats strong{color:var(--ink);font-size:1.25rem;font-variant-numeric:tabular-nums}
+  .pin-context{display:flex;align-items:center;gap:8px;margin-top:10px}
+  /* Settings are compact tokens rather than one clipped sentence.  In a narrow inspector they
+     wrap before the Adjust action, so the active time mode and walking pace stay legible. */
+  .pin-context>.pin-settings{display:flex;flex:1 1 154px;flex-wrap:wrap;gap:2px 0;min-width:0;
+    color:var(--mut);font-size:.71875rem;line-height:1.35}
+  .pin-settings>span{white-space:nowrap}
+  .pin-settings>span+span:before{content:" · ";color:var(--mut)}
+  .pin-context>.quiet-action{flex:0 0 auto;white-space:nowrap}
+  .quiet-action,.pin-view button{min-height:36px;border:1px solid var(--line);border-radius:8px;
+    padding:0 10px;background:var(--bg-button);color:var(--ink);cursor:pointer;font-size:.75rem;font-weight:650}
+  .pin-view{display:none;grid-template-columns:1fr 1fr;gap:5px;margin-top:10px}
+  .pin-view button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--ink-on-accent)}
+  .cmp{padding:0 16px 16px}
+  .route-section{padding-top:18px}
+  .route-section-title{margin:0 0 8px;color:var(--ink);font-size:.875rem;font-weight:750;line-height:1.3}
+  .route-section-title span{color:var(--mut);font-weight:600}
+  .choice-list{border-top:1px solid var(--line)}
+  .route-row{position:relative;display:grid;grid-template-columns:12px minmax(0,1fr) auto;width:100%;
+    gap:10px;min-height:56px;padding:11px 0;border:0;border-bottom:1px solid var(--line);border-radius:0;
+    background:transparent;color:var(--ink);text-align:left;cursor:pointer}
+  .route-row:last-child{border-bottom:0}
+  .route-row:hover,.route-row:focus-visible{background:var(--bg-hover)}
+  .route-row[aria-pressed="true"]{background:var(--bg-hover)}
+  .route-dot{width:10px;height:10px;border-radius:50%;margin-top:5px;border:1px solid rgba(0,0,0,.35);
+    box-shadow:0 0 0 1px rgba(255,255,255,.18)}
+  .route-main{min-width:0}
+  .route-name{display:block;font-size:.875rem;font-weight:750;line-height:1.3;overflow-wrap:anywhere}
+  .route-why{display:block;margin-top:3px;color:var(--mut);font-size:.75rem;line-height:1.4;overflow-wrap:anywhere}
+  .route-time{text-align:right;white-space:nowrap;font-size:.9375rem;font-weight:800;font-variant-numeric:tabular-nums}
+  .route-time small{display:block;margin-top:3px;color:var(--mut);font-size:.6875rem;font-weight:550}
+  .route-selected-label{display:block;margin-top:3px;color:var(--accent);font-size:.6875rem;font-weight:750}
+  .alternatives{padding-top:20px}
+  .expert{border-top:1px solid var(--line);margin-top:18px}
+  .expert>summary{min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:8px;
+    list-style:none;color:var(--ink);cursor:pointer;font-size:.8125rem;font-weight:700}
+  .expert>summary::-webkit-details-marker{display:none}
+  .expert>summary:after{content:"+";color:var(--mut);font-size:1rem}
+  .expert[open]>summary:after{content:"−"}
+  .boarding-group{padding:16px 0 0}
+  .boarding-group+.boarding-group{border-top:1px solid var(--line);margin-top:14px}
+  .boarding-heading{margin:0 0 8px;line-height:1.35}
+  .boarding-place{display:block;color:var(--ink);font-size:.8125rem;font-weight:750}
+  .boarding-detail{display:block;margin-top:2px;color:var(--mut);font-size:.6875rem;font-weight:600}
+  .selected-route{margin-top:22px;padding-top:18px;border-top:1px solid var(--line)}
+  .selected-route-summary{display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:10px;align-items:start}
+  .selected-route-summary .route-why{margin-top:4px}
+  .route-directions{margin:10px 0 0;padding:0;list-style:none;border-top:1px solid var(--line)}
+  .route-directions li{display:flex;gap:8px;padding:10px 0;border-bottom:1px solid var(--line);font-size:.8125rem;line-height:1.4}
+  .route-directions li:last-child{border-bottom:0}
+  .route-step{display:inline-flex;align-items:center;justify-content:center;flex:0 0 18px;height:18px;
+    border-radius:50%;background:var(--bg-button);border:1px solid var(--line);color:var(--mut);
+    font-size:.625rem;font-weight:750;margin-top:1px}
+  .route-copy{min-width:0}.route-detail{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
+  .route-allowance{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
+  .selected-directions{border-top:1px solid var(--line);margin-top:13px}
+  .selected-directions>summary{min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:8px;
+    list-style:none;cursor:pointer;color:var(--ink);font-size:.8125rem;font-weight:700}
+  .selected-directions>summary::-webkit-details-marker{display:none}
+  .selected-directions>summary:after{content:"+";color:var(--mut);font-size:1rem}
+  .selected-directions[open]>summary:after{content:"−"}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  .cmploading{padding:10px 0;color:var(--mut);font-size:.75rem}
+  .pin-links{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px 16px;
+    border-top:1px solid var(--line);font-size:.75rem}
+  .pin-links .gm{margin:0}
+  .show-routes{min-height:44px;border:0;background:none;color:var(--accent);padding:8px 0;cursor:pointer;font-weight:650}
+  #touchpeek{display:none;position:fixed;z-index:1250;left:8px;right:8px;bottom:max(8px,env(safe-area-inset-bottom));
+    background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:15px;
+    box-shadow:var(--shadow-pop);padding:14px;max-height:calc(100dvh - 16px);overflow-y:auto;overscroll-behavior:contain}
+  #touchpeek.open{display:block}
+  #touchpeek .peek-close{position:absolute;right:4px;top:4px;width:44px;height:44px;border:0;border-radius:9px;
+    background:transparent;color:var(--mut);font-size:22px;cursor:pointer}
+  #touchpeek .peek-title{padding-right:42px;font-size:1rem;font-weight:750}
+  #touchpeek .peek-stats{margin-top:6px;color:var(--mut);font-size:.8125rem}
+  #touchpeek .peek-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+  #touchpeek button.inspect{min-height:44px;border:0;border-radius:9px;background:var(--accent);
+    color:var(--ink-on-accent);font-weight:750;cursor:pointer}
+  #touchpeek button.dismiss{min-height:44px;border:1px solid var(--line);border-radius:9px;background:var(--bg-button);
+    color:var(--ink);font-weight:650;cursor:pointer}
   /* --- keep-pin recompute loading state on the pinned card (Max transfers / Walk speed) --- */
   /* The "updating…" line sits at the top of the card; the compare strips dim + go inert so the
      user sees it's recalculating while the card stays put (same position/size) and the OLD route
@@ -171,14 +274,16 @@
     border:2px solid var(--line);border-top-color:var(--accent);animation:pinspin .7s linear infinite}
   @keyframes pinspin{to{transform:rotate(360deg)}}
   /* --- added: how-it-works link + modal --- */
-  .info-link{color:var(--accent);font-size:11.5px;cursor:pointer;text-decoration:none;margin-left:6px}
+  .info-link{color:var(--accent);font-size:11.5px;cursor:pointer;text-decoration:none;margin-left:6px;
+    padding:0;border:0;background:transparent}
   .info-link:hover{text-decoration:underline}
   /* shared modal shell: How it works + About both use it (one source of overlay styling) */
-  .modal{position:absolute;inset:0;z-index:1400;background:var(--modal-bg);display:none;
+  .modal{position:fixed;inset:0;z-index:1400;background:var(--modal-bg);display:none;
     align-items:center;justify-content:center;padding:18px}
   .modal.open{display:flex}
   .modal .card{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:14px;
-    max-width:440px;max-height:84vh;overflow-y:auto;padding:20px 22px;box-shadow:var(--shadow-pop);
+    width:min(720px,calc(100vw - 48px));max-width:720px;max-height:calc(100dvh - 48px);
+    overflow-y:auto;overscroll-behavior:contain;padding:20px 22px;box-shadow:var(--shadow-pop);
     font-size:13.5px;line-height:1.55}
   .modal .card h2{margin:0 0 10px;font-size:15px}
   .modal .card h3{margin:16px 0 5px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
@@ -186,7 +291,8 @@
   .modal .card a{color:var(--accent)}
   .modal .card ul{margin:0;padding-left:18px}
   .modal .card ul li{margin-bottom:3px}
-  .modal .card .x{float:right;cursor:pointer;color:var(--mut);font-size:18px;line-height:1;margin:-4px -4px 0 0}
+  .modal .card .x{float:right;display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;
+    border:0;border-radius:9px;background:transparent;cursor:pointer;color:var(--mut);font-size:18px;line-height:1;margin:-10px -10px 0 0}
   .modal .card .x:hover{color:var(--ink)}
   /* slim footer bar pinned to the bottom of the side panel: About + How it works tabs */
   .foot-bar{margin-top:auto;display:flex;border-top:1px solid var(--line);background:var(--panel)}
@@ -205,6 +311,8 @@
   .rtbadge{display:inline-block;transform:translate(-50%,-135%);background:var(--panel);color:var(--ink);
     border:1px solid var(--line);padding:2px 8px;border-radius:10px;font-size:11.5px;font-weight:700;
     white-space:nowrap;box-shadow:var(--shadow)}
+  .leaflet-cells-pane canvas{opacity:var(--heat-opacity);transition:opacity .2s cubic-bezier(.25,1,.5,1)}
+  body.route-pinned .leaflet-cells-pane canvas{opacity:var(--heat-pinned-opacity)}
   /* --- added: mobile bottom-sheet handle (hidden on desktop) --- */
   /* it's a real <button> (keyboard-operable); strip the UA chrome so the sheet styling wins */
   #sheetbtn{display:none;border:0;padding:0;width:100%;font-family:inherit}
@@ -271,10 +379,31 @@
     /* breakdown popup fills more width on small screens */
     .bd{width:auto;max-width:78vw}
     .leaflet-popup-content{max-width:80vw}
-    .modal .card{font-size:14px}
+    .modal{padding:12px}
+    .modal .card{width:100%;max-height:calc(100dvh - 24px);font-size:14px}
     /* on mobile the side panel is a bottom sheet; float the pinned card to a fixed corner
        so it isn't trapped inside the collapsed sheet */
-    #pincard{top:10px;right:10px;left:auto;max-width:78vw}
+    #pincard{top:0;right:0;left:0;bottom:0;width:100vw;max-height:100dvh;height:100dvh;border-radius:0;
+      border-width:0;transition:transform .24s cubic-bezier(.25,1,.5,1)}
+    #pincard .pin-head{padding-top:max(16px,env(safe-area-inset-top))}
+    #pincard .pin-view{display:grid}
+    #pincard .route-row{min-height:64px}
+    #pincard .route-name{font-size:1rem}
+    #pincard .route-why,#pincard .route-directions li{font-size:.875rem}
+    #pincard .quiet-action,#pincard .pin-view button{min-height:44px;font-size:.875rem}
+    #pincard .pin-context{align-items:flex-start;flex-wrap:wrap}
+    #pincard .pin-settings{line-height:1.45}
+    #pincard .pin-links{padding-bottom:max(18px,env(safe-area-inset-bottom))}
+    body.pin-map-view #pincard{top:auto;height:auto;max-height:calc(230px + env(safe-area-inset-bottom));border:1px solid var(--line);
+      border-radius:16px 16px 0 0}
+    body.pin-map-view #pincard #pinbody{overflow:hidden}
+    body.pin-map-view #pincard .cmp,body.pin-map-view #pincard .pin-links{display:none}
+    body.pin-map-view #pincard .pin-head{border-bottom:0;padding-bottom:max(12px,env(safe-area-inset-bottom))}
+    /* Pinning is a focused route-inspection mode. The controls sheet and broad map legend add no
+       value behind a two-screen route card and otherwise compete for the same bottom pixels. */
+    body.route-pinned:not(.route-adjusting) #panel{display:none}
+    body.route-pinned.route-adjusting #panel{display:flex;z-index:1300;transform:translateY(0);max-height:82vh}
+    body.route-pinned.route-adjusting #pincard{display:none}
     /* onboarding: full-width centering (panel is a bottom sheet, not a side rail) and the
        CTA points DOWN toward the "Controls" sheet handle. Sits above the 52px sheet. */
     #prompt{padding:18px;padding-bottom:84px;align-items:center}
@@ -282,9 +411,18 @@
     #prompt .cta .arr{animation:obArrDn 1.3s ease-in-out infinite}
     @keyframes obArrDn{0%,100%{transform:translateY(0)}50%{transform:translateY(4px)}}
   }
+  @media (prefers-reduced-motion:reduce){
+    /* Keep state changes immediate without globally clobbering third-party/map transitions. */
+    #pincard,#panel,.leaflet-cells-pane canvas,#pincard.pinloading .cmp{
+      transition-duration:.01ms!important}
+    #pincard,#prompt .ob,#prompt .cta .arr,#pincard .spin{
+      animation:none!important}
+    html{scroll-behavior:auto}
+  }
 </style></head>
 <body>
-<div id="map"></div><div id="busy">computing…</div>
+<a class="skip-link" href="#panel">Skip to commute controls</a>
+<div id="map" role="region" aria-label="Commute-time map. Route details appear in the route inspector."></div><div id="busy" role="status" aria-live="polite" aria-atomic="true">computing…</div>
 <div id="prompt">
   <div class="ob" role="dialog" aria-label="Get started">
     <h2>Where can you live and still get to work?</h2>
@@ -297,34 +435,63 @@
       <button id="obgo" type="button" aria-label="Map this workplace">Go <span class="arr" aria-hidden="true">→</span></button>
     </div>
   </div></div>
-<div id="panel">
+<aside id="panel" aria-label="Commute controls" tabindex="-1">
   <button id="sheetbtn" aria-label="Toggle controls" aria-expanded="false">Controls</button>
-  <h1>Commute to your workplace <a class="info-link" id="howlink" role="button" tabindex="0">How it works</a></h1>
+  <h1>Commute to your workplace <button class="info-link" id="howlink" type="button">How it works</button></h1>
   <div class="sub">Enter your workplace address to begin. <b>Hover or tap</b> any area to see its time + the
     route drawn on the map — the lines you'd ride, the transfers, where you'd walk; <b>click</b> to pin
     the route with a Google Maps link (Esc unpins).</div>
-  <div class="ctl"><div class="lab">Workplace</div>
+  <div class="ctl"><div class="lab"><span>Workplace</span><button class="help" type="button"
+    aria-label="What is Workplace?" title="Set the destination you commute to."
+    data-tip="Set the destination you commute to. The map shows travel time from each area to this place.">?</button></div>
     <div class="addr"><div class="acwrap"><input id="addr" placeholder="e.g. 1 Market St" autocomplete="off"
       role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="ac"><div id="ac" role="listbox"></div></div><button id="go">Set</button></div>
     <div id="dest" style="color:var(--mut);font-size:11px;margin-top:6px"></div>
     <div id="refinebox"><button id="refine" class="btn sec" style="margin-top:9px" disabled>Refine — exact (~30s)</button>
     <div class="note">Fast map (±~2 min) auto-sharpens to exact times. Use <b>Refine</b> to re-run the exact pass.</div></div>
     <div id="estnote" class="note" style="display:none">Door-to-door <b>estimates</b>, <span id="estphrase"></span> by walk + transit.</div></div>
-  <div class="ctl"><div class="lab">Time estimate</div>
+  <!-- Static tip = the ARRIVE-BY copy (the buttons' static labels are Realistic/Best-case).
+       Under DEPARTAFTER, applyCfg rewrites BOTH the labels (Scheduled/Best-case) and this tip. -->
+  <div class="ctl"><div class="lab"><span>Time estimate</span><button class="help" type="button"
+    aria-label="What is Time estimate?" title="Choose the commute number shown on the map."
+    data-tip="Choose which commute number to show. Best-case assumes perfect timing — you leave to the second and never wait. Realistic adds the typical service delay (a late vehicle, a missed transfer) to your committed plan.">?</button></div>
     <div class="seg" id="metric" role="group" aria-label="Time estimate"><button data-v="r" class="on">Realistic</button><button data-v="b">Best-case</button></div></div>
-  <div class="ctl"><div class="lab">Color by</div>
+  <div class="ctl"><div class="lab"><span>Color by</span><button class="help" type="button"
+    aria-label="What is Color by?" title="Choose whether colors mean commute time or primary transit line."
+    data-tip="Time colors show minutes. Primary line colors show the main transit line used from each area.">?</button></div>
     <div class="seg" id="cmode" role="group" aria-label="Color by"><button data-v="time" class="on">Time</button><button data-v="line">Primary line</button></div></div>
-  <div class="ctl"><div class="lab">Appearance</div>
+  <div class="ctl"><div class="lab"><span>Map colors</span><button class="help" type="button"
+    aria-label="What are Map colors?" title="Hide colored commute cells to read the basemap."
+    data-tip="Turn this off to hide the colored commute cells, making streets and neighborhood labels easier to read.">?</button></div>
+    <div class="seg" id="mapcolors" role="group" aria-label="Map colors"><button data-v="on" class="on">On</button><button data-v="off">Off</button></div></div>
+  <div class="ctl"><div class="range-meta"><div class="lab" style="margin-bottom:0"><span>Map color strength</span><button class="help" type="button"
+    aria-label="What is map color strength?" title="Adjust how strongly commute colors cover the streets."
+    data-tip="Lower this to make streets and neighborhood labels easier to read. Route lines and the selected-area outline stay clear.">?</button></div>
+    <output id="opacityval" for="opacity">65%</output></div>
+    <input type="range" id="opacity" min="20" max="100" step="5" value="65" aria-label="Map color strength (percent)"></div>
+  <div class="ctl"><div class="lab"><span>Appearance</span><button class="help" type="button"
+    aria-label="What is Appearance?" title="Choose the basemap theme."
+    data-tip="Auto follows your device. Light and Dark force the basemap theme for this session.">?</button></div>
     <div class="seg" id="theme" role="group" aria-label="Appearance"><button data-v="auto" class="on">Auto</button><button data-v="light">Light</button><button data-v="dark">Dark</button></div></div>
-  <div class="ctl"><div class="lab">Max transfers</div>
+  <div class="ctl"><div class="lab"><span>Max transfers</span><button class="help" type="button"
+    aria-label="What are Max transfers?" title="Limit how many times routes can change vehicles."
+    data-tip="Limit how many times a route can change vehicles. Any allows the router to use the best reasonable transit path.">?</button></div>
     <div class="seg" id="maxrides" role="group" aria-label="Max transfers"><button data-v="0">0</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="any" class="on">Any</button></div></div>
-  <div class="ctl"><div class="lab">Walk speed</div>
+  <div class="ctl"><div class="lab"><span>Walk speed</span><button class="help" type="button"
+    aria-label="What is Walk speed?" title="Adjust walking time for access, transfers, and final walk."
+    data-tip="Adjusts all walking parts of the trip: getting to transit, transfer walks, and the final walk to work.">?</button></div>
     <div class="seg" id="speed" role="group" aria-label="Walk speed"><button data-v="slow">Slow</button><button data-v="med" class="on">Medium</button><button data-v="fast">Fast</button></div></div>
-  <div class="ctl"><div class="lab">Sweet spot — green ≤ <span class="val" id="idval">25</span> min (recolors)</div>
+  <div class="ctl"><div class="lab"><span>Sweet spot — green ≤ <span class="val" id="idval">25</span> min (recolors)</span><button class="help" type="button"
+    aria-label="What is Sweet spot?" title="Set where the map starts feeling good."
+    data-tip="Sets the green point on the color scale. Lower values make the map stricter; higher values make more places look good.">?</button></div>
     <input type="range" id="ideal" min="10" max="45" value="25" aria-label="Sweet spot threshold (minutes)"></div>
-  <div class="ctl"><div class="lab">Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</div>
+  <div class="ctl"><div class="lab"><span>Max commute — hide above <span class="val" id="thrval">40</span> min (filters)</span><button class="help" type="button"
+    aria-label="What is Max commute?" title="Hide areas above this commute time."
+    data-tip="Hides areas slower than this many minutes so the map and neighborhood list stay focused.">?</button></div>
     <input type="range" id="thr" min="10" max="70" value="40" aria-label="Max commute (minutes)"></div>
-  <div class="ctl"><div class="lab">Overlay real transit lines</div>
+  <div class="ctl"><div class="lab"><span>Overlay real transit lines</span><button class="help" type="button"
+    aria-label="What are real transit lines?" title="Draw agency route shapes on the map."
+    data-tip="Draws the real BART, Muni, and Caltrain route shapes on top of the map for orientation.">?</button></div>
     <div style="display:flex;flex-wrap:wrap;gap:11px;font-size:12.5px">
       <!-- label colors are set from viz.js MODECOLOR at boot — the ONE mode palette, no drift -->
       <label style="cursor:pointer"><input type="checkbox" data-m="bart"> <span>BART</span></label>
@@ -332,26 +499,33 @@
       <label style="cursor:pointer"><input type="checkbox" data-m="bus"> <span>Bus</span></label>
       <label style="cursor:pointer"><input type="checkbox" data-m="cable"> <span>Cable</span></label>
     </div></div>
-  <div class="ctl" style="padding-bottom:5px"><div class="lab">Neighborhoods <span id="nbcount" style="color:var(--mut);text-transform:none;letter-spacing:0;font-weight:400"></span></div></div>
+  <div class="ctl" style="padding-bottom:5px"><div class="lab"><span>Neighborhoods <span id="nbcount" style="color:var(--mut);text-transform:none;letter-spacing:0;font-weight:400"></span></span><button class="help" type="button"
+    aria-label="What are Neighborhoods?" title="Ranked neighborhoods under the current commute limit."
+    data-tip="Neighborhoods are ranked by the selected commute time after your max-commute filter is applied.">?</button></div></div>
   <div id="list"></div>
   <div class="export"><button id="copylist">Copy list</button><button id="dlcsv">Download CSV</button></div>
   <div class="foot-bar">
     <button id="aboutbtn" type="button">About</button>
     <button id="howbtn" type="button">How it works</button>
   </div>
-</div>
+</aside>
 <div id="legend"><b id="legtitle">Realistic door-to-door (min)</b><div class="bar"></div>
   <div class="sc"></div></div>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="helptip" role="tooltip"></div>
 <!-- pinned route card: a fixed corner panel that holds the clicked cell's breakdown so it
      never covers the route drawn on the map (replaces the old on-cell popup pin). -->
-<div id="pincard" role="dialog" aria-label="Pinned route">
-  <span class="pinx" id="pinx" role="button" tabindex="0" aria-label="Unpin route">&times;</span>
+<aside id="pincard" role="region" aria-label="Route inspector" tabindex="-1">
+  <button class="pinx" id="pinx" type="button" aria-label="Close route inspector">&times;</button>
   <div id="pinbody"></div>
-</div>
-<div id="howmodal" class="modal"><div class="card">
-  <span class="x" id="howx" role="button" tabindex="0" aria-label="Close">&times;</span>
-  <h2>How it works</h2>
+</aside>
+<aside id="touchpeek" role="region" aria-label="Commute preview" aria-live="polite" aria-atomic="true" aria-hidden="true">
+  <button class="peek-close" id="peekx" type="button" aria-label="Close commute preview">&times;</button>
+  <div id="peekbody"></div>
+</aside>
+<div id="howmodal" class="modal" role="dialog" aria-modal="true" aria-labelledby="howtitle"><div class="card" tabindex="-1">
+  <button class="x" id="howx" type="button" aria-label="Close">&times;</button>
+  <h2 id="howtitle">How it works</h2>
   <p>The map shows <b>door-to-door</b> travel time by <b>walking + public transit only</b>
   (Muni / BART / Caltrain) — no driving or biking — on real weekday schedules,
   <b><span id="howtime"></span></b>. Each area is colored by how long it takes to reach your
@@ -371,9 +545,9 @@
     <li><a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a> — basemap tiles</li>
   </ul>
 </div></div>
-<div id="aboutmodal" class="modal"><div class="card">
-  <span class="x" id="aboutx" role="button" tabindex="0" aria-label="Close">&times;</span>
-  <h2>About</h2>
+<div id="aboutmodal" class="modal" role="dialog" aria-modal="true" aria-labelledby="abouttitle"><div class="card" tabindex="-1">
+  <button class="x" id="aboutx" type="button" aria-label="Close">&times;</button>
+  <h2 id="abouttitle">About</h2>
   <p>SF Commute Explorer maps where in San Francisco you can live and still reach a workplace
   you choose within a reachable transit commute.</p>
   <p>Built by <a href="https://akshaymanglik.com" target="_blank" rel="noopener">Akshay Manglik</a>.</p>
@@ -384,10 +558,24 @@
 <script>
 /*__VIZ__*/
 const CELLS=__CELLS__, LINES=__LINES__, CFG=__CFG__;
+function revealControlsForSkip(){
+  if(document.body.classList.contains("route-pinned")){
+    document.body.classList.add("route-adjusting");panelEl.classList.add("open");
+    sheetBtn.textContent="Done adjusting";sheetBtn.setAttribute("aria-expanded","true");
+    const adjust=document.getElementById("pinadjust");if(adjust)adjust.setAttribute("aria-expanded","true");
+    requestAnimationFrame(()=>map.invalidateSize({pan:false}));
+  }
+  document.getElementById("panel").focus({preventScroll:true});
+}
+document.querySelector(".skip-link").addEventListener("click",e=>{e.preventDefault();revealControlsForSkip();});
 // CFG.raptor: the map IS the engine result (no separate exact pass) -> drop the R5 "Refine"
 // affordance. CFG.arriveby: frame everything as an arrive-by-09:00 estimate (CFG.timephrase).
-let metric="r", ideal=25, thr=40, cmode="time", TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
-let REAL={}, VAR={};   // service-noise overlay (RAPTOR arrive-by): REAL[id]=realistic(MC p50) min; VAR[id]={frag,std,stuck,alt}. Populated by /variance after the map paints; survives the exact-refine overwrite of TT.
+let metric="r", ideal=25, thr=40, cmode="time", mapcolors="on", heatOpacity=.65,
+  TT={}, ATTR={}, NB={}, DESTLL=null, LINECOLOR={}, GEN=0;
+let REAL={}, VAR={};   // service-noise overlay: REAL[id]=realistic(MC p50) min (arrive-by ONLY — depart-after serves realistic:{} and REAL stays empty); VAR[id]={frag,std,stuck,alt} (BOTH semantics). Populated by /variance (applyVariancePayload) after the map paints; survives the exact-refine overwrite of TT.
+// /variance is progressive, but its lifecycle must still terminate explicitly. Tie the state to
+// GEN so a slow response from the previous workplace cannot mark the new destination ready/failed.
+let varianceState={status:"idle",gen:0,error:""};       // idle | loading | ready | failed
 let EXACT=false;   // true once the exact refine has replaced the fast map (so hover==map, not a contradicting exact number on a fast cell)
 let maxxfers="any";   // "0"/"1"/"2" transfers, or "any" (the R5 default 8-ride cap)
 // UI transfers -> R5 ride cap (rides = transfers + 1). "any" stays unset so the URL and
@@ -395,22 +583,72 @@ let maxxfers="any";   // "0"/"1"/"2" transfers, or "any" (the R5 default 8-ride 
 function ridesParam(){
   if(maxxfers==="any")return "";
   const n=+maxxfers;return Number.isFinite(n)?`&maxrides=${n+1}`:"";}
-let walkspeed="med";                              // walk pace toggle (slow|med|fast); RAPTOR arrive-by only
-// CFG.speedtoggle: the server only fully wires walk speed under RAPTOR arrive-by (map AND
-// breakdown apply it). Elsewhere hide the control and never send &speed= — it would be a
-// half-no-op (e.g. under departafter the map shifts but the R5 hover stays at 4.8 km/h).
+let walkspeed="med";                              // calibrated walk pace toggle (slow|med|fast)
+// CFG.speedtoggle: RAPTOR applies the selected pace to access, transfer, egress, and pure walking
+// in both served semantics. Hide the control only for a legacy stack that cannot honor it end to end.
 function speedParam(){return (walkspeed==="med"||!CFG.speedtoggle)?"":`&speed=${walkspeed}`;}
 if(!CFG.speedtoggle)document.getElementById("speed").closest(".ctl").style.display="none";
 let CURLABEL="";                                  // current workplace label (for permalink + dest line)
-const TOUCH = ("ontouchstart" in window) || (navigator.maxTouchPoints>0) || window.matchMedia("(max-width:719px)").matches;
+// Layout width is not input modality: a narrow desktop (or a touch-capable laptop used with a
+// mouse) must keep desktop hover and one-click inspection.  Default to the touch-first flow only
+// when the device has a coarse pointer *and* no hover-capable pointer; the cell click handler below
+// additionally respects PointerEvent.pointerType for hybrid devices.
+const TOUCH=!!(window.matchMedia&&window.matchMedia("(any-pointer: coarse)").matches&&
+  !window.matchMedia("(any-hover: hover)").matches);
+let lastPointerType="";
+function rememberPointerModality(ev){
+  const original=ev&&ev.originalEvent||ev;
+  const type=original&&typeof original.pointerType==="string"?original.pointerType:"";
+  if(type==="mouse"||type==="touch"||type==="pen")lastPointerType=type;
+}
+// Leaflet can surface a compatibility click without its original PointerEvent. Remember the last
+// genuine pointer-down at capture time so a hybrid device follows the interaction the person just
+// used: finger/pen previews first; mouse opens the inspector directly.
+document.addEventListener("pointerdown",rememberPointerModality,true);
+function touchInteraction(ev){
+  const original=ev&&ev.originalEvent;
+  if(original&&typeof original.pointerType==="string"&&original.pointerType)
+    return original.pointerType==="touch"||original.pointerType==="pen";
+  if(typeof lastPointerType==="string"&&lastPointerType)return lastPointerType==="touch"||lastPointerType==="pen";
+  return TOUCH;
+}
+const REDUCE_MOTION=!!(window.matchMedia&&window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 let SCALE=ramp(ideal).S;                          // current time->color scale (recomputed in redraw)
-let BDCACHE={};                                   // per-cell route breakdown cache (cleared on new workplace)
+// Route breakdowns carry traced geometry and can be much larger than the cell-time map. Keep a
+// small deterministic LRU instead of retaining every cell a user has ever inspected. `protectedKey`
+// lets a write preserve the currently selected cell while its lightweight response is upgraded in
+// place; destination/settings changes clear the same cache instance.
+const BREAKDOWN_CACHE_LIMIT=32;
+function createLRU(limit){
+  const cap=Math.max(1,Math.floor(Number(limit)||1)),data=new Map(),keyOf=key=>String(key);
+  return {
+    get(key){const k=keyOf(key);if(!data.has(k))return undefined;
+      const value=data.get(k);data.delete(k);data.set(k,value);return value;},
+    set(key,value,protectedKey){const k=keyOf(key);if(data.has(k))data.delete(k);data.set(k,value);
+      const keep=protectedKey==null?null:keyOf(protectedKey);
+      while(data.size>cap){let victim;
+        for(const candidate of data.keys()){if(candidate!==keep){victim=candidate;break;}}
+        if(victim===undefined)break;data.delete(victim);}
+      return value;},
+    clear(){data.clear();},
+    get size(){return data.size;}
+  };
+}
+const BDCACHE=createLRU(BREAKDOWN_CACHE_LIMIT);    // cleared on new workplace / routing settings
 // Appearance: persisted preference is "auto" | "light" | "dark". "auto" follows
 // prefers-color-scheme and re-applies when the OS toggles. The RESOLVED theme (always
-// "light" or "dark") drives the data-theme attribute, the basemap, and cellOpacity().
+// "light" or "dark") drives the data-theme attribute and basemap; heatmap opacity is separate.
 let themePref="auto", THEME="dark";
 const _mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: light)") : null;
-const cellOpacity=()=>THEME==="light"?0.85:0.72;  // light basemap needs more saturation to read
+const cellOpacity=()=>1;  // the pane's composited CSS opacity is the O(1) user control
+function applyHeatOpacity(){
+  heatOpacity=Math.min(1,Math.max(.2,+heatOpacity||.65));
+  document.documentElement.style.setProperty("--heat-opacity",String(heatOpacity));
+  document.documentElement.style.setProperty("--heat-pinned-opacity",String(heatOpacity*.30));
+  const slider=document.getElementById("opacity"),out=document.getElementById("opacityval");
+  if(slider)slider.value=String(Math.round(heatOpacity*100));
+  if(out)out.textContent=`${Math.round(heatOpacity*100)}%`;
+}
 function resolveTheme(p){return p==="light"||p==="dark"?p:(_mq&&_mq.matches?"light":"dark");}
 function applyTheme(){
   THEME=resolveTheme(themePref);
@@ -422,6 +660,8 @@ function applyTheme(){
   // bootTheme/applyHash/button clicks all happen later, and prefers-color-scheme change
   // events are async tasks that can't fire mid-parse. Plain call is safe.
   layer.setStyle(style);
+  cellFocusHaloLayer.setStyle(cellFocusHaloStyle);
+  cellFocusLayer.setStyle(cellFocusStyle);
   // Route casing is theme-aware (--route-casing); re-render any drawn route so a live theme
   // toggle restyles the PRIMARY casing. DRAWN/redrawCurrentRoute are declared below but every
   // applyTheme caller runs after full parse (same reasoning as layer.setStyle above).
@@ -433,6 +673,35 @@ const gmaps=(olat,olon)=>gmapsURL(olat,olon,DESTLL[0],DESTLL[1]);
 const color=v=>colorScale(v,SCALE);
 let bdToken=0;  // cancels stale hover-breakdown fetches
 const map=L.map("map",{preferCanvas:true}).setView([37.762,-122.43],12.3);  // canvas: 3k polygons stay light on CPU
+// Keep the heatmap, tapped/pinned cell, and routes on separate panes. Hover never dims or outlines
+// the city. The double focus outline stays readable on either basemap at every heatmap opacity.
+map.createPane("cellsPane");map.getPane("cellsPane").style.zIndex=400;
+map.createPane("cellFocusHaloPane");map.getPane("cellFocusHaloPane").style.zIndex=414;
+map.getPane("cellFocusHaloPane").style.pointerEvents="none";
+map.createPane("cellFocusPane");map.getPane("cellFocusPane").style.zIndex=415;
+map.getPane("cellFocusPane").style.pointerEvents="none";
+map.createPane("routePane");map.getPane("routePane").style.zIndex=430;
+map.getPane("routePane").style.pointerEvents="none";
+function cellFocusHaloStyle(){
+  // This outer contrast ring deliberately never shares the heatmap pane or its opacity.  It gives
+  // a selected cell a stable silhouette even when the user fades the colored cells right down.
+  return {fillOpacity:0,color:THEME==="light"?"#071625":"#f7fbff",opacity:1,weight:7};
+}
+function cellFocusStyle(f){
+  // Keep the inner stroke independent too: the selected cell is an outline, not another opaque
+  // heatmap tile, so it remains easy to find without overpowering nearby travel-time colors.
+  return {fillOpacity:0,color:THEME==="light"?"#fff":"#071625",opacity:1,weight:3};
+}
+const cellFocusHaloLayer=L.geoJSON(null,{pane:"cellFocusHaloPane",interactive:false,
+  style:cellFocusHaloStyle}).addTo(map);
+const cellFocusLayer=L.geoJSON(null,{pane:"cellFocusPane",interactive:false,style:cellFocusStyle}).addTo(map);
+function showCellFocus(f){
+  cellFocusHaloLayer.clearLayers();cellFocusLayer.clearLayers();
+  if(f){cellFocusHaloLayer.addData(f);cellFocusLayer.addData(f);}
+}
+function clearCellFocus(){
+  cellFocusHaloLayer.clearLayers();cellFocusLayer.clearLayers();
+}
 // Basemap is theme-aware: swapped in applyTheme() when light/dark changes (dark_all <-> light_all).
 const BASE_TILES={dark:"https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
                   light:"https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"};
@@ -446,6 +715,9 @@ const TILE_OPTS={maxZoom:19,attribution:'&copy; <a href="https://www.openstreetm
 let baseTheme=document.documentElement.dataset.theme==="light"?"light":"dark";
 let BASE=L.tileLayer(BASE_TILES[baseTheme],TILE_OPTS).addTo(map);
 function legend(){const sc=document.querySelector("#legend .sc"),bar=document.querySelector("#legend .bar");
+  if(mapcolors==="off"){bar.style.display="none";sc.style.flexWrap="nowrap";
+    sc.innerHTML=`<span>Commute colors hidden</span>`;
+    document.getElementById("legtitle").textContent="Map colors off";return;}
   if(cmode=="line"){bar.style.display="none";sc.style.flexWrap="wrap";
     const ord=Object.keys(LINECOLOR);
     sc.innerHTML=ord.length?ord.slice(0,16).map(l=>`<span style="white-space:nowrap;margin:0 8px 3px 0"><span style="display:inline-block;width:9px;height:9px;background:${LINECOLOR[l]};border-radius:2px"></span> ${escapeHTML(l)}</span>`).join(""):"computing line map…";
@@ -453,7 +725,9 @@ function legend(){const sc=document.querySelector("#legend .sc"),bar=document.qu
   const {hi,S}=ramp(ideal);bar.style.display="block";sc.style.flexWrap="nowrap";
   bar.style.background="linear-gradient(90deg,"+S.map(s=>rgb(s[1])+" "+Math.round(s[0]/hi*100)+"%").join(",")+")";
   sc.innerHTML=`<span>0</span><span>${ideal} (ideal)</span><span>${hi}+</span>`;
-  document.getElementById("legtitle").textContent=(metric=="r"?"Realistic":"Best-case")+" door-to-door (min)";}
+  const metricLabel=DEPARTAFTER ? (metric=="r"?"Scheduled":"Best-case")
+                                : (metric=="r"?"Realistic":"Best-case");
+  document.getElementById("legtitle").textContent=metricLabel+" door-to-door (min)";}
 function val(id){
   // Best-case is always TT[0] (p5). Typical:
   //   ARRIVE-BY: the committed-MC overlay (REAL) IS the typical headline — prefer it when loaded;
@@ -465,17 +739,19 @@ function val(id){
   const v=TT[id];return v?(metric=="r"?v[1]:v[0]):null;}
 function style(f){const id=f.properties.id,v=val(id);
   if(v==null||v>thr)return{fillOpacity:0,opacity:0,weight:0};
+  if(mapcolors==="off")return{fillOpacity:0,opacity:0,weight:0};
   const op=cellOpacity();
   if(cmode=="line"){const ln=ATTR[id];return ln?{fillColor:LINECOLOR[ln]||"#888",fillOpacity:Math.min(op+.04,.9),weight:0}:{fillColor:"#888",fillOpacity:.06,weight:0};}
   return{fillColor:color(v),fillOpacity:op,weight:0};}
 function buildLineColors(){const PAL=["#e6194B","#3cb44b","#ffe119","#4363d8","#f58231","#911eb4","#42d4f4","#f032e6","#bfef45","#fabed4","#469990","#dcbeff","#9A6324","#800000","#aaffc3","#808000","#000075"];
   const cnt={};Object.values(ATTR).forEach(l=>cnt[l]=(cnt[l]||0)+1);
   LINECOLOR={};Object.keys(cnt).sort((a,b)=>cnt[b]-cnt[a]).forEach((l,i)=>LINECOLOR[l]=l=="walk only"?"#7fd1ff":PAL[i%PAL.length]);}
-function lineColor(line){  // match the overlay legend colors
-  if(/^(Red|Yellow|Blue|Green|Orange|Gr[ae]y)-[NSEW]$/i.test(line))return MODECOLOR.bart;
-  if(["PM","PH","CA"].includes(line))return MODECOLOR.cable;
-  if(/^[JKLMNT]$/.test(line)||line==="KLM")return MODECOLOR.metro;
-  return MODECOLOR.bus;
+function lineColor(line,mode){
+  // Mode is GTFS-derived on geometry/service metadata. The attribution palette is an authoritative
+  // fallback for text-only legs; unknown services use the neutral transit bucket rather than a
+  // line-name heuristic.
+  if(mode&&MODECOLOR[mode])return MODECOLOR[mode];
+  return LINECOLOR[line]||MODECOLOR.bus;
 }
 // fragility chip: a one-word read on SERVICE risk (miss-a-connection re-route + last-train).
 // frag = p90-p50 bad-day delta (min); stuck = fraction of MC draws that hit the cap.
@@ -507,7 +783,7 @@ const DEPARTAFTER=!!(CFG&&CFG.departafter);
 // schedule, so best-case = the luckiest departure in the window and typical = the median departure;
 // bad-day = the same trip when service runs late.
 const BD_FOOT=DEPARTAFTER
-  ? "best-case = the luckiest departure in the morning window; typical = the median departure — bad-day adds service delays (a late vehicle, a missed transfer)"
+  ? "scheduled = timed to your first vehicle, so starting wait is not counted; bad-day adds service delays (a late vehicle, a missed transfer)"
   : "best-case = perfect timing (~0 wait); typical = your planned trip with service delays — a missed transfer costs a wait";
 // The per-cell fragility for a breakdown d's summary chip. ARRIVE-BY (passthrough): the cell overlay
 // from /variance (VAR[id].frag mirrored onto d.var) — byte-identical to the prior `d.var?d.var.frag:0`.
@@ -622,7 +898,8 @@ function summaryVM(d){
   const head=DEPARTAFTER ? d.total : (showR?d.real:d.total);
   const otherJ=DEPARTAFTER ? (showR?d.best:d.typical) : null;
   const other=DEPARTAFTER ? (otherJ?otherJ.total:null) : (showR?d.total:d.real);
-  const headLab=showR?"typical":"best-case", otherLab=showR?"best-case":"typical";
+  const headLab=DEPARTAFTER ? (showR?"scheduled":"best-case") : (showR?"typical":"best-case");
+  const otherLab=DEPARTAFTER ? (showR?"best-case":"scheduled") : (showR?"best-case":"typical");
   const lab=l=>(l=="typical"&&tilde)?"~":"";          // approximate-typical gets the "~"
   return {head, headLab, headTilde:lab(headLab), otherVal:other, otherLab, otherTilde:lab(otherLab),
     xfers:d.xfers, frag:bdFrag(d), stuck:d.var?d.var.stuck:0,
@@ -645,14 +922,23 @@ function summaryHTML(d){
     `${d.xfers} transfer${d.xfers==1?"":"s"}${otherTxt}</div>`;
   let vline="";
   if(showSig && (frag>0 || (stuck||0)>=0.05)){
+    // Bad-day ABSOLUTE = the TYPICAL/scheduled total + frag, REGARDLESS of the selected metric:
+    // frag is p90−p50 of the committed MC, so it's only meaningful on top of the typical. Anchoring
+    // on the selected headline understated the bad day by (typical − best) in Best-case mode.
+    const badBase=(d.typical&&d.typical.total!=null)?d.typical.total:d.total;
+    const badAbs=(badBase!=null&&frag>0)?badBase+frag:null;
+    const badTxt=DEPARTAFTER && badAbs!=null
+      ? `bad-day <b style="color:var(--ink)">${badAbs}m</b> <span style="color:var(--mut)">(+${frag})</span> · `
+      : (frag>0?`bad-day <b style="color:var(--ink)">+${frag}</b> · `:``);
     vline=`<div style="margin:0 0 8px;color:var(--mut);font-size:11.5px;white-space:nowrap">`+
-      (frag>0?`bad-day <b style="color:var(--ink)">+${frag}</b> · `:``)+
+      badTxt+
       fragChip(frag,stuck)+`</div>`;
   }
   return `<div class="h"><b>${escapeHTML(d.name||"")}</b></div>`+headBig+ctxLine+vline;
 }
 function bdHTML(d){
   if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
+  const raw=d;   // the chip mapping needs the RAW breakdown (buildCompare consumes both journeys)
   // DEPART-AFTER: normalize the both-journey response to the ACTIVE-journey shape (best/typical picked
   // by the selector), re-picked on every render so a metric toggle re-renders with no re-fetch.
   // ARRIVE-BY: passthrough (byte-identical).
@@ -664,17 +950,16 @@ function bdHTML(d){
   // Hover tooltip: SURFACE the alternative lines right here (read-only) so you can see multiple
   // routes exist WITHOUT clicking — but the map still draws ONLY the primary on hover (these chips
   // are non-interactive: no hover/click handlers, the interactive compare lives in the pinned card).
-  // Each chip's dot uses the SAME identity color the compare strip will show when pinned
-  // (ALT_CASING[k % len]) so the affordance and the eventual pinned list read as the same routes.
+  // Chip identity (line/min/dot color) comes from hoverAltChipData — the SAME deduped compare
+  // computation the pinned card uses — so a chip's dot == that route's pinned dot + drawn casing.
   let altfoot="";
-  const alts=d.alts||[];
-  const nAlt=alts.length;
+  const altChips=hoverAltChipData(raw);
+  const nAlt=altChips.length;
   if(nAlt>0){
-    const chips=alts.map((a,k)=>{
-      const col=ALT_CASING[k%ALT_CASING.length];
-      return `<span class="altchip"><span class="adot" style="background:${col}"></span>`+
-        `${escapeHTML(a.line)} <span class="amin">~${a.min}m</span></span>`;
-    }).join("");
+    const chips=altChips.map(ch=>
+      `<span class="altchip"><span class="adot" style="background:${ch.color}"></span>`+
+        `${escapeHTML(ch.line)} <span class="amin">~${ch.min}m</span></span>`
+    ).join("");
     altfoot=`<div class="altfoot"><span class="alab">also serves</span>`+
       `<div class="alts">${chips}</div>`+
       `<span class="ahint"><b>Click</b> to compare on the map</span></div>`;
@@ -686,71 +971,106 @@ function bdHTML(d){
     altfoot+
     `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
     `<div class="foot">${BD_FOOT}</div></div>`;}
-// Pinned compare card: the shared summary, THEN a vertical compare list (primary + each alt as a
-// selectable strip), THEN the Google Maps link. The strip list is built from compareList (set by
-// openPin/refresh via buildCompare). The currently-DRAWN strip (previewKey ?? selKey) is marked
-// (● + .sel highlight); the rest are ○. Row hover previews, row click locks (see wireCompareRows).
+// Pinned compare card: the shared summary, THEN route families built from the exact alternatives,
+// THEN the Google Maps link. compareList is still the raw backend option set; compareHTML groups it
+// into commuter-facing families and branches while preserving exact traces underneath.
 function compareHTML(d){
   if(!compareList.length)return "";
-  const drawnKey=previewKey!=null?previewKey:selKey;
-  // CONSISTENCY RULE (the user's "the numbers always agree with the selector"): EVERY strip — primary
-  // AND each alt — shows the metric-selected number. Best-case → the route's best-case total; Typical
-  // → the route's OWN committed-plan typical (o.real, scored by the same MC as the primary). The legs
-  // always sum to best-case, so in Typical mode we append a "typical wait +Nm" segment per strip
-  // (optRead.waitExtra = real − best-case ≥ 0) so each row's legs+wait sum to ITS displayed number
-  // (the "legs add up to the number" rule), applied to every strip, not just the primary.
-  // SORT by the displayed metric so the order matches the numbers (typical when Typical is selected,
-  // best-case otherwise); the primary keeps its identity slot color but can move within the list.
-  const reads=compareList.map(o=>({o,r:optRead(o)}));
-  reads.sort((a,b)=>a.r.head-b.r.head);
-  const rows=reads.map(({o,r})=>{
-    const sel=o.key===drawnKey;
-    // legs are the ACTIVE journey's legs (depart-after re-picks by metric via optLegs; arrive-by
-    // uses the option's single traced legs). waitExtra is 0 under depart-after (no reconciliation).
-    const seq=legsRowHTML(optLegs(o),false,r.waitExtra);
-    return `<div class="strip${sel?" sel":""}" data-key="${escapeHTML(o.key)}" role="button" tabindex="0" aria-pressed="${sel}">`+
-      `<span class="mark">${sel?"●":"○"}</span>`+
-      `<span class="dot" style="background:${o.identityColor}"></span>`+
-      `<span class="seq">${seq}</span>`+
-      `<span class="tot">${r.head}m`+
-      (r.frag>0?` <span style="color:var(--mut);font-weight:400;font-size:10px" title="bad-day delta (p90−p50)">+${r.frag}</span>`:``)+
-      `</span></div>`;
-  }).join("");
+  const choices=routeChoices(),recommended=recommendedChoice(choices);
+  const practical=practicalChoices(choices,recommended);
+  const more=moreRouteChoices(choices,recommended);
   // Loading line covers BOTH "alternatives still loading" (before /variance) AND "typicals still
   // loading" (arrive-by only: Typical selected, but the per-alt typicals from /itinerary?pin=1 haven't
-  // landed yet — strips show best-case until they do, then the card re-renders). varianceReady() gates
-  // the former. DEPART-AFTER: each alt's typical journey arrives WITH the alt (pin=1 only adds frag),
+  // landed yet — strips show best-case until they do, then the card re-renders). The explicit
+  // variance lifecycle gates the former. DEPART-AFTER: each alt's typical journey arrives WITH the alt (pin=1 only adds frag),
   // so typicals are NEVER pending — only the alt SET waits on /variance.
   const noAlts=(d&&(d.alts||[]).length===0);
-  const typsPending=(!DEPARTAFTER && metric=="r" && (d.alts||[]).length>0 && !(d.alts||[]).some(a=>a.real!=null));
-  const loadMsg=noAlts ? (varianceReady()?"":"loading alternatives…")
-                       : (typsPending?"loading typical times…":"");
-  const loading=loadMsg?`<div class="cmploading">${loadMsg}</div>`:"";
-  return `<div class="cmp"><div class="cmphdr">Compare routes</div>${rows}${loading}</div>`;
+  const varianceDown=varianceFailed();
+  const typsPending=(!varianceDown && !DEPARTAFTER && metric=="r" && (d.alts||[]).length>0 && !(d.alts||[]).some(a=>a.real!=null));
+  const loadMsg=d&&d._pinPending?"loading more route choices…":
+    (noAlts ? (varianceSettled()?"":"loading alternatives…")
+            : (typsPending?"loading typical times…":""));
+  const loading=loadMsg?`<div class="cmploading" role="status">${loadMsg}</div>`:"";
+  const degraded=varianceDown?`<div class="cmploading variance-degraded" role="status">`+
+    `Bad-day estimates are unavailable. Route choices are still shown.</div>`:"";
+  const alternatives=practical.length?`<section class="route-section alternatives practical-alternatives" aria-labelledby="alt-routes-title">`+
+    `<h2 class="route-section-title" id="alt-routes-title">Good alternatives <span>(${practical.length})</span></h2><div class="choice-list">`+
+    practical.map(c=>routeRowHTML(c,recommended,"practical-route")).join("")+`</div></section>`:"";
+  // Keep rows in the closed native disclosure so opening it is instant and cannot depend on a
+  // second card render. The browser withholds the closed subtree visually; the list is small and
+  // already present in the response, so deferred DOM construction only created an empty-panel race.
+  const morePanel=additionalChoicesHTML(more,recommended);
+  const moreDetails=more.length?`<details class="expert" id="allroutes"${allRoutesOpen?" open":""}><summary id="all-routes-toggle" `+
+    `aria-expanded="${allRoutesOpen}" aria-controls="all-routes-panel">See ${more.length} additional route choice${more.length===1?"":"s"}</summary>`+
+    `<div id="all-routes-panel">${morePanel}</div></details>`:"";
+  const selected=findChoice(selKey)||recommended;
+  return `<div class="cmp"><section class="route-section recommended route-recommendations" aria-labelledby="routes-title">`+
+    `<h2 class="route-section-title" id="routes-title">Recommended route</h2><div class="choice-list">`+
+    (recommended?routeRowHTML(recommended,recommended,"recommended"):"")+`</div></section>`+
+    alternatives+loading+degraded+moreDetails+selectedRouteHTML(selected,recommended,d)+
+    `<div id="route-selection-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div></div>`;
 }
-// True once /variance has landed (so the absence of alts is real, not "still loading").
-function varianceReady(){return Object.keys(VAR).length>0||Object.keys(REAL).length>0;}
+function resetVarianceState(gen){varianceState={status:"idle",gen,error:""};}
+function setVarianceState(status,gen,error){if(gen!==GEN)return false;
+  varianceState={status,gen,error:error||""};return true;}
+// Ready means bad-day metrics landed. Failed is also terminal: the server can still return the
+// planned structural route families through pin=1 even when the service-noise overlay is absent.
+function varianceReady(){return varianceState.gen===GEN&&varianceState.status==="ready";}
+function varianceFailed(){return varianceState.gen===GEN&&varianceState.status==="failed";}
+function varianceSettled(){return varianceReady()||varianceFailed();}
 function pinHTML(d){
   if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
-  // summaryHTML reads the ACTIVE journey (normalize); compareHTML reads compareList (built from raw d
-  // so both journeys survive) + raw d.alts for its loading gate, so it gets the raw d.
-  return `<div class="bd">`+summaryHTML(normalizeBD(d))+compareHTML(d)+
-    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank">Open in Google Maps ↗</a>`+
-    `<div class="foot">${BD_FOOT}</div></div>`;}
-/* ============ single drawn route + compare mode ============ */
-// MODEL: the map NEVER shows more than ONE route. On HOVER (not pinned) we draw the cell's
-// PRIMARY route, clean. On CLICK (pin) we enter COMPARE MODE: the corner card lists the primary
-// + each alt as a selectable strip, and the map draws exactly ONE route = the selected (or
-// previewed) strip. State:
+  const choices=routeChoices(),recommended=recommendedChoice(choices);
+  const selected=choices.find(c=>c.o.key===selKey)||recommended;
+  const r=recommended?recommended.r:{head:normalizeBD(d).total,frag:bdFrag(d)};
+  const o=recommended&&recommended.o;
+  const transferCount=o?optionTransfers(o):normalizeBD(d).xfers;
+  const walk=o?optionWalk(o):0;
+  const allowance=o?optionScheduleAllowance(o):0;
+  const risk=(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:"low schedule risk";
+  const settings=[
+    DEPARTAFTER?(metric==="r"?"Scheduled":"Best-case"):(metric==="r"?"Realistic":"Best-case"),
+    `${walkspeed==="med"?"Medium":walkspeed[0].toUpperCase()+walkspeed.slice(1)} walk`,
+    maxxfers==="any"?"Any transfers":`${maxxfers} max transfer${maxxfers==="1"?"":"s"}`,
+  ];
+  const head=`<header class="pin-head pin-summary"><div class="pin-place">${escapeHTML(d.name||"Selected area")}</div>`+
+    `<div class="pin-dest">to ${escapeHTML(CURLABEL||"your workplace")}</div>`+
+    `<div class="pin-stats"><strong data-summary="time">${formatMinutes(r.head)}</strong>`+
+    `<span data-summary="risk">${escapeHTML(risk)}</span>`+
+    `<span data-summary="walk">${formatMinutes(walk)} walk</span>`+
+    `<span data-summary="allowance"${allowance>0?"":" hidden"}>${allowance>0?`allow ${formatMinutes(allowance)} before boarding`:""}</span>`+
+    `<span data-summary="transfers">${transferCount} transfer${transferCount===1?"":"s"}</span></div>`+
+    `<div class="pin-context"><span class="pin-settings" aria-label="Route settings: ${escapeHTML(settings.join(", "))}">`+
+    settings.map(setting=>`<span>${escapeHTML(setting)}</span>`).join("")+`</span>`+
+    `<button type="button" class="quiet-action" id="pinadjust" aria-controls="panel" aria-expanded="${document.body.classList.contains("route-adjusting")}">Adjust settings</button></div>`+
+    `<div class="pin-view" id="pinview" role="group" aria-label="Route inspector view">`+
+    `<button type="button" data-view="routes" aria-pressed="${!document.body.classList.contains("pin-map-view")}">Routes</button>`+
+    `<button type="button" data-view="map" aria-pressed="${document.body.classList.contains("pin-map-view")}">Map</button></div></header>`;
+  return `<div class="bd">${head}${compareHTML(d)}`+
+    mapRouteToggleHTML(choices,recommended,selected)+
+    `<div class="foot" style="padding:0 16px 16px">${BD_FOOT}</div></div>`;}
+function touchPreviewHTML(d){
+  d=normalizeBD(d);
+  if(!d||d.error)return `<div class="peek-title">No transit route from this area</div>`;
+  const vm=summaryVM(d),bad=vm.frag>0?` · bad-day +${vm.frag}`:"";
+  return `<div class="peek-title">${escapeHTML(d.name||"Selected area")}</div>`+
+    `<div class="peek-stats"><b style="color:var(--ink)">${vm.head} min</b> · ${d.xfers} transfer${d.xfers===1?"":"s"}${bad}</div>`+
+    `<div class="peek-actions"><button type="button" class="dismiss" data-peek="map">Keep exploring</button>`+
+    `<button type="button" class="inspect" id="peekinspect">Inspect routes</button></div>`;
+}
+/* ============ drawn route + compare mode ============ */
+// MODEL: on HOVER (not pinned) we draw the cell's PRIMARY route, clean. On CLICK (pin) we enter
+// focused route inspection: one recommended route is fully legible while practical alternatives
+// remain as quiet ghosts. Hover/focus previews one exact row; click locks it without moving the map.
+// State:
 //   routePin   cell id whose route is pinned (null = hover mode). While non-null, hovering OTHER
-//              cells does NOTHING (no tooltip, no outline, no draw) — the only interaction is the
-//              card's strips. closeOpenInfo/closePin null it.
-//   DRAWN      {id, legs, identityColor, total} of the SINGLE route currently inked (for the
-//              zoomend re-render + the tooltip-avoidance geometry). null = nothing drawn.
+//              cells does NOTHING (no tooltip, no outline, no draw) — the pinned card owns route
+//              focus. closeOpenInfo/closePin null it.
+//   DRAWN      hover mode: {id, legs, identityColor, total}; pinned mode:
+//              {id, multi:true, famKey, branchKey}. Used for zoom re-render. null = nothing drawn.
 //   compareList[] the pinned cell's route options [{key,line,identityColor,legs,total,isPrimary}],
 //              primary first; built by buildCompare(d). Empty in hover mode.
-//   selKey     the LOCKED selection in compare mode (a strip key; default PRIMARY_KEY).
-//   previewKey a strip the cursor is hovering (overrides selKey for what's drawn); null otherwise.
+//   selKey / previewKey identify the locked and transient exact route choices.
 // d.geom is the SAME traced journey as the breakdown chips (legs match 1:1); d.alts are the
 // under-delays re-routes (each {line,min,legs:[geom...]}). Legacy R5 serves geom:null + alts:[]
 // → no route drawn, no compare list, just the text breakdown (graceful).
@@ -758,21 +1078,21 @@ const routeLayer=L.layerGroup().addTo(map);   // ONE reused group; the single ro
 // preferCanvas keeps the 3k cells light; the route strokes go in a dedicated SVG renderer (their
 // own pane, ABOVE the canvas cells) for crisp casing-under-stroke stacking + dashes. They're
 // NON-interactive so they never steal the cell hover that drives the tooltip.
-const ROUTE_SVG=L.svg();map.addLayer(ROUTE_SVG);
+const ROUTE_SVG=L.svg({pane:"routePane"});map.addLayer(ROUTE_SVG);
 let routePin=null;      // cell id whose route is pinned (click), or null
 let hoverCell=null;     // cell id currently hovered (gates stale async draws)
 let DRAWN=null;         // {id, legs, identityColor, total} of the single route currently drawn
 function clearRoute(){routeLayer.clearLayers();DRAWN=null;TT_AVOID=[];TT_BLOCKS=[];}
-function routeColor(g){return (g.tmode&&MODECOLOR[g.tmode])||lineColor(g.name||"");}
+function routeColor(g){return lineColor(g.name||"",g.tmode);}
 // ---- route-identity CASING palette ------------------------------------------------------------
 // The casing is the wide halo under EVERY leg of the drawn route (walk + each transit leg) — its
 // IDENTITY color. Only ONE route draws at a time, but the casing color still matters: it MATCHES
 // the color dot on that route's compare-list strip, so the strip and the drawn line read as the
-// same thing. PRIMARY is always WHITE (theme-aware --route-casing); each ALT gets one of 4 vivid,
+// same thing. PRIMARY is always WHITE (theme-aware --route-casing); each ALT gets a vivid,
 // mutually-distinct hues (slot = the alt's index in d.alts), so its dot is recognizable. A thin
 // DARK SEPARATOR ring sits between the identity casing and the mode-colored stroke so the rim
 // shows on top of any mode color regardless of contrast.
-const ALT_CASING=["#ff3db4","#11c7c7","#f59000","#a16bff"];  // magenta · cyan · amber · violet
+const ALT_CASING=["#ff3db4","#11c7c7","#f59000","#a16bff","#7ed957","#ff6b6b"];
 const SEPARATOR="rgba(12,14,18,.85)";                        // dark ring (reads on dark + light)
 const PRIMARY_KEY="__primary__";
 function primaryCasing(){
@@ -832,11 +1152,16 @@ function addPill(latlng,color,name,min){
 // `totalMin` is the route's STRUCTURAL best-case total (the traced journey). `badgeMin` is what the
 // "~N min" badge SHOWS — the selected-metric number for the drawn cell (= the headline + cell color);
 // it defaults to totalMin (best-case) so the badge is never blank when no metric override is given.
-function drawOne(legs,identityColor,totalMin,badgeMin){
+function drawOne(legs,identityColor,totalMin,badgeMin,opts){
+  opts=opts||{};
   if(badgeMin==null)badgeMin=totalMin;
-  routeLayer.clearLayers();
+  const append=!!opts.append;
+  const showLabels=opts.labels!==false;
+  const showBadge=opts.badge!==false;
+  const op=opts.opacity==null?1:opts.opacity;
+  if(!append)routeLayer.clearLayers();
   const segs=(legs||[]).filter(g=>g.pts&&g.pts.length>1);
-  if(!segs.length){DRAWN=null;TT_AVOID=[];TT_BLOCKS=[];return;}
+  if(!segs.length){if(!append){DRAWN=null;TT_AVOID=[];TT_BLOCKS=[];}return {segs:[],placed:[],badgeLL:null};}
   const casingW=10, sepW=7, strokeW=4.5;
   const walkW=3, walkSepW=walkW+2, walkCasingW=walkW+5;
   // PASS 1: transit identity casing (widest) THEN the dark separator ring — both under every
@@ -844,38 +1169,45 @@ function drawOne(legs,identityColor,totalMin,badgeMin){
   segs.forEach(g=>{
     if(g.mode==="walk")return;
     routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:identityColor,weight:casingW,
-      opacity:.95,interactive:false,lineCap:"round",lineJoin:"round"}));
+      opacity:.95*op,interactive:false,lineCap:"round",lineJoin:"round"}));
     routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:SEPARATOR,weight:sepW,
-      opacity:.9,interactive:false,lineCap:"round",lineJoin:"round"}));
+      opacity:.9*op,interactive:false,lineCap:"round",lineJoin:"round"}));
   });
   // WALK pass: SOLID identity casing + dark separator + dotted gray stroke (a single route's walk
   // legs don't overlap, so no cross-route edge merge — draw each leg directly).
   segs.forEach(g=>{
     if(g.mode!=="walk")return;
     routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:identityColor,weight:walkCasingW,
-      opacity:.95,interactive:false,lineCap:"round",lineJoin:"round"}));
+      opacity:.95*op,interactive:false,lineCap:"round",lineJoin:"round"}));
     routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:SEPARATOR,weight:walkSepW,
-      opacity:.9,interactive:false,lineCap:"round",lineJoin:"round"}));
+      opacity:.9*op,interactive:false,lineCap:"round",lineJoin:"round"}));
     routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:"#9aa3af",weight:walkW,
-      dashArray:DASH_WALK,opacity:.98,interactive:false,lineCap:"round"}));
+      dashArray:DASH_WALK,opacity:.98*op,interactive:false,lineCap:"round"}));
   });
   // PASS 2: colored transit strokes + gather pill specs.
-  const pillSpecs=[];
+  const pillSpecs=[];let transitPillIndex=0;
   segs.forEach(g=>{
     if(g.mode==="walk")return;
     routeLayer.addLayer(L.polyline(g.pts,{renderer:ROUTE_SVG,color:routeColor(g),weight:strokeW,
-      opacity:1,interactive:false,lineCap:"round",lineJoin:"round"}));
-    pillSpecs.push({pts:g.pts,color:routeColor(g),name:g.name,min:g.min});
+      opacity:op,interactive:false,lineCap:"round",lineJoin:"round"}));
+    const pillName=transitPillIndex===0&&opts.firstTransitLabel?opts.firstTransitLabel:g.name;
+    if(showLabels)pillSpecs.push({pts:g.pts,color:routeColor(g),name:pillName,min:g.min});
+    transitPillIndex++;
   });
   // origin total badge (above everything)
   const badgeLL=segs[0].pts[0];
-  routeLayer.addLayer(L.marker(badgeLL,{interactive:false,keyboard:false,zIndexOffset:300,
-    icon:L.divIcon({className:"rtwrap",iconSize:null,html:`<span class="rtbadge">~${badgeMin} min</span>`})}));
+  if(showBadge){
+    routeLayer.addLayer(L.marker(badgeLL,{interactive:false,keyboard:false,zIndexOffset:300,
+      icon:L.divIcon({className:"rtwrap",iconSize:null,html:`<span class="rtbadge">~${badgeMin} min</span>`})}));
+  }
   // within-route pill collision nudge
-  const placed=placePills(pillSpecs);
-  placed.forEach(p=>addPill(p.latlng,p.spec.color,p.spec.name,p.spec.min));
-  rebuildAvoid(legs);                              // tooltip-avoidance: route points
-  rebuildBlocks(placed,badgeLL);                  // + pill anchor rects + the badge rect
+  const placed=showLabels?placePills(pillSpecs):[];
+  if(showLabels)placed.forEach(p=>addPill(p.latlng,p.spec.color,p.spec.name,p.spec.min));
+  if(!append){
+    rebuildAvoid(legs);                            // tooltip-avoidance: route points
+    rebuildBlocks(placed,showBadge?badgeLL:null);  // + pill anchor rects + the badge rect
+  }
+  return {segs,placed,badgeLL:showBadge?badgeLL:null};
 }
 // Estimated container-px rect of a pill / the badge given its anchor latlng.
 const PILL_W=64, PILL_H=20, BADGE_W=82, BADGE_H=24, BLOCK_PAD=4;
@@ -1055,8 +1387,26 @@ function openHoverInPlace(l,d){
 }
 /* ---- compare model: build the strip list + draw the selected/previewed route ---------------- */
 let compareList=[];     // pinned cell's route options [{key,line,identityColor,legs,total,isPrimary}]
-let selKey=PRIMARY_KEY; // the LOCKED selection (a strip key); default = primary
-let previewKey=null;    // a strip being hovered (overrides selKey for what's drawn); null otherwise
+let selKey=PRIMARY_KEY; // locked exact route choice; server primary on each new pin
+let previewKey=null;    // pointer/keyboard preview overrides selKey until the row is left
+let allRoutesOpen=false,directionsOpen=false,showAllRoutes=false;
+let restoreRouteFocusKey=null,pendingSelectionAnnouncement="";
+function resetRouteDisclosureState(){
+  allRoutesOpen=false;directionsOpen=false;restoreRouteFocusKey=null;pendingSelectionAnnouncement="";
+}
+function stableRouteKey(family,branch,fallback){
+  if(family&&family.key!=null&&branch&&branch.key!=null)
+    return "struct:"+JSON.stringify([String(family.key),String(branch.key)]);
+  return fallback;
+}
+function routeChoiceKey(option,fallback){
+  const choiceKey=option&&option.choice_key;
+  if(typeof choiceKey==="string"&&choiceKey)return choiceKey;
+  // A cached/legacy response may predate the public exact-choice key. Its family/branch pair is
+  // still safer than a position, while the final fallback keeps the historical sparse payloads
+  // usable until they refresh.
+  return stableRouteKey(option&&option.family,option&&option.branch,fallback);
+}
 // Build the compare list from a breakdown d: primary first, then each alt. Each option carries the
 // geom legs to draw + its identity color (white primary / ALT_CASING slot) + total minutes.
 // DEPART-AFTER: an option additionally carries `da:{best:{total,legs}, typical:{total,legs}, frag}` —
@@ -1073,8 +1423,8 @@ function buildCompare(d){
       // legs == geom) and like arrive-by — so optLegs(prim) returns a DRAWABLE leg list and
       // drawSelected paints the primary route on click. d.best/d.typical carry a SEPARATE text `legs`
       // (no pts) + `geom` (with pts); using `.legs` here drew nothing (the click-no-route bug).
-      out.push({key:PRIMARY_KEY,line:dominantLine((d.typical||d.best||{geom:d.geom}).geom||d.geom),
-        identityColor:primaryCasing(),isPrimary:true,
+      out.push({key:routeChoiceKey(d,PRIMARY_KEY),choiceKey:d.choice_key||null,line:dominantLine((d.typical||d.best||{geom:d.geom}).geom||d.geom),
+        identityColor:primaryCasing(),isPrimary:true,family:d.family||null,branch:d.branch||null,
         da:{best:(d.best?{total:d.best.total,legs:d.best.geom}:null),
             typical:(d.typical?{total:d.typical.total,legs:d.typical.geom}:{total:d.total,legs:d.geom}),
             frag:(d.frag!=null?d.frag:(d.var&&d.var.frag!=null?d.var.frag:null))}});
@@ -1082,9 +1432,9 @@ function buildCompare(d){
       // arrive-by: `real`/`frag` are the PRIMARY's committed-plan TYPICAL (from /variance's REAL/VAR,
       // mirrored onto d before render); `total` is its best-case. Every strip carries BOTH metrics so
       // the compare list can follow the selector consistently (see compareHTML).
-      out.push({key:PRIMARY_KEY,line:dominantLine(d.geom),identityColor:primaryCasing(),
+      out.push({key:routeChoiceKey(d,PRIMARY_KEY),choiceKey:d.choice_key||null,line:dominantLine(d.geom),identityColor:primaryCasing(),
         legs:d.geom,total:d.total,real:(d.real!=null?d.real:null),
-        frag:(d.var?d.var.frag:null),isPrimary:true});
+        frag:(d.var?d.var.frag:null),isPrimary:true,family:d.family||null,branch:d.branch||null});
     }
   }
   // Drop WALK-ONLY alternatives (a line-labeled journey with no actual ride): they're just slower
@@ -1097,22 +1447,57 @@ function buildCompare(d){
     const lists=da?[(a.best||{}).legs,(a.typical||{}).legs]:[a.legs];
     return lists.some(legs=>(legs||[]).some(g=>g&&g.mode==="transit"));
   };
+  const legSig=legs=>(legs||[]).map(g=>{
+    const name=(g&&(g.line||g.name))||"";
+    const min=(g&&Number.isFinite(+g.min))?Math.round(+g.min):"";
+    const wait=(g&&Number.isFinite(+g.wait))?Math.round(+g.wait):"";
+    const pts=(g&&Array.isArray(g.pts)?g.pts:[]).map(p=>
+      Array.isArray(p)?p.map(Number).join(","):"").join(";");
+    return [g&&g.mode||"",name,min,wait,pts].join(":");
+  }).join("|");
+  const optSig=o=>{
+    if(!o)return "";
+    // Server family/branch keys are authoritative structural identity. Include them so two routes
+    // with the same display legs/minutes but different boarding corridors or directions cannot be
+    // erased by this legacy duplicate guard before buildFamilies sees them.
+    const grouping=(o.family&&o.family.key!=null&&o.branch&&o.branch.key!=null)
+      ?"||group:"+JSON.stringify([String(o.family.key),String(o.branch.key)]):"";
+    if(o.da){
+      const best=o.da.best?legSig(o.da.best.legs):"";
+      const typical=o.da.typical?legSig(o.da.typical.legs):"";
+      return [best||typical,typical||best].join("||")+grouping;
+    }
+    return legSig(o.legs)+grouping;
+  };
   (d&&d.alts||[]).filter(altHasTransit).forEach((a,k)=>{
-    // key is the row's stable slot ("alt0"…), NOT the line name — two alts could share a line
-    // name (rare, but server-dependent), which would collide select/preview if keyed by line.
+    // A server-authored family+branch pair is the durable route identity across progressive
+    // lightweight/pinned payloads. Only legacy payloads without that structural truth use a
+    // positional fallback, so reordered/incrementally inserted alternatives cannot move focus.
+    const key=routeChoiceKey(a,"alt"+k);
     if(da){
       // depart-after alt: BOTH journeys ({line,best:{total,legs},typical:{total,legs}[,frag]}).
-      out.push({key:"alt"+k,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],isPrimary:false,
+      out.push({key,choiceKey:a.choice_key||null,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],isPrimary:false,
+        family:a.family||null,branch:a.branch||null,
         da:{best:(a.best||null), typical:(a.typical||null), frag:(a.frag!=null?a.frag:null)}});
     } else {
       // arrive-by alt: a.real/a.frag = this alt's OWN committed-plan typical (served on
       // /itinerary?pin=1, the same committed MC as the primary) — null until that lands (re-render).
-      out.push({key:"alt"+k,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],
+      out.push({key,choiceKey:a.choice_key||null,line:a.line,identityColor:ALT_CASING[k%ALT_CASING.length],
         legs:a.legs,total:a.min,real:(a.real!=null?a.real:null),
-        frag:(a.frag!=null?a.frag:null),isPrimary:false});
+        frag:(a.frag!=null?a.frag:null),isPrimary:false,
+        family:a.family||null,branch:a.branch||null});
     }
   });
-  return out;
+  const seen=new Set(), deduped=[];
+  let altSlot=0;
+  out.forEach(o=>{
+    const sig=optSig(o)+(o.choiceKey?"||choice:"+o.choiceKey:"");
+    if(sig&&seen.has(sig))return;
+    if(sig)seen.add(sig);
+    if(!o.isPrimary)o.identityColor=ALT_CASING[(altSlot++)%ALT_CASING.length];
+    deduped.push(o);
+  });
+  return deduped;
 }
 // The active-journey {total,legs} for a depart-after option (re-picked by the live metric). Falls
 // back to the other journey if one is missing (a one-sided alt shouldn't blank a strip).
@@ -1142,6 +1527,363 @@ function optRead(o){
   // per-route bad-day (p90−p50), shown only in Typical mode where it's meaningful
   return {showR,head,waitExtra:showR?Math.max(0,real-o.total):0,frag:(showR&&o.frag!=null)?o.frag:0};
 }
+function uniq(a){const out=[];(a||[]).forEach(x=>{if(x&&!out.includes(x))out.push(x);});return out;}
+function tlegs(o){return (optLegs(o)||[]).filter(g=>g&&g.mode==="transit"&&(g.name||g.line));}
+function lname(g){return String((g&&g.name)||(g&&g.line)||"");}
+function lineNames(o){return tlegs(o).map(lname);}
+function routeServices(raw,fallbackLines){
+  const out=[],seen=new Set();
+  (Array.isArray(raw)?raw:[]).forEach((service,i)=>{
+    if(!service||typeof service!=="object")return;
+    const name=String(service.name||"");if(!name)return;
+    const key=String(service.key||`display:${name}:${i}`);if(seen.has(key))return;
+    seen.add(key);out.push({...service,key,name});
+  });
+  if(!out.length)(fallbackLines||[]).forEach((line,i)=>{
+    const name=String(line||"");if(!name)return;
+    const key=`legacy-line:${name}:${i}`;if(!seen.has(key)){seen.add(key);out.push({key,name});}
+  });
+  return out;
+}
+function serviceNames(meta){
+  return uniq(routeServices(meta&&meta.services,meta&&meta.lines).map(service=>service.name));
+}
+// Route-family identity and dominance are server responsibilities. The browser only groups and
+// renders the supplied metadata. If a stale/legacy response has no complete metadata, keep that
+// route visible as its OWN family: a conservative fallback is safer than guessing that two routes
+// share a corridor and reintroducing a second, divergent classifier here.
+function routeGrouping(o){
+  const family=o&&o.family, branch=o&&o.branch;
+  if(family&&family.key!=null&&branch&&branch.key!=null){
+    const flines=uniq(Array.isArray(family.lines)?family.lines.map(String):[]);
+    const blines=uniq(Array.isArray(branch.lines)?branch.lines.map(String):[]);
+    const tags=uniq(Array.isArray(family.tags)?family.tags.map(String):[]);
+    const fservices=routeServices(family.services,flines);
+    const bservices=routeServices(branch.services,[]);
+    const serviceKeys=uniq(Array.isArray(branch.serviceKeys)?branch.serviceKeys.map(String):
+      bservices.map(service=>service.key));
+    return {
+      family:{key:String(family.key),name:String(family.name||flines.join(" / ")||"Route family"),
+        sub:String(family.sub||"route family"),lines:flines,tags,services:fservices},
+      branch:{key:String(branch.key),name:String(branch.name||"Route option"),
+        kind:String(branch.kind||"route"),lines:blines,services:bservices,serviceKeys}
+    };
+  }
+  const names=uniq(lineNames(o));
+  const label=String((o&&o.line)||names.join(" > ")||(o&&o.isPrimary?"Primary route":"Alternate route"));
+  const key="legacy:"+String((o&&o.key)||"route");
+  return {
+    family:{key,name:label,sub:(o&&o.isPrimary)?"primary route":"alternate route",lines:names,tags:[],
+      services:routeServices([],names)},
+    branch:{key:key+":branch",name:names.length?label:"Walk finish",
+      kind:names.length?"route":"walk",lines:names,services:[],serviceKeys:[]}
+  };
+}
+function displayOptions(){return compareList.slice();}
+// Hover "also serves" chip data — derived from the SAME deduped compare computation the pinned
+// card uses (buildCompare assigns the contiguous ALT_CASING slots AFTER walk-only filtering +
+// duplicate suppression; server-side structural dominance has already dropped noise rows), so each
+// chip's dot color == that route's pinned family dot AND its drawn identity casing. Coloring by
+// the raw d.alts index drifted from the pinned card whenever an alt was deduped/filtered.
+// Takes the RAW breakdown (both journeys survive) and returns [{line,min,color}]; `min` is the
+// selected-metric read (optRead), matching what the pinned strips display.
+function hoverAltChipData(rawD){
+  if(!rawD||rawD.error)return [];
+  const list=buildCompare(rawD);
+  return list.filter(o=>!o.isPrimary)
+    .map(o=>({line:o.line,min:optRead(o).head,color:o.identityColor}));
+}
+function rangeText(vals,suffix){
+  vals=(vals||[]).filter(v=>Number.isFinite(v)).sort((a,b)=>a-b);
+  if(!vals.length)return "";
+  const lo=vals[0],hi=vals[vals.length-1];
+  return (lo===hi?String(lo):`${lo}-${hi}`)+(suffix||"");
+}
+function buildFamilies(){
+  const reads=displayOptions().map(o=>({o,r:optRead(o)})).sort((a,b)=>a.r.head-b.r.head);
+  const byKey=new Map();
+  reads.forEach(x=>{
+    const grouping=routeGrouping(x.o), key=grouping.family.key;
+    if(!byKey.has(key))byKey.set(key,{key,meta:grouping.family,opts:[],branches:new Map()});
+    const fam=byKey.get(key);
+    fam.opts.push(x);
+    const bkey=grouping.branch.key;
+    if(!fam.branches.has(bkey))fam.branches.set(bkey,{key:bkey,meta:grouping.branch,opts:[]});
+    fam.branches.get(bkey).opts.push(x);
+  });
+  return Array.from(byKey.values()).map(f=>{
+    f.branches=Array.from(f.branches.values()).map(b=>{
+      b.opts.sort((a,b)=>a.r.head-b.r.head);
+      return b;
+    }).sort((a,b)=>a.opts[0].r.head-b.opts[0].r.head);
+    return f;
+  }).sort((a,b)=>a.opts[0].r.head-b.opts[0].r.head);
+}
+function lineChipStyle(line,mode){
+  const c=lineColor(line,mode);
+  return `background:${c}26;color:${c};border:1px solid ${c}55`;
+}
+function naturalList(items){
+  items=uniq((items||[]).map(String));
+  if(items.length<2)return items[0]||"transit";
+  if(items.length===2)return `${items[0]} or ${items[1]}`;
+  return `${items.slice(0,-1).join(", ")}, or ${items[items.length-1]}`;
+}
+function formatMinutes(value){
+  const minutes=Number(value);
+  if(!Number.isFinite(minutes))return "—";
+  if(minutes>0&&minutes<1)return "<1 min";
+  const whole=Math.round(minutes);
+  if(Math.abs(minutes-whole)<0.05)return `${whole} min`;
+  return `${Math.round(minutes*10)/10} min`;
+}
+function legPhysicalMin(g){
+  const physical=Number(g&&g.physical_min),fallback=Number(g&&g.min);
+  return Number.isFinite(physical)&&physical>=0?physical:(Number.isFinite(fallback)&&fallback>=0?fallback:0);
+}
+function legScheduleAllowanceMin(g){
+  if(!g||g.mode!=="walk")return 0;
+  const explicit=[g.schedule_allowance_min,g.allowance_min,g.slack_min]
+    .map(Number).find(v=>Number.isFinite(v)&&v>0);
+  if(explicit!=null)return explicit;
+  const total=Number(g.min),physical=Number(g.physical_min);
+  return Number.isFinite(total)&&Number.isFinite(physical)?Math.max(0,total-physical):0;
+}
+function optionWalk(o){return (optLegs(o)||[]).filter(g=>g&&g.mode==="walk")
+  .reduce((sum,g)=>sum+legPhysicalMin(g),0);}
+function optionScheduleAllowance(o){return (optLegs(o)||[]).filter(g=>g&&g.mode==="walk")
+  .reduce((sum,g)=>sum+legScheduleAllowanceMin(g),0);}
+function optionTransfers(o){return Math.max(0,tlegs(o).length-1);}
+function routeChoices(){
+  const out=[];
+  buildFamilies().forEach(f=>f.branches.forEach(b=>{
+    (b.opts||[]).forEach(x=>{if(x)out.push({family:f,branch:b,o:x.o,r:x.r});});
+  }));
+  return out.sort((a,b)=>(a.o.isPrimary?-1:b.o.isPrimary?1:
+    (a.r.head-b.r.head)||(a.r.frag-b.r.frag)||String(a.o.key).localeCompare(String(b.o.key))));
+}
+function recommendedChoice(choices){return (choices||routeChoices()).find(c=>c.o.isPrimary)||
+  (choices||routeChoices())[0]||null;}
+function representativeChoices(choices){
+  const grouped=new Map();
+  (choices||routeChoices()).forEach(choice=>{
+    const key=`${choice.family.key}\u0000${choice.branch.key}`;
+    if(!grouped.has(key))grouped.set(key,[]);
+    grouped.get(key).push(choice);
+  });
+  return [...grouped.values()].map(group=>group.find(choice=>choice.o.isPrimary)||group[0]);
+}
+function branchServiceRows(choice){
+  const b=(choice&&choice.branch&&choice.branch.meta)||{};
+  let services=routeServices(b.services,b.lines);
+  if(!services.length){
+    const key=choice&&choice.branch&&choice.branch.key;
+    services=routeServices(choice&&choice.family&&choice.family.meta.services,[])
+      .filter(s=>(s.branchKeys||[]).map(String).includes(String(key)));
+  }
+  return services;
+}
+function routeTitle(choice){
+  const fam=choice.family.meta.name||"Route";
+  const branch=choice.branch.meta.name||"";
+  // A discovered walk-finish branch is often labeled "walk after <the exact family
+  // catalog>" by the server. Repeating that same catalog on both sides of the separator
+  // makes dense rows look like two routes. Preserve the generic branch distinction while
+  // saying the useful thing once; a branch naming only a subset remains untouched.
+  const walkPrefix="walk after ";
+  const compact=s=>String(s||"").replace(/\s+/g," ").trim().toLowerCase();
+  if(compact(branch).startsWith(walkPrefix)&&
+      compact(branch).slice(walkPrefix.length)===compact(fam)){
+    return `${fam} · walk to destination`;
+  }
+  return branch&&branch!==fam?`${fam} · ${branch}`:fam;
+}
+function routeReason(choice,recommended){
+  if(choice===recommended){
+    const min=Math.min(...routeChoices().map(c=>c.r.head));
+    return choice.r.head===min?"Fastest route shown by the planner":"Planner's recommended route";
+  }
+  const delta=choice.r.head-recommended.r.head;
+  const prefix=delta>0?`${formatMinutes(delta)} slower`:delta<0?`${formatMinutes(-delta)} faster`:"Similar time";
+  if(choice.family.key!==recommended.family.key)return `${prefix} · different boarding corridor`;
+  if(choice.branch.key!==recommended.branch.key)return `${prefix} · different destination approach`;
+  const transfers=optionTransfers(choice.o), recTransfers=optionTransfers(recommended.o);
+  if(transfers<recTransfers)return `${prefix} · ${recTransfers-transfers} fewer transfer${recTransfers-transfers===1?"":"s"}`;
+  const walk=optionWalk(choice.o), recWalk=optionWalk(recommended.o);
+  if(walk<recWalk)return `${prefix} · ${formatMinutes(recWalk-walk)} less walking`;
+  if((choice.r.frag||0)<(recommended.r.frag||0))return `${prefix} · lower bad-day delay`;
+  return `${prefix} · a distinct route choice`;
+}
+function displayStopName(name){
+  return String(name||"").replace(/\s*&\s*/g," & ").replace(/\s+/g," ").trim();
+}
+function routeActionsHTML(choice){
+  const legs=optLegs(choice.o)||[], transit=legs.filter(g=>g&&g.mode==="transit");
+  const firstServices=serviceNames({services:branchServiceRows(choice)});
+  let rideIndex=0,step=0,lastService="";
+  return legs.map((g,index)=>{
+    if(!g)return "";
+    let copy="",detail="";
+    if(g.mode==="transit"){
+      const service=rideIndex===0&&firstServices.length?naturalList(firstServices):lname(g);
+      const board=g.board&&g.board.name?` at ${displayStopName(g.board.name)}`:"";
+      // A branch catalog can contain several proven first-board services. Its representative
+      // geometry has one exact GTFS terminal, but sibling services may use different headsigns;
+      // never apply the representative's terminal to the whole interchangeable service set.
+      const toward=g.toward&&!(rideIndex===0&&firstServices.length>1)?` toward ${g.toward}`:"";
+      const verb=rideIndex===0?`Board ${service}`:(service===lastService?`Reboard ${service}`:`Transfer to ${service}`);
+      copy=`${verb}${board}${toward}`;
+      const ride=Number.isFinite(+g.min)?`Ride ${formatMinutes(g.min)}`:"";
+      const alight=g.alight&&g.alight.name?`get off at ${displayStopName(g.alight.name)}`:"";
+      detail=[ride,alight].filter(Boolean).join(" · ");
+      lastService=service;rideIndex++;
+    }else if(g.mode==="walk"){
+      const next=legs.slice(index+1).find(leg=>leg&&leg.mode==="transit");
+      const destination=next&&next.board&&next.board.name?` to ${displayStopName(next.board.name)}`:
+        (rideIndex>=transit.length&&transit.length?" to your workplace":"");
+      const physical=legPhysicalMin(g),allowance=legScheduleAllowanceMin(g);
+      if(physical>0)copy=`Walk ${formatMinutes(physical)}${destination}`;
+      else if(allowance>0)copy=`Allow ${formatMinutes(allowance)} before boarding`;
+      if(allowance>0&&physical>0)detail=`Allow ${formatMinutes(allowance)} before boarding`;
+    }
+    if(!copy)return "";
+    step++;
+    return `<li><span class="route-step" aria-hidden="true">${step}</span>`+
+      `<span class="route-copy"><span>${escapeHTML(copy)}</span>`+
+      (detail?`<small class="route-detail">${escapeHTML(detail)}</small>`:"")+`</span></li>`;
+  }).join("");
+}
+function routeRowHTML(choice,recommended,where){
+  const o=choice.o,r=choice.r,selected=selKey===o.key;
+  const walk=optionWalk(o),allowance=optionScheduleAllowance(o);
+  const bad=(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:`${formatMinutes(walk)} walk`;
+  const reason=routeReason(choice,recommended);
+  const classes=["route-row","route-choice",choice===recommended?"recommended":"",where||""].filter(Boolean).join(" ");
+  return `<button type="button" class="${classes}" data-key="${escapeHTML(o.key)}" `+
+    `data-family="${escapeHTML(choice.family.key)}" data-branch="${escapeHTML(choice.branch.key)}" `+
+    `data-family-name="${escapeHTML(choice.family.meta.name||"Route")}" `+
+    `data-branch-name="${escapeHTML(choice.branch.meta.name||"")}" `+
+    `aria-pressed="${selected}">`+
+    `<span class="route-dot" aria-hidden="true" style="background:${o.identityColor||primaryCasing()}"></span>`+
+    `<span class="route-main"><span class="route-name">${escapeHTML(routeTitle(choice))}</span>`+
+    `<span class="route-why">${escapeHTML(reason)}${allowance>0?` · allow ${formatMinutes(allowance)} before boarding`:""}</span>`+
+    (selected?`<span class="route-selected-label">Selected</span>`:"")+`</span>`+
+    `<span class="route-time">${formatMinutes(r.head)}<small>${escapeHTML(bad)}</small></span></button>`;
+}
+function practicalChoices(choices,recommended){
+  const candidates=representativeChoices(choices).filter(c=>c!==recommended).sort((a,b)=>(a.r.head-b.r.head)||(a.r.frag-b.r.frag));
+  const picked=[],shownTitles=new Set(recommended?[routeTitle(recommended)]:[]);
+  // The exact branch model can contain several nearby alight-and-walk finishes with the same
+  // human title. Keep every branch reachable under More, but do not spend the scarce headline
+  // slots on visually indistinguishable choices. Distinct transfer finishes on one corridor still
+  // qualify because their server-derived branch names differ.
+  for(const c of candidates){
+    const title=routeTitle(c);if(shownTitles.has(title))continue;
+    shownTitles.add(title);picked.push(c);
+    if(picked.length===3)break;
+  }
+  return picked;
+}
+function featuredChoices(choices,recommended){
+  return [recommended,...practicalChoices(choices,recommended)].filter(Boolean);
+}
+const COMPACT_MAP_ROUTE_LIMIT=4;
+function compactMapChoices(choices,recommended,selected){
+  const compact=[],seen=new Set();
+  const add=choice=>{const key=choice&&choice.o&&choice.o.key;
+    if(choice&&key!=null&&!seen.has(key)&&compact.length<COMPACT_MAP_ROUTE_LIMIT){seen.add(key);compact.push(choice);}};
+  // The selected exact route and the recommendation are the two non-negotiable anchors. Fill the
+  // remaining slots from the already-ranked featured set, never exceeding the compact map ceiling.
+  add(recommended);add(selected);
+  featuredChoices(choices,recommended).forEach(add);
+  return compact;
+}
+function mapRouteToggleLabel(routeCount){
+  const count=routeCount==null?routeChoices().length:routeCount;
+  return showAllRoutes?"Show featured routes on map":
+    `Show all ${count} routes on map`;
+}
+function mapRouteToggleHTML(choices,recommended,selected){
+  if(compactMapChoices(choices,recommended,selected).length>=choices.length)return "";
+  return `<div class="pin-links"><button class="show-routes" type="button" aria-pressed="${showAllRoutes}">${mapRouteToggleLabel(choices.length)}</button></div>`;
+}
+function moreRouteChoices(choices,recommended){
+  const featured=new Set(featuredChoices(choices,recommended).map(c=>c.o.key));
+  return choices.filter(c=>!featured.has(c.o.key));
+}
+function familyRouteChoices(choices,familyKey){
+  return choices.filter(c=>String(c.family.key)===String(familyKey));
+}
+function choiceBoardingParts(choice){
+  const first=(optLegs(choice&&choice.o)||[]).find(g=>g&&g.mode==="transit")||{};
+  return {board:first.board&&first.board.name?displayStopName(first.board.name):"",
+    toward:first.toward?String(first.toward):""};
+}
+function choiceBoardingContext(choice){
+  const parts=choiceBoardingParts(choice);
+  const board=parts.board?`Board at ${parts.board}`:"";
+  const toward=parts.toward?`toward ${parts.toward}`:"";
+  return [board,toward].filter(Boolean).join(" · ");
+}
+function boardingGroupLabel(family,members,duplicateName){
+  const name=(family&&family.meta&&family.meta.name)||"Additional boarding option";
+  const context=choiceBoardingContext((members||[])[0]);
+  const sub=family&&family.meta&&family.meta.sub;
+  if(context)return `${context} · ${name}`;
+  if(duplicateName&&sub)return `${sub} · ${name}`;
+  return name;
+}
+function boardingHeadingHTML(family,members,duplicateName){
+  const name=(family&&family.meta&&family.meta.name)||"Additional boarding option";
+  const parts=choiceBoardingParts((members||[])[0]);
+  if(parts.board){
+    const detail=[parts.toward?`Toward ${parts.toward}`:"",`Services: ${name}`]
+      .filter(Boolean).join(" · ");
+    return `<span class="boarding-place">${escapeHTML(`Board at ${parts.board}`)}</span>`+
+      `<span class="boarding-detail">${escapeHTML(detail)}</span>`;
+  }
+  return `<span class="boarding-place">${escapeHTML(boardingGroupLabel(family,members,duplicateName))}</span>`;
+}
+function additionalChoicesHTML(choices,recommended){
+  const groups=new Map();
+  (choices||[]).forEach(choice=>{
+    // A family is a corridor, not necessarily a single boarding experience. Keep opposite
+    // directions and distinct stops separate even when the server correctly puts them in one
+    // service family. The visible heading begins with this discovered context; the family name is
+    // only the secondary service cue.
+    const context=choiceBoardingContext(choice);
+    const key=`${String(choice.family.key)}\u0000${context}`;
+    if(!groups.has(key))groups.set(key,{family:choice.family,context,members:[]});
+    groups.get(key).members.push(choice);
+  });
+  const names={};groups.forEach(group=>{
+    const name=(group.family.meta&&group.family.meta.name)||"Additional boarding option";
+    names[name]=(names[name]||0)+1;
+  });
+  return [...groups.values()].map(group=>{
+    const name=(group.family.meta&&group.family.meta.name)||"Additional boarding option";
+    const heading=boardingHeadingHTML(group.family,group.members,names[name]>1);
+    return `<section class="boarding-group" data-family="${escapeHTML(group.family.key)}" data-boarding-context="${escapeHTML(group.context)}">`+
+      `<h3 class="boarding-heading">${heading}</h3><div class="choice-list">`+
+      group.members.map(c=>routeRowHTML(c,recommended,"additional-route")).join("")+`</div></section>`;
+  }).join("");
+}
+function selectedRouteHTML(choice,recommended,d){
+  if(!choice)return "";
+  const o=choice.o,r=choice.r,walk=optionWalk(o),allowance=optionScheduleAllowance(o);
+  const directions=routeActionsHTML(choice),stepCount=(directions.match(/<li\b/g)||[]).length;
+  const risk=(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:"low schedule risk";
+  return `<section class="selected-route" id="selected-route-panel" aria-labelledby="selected-route-title">`+
+    `<h2 class="route-section-title" id="selected-route-title">Selected route</h2>`+
+    `<div class="selected-route-summary"><span class="route-dot" aria-hidden="true" style="background:${o.identityColor||primaryCasing()}"></span>`+
+      `<div><span class="route-name">${escapeHTML(routeTitle(choice))}</span><span class="route-why">${escapeHTML(routeReason(choice,recommended))}</span>`+
+      (allowance>0?`<span class="route-allowance">Allow ${formatMinutes(allowance)} before boarding</span>`:"")+`</div>`+
+      `<div class="route-time">${formatMinutes(r.head)}<small>${formatMinutes(walk)} walk · ${escapeHTML(risk)}</small></div></div>`+
+    `<details class="selected-directions" id="route-directions"${directionsOpen?" open":""}>`+
+      `<summary aria-expanded="${directionsOpen}">Step-by-step directions (${stepCount} step${stepCount===1?"":"s"})</summary>`+
+      `<ol class="route-directions">${directions||"<li>No detailed steps are available for this route.</li>"}</ol></details>`+
+    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank" rel="noopener">Open in Google Maps ↗</a></section>`;
+}
 // The dominant transit line of a geom leg list (the longest in-vehicle leg) — labels the primary
 // strip when there's no single "line" field. Falls back to "walk only".
 function dominantLine(legs){
@@ -1150,22 +1892,40 @@ function dominantLine(legs){
   return best||"walk only";
 }
 function findOpt(key){return compareList.find(o=>o.key===key)||null;}
-// Draw whichever route compare mode wants: previewKey if hovering a strip, else the locked selKey.
-// The BADGE follows the selector ONLY for the PRIMARY (it has a best-case/typical pair via REAL):
-// Realistic → REAL[cell] (the typical, == headline + cell color); Best-case → the structural total.
-// An ALT has only its single draw-based number (a.min == opt.total), so its badge = that.
-function drawSelected(){
-  const key=previewKey!=null?previewKey:selKey;
-  const opt=findOpt(key)||compareList[0];
-  if(!opt){clearRoute();return;}
-  // The badge follows the selector for EVERY route (consistency rule): the drawn strip's displayed
-  // metric number = optRead.head. legs/total are the ACTIVE journey's — arrive-by has one traced
-  // journey (opt.legs/opt.total); depart-after re-picks best/typical by the live metric (optLegs/
-  // optTotal), so toggling the metric re-draws the OTHER journey (different legs + geometry).
-  const legs=optLegs(opt), total=optTotal(opt), badge=optRead(opt).head;
-  drawOne(legs,opt.identityColor,total,badge);
-  DRAWN={id:routePin,legs,identityColor:opt.identityColor,total,badge,isPrimary:opt.isPrimary};
+function effectiveChoiceKey(){return previewKey||selKey;}
+function findChoice(key){return routeChoices().find(c=>c.o.key===key)||null;}
+function rebuildAvoidForOptions(opts){
+  TT_AVOID=[];
+  (opts||[]).forEach(o=>(optLegs(o)||[]).forEach(g=>{
+    (g.pts||[]).forEach(p=>{const cp=map.latLngToContainerPoint(L.latLng(p[0],p[1]));
+      TT_AVOID.push({x:cp.x,y:cp.y});});
+  }));
+  rebuildBlocks([],null);
 }
+// Focused route inspection: draw alternatives first as quiet ghosts, then the selected exact route
+// last at full strength with the sole label/badge. The map and card now share one selection key.
+function drawCompareRoutes(){
+  if(routePin==null||!compareList.length){clearRoute();return;}
+  const prim=compareList.find(o=>o.isPrimary);if(prim)prim.identityColor=primaryCasing();
+  const choices=routeChoices(),recommended=recommendedChoice(choices);
+  // Compact map mode is deliberately recommendation-first: it leaves the selected exact route
+  // fully legible and puts only the featured choices behind it as quiet context. Expanded mode
+  // exposes every exact option, including siblings retained under Additional.
+  const selected=choices.find(c=>c.o.key===effectiveChoiceKey())||recommended||choices[0];
+  const visible=showAllRoutes?choices:compactMapChoices(choices,recommended,selected);
+  routeLayer.clearLayers();
+  visible.filter(c=>c!==selected).forEach(c=>drawOne(optLegs(c.o),c.o.identityColor,optTotal(c.o),c.r.head,
+    {append:true,labels:false,badge:false,opacity:.13}));
+  if(!selected){clearRoute();return;}
+  const firstNames=serviceNames({services:branchServiceRows(selected)});
+  const firstTransitLabel=firstNames.length>1?firstNames.join(" / "):"";
+  drawOne(optLegs(selected.o),selected.o.identityColor,optTotal(selected.o),selected.r.head,
+    {append:true,labels:true,badge:true,opacity:1,firstTransitLabel});
+  rebuildAvoidForOptions(visible.map(c=>c.o));
+  DRAWN={id:routePin,multi:true,key:selected.o.key,famKey:selected.family.key,
+    branchKey:selected.branch.key,ghostCount:Math.max(0,visible.length-1)};
+}
+function drawSelected(){drawCompareRoutes();}
 // HOVER-MODE draw (not pinned): always the PRIMARY route, clean. Called by maybeRoute/drawJourney.
 // The badge follows the selector (badgeFor) so it matches the hover card headline + the cell color.
 // DEPART-AFTER: normalize first so the drawn geom/total is the ACTIVE journey (best in Best-case,
@@ -1196,6 +1956,7 @@ function maybeRoute(id,d){
 // stored metric-aware badge so a zoom never reverts the badge to the best-case total.
 map.on("zoomend",()=>{
   if(!DRAWN)return;
+  if(DRAWN.multi){drawCompareRoutes();return;}
   drawOne(DRAWN.legs,DRAWN.identityColor,DRAWN.total,DRAWN.badge);
 });
 // Re-render the currently-drawn route (theme toggle: the PRIMARY casing is theme-aware; metric
@@ -1206,15 +1967,15 @@ function redrawCurrentRoute(){
   if(routePin!=null&&compareList.length){
     // refresh the primary option's casing to the new theme, then redraw the selection (drawSelected
     // recomputes the metric-aware badge for whichever strip is drawn).
-    const prim=findOpt(PRIMARY_KEY);if(prim)prim.identityColor=primaryCasing();
+    const prim=compareList.find(o=>o.isPrimary);if(prim)prim.identityColor=primaryCasing();
     drawSelected();
     return;
   }
   // hover mode: the hover route is always the PRIMARY. DEPART-AFTER toggling the metric must re-draw
   // the OTHER journey (best<->typical = different legs + geometry), so re-derive from the cached
   // breakdown via drawPrimary (which normalizes to the active journey). The cell id is on DRAWN.
-  if(DEPARTAFTER && DRAWN.isPrimary!==false && DRAWN.id!=null && BDCACHE[DRAWN.id]){
-    drawPrimary(DRAWN.id, BDCACHE[DRAWN.id]); return;
+  if(DEPARTAFTER && DRAWN.isPrimary!==false && DRAWN.id!=null){
+    const cached=BDCACHE.get(DRAWN.id);if(cached){drawPrimary(DRAWN.id,cached);return;}
   }
   // The only theme-aware casing is the primary (white). Re-resolve it. Recompute the badge from the
   // current selector (== headline + cell color).
@@ -1231,10 +1992,19 @@ function redrawCurrentRoute(){
 // route. While pinned, hover-drawing is suppressed (maybeRoute gates on routePin) but hover text
 // tooltips still work. On pin we fitBounds to the route, padding the corner the card occupies.
 const pinCard=document.getElementById("pincard"),pinBody=document.getElementById("pinbody");
+let resetPinScroll=false; // stays armed through the async placeholder -> final-card replacement
 let pinFeature=null;     // the L.geoJSON feature object currently pinned (for refresh in place)
 let justPinned=false;    // set by a cell click; the map-background click skips closePin this tick
 let pendingFitId=null;   // cell id a pin requested a one-shot fitBounds for (consumed by drawJourney)
-function setPinHTML(h){pinBody.innerHTML=h;}
+function setPinHTML(h){
+  pinBody.innerHTML=h;
+  if(resetPinScroll){
+    // WebKit/Chromium can restore a hidden scroller's old offset when it becomes visible or its
+    // async contents are replaced. Reset both now and after layout; renderPin disarms the flag.
+    pinBody.scrollTop=0;
+    requestAnimationFrame(()=>{if(resetPinScroll)pinBody.scrollTop=0;});
+  }
+}
 // ---- camera: frame the route + destination + origin INSIDE the unoccluded map rectangle -------
 // Reads the LIVE bounding rects of the fixed UI chrome (side panel, pinned card, legend incl. the
 // time badge) and returns real per-side pixel INSETS of the region those overlays block — measured
@@ -1262,11 +2032,14 @@ function viewInsets(){
   //   extending `right` all the way to the card's LEFT edge. The card then sits inside the reserved
   //   right strip alongside the panel, so the route can't pass beside it at a different y AND a route
   //   hugging the top of the usable LEFT area never collides with it (no separate top inset needed →
-  //   no wasted top band). Mobile: the card is top-centered → a TOP inset = its bottom edge.
+  //   no wasted top band). Mobile Routes mode fills the screen, so its current fit is intentionally
+  //   irrelevant. Compact Map mode moves the card to the BOTTOM and reserves that bottom band.
   if(pinCard.classList.contains('open')){
     const qc=measure(document.getElementById('pincard'));
     if(qc){ if(desktop) right=Math.max(right, sz.x-qc.l);
-            else top=Math.max(top, qc.b); }
+            else if(document.body.classList.contains('pin-map-view'))
+              bottom=Math.max(bottom,sz.y-qc.t);
+            else top=Math.max(top,qc.b); }
   }
   // LEGEND — bottom-left; reserve a bottom inset only as tall as the legend (+ the origin badge that
   // floats above a low origin cell) so a low route + its badge clear it. It's narrow → no left inset.
@@ -1296,7 +2069,7 @@ function fitBoundsUnoccluded(bounds){
   const span=b.getNorth()-b.getSouth();
   if(DESTLL && span>0 && (b.getNorth()-DESTLL[0])<span*0.15) topPad=Math.max(topPad,DEST_H+INSET_BREATH);
   map.fitBounds(b,{paddingTopLeft:[ins.left,topPad],
-    paddingBottomRight:[ins.right,ins.bottom],maxZoom:15,animate:true,duration:0.5});
+    paddingBottomRight:[ins.right,ins.bottom],maxZoom:15,animate:!REDUCE_MOTION,duration:REDUCE_MOTION?0:0.5});
 }
 // UNION-FIT (one fit per pin): frame the union of the PRIMARY + EVERY alt route (+ destination +
 // origin) so toggling/hovering compare strips draws a different polyline inside an UNCHANGED
@@ -1306,10 +2079,11 @@ function fitBoundsUnoccluded(bounds){
 // refresh never re-fits.
 function fitToCompare(){
   const pts=[];
-  (compareList||[]).forEach(o=>(o.legs||[]).forEach(g=>{if(g.pts)g.pts.forEach(p=>pts.push(p));}));
+  displayOptions().forEach(o=>(optLegs(o)||[]).forEach(g=>{if(g.pts)g.pts.forEach(p=>pts.push(p));}));
   if(DESTLL)pts.push(DESTLL);
-  if(routePin!=null&&BDCACHE[routePin]){const d=BDCACHE[routePin];
+  if(routePin!=null){const d=BDCACHE.get(routePin);if(d){
     if(d.olat!=null)pts.push([d.olat,d.olon]);}            // origin cell
+  }
   if(!pts.length)return;
   fitBoundsUnoccluded(L.latLngBounds(pts));
 }
@@ -1317,12 +2091,39 @@ function fitToCompare(){
 // render summary + strips, then draw the selected route. Reused by openPin's load AND the
 // /variance refresh (so the list gains its alternatives in place when they land).
 function renderPin(f,d){
+  captureRouteDisclosureState();
+  const focusKey=restoreRouteFocusKey;
+  const priorSelection=selKey;
   compareList=buildCompare(d);
-  // Keep the locked selection if it still exists (e.g. /variance refresh added alts but the user
-  // already picked one); otherwise default to the primary.
-  if(!findOpt(selKey))selKey=compareList.length?compareList[0].key:PRIMARY_KEY;
+  const choices=routeChoices(),recommended=recommendedChoice(choices);
+  const selectionReplaced=!findChoice(selKey);
+  if(selectionReplaced)selKey=recommended?recommended.o.key:(compareList[0]||{}).key||PRIMARY_KEY;
+  if(selectionReplaced){
+    directionsOpen=false;
+    const replacement=findChoice(selKey);
+    if(priorSelection!==selKey&&replacement)
+      pendingSelectionAnnouncement=`Route changed to ${routeTitle(replacement)}, ${formatMinutes(replacement.r.head)}.`;
+  }
   previewKey=null;
+  const focusRecommended=resetPinScroll;
   setPinHTML(pinHTML(d));
+  restoreRouteDisclosureState();
+  if(resetPinScroll){
+    pinBody.scrollTop=0;
+    requestAnimationFrame(()=>{
+      if(routePin===f.properties.id)pinBody.scrollTop=0;
+      resetPinScroll=false;
+    });
+  }
+  if(focusRecommended)requestAnimationFrame(()=>{
+    const row=pinCard.querySelector(".route-choice.recommended");if(row)row.focus({preventScroll:true});});
+  else if(focusKey)requestAnimationFrame(()=>{
+    const row=[...pinCard.querySelectorAll(".route-choice")].find(el=>el.dataset.key===focusKey);
+    if(row)row.focus({preventScroll:true});});
+  const fallbackAnnouncement=pendingSelectionAnnouncement;pendingSelectionAnnouncement="";
+  if(fallbackAnnouncement)requestAnimationFrame(()=>{
+    const live=pinCard.querySelector("#route-selection-status");if(live)live.textContent=fallbackAnnouncement;
+  });
   // Draw the selected route (compare mode). maybeRoute/drawJourney route through drawSelected.
   maybeRoute(f.properties.id,d);
   // ONE-SHOT UNION FIT: now that compareList (primary + every alt) AND the card's final HTML/height
@@ -1340,7 +2141,10 @@ function openPin(f,l){
   // async success can't paint a hover tooltip/route after the pin. The reveal is also guarded by
   // routePin in openHoverInPlace; this is belt-and-suspenders. (hoverCell stays so closePin can
   // restore the hover route on unpin.)
-  bdToken++;
+  // Preserve a same-cell touch prefetch: it is the exact request the inspector needs.  Any
+  // other preview prefetch is stale once this cell becomes the selected route.
+  cancelPinPrefetch(pinRequestKey(f));
+  bdToken++;pinUpgradeSeq++;pinUpgradeKey="";
   // LEAK FIX: unbind EVERY cell's tooltip, not just hoverLayer/the clicked layer. A cell hovered
   // earlier in a continuous sweep is only closeTooltip()'d on mouseout (still BOUND) — Leaflet's
   // sticky _onMouseMove then REOPENS that already-bound tooltip when the cursor crosses it during
@@ -1349,7 +2153,10 @@ function openPin(f,l){
   // while pinned. The mouseover handler rebinds a fresh tooltip on the next (post-unpin) hover.
   layer.eachLayer(ll=>{if(ll.getTooltip&&ll.getTooltip())ll.unbindTooltip();});
   pinFeature=f;routePin=f.properties.id;
-  compareList=[];selKey=PRIMARY_KEY;previewKey=null;     // fresh compare state for this pin
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
+  resetPinScroll=true;      // keep reset armed until the async final card has laid out
+  document.body.classList.add("route-pinned");document.body.classList.remove("route-adjusting","pin-map-view");
+  showCellFocus(f);
   pinCard.classList.add("open");
   setPinHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b></div><div style="color:var(--mut)">loading route…</div></div>`);
   // Arm a one-shot fitBounds for this pin: drawJourney consumes it once the pinned cell's geom
@@ -1359,54 +2166,338 @@ function openPin(f,l){
   // the compare card. onReady fires after the route is drawn, with the breakdown d (or null for a
   // no-route/legacy cell → card stays the text breakdown, no compare list).
   loadBreak(f,h=>{setPinHTML(h);},d=>{if(routePin===f.properties.id&&d&&!d.error&&d.geom)renderPin(f,d);});
+  requestAnimationFrame(()=>map.invalidateSize({pan:false}));
 }
 function closePin(){
   if(!pinCard.classList.contains("open")&&routePin==null)return;
+  // AbortController cannot retract bytes whose response headers already arrived.  Invalidate the
+  // subscriber first so a late JSON body can never repopulate the cache, card, or route after close.
+  bdToken++;clearTimeout(bdTimer);cancelPinPrefetch();cancelLightBreakdown();
+  pinUpgradeSeq++;pinUpgradeKey="";
   pinCard.classList.remove("open");pinFeature=null;routePin=null;pendingFitId=null;
-  compareList=[];selKey=PRIMARY_KEY;previewKey=null;     // reset compare state
+  resetPinScroll=false;pinBody.scrollTop=0;
+  document.body.classList.remove("route-pinned","route-adjusting","pin-map-view");
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
+  clearCellFocus();
   // If the mouse is parked over another cell with a cached breakdown, fall back to its hover
   // route immediately; otherwise clear the drawn route.
-  if(hoverCell!=null&&BDCACHE[hoverCell])drawJourney(hoverCell,BDCACHE[hoverCell]);
-  else clearRoute();
+  const hoverCached=hoverCell!=null?BDCACHE.get(hoverCell):null;
+  if(hoverCached)drawJourney(hoverCell,hoverCached);else clearRoute();
+  requestAnimationFrame(()=>{map.invalidateSize({pan:false});map.getContainer().focus?.({preventScroll:true});});
 }
 document.getElementById("pinx").onclick=closePin;
-document.getElementById("pinx").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();closePin();}});
-// Compare-row interaction (delegated, document-level): the strips live in the pinned card and are
-// innerHTML-set on every render, so delegate. HOVER a row → preview THAT route on the map (single
-// clean swap). Mouse-leaving the LIST returns to the locked selection. CLICK (or Enter/Space) a row
-// → lock it as the selection (previewKey cleared so it persists after the cursor leaves).
-function previewRow(key){if(routePin==null)return;previewKey=key;drawSelected();markStrips();}
-function clearPreview(){if(routePin==null||previewKey==null)return;previewKey=null;drawSelected();markStrips();}
-function lockRow(key){if(routePin==null)return;selKey=key;previewKey=null;drawSelected();markStrips();}
-// Update only the strips' selected mark/highlight in place (no full re-render → no flicker, keeps
-// focus). The drawn strip = previewKey ?? selKey.
-function markStrips(){
-  const drawnKey=previewKey!=null?previewKey:selKey;
-  pinCard.querySelectorAll(".cmp .strip").forEach(s=>{
-    const sel=s.getAttribute("data-key")===drawnKey;
-    s.classList.toggle("sel",sel);s.setAttribute("aria-pressed",String(sel));
-    const m=s.querySelector(".mark");if(m)m.textContent=sel?"●":"○";});
+let pinUpgradeSeq=0,pinUpgradeKey="";
+// Touch users first receive a compact, immediately drawable route preview.  If they pause on it,
+// warm the richer pin=1 response in the background so Inspect normally opens with every route
+// family ready.  This is deliberately ONE delayed request for the currently-open touch preview:
+// it is not a map-hover prefetch and cannot turn a scrub across the city into a request storm.
+const PIN_PREFETCH_DELAY=180;
+let pinPrefetchTimer=null,pinPrefetchSeq=0,pinPrefetchKey="",pinPrefetchAbort=null,pinPrefetchId=null;
+function routeRequestKey(id){
+  return `${GEN}|${id}|${DESTLL&&DESTLL[0]}|${DESTLL&&DESTLL[1]}|${maxxfers}|${walkspeed}`;}
+function pinRequestKey(f){return routeRequestKey(f&&f.properties&&f.properties.id);}
+function cancelPinPrefetch(keepKey){
+  if(pinPrefetchKey&&keepKey&&pinPrefetchKey===keepKey)return;
+  const id=pinPrefetchId;
+  if(pinPrefetchTimer!=null){clearTimeout(pinPrefetchTimer);pinPrefetchTimer=null;}
+  if(pinPrefetchAbort){pinPrefetchAbort.abort();pinPrefetchAbort=null;}
+  if(pinPrefetchKey){pinPrefetchSeq++;pinPrefetchKey="";}
+  pinPrefetchId=null;
+  const cached=id!=null?BDCACHE.get(id):null;
+  if(cached&&!cached._pin)cached._pinPending=false;
+}
+function launchPinPrefetch(f,key){
+  pinPrefetchTimer=null;
+  const touchOwns=!!(touchFeature&&touchFeature.properties.id===f.properties.id&&touchPeek.classList.contains("open"));
+  const pinOwns=!!(routePin===f.properties.id&&pinFeature&&pinFeature.properties.id===f.properties.id);
+  if(pinPrefetchKey!==key||(!touchOwns&&!pinOwns)||!varianceSettled()){
+    if(pinPrefetchKey===key){const cached=BDCACHE.get(f.properties.id);if(cached&&!cached._pin)cached._pinPending=false;
+      pinPrefetchKey="";pinPrefetchId=null;}
+    return;
+  }
+  const cached=BDCACHE.get(f.properties.id);
+  if(!cached||cached._pin||cached.error){pinPrefetchKey="";pinPrefetchId=null;return;}
+  const seq=++pinPrefetchSeq,controller=new AbortController();pinPrefetchAbort=controller;
+  cached._pinPending=true;
+  fetch(`/itinerary?id=${f.properties.id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}&pin=1`,
+    {signal:controller.signal})
+    .then(r=>r.ok?r.json():null)
+    .then(d=>{
+      if(seq!==pinPrefetchSeq||pinPrefetchKey!==key||!d||d.error)return;
+      d._pin=true;d._pinPending=false;BDCACHE.set(f.properties.id,d,routePin);
+      // The user may have tapped Inspect while the prefetch was in flight.  In that case the
+      // enriched response becomes the same single source of truth for the already-open card.
+      if(routePin===f.properties.id&&pinFeature&&pinFeature.properties.id===f.properties.id){
+        d.name=f.properties.n;d.real=REAL[f.properties.id];d.var=VAR[f.properties.id];
+        const scroll=pinBody.scrollTop;renderPin(f,d);
+        requestAnimationFrame(()=>{if(routePin===f.properties.id)pinBody.scrollTop=scroll;});
+      }
+    })
+    .catch(e=>{if(e&&e.name!=="AbortError")console.warn("pin prefetch",e);})
+    .finally(()=>{
+      if(seq!==pinPrefetchSeq||pinPrefetchKey!==key)return;
+      pinPrefetchAbort=null;pinPrefetchKey="";pinPrefetchId=null;
+      const latest=BDCACHE.get(f.properties.id);
+      if(latest&&!latest._pin)latest._pinPending=false;
+    });
+}
+function schedulePinPrefetch(f,immediate=false){
+  const touchOwns=!!(touchFeature&&touchFeature.properties.id===f.properties.id&&touchPeek.classList.contains("open"));
+  const pinOwns=!!(routePin===f.properties.id&&pinFeature&&pinFeature.properties.id===f.properties.id);
+  // On a hybrid device a pointerType="touch" interaction can open a preview even though the
+  // default device mode is desktop.  Its existing preview key remains the ownership proof while
+  // Inspect promotes the request; ordinary desktop pins never enter this prefetch path.
+  if(!(TOUCH||touchOwns||pinPrefetchKey)||!f||!DESTLL||!EXACT||!varianceSettled()||(!touchOwns&&!pinOwns))return false;
+  const cached=BDCACHE.get(f.properties.id);if(!cached||cached._pin||cached.error)return false;
+  const key=pinRequestKey(f);
+  if(pinPrefetchKey===key){
+    if(immediate&&pinPrefetchTimer!=null){clearTimeout(pinPrefetchTimer);launchPinPrefetch(f,key);}
+    return true;
+  }
+  cancelPinPrefetch();pinPrefetchKey=key;pinPrefetchId=f.properties.id;cached._pinPending=true;
+  if(immediate)launchPinPrefetch(f,key);
+  else pinPrefetchTimer=setTimeout(()=>launchPinPrefetch(f,key),PIN_PREFETCH_DELAY);
+  return true;
+}
+function upgradePinnedBreakdown(f){
+  if(!f||routePin==null||!DESTLL)return;
+  const id=f.properties.id;
+  // While /variance is running, wait so its normal completion owns the one refresh. A terminal
+  // variance failure is different: pin=1 can still return the server's planned structural route
+  // families (only bad-day metrics are degraded), so release the same single upgrader on failure.
+  if(!varianceSettled())return;
+  const key=pinRequestKey(f);
+  const existing=BDCACHE.get(id);
+  // A mobile preview may already be warming this exact enriched response.  Promote that one
+  // request on Inspect (and flush its small debounce) rather than issuing a duplicate pin=1 call.
+  if(pinPrefetchKey===key){schedulePinPrefetch(f,true);return;}
+  if(pinUpgradeKey===key||(existing&&existing._pin))return;
+  pinUpgradeKey=key;const seq=++pinUpgradeSeq;
+  fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}&pin=1`)
+    .then(r=>r.ok?r.json():null)
+    .then(d=>{
+      if(seq!==pinUpgradeSeq||pinUpgradeKey!==key)return;
+      pinUpgradeKey="";
+      if(!d||d.error){const cached=BDCACHE.get(id);if(cached){cached._pinPending=false;
+        if(routePin===id&&pinFeature)renderPin(pinFeature,Object.assign({},cached,
+          {name:f.properties.n,real:REAL[id],var:VAR[id]}));}return;}
+      d._pin=true;d._pinPending=false;BDCACHE.set(id,d,routePin);
+      if(routePin!==id||!pinFeature||pinFeature.properties.id!==id)return;
+      d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];
+      const scroll=pinBody.scrollTop;renderPin(f,d);
+      requestAnimationFrame(()=>{if(routePin===id)pinBody.scrollTop=scroll;});
+    })
+    .catch(()=>{if(seq===pinUpgradeSeq&&pinUpgradeKey===key){pinUpgradeKey="";
+      const cached=BDCACHE.get(id);if(cached){cached._pinPending=false;
+        if(routePin===id&&pinFeature)renderPin(pinFeature,Object.assign({},cached,{name:f.properties.n,real:REAL[id],var:VAR[id]}));}}});
+}
+const touchPeek=document.getElementById("touchpeek"),peekBody=document.getElementById("peekbody");
+let touchFeature=null,touchLayer=null;
+function closeTouchPreview(clearDraw=true){
+  // A close button, Keep exploring, or Escape can be the active element.  Do not leave keyboard
+  // focus inside an aria-hidden sheet; Inspect deliberately passes false and moves into #pincard.
+  const restoreMapFocus=clearDraw&&routePin==null&&touchPeek.contains(document.activeElement);
+  touchPeek.classList.remove("open");touchPeek.setAttribute("aria-hidden","true");
+  touchFeature=null;touchLayer=null;
+  // Inspect promotes this preview into the pinned card, so retain its one possible enrichment
+  // request.  A true dismissal/background tap cancels it immediately.
+  if(clearDraw){cancelPinPrefetch();cancelLightBreakdown();}
+  if(clearDraw&&routePin==null){bdToken++;clearTimeout(bdTimer);hoverCell=null;hoverLayer=null;clearRoute();clearCellFocus();}
+  if(restoreMapFocus)requestAnimationFrame(()=>map.getContainer().focus?.({preventScroll:true}));
+}
+function inspectTouchPreview(){
+  if(!touchFeature)return;
+  const f=touchFeature,l=touchLayer;
+  closeTouchPreview(false);hoverCell=null;hoverLayer=null;
+  openPin(f,l);
+  // Preview is a non-modal live region and deliberately leaves focus on the map.  Inspect is the
+  // explicit transition into the full route region, so enter it immediately; renderPin moves on to
+  // the recommended native route button when the final response is ready.
+  requestAnimationFrame(()=>{if(routePin===f.properties.id)pinCard.focus({preventScroll:true});});
+}
+function openTouchPreview(f,l){
+  const id=f.properties.id;
+  if(touchFeature&&touchFeature.properties.id===id&&touchPeek.classList.contains("open")){
+    inspectTouchPreview();return;
+  }
+  // A map tap while Adjust settings (or compact Map view) is open starts a new selection.
+  // Leave the old pinned route explicitly before opening its replacement preview; otherwise
+  // route-adjusting's mobile CSS forces the controls sheet visible even after `.open` is removed,
+  // and dismissing the preview still sees the stale routePin.
+  if(routePin!=null)closePin();
+  // Give a first-tap preview the map instead of stacking it over the expanded controls sheet.
+  // The controls remain one tap away; collapsing also makes the selected tile and route readable
+  // on short phones where two simultaneous bottom sheets otherwise leave almost no map.
+  if(panelEl.classList.contains("open")){
+    panelEl.classList.remove("open");sheetBtn.textContent="Controls";
+    sheetBtn.setAttribute("aria-expanded","false");
+    requestAnimationFrame(()=>map.invalidateSize({pan:false}));
+  }
+  cancelPinPrefetch();
+  bdToken++;clearTimeout(bdTimer);touchFeature=f;touchLayer=l;hoverCell=id;hoverLayer=null;
+  showCellFocus(f);
+  const v=val(id),estimate=!EXACT&&v!=null?` · ~${v} min estimate`:"";
+  peekBody.innerHTML=`<div class="peek-title">${escapeHTML(f.properties.n||"Selected area")}</div>`+
+    `<div class="peek-stats">Loading commute${estimate}…</div>`;
+  touchPeek.classList.add("open");touchPeek.setAttribute("aria-hidden","false");
+  loadBreak(f,()=>{},d=>{
+    if(!touchFeature||touchFeature.properties.id!==id||!touchPeek.classList.contains("open"))return;
+    if(d){d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];peekBody.innerHTML=touchPreviewHTML(d);
+      schedulePinPrefetch(f);}
+    else if(EXACT)peekBody.innerHTML=touchPreviewHTML({error:"no route"});
+  });
+}
+document.getElementById("peekx").onclick=()=>closeTouchPreview();
+touchPeek.addEventListener("click",e=>{
+  if(e.target.closest("#peekinspect")){inspectTouchPreview();return;}
+  if(e.target.closest('[data-peek="map"]'))closeTouchPreview();
+});
+// One exact route-row interaction model for recommended, practical, and additional choices.
+function previewRow(key){if(routePin==null||effectiveChoiceKey()===key)return;previewKey=key;drawSelected();}
+function clearPreview(){if(routePin==null||previewKey==null)return;previewKey=null;drawSelected();}
+function lockRow(key){if(routePin==null||!findChoice(key))return;
+  const before=effectiveChoiceKey(),selectionChanged=selKey!==key;selKey=key;previewKey=null;
+  if(!selectionChanged)return;
+  directionsOpen=false;
+  if(before!==key)drawSelected();
+  markRouteChoices();refreshSelectedRoutePanel();announceRouteSelection(findChoice(selKey));}
+function markRouteChoices(){
+  pinCard.querySelectorAll(".route-choice").forEach(s=>{
+    const sel=s.getAttribute("data-key")===selKey;
+    s.setAttribute("aria-pressed",String(sel));
+    const label=s.querySelector(".route-selected-label");
+    if(sel&&!label){const el=document.createElement("span");el.className="route-selected-label";el.textContent="Selected";s.querySelector(".route-main")?.appendChild(el);}
+    if(!sel&&label)label.remove();});
+  const choice=findChoice(selKey)||recommendedChoice();
+  if(choice){const r=choice.r,transfers=optionTransfers(choice.o),walk=optionWalk(choice.o);
+    const values={time:formatMinutes(r.head),risk:(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:"low schedule risk",
+      walk:`${formatMinutes(walk)} walk`,transfers:`${transfers} transfer${transfers===1?"":"s"}`};
+    const allowance=optionScheduleAllowance(choice.o),allowanceEl=pinCard.querySelector('[data-summary="allowance"]');
+    if(allowanceEl){allowanceEl.hidden=allowance<=0;allowanceEl.textContent=allowance>0?`allow ${formatMinutes(allowance)} before boarding`:"";}
+    Object.entries(values).forEach(([key,value])=>{const el=pinCard.querySelector(`[data-summary="${key}"]`);
+      if(el)el.textContent=value;});}
+}
+function refreshSelectedRoutePanel(){
+  const panel=pinCard.querySelector("#selected-route-panel"),choice=findChoice(selKey),recommended=recommendedChoice();
+  const d=routePin!=null?BDCACHE.get(routePin):null;
+  if(panel&&choice&&d)panel.outerHTML=selectedRouteHTML(choice,recommended,d);
+}
+function announceRouteSelection(choice,fallback){
+  const live=pinCard.querySelector("#route-selection-status");if(!live||!choice)return;
+  live.textContent=`${fallback?"Route changed to ":"Selected "}${routeTitle(choice)}, ${formatMinutes(choice.r.head)}.`;
 }
 document.addEventListener("mouseover",e=>{
-  const strip=e.target.closest&&e.target.closest(".cmp .strip");if(!strip)return;
-  previewRow(strip.getAttribute("data-key"));});
+  const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(!row||TOUCH)return;
+  previewRow(row.dataset.key);});
 document.addEventListener("mouseout",e=>{
-  // leaving the WHOLE list (not just moving between strips) restores the locked selection
-  const cmp=e.target.closest&&e.target.closest(".cmp");if(!cmp)return;
-  if(e.relatedTarget&&cmp.contains(e.relatedTarget))return;   // still inside the list → keep preview
+  const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(!row||TOUCH)return;
+  if(e.relatedTarget&&row.contains(e.relatedTarget))return;
   clearPreview();});
+document.addEventListener("focusin",e=>{
+  const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(row&&!TOUCH)previewRow(row.dataset.key);});
+document.addEventListener("focusout",e=>{
+  const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(!row||TOUCH)return;
+  if(e.relatedTarget&&row.contains(e.relatedTarget))return;clearPreview();});
+function captureRouteDisclosureState(){
+  const all=pinCard.querySelector("#allroutes");if(all)allRoutesOpen=all.open;
+  const directions=pinCard.querySelector("#route-directions");if(directions)directionsOpen=directions.open;
+  const active=document.activeElement;
+  const row=active&&active.closest&&active.closest("#pincard .route-choice");
+  restoreRouteFocusKey=row?row.dataset.key:null;
+}
+function restoreRouteDisclosureState(){
+  const all=pinCard.querySelector("#allroutes");
+  if(all&&allRoutesOpen){all.open=true;all.querySelector("summary")?.setAttribute("aria-expanded","true");}
+  const directions=pinCard.querySelector("#route-directions");
+  if(directions&&directionsOpen){directions.open=true;directions.querySelector("summary")?.setAttribute("aria-expanded","true");}
+}
+function handleRouteDisclosureToggle(e){
+  const details=e.target;
+  if(!details||!details.matches)return;
+  if(details.matches("#allroutes")){
+    allRoutesOpen=details.open;
+    details.querySelector("summary")?.setAttribute("aria-expanded",String(details.open));
+    if(details.open){
+      const panel=details.querySelector("#all-routes-panel");
+      if(panel&&!panel.querySelector(".route-choice")){
+        const choices=routeChoices(),recommended=recommendedChoice(choices);
+        panel.innerHTML=additionalChoicesHTML(
+          moreRouteChoices(choices,recommended),recommended);
+      }
+    }
+    return;
+  }
+  if(details.matches("#route-directions")){
+    directionsOpen=details.open;
+    details.querySelector("summary")?.setAttribute("aria-expanded",String(details.open));
+  }
+}
+document.addEventListener("toggle",handleRouteDisclosureToggle,true);
 document.addEventListener("click",e=>{
-  const strip=e.target.closest&&e.target.closest(".cmp .strip");if(!strip)return;
-  lockRow(strip.getAttribute("data-key"));});
-document.addEventListener("keydown",e=>{
-  if(e.key!=="Enter"&&e.key!==" ")return;
-  const strip=e.target.closest&&e.target.closest(".cmp .strip");if(!strip)return;
-  e.preventDefault();lockRow(strip.getAttribute("data-key"));});
+  const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(row){lockRow(row.dataset.key);return;}
+  if(e.target.closest&&e.target.closest("#pinadjust")){
+    const open=!document.body.classList.contains("route-adjusting");
+    document.body.classList.toggle("route-adjusting",open);
+    if(TOUCH){panelEl.classList.toggle("open",open);sheetBtn.textContent=open?"Done adjusting":"Controls";
+      sheetBtn.setAttribute("aria-expanded",String(open));}
+    e.target.closest("#pinadjust").setAttribute("aria-expanded",String(open));
+    requestAnimationFrame(()=>map.invalidateSize({pan:false}));return;
+  }
+  const view=e.target.closest&&e.target.closest("#pinview [data-view]");if(view){
+    const showMap=view.dataset.view==="map";
+    document.body.classList.toggle("pin-map-view",showMap);
+    pinCard.querySelectorAll("#pinview [data-view]").forEach(b=>b.setAttribute("aria-pressed",String(b===view)));
+    requestAnimationFrame(()=>{map.invalidateSize({pan:false});
+      if(showMap)fitToCompare();
+      else pinCard.querySelector(`.route-choice[data-key="${CSS.escape(selKey)}"]`)?.scrollIntoView({block:"nearest"});
+    });return;
+  }
+  const all=e.target.closest&&e.target.closest(".show-routes");if(all){
+    showAllRoutes=!showAllRoutes;all.setAttribute("aria-pressed",String(showAllRoutes));
+    all.textContent=mapRouteToggleLabel();drawSelected();return;
+  }
+});
 // Click-elsewhere unpins: a click on the map background (not a cell, not the card itself).
 // A cell click sets justPinned for this tick (canvas layer + map both fire click), so skip it.
-map.on("click",()=>{if(justPinned){justPinned=false;return;}closePin();});
-let bdTimer;
-// loadBreak(f, setHTML, onReady?) — fetch/render a cell's breakdown.
+map.on("click",()=>{if(justPinned){justPinned=false;return;}
+  if(touchPeek.classList.contains("open")){closeTouchPreview();return;}closePin();});
+let bdTimer,bdActive=null,bdLightFlight=null;
+function breakdownRequestPending(id){return !!(bdActive&&bdActive.token===bdToken&&bdActive.id===id);}
+function cancelLightBreakdown(keepKey){
+  if(!bdLightFlight||(keepKey&&bdLightFlight.key===keepKey))return;
+  bdLightFlight.controller.abort();bdLightFlight=null;
+}
+// The Preview and full Inspector are two subscribers to the same lightweight route data.  Keep
+// exactly one request per generation/cell/routing-parameter key so an immediate Preview -> Inspect
+// transition does not cancel the useful response and issue it again.  The subscriber's bdToken
+// still controls who may render; the shared promise controls only transport and JSON parsing.
+function lightBreakdownRequest(id){
+  const key=routeRequestKey(id);
+  if(bdLightFlight&&bdLightFlight.key===key)return bdLightFlight.promise;
+  cancelLightBreakdown();
+  const controller=new AbortController();
+  const url=`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`;
+  const doFetch=()=>fetch(url,{signal:controller.signal});
+  const promise=(async()=>{
+    try{
+      let r=await doFetch();
+      if(r.status===429){
+        const wait=retryAfter(r);await sleep(wait);if(controller.signal.aborted)return {aborted:true};
+        r=await doFetch();
+        if(r.status===429)return {error:"Too many hovers — slow down a sec."};
+      }
+      if(!r.ok)return {error:`Route lookup failed (${r.status}).`};
+      return {data:await r.json()};
+    }catch(e){
+      if(e&&e.name==="AbortError")return {aborted:true};
+      console.error("loadBreak",e);return {error:"Couldn't load route — try again in a moment."};
+    }
+  })();
+  const flight={key,promise,controller};bdLightFlight=flight;
+  promise.finally(()=>{if(bdLightFlight===flight)bdLightFlight=null;});
+  return promise;
+}
+// loadBreak(f, setHTML, onReady?, opts?) — fetch/render a cell's breakdown.
 //   setHTML(html)   sets the card/tooltip content (placeholders AND the final breakdown).
 //   onReady(d)      OPTIONAL — fired ONCE, after the content is FINAL and the route (if any) is
 //                   drawn. The hover path uses it to OPEN the tooltip only when it can appear in
@@ -1416,7 +2507,9 @@ let bdTimer;
 //                   fires so the hover gets feedback, just with no route to avoid.
 //   For CACHED cells everything below runs synchronously → onReady fires in the same tick as the
 //   mouseover, so the tooltip appears instantly in place.
-function loadBreak(f,setHTML,onReady){const id=f.properties.id,v=val(id);
+//   opts.hoverDebounce is an explicit desktop-hover-only contract; every explicit interaction and
+//   refresh starts its uncached fetch immediately.
+function loadBreak(f,setHTML,onReady,opts){const id=f.properties.id,v=val(id),wantPin=(routePin!=null&&routePin===id);
   const ready=d=>{if(onReady)onReady(d);};
   // A genuinely UNREACHABLE cell (v==null → [None,None] in TT, no journey within the ~75 min cap)
   // shows a clear "no route" breakdown, NOT a silent "—". We already know it's unreachable from the
@@ -1428,7 +2521,11 @@ function loadBreak(f,setHTML,onReady){const id=f.properties.id,v=val(id);
     setHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b> · ~${v} min <span style="color:var(--mut);font-weight:400">estimate</span></div><div style="color:var(--mut)">refining to exact times + route…</div></div>`);
     ready(null);                                    // no route yet, but show the estimate placeholder in place
     return;}
-  if(BDCACHE[id]){const d=Object.assign({},BDCACHE[id],{name:f.properties.n,real:REAL[id],var:VAR[id]});setHTML(bdHTML(d));maybeRoute(id,d);ready(d);return;}
+  {const cached=BDCACHE.get(id);if(cached){const d=Object.assign({},cached,{name:f.properties.n,real:REAL[id],var:VAR[id]});
+    if(wantPin&&!d._pin)d._pinPending=true;
+    setHTML(bdHTML(d));maybeRoute(id,d);ready(d);
+    if(wantPin&&!d._pin)upgradePinnedBreakdown(f);
+    return;}}
   // Uncached: keep the cell highlighted (done on hover) but DON'T flash a placeholder card —
   // open-after-ready means the hover tooltip stays closed until the fetch lands, so we never show
   // then reposition a "loading route…" box. The PINNED card (which passes no onReady) still wants
@@ -1436,23 +2533,34 @@ function loadBreak(f,setHTML,onReady){const id=f.properties.id,v=val(id);
   // never jumps).
   if(!onReady)setHTML(`<div class="bd" style="min-height:150px"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b> · ${v} min</div><div style="color:var(--mut)">loading route…</div></div>`);
   clearTimeout(bdTimer);const my=++bdToken;
-  bdTimer=setTimeout(async()=>{
-    const doFetch=()=>fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
+  const fetchBreakdown=async()=>{
+    if(my!==bdToken)return;                 // a cleared hover timer may already be queued to run
+    const active={token:my,id};bdActive=active;
+    // Pinning first requests the normal lightweight response. It is immediately drawable and
+    // makes the mobile preview cache reusable; per-route bad-day enrichment continues in the
+    // background instead of holding the full-screen inspector on a blank loading shell.
     const fail=msg=>{if(my===bdToken){setHTML(`<div class="bd"><span style="color:var(--mut)">${msg}</span></div>`);ready(null);}};
     try{
-      let r=await doFetch();
-      if(r.status===429){                              // hit /itinerary's 120/min rate limit -> one polite retry
-        const wait=retryAfter(r);await sleep(wait);if(my!==bdToken)return;
-        r=await doFetch();if(my!==bdToken)return;
-        if(r.status===429){fail("Too many hovers — slow down a sec.");return;}
-      }
-      if(!r.ok){fail(`Route lookup failed (${r.status}).`);return;}
-      const d=await r.json();if(my!==bdToken)return;
-      if(!d.error)BDCACHE[id]=d;
+      const result=await lightBreakdownRequest(id);if(my!==bdToken||result.aborted)return;
+      if(result.error){fail(result.error);return;}
+      const d=result.data;
+      // /variance can finish while this initial lightweight pin request is in flight. Its refresh
+      // may have completed the richer pin=1 request first; never let this older response regress
+      // the cache/card back to `_pin:false` or launch a duplicate enrichment request.
+      if(wantPin){const current=BDCACHE.get(id);if(current&&current._pin){
+        const newest=Object.assign({},current,{name:f.properties.n,real:REAL[id],var:VAR[id]});
+        setHTML(bdHTML(newest));maybeRoute(id,newest);ready(newest);return;}}
+      if(!d.error){d._pin=false;d._pinPending=wantPin;BDCACHE.set(id,d,routePin);}
       d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];setHTML(bdHTML(d));maybeRoute(id,d);ready(d);
+      if(wantPin&&!d.error)upgradePinnedBreakdown(f);
     }catch(e){console.error("loadBreak",e);fail("Couldn't load route — try again in a moment.");}
-  },150);}
-const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
+    finally{if(bdActive===active)bdActive=null;}
+  };
+  // Only pointer-hover is intentionally debounced. Explicit click/tap/pin and programmatic
+  // refresh call sites omit this option and start the request in the current task.
+  if(opts&&opts.hoverDebounce)bdTimer=setTimeout(fetchBreakdown,150);
+  else{bdTimer=null;fetchBreakdown();}}
+const layer=L.geoJSON(CELLS,{pane:"cellsPane",style,onEachFeature:(f,l)=>{
   // Desktop: hover shows the sticky breakdown tooltip. Touch has no hover, so we skip it
   // (a leftover sticky tooltip on tap is confusing) and rely on click/tap -> popup below.
   if(!TOUCH){
@@ -1468,9 +2576,8 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
       //   (loadBreak renders the message; no route to draw).
       // So there is NO early-return here on a dimmed/unreachable cell — only the no-destination guard.
       hoverCell=f.properties.id;hoverLayer=l;
-      // INSTANT feedback: highlight the cell outline on hover (the canvas outline can't read CSS
-      // vars, so resolve THEME here). This is the only immediate visual — the TOOLTIP is held back.
-      l.setStyle(THEME==="light"?{weight:2,color:"#1a1d23"}:{weight:1.4,color:"#fff"});
+      // Hover previews the route and tooltip without changing heatmap opacity or adding a separate
+      // focus treatment. Selection focus is reserved for an explicit tap/click.
       // OPEN-AFTER-READY: open the tooltip now but HELD INVISIBLE (the .tt-pending class). It exists
       // for hit-testing + sticky tracking, but the user can't see it until onReady REVEALS it once
       // its content + route + the final route-aware direction are all ready — so the card appears
@@ -1485,12 +2592,13 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
         d=>{                                              // onReady: content final + route drawn → reveal in place
           if(hoverCell!==myCell||!l.getTooltip())return;  // moved away before it landed → leave it hidden
           openHoverInPlace(l,d);
-        });
+        },{hoverDebounce:true});
     });
-    l.on("mouseout",()=>{layer.resetStyle(l);clearTimeout(bdTimer);
-      if(hoverCell===f.properties.id){hoverCell=null;hoverLayer=null;lastTipDir=null;lastTipAx=null;lastTipPerp=0;
+    l.on("mouseout",()=>{
+      if(hoverCell===f.properties.id){clearTimeout(bdTimer);bdToken++;
+        hoverCell=null;hoverLayer=null;lastTipDir=null;lastTipAx=null;lastTipPerp=0;
         if(l.getTooltip())l.closeTooltip();}                 // close the (revealed-or-pending) tooltip on leave
-      if(routePin==null)clearRoute();});                      // pinned route survives mouseout
+      if(routePin==null){clearRoute();clearCellFocus();}});    // pinned route survives mouseout
   }
   // Click (desktop) / tap (touch): pin the breakdown into the fixed corner card (NOT an on-cell
   // popup), so it never covers the drawn route. The map-background click handler unpins; this
@@ -1510,8 +2618,8 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
     // corner card only. closeTooltip() alone leaves the sticky tooltip's mousemove-reopen path live,
     // so fitBounds panning the cell back under the parked cursor would reopen it on top of the card.
     // unbindTooltip kills it for good; the mouseover handler rebinds a fresh one on the next hover.
-    if(l.getTooltip())l.unbindTooltip();layer.resetStyle(l);
-    openPin(f,l);});
+    if(l.getTooltip())l.unbindTooltip();
+    if(touchInteraction(ev))openTouchPreview(f,l);else openPin(f,l);});
 }}).addTo(map);
 // ---- info-panel lifecycle: keep open tooltips/popups in sync with the current params --------
 // A Leaflet sticky tooltip stays open until mouseout, so a param change (speed, transfers, new
@@ -1526,10 +2634,12 @@ const layer=L.geoJSON(CELLS,{style,onEachFeature:(f,l)=>{
 // "Cannot read properties of undefined" on any layer without a tooltip bound. The method exists on
 // every layer via inheritance, so `l.isTooltipOpen && l.isTooltipOpen()` doesn't guard.)
 function closeOpenInfo(){
-  bdToken++; clearTimeout(bdTimer);
+  cancelPinPrefetch();cancelLightBreakdown();
+  bdToken++; pinUpgradeSeq++; pinUpgradeKey=""; clearTimeout(bdTimer);
   routePin=null; hoverCell=null; hoverLayer=null; lastTipDir=null; lastTipAx=null; lastTipPerp=0; pendingFitId=null; clearRoute();   // drawn route is stale with the open cards
   pinCard.classList.remove("open"); pinFeature=null;   // close the pinned corner card too
-  compareList=[];selKey=PRIMARY_KEY;previewKey=null;   // reset compare state
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
+  document.body.classList.remove("route-pinned","route-adjusting","pin-map-view");clearCellFocus();closeTouchPreview(false);
   layer.eachLayer(l=>{
     const tip=l.getTooltip&&l.getTooltip(); if(tip&&tip.isOpen())l.closeTooltip();
   });
@@ -1541,7 +2651,7 @@ function closeOpenInfo(){
 // pinned. (Unbind, not just close, so a sticky tooltip can't mousemove-reopen over the pinned card
 // — same reasoning as openPin's leak fix.)
 function closeHoverKeepPin(){
-  bdToken++; clearTimeout(bdTimer);
+  bdToken++; clearTimeout(bdTimer);cancelLightBreakdown();
   hoverCell=null; hoverLayer=null; lastTipDir=null; lastTipAx=null; lastTipPerp=0;
   layer.eachLayer(l=>{if(l.getTooltip&&l.getTooltip())l.unbindTooltip();});
 }
@@ -1553,28 +2663,32 @@ function setPinLoading(on){
   const body=pinCard.querySelector(".bd");if(!body)return;
   let note=body.querySelector(".pinupd");
   if(on){if(!note){note=document.createElement("div");note.className="pinupd";
-    note.innerHTML='<span class="spin"></span>updating…';body.insertBefore(note,body.firstChild);}}
+    note.setAttribute("role","status");note.innerHTML='<span class="spin" aria-hidden="true"></span>updating…';
+    const head=body.querySelector(".pin-head");(head||body).appendChild(note);}}
   else if(note)note.remove();
 }
 function refreshOpenInfo(){
   // Re-render the pinned corner card in place (metric/cmode toggle, /variance arriving). renderPin
   // rebuilds the compare list (keeping the locked selKey when it still exists) + redraws.
   if(pinFeature){
-    const id=pinFeature.properties.id, cached=BDCACHE[id];
-    if(!cached){if(EXACT)loadBreak(pinFeature,h=>setPinHTML(h),d=>{if(routePin===id&&d&&!d.error&&d.geom)renderPin(pinFeature,d);});}
-    else renderPin(pinFeature,Object.assign({},cached,{name:pinFeature.properties.n,real:REAL[id],var:VAR[id]}));
+    const id=pinFeature.properties.id, cached=BDCACHE.get(id);
+    if(!cached){
+      if(EXACT&&!breakdownRequestPending(id))loadBreak(pinFeature,h=>setPinHTML(h),d=>{if(routePin===id&&d&&!d.error&&d.geom)renderPin(pinFeature,d);});
+    }else if(!cached._pin){
+      loadBreak(pinFeature,h=>setPinHTML(h),d=>{if(routePin===id&&d&&!d.error&&d.geom)renderPin(pinFeature,d);});
+    }else renderPin(pinFeature,Object.assign({},cached,{name:pinFeature.properties.n,real:REAL[id],var:VAR[id]}));
   }
   layer.eachLayer(l=>{
     const tip=l.getTooltip&&l.getTooltip();
     const tipOpen=tip&&tip.isOpen();
     if(!tipOpen)return;
     const f=l.feature;if(!f)return;const id=f.properties.id;
-    const cached=BDCACHE[id];
+    const cached=BDCACHE.get(id);
     if(!cached){
       // Legacy-R5 path: a tooltip opened pre-refine shows the "refining…" placeholder and
       // has no cached breakdown yet. Once EXACT, re-trigger the fetch into the open card so
       // it upgrades in place instead of staying a placeholder until the user re-hovers.
-      if(EXACT)loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});
+      if(EXACT&&!breakdownRequestPending(id))loadBreak(f,h=>{if(l.getTooltip())l.setTooltipContent(h);});
       return;
     }
     const d=Object.assign({},cached,{name:f.properties.n,real:REAL[id],var:VAR[id]});
@@ -1588,19 +2702,43 @@ function refreshDrawnRoute(){
   const id = routePin!=null ? routePin : hoverCell;
   if(id==null||!DESTLL)return;
   const f = pinFeature || (hoverCell!=null ? _featureById(hoverCell) : null);
+  // A selected mobile preview already owns a lightweight response.  When variance finishes, do
+  // not re-fetch that same light route; use the idle slot to prepare its one richer Inspector
+  // response instead.  Desktop hover remains deliberately request-free here.
+  if(routePin==null&&typeof touchFeature!=="undefined"&&touchFeature&&touchFeature.properties.id===id&&
+     touchPeek.classList.contains("open")){
+    const cached=BDCACHE.get(id);
+    if(cached){
+      cached.real=REAL[id];cached.var=VAR[id];
+      peekBody.innerHTML=touchPreviewHTML(Object.assign({},cached,{name:touchFeature.properties.n}));
+      schedulePinPrefetch(touchFeature);
+      return;
+    }
+  }
+  // The variance refresh can arrive while either a pin or hover's initial light lookup is still
+  // pending. That owner will publish the primary route; do not cancel it and launch another lookup.
+  if(breakdownRequestPending(id)&&!BDCACHE.get(id))return;
+  // Pinned cards already have a lightweight, immediately usable response. Route all expensive
+  // enrichment through the single cancellable upgrader so a variance arrival cannot race a second
+  // pin=1 request or replace a newer destination's cache entry.
+  if(routePin!=null&&id===routePin&&f){
+    const cached=BDCACHE.get(id);
+    // The initial lightweight request owns this cell until it settles. Starting pin=1 while the
+    // cache is still empty creates an out-of-order overwrite race and duplicates the heavy lookup;
+    // loadBreak will call the upgrader itself as soon as it publishes the lightweight response.
+    if(cached&&!cached._pin)cached._pinPending=true;
+    if(cached)renderPin(f,Object.assign({},cached,{name:f.properties.n,real:REAL[id],var:VAR[id]}));
+    upgradePinnedBreakdown(f);
+    return;
+  }
   const tok=++bdToken;
-  // PINNED → request per-alt typicals too (pin=1): the compare card needs every strip's own
-  // committed-plan typical so the Typical metric is consistent across strips. A plain hover never
-  // sets pin=1, so it never pays the per-route MC cost.
-  const pinParam = (routePin!=null && id===routePin) ? "&pin=1" : "";
-  fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}${pinParam}`)
+  fetch(`/itinerary?id=${id}&dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`)
     .then(r=>r.ok?r.json():null)
     .then(d=>{
       if(!d||d.error||tok!==bdToken)return;
-      BDCACHE[id]=d;                                   // refresh cache with the now-populated alts
+      d._pin=false;
+      BDCACHE.set(id,d,routePin);                       // refresh cache with the now-populated alts
       if(f){d.name=f.properties.n;}d.real=REAL[id];d.var=VAR[id];
-      // PINNED: rebuild the compare card (renderPin keeps the locked selection + adds the new alts).
-      if(pinFeature&&pinFeature.properties.id===id){renderPin(pinFeature,d);return;}
       // HOVER: just redraw the clean primary (the tooltip's "+N alternatives" hint updates via
       // the existing refreshOpenInfo path; here we only refresh the drawn route).
       if(hoverCell===id)drawJourney(id,d);
@@ -1620,7 +2758,9 @@ document.querySelectorAll("input[data-m]").forEach(cb=>{
   cb.onchange=()=>{if(cb.checked)overlays[m].addTo(map);else map.removeLayer(overlays[m]);};});
 let pin=null;   // workplace marker — set via the address box only (no map-click / drag)
 
-function redraw(){SCALE=ramp(ideal).S;layer.setStyle(style);legend();renderList();}
+function redraw(){SCALE=ramp(ideal).S;layer.setStyle(style);
+  cellFocusHaloLayer.setStyle(cellFocusHaloStyle);cellFocusLayer.setStyle(cellFocusStyle);
+  legend();renderList();}
 function renderList(){const rows=Object.entries(NB).filter(([k,v])=>v!=null).sort((a,b)=>a[1]-b[1]);
   document.getElementById("list").innerHTML=rows.map(([n,v])=>{const c=v<=thr?color(v):"var(--ink-arr)";
     return `<div class="nb"><span><span style="color:${c}">●</span> ${escapeHTML(n)}</span><span class="t" style="color:${c}">${v}<small> min</small></span></div>`;}).join("");
@@ -1652,8 +2792,9 @@ async function setWorkplace(lat,lon,label,opts){
   const persist=opts.persist!==false;
   const keepPinId=opts.keepPinId!=null?opts.keepPinId:null;
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
+  resetVarianceState(myGen);                         // destination/settings get a fresh lifecycle
   document.getElementById("prompt").style.display="none";
-  DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE={};REAL={};VAR={};
+  DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE.clear();REAL={};VAR={};
   if(recenter)TT={};                                 // new workplace -> drop OLD times so a hover before /compute lands doesn't show last workplace's commute under the new name (param tweaks keep TT visible during the load window — same workplace, just new speed)
   if(keepPinId==null)closeOpenInfo();                // workplace changed -> any open tooltip is stale (a keepPin recompute keeps the pin + its drawn route; the caller already closed the hover affordances)
   if(!CFG.raptor)document.getElementById("refine").disabled=true;   // re-enabled after the fast map lands
@@ -1675,12 +2816,12 @@ async function setWorkplace(lat,lon,label,opts){
   if(myGen!==GEN)return;
   if(!CFG.raptor)document.getElementById("refine").disabled=false;  // re-refinable via the button (R5 only)
   syncHash();
-  if(cmode=="line")loadAttribution();
+  if(cmode=="line"&&mapcolors==="on")loadAttribution();
   // /variance layers realistic + fragility + alt-lines on top of the perfect map. In atomic mode we
   // await it so the param tweak is one clean paint; otherwise fire-and-forget (progressive).
   if(atomic){
-    await loadVariance();
-    if(myGen===GEN && Object.keys(REAL).length===0){aggregate();redraw();}   // /variance no-op -> fall back to perfect
+    await loadVariance({skipActive:keepPinId!=null});
+    if(myGen===GEN && Object.keys(REAL).length===0 && Object.keys(VAR).length===0){aggregate();redraw();}   // /variance genuinely empty (MC off) -> fall back to perfect (a non-empty payload already painted inside loadVariance)
   } else loadVariance();
   if(myGen===GEN)busy(false);
   // KEEP-PIN re-render (RAPTOR route-viz path): the new map (+ atomic /variance) has landed for
@@ -1718,7 +2859,7 @@ async function refreshPinForParams(id,gen){
     if(gen!==GEN||routePin!==id||tok!==bdToken)return;
     if(!d||d.error||!d.geom){pinNoRoute(f);return;}        // unreachable under the new cap/pace
     setPinLoading(false);
-    BDCACHE[id]=d;d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];
+    d._pin=true;BDCACHE.set(id,d,routePin);d.name=f.properties.n;d.real=REAL[id];d.var=VAR[id];
     renderPin(f,d);                                        // pendingFitId is null on this path -> no camera move
   }catch(e){if(gen===GEN&&routePin===id&&tok===bdToken)setPinLoading(false);}
 }
@@ -1726,7 +2867,7 @@ async function refreshPinForParams(id,gen){
 // intact) with a clear settings-specific message + the cell name, drop the now-stale compare list,
 // and clear the drawn route. The user can close it via ×/Esc/background-click as usual.
 function pinNoRoute(f){
-  setPinLoading(false);compareList=[];selKey=PRIMARY_KEY;previewKey=null;
+  setPinLoading(false);compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
   setPinHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b></div>`+
     `<div style="color:var(--mut);font-size:12px;margin-top:4px">No route within these settings.</div>`+
     `<div class="foot" style="margin-top:8px">Try raising Max transfers or the Max-commute limit.</div></div>`);
@@ -1750,7 +2891,7 @@ async function refine(){
     if(r.ok){const d2=await r.json();if(myGen!==GEN)return;TT=d2.cells;EXACT=true;
       document.getElementById("dest").textContent=(label||"")+`  ·  exact ${(d2.ms/1000).toFixed(1)}s`;
       aggregate();redraw();refreshOpenInfo();           // any "refining…" placeholder tooltips now upgrade in place
-      if(cmode=="line")loadAttribution();               // re-derive lines off the exact result
+      if(cmode=="line"&&mapcolors==="on")loadAttribution();  // re-derive lines off the exact result
     }
   }catch(e){/* keep the fast approximation if exact isn't available */}
   finally{if(myGen===GEN){busy(false);btn.disabled=false;}}
@@ -1771,21 +2912,48 @@ async function loadAttribution(){if(!DESTLL)return;const myGen=GEN;busy("mapping
   }catch(e){}finally{if(myGen===GEN)busy(false);}}
 // ---- service-noise overlay: realistic (MC p50) + fragility + alt-lines ------------------
 //      Progressive (fetched AFTER /compute paints the perfect map), gen-guarded, best-effort.
-//      Returns {} when the server isn't in RAPTOR arrive-by + MC mode -> we keep the perfect map.
-async function loadVariance(){if(!DESTLL)return;const myGen=GEN;
+//      The payload shape differs by semantic: ARRIVE-BY serves BOTH maps ({realistic, variance});
+//      DEPART-AFTER (the DEFAULT) serves realistic:{} (the typical headline IS the served p50 —
+//      no MC override) with a POPULATED variance map ({frag,stuck,alt} per cell). EITHER map
+//      being non-empty means the MC landed; a fully-empty payload (MC off / legacy R5) keeps the
+//      perfect map untouched.
+// Store a /variance payload into REAL/VAR. Accepts it when EITHER map is non-empty (an empty
+// `realistic` is NORMAL under depart-after) and reports whether anything landed, so loadVariance
+// can run the dependent refreshes. Pure state setter — the fetch/orchestration stays above.
+function applyVariancePayload(d){
+  const real=(d&&d.realistic)||{}, vari=(d&&d.variance)||{};
+  if(!Object.keys(real).length&&!Object.keys(vari).length)return false;
+  REAL=real;VAR=vari;
+  return true;
+}
+function failVariance(gen,skipActive,message){
+  if(!setVarianceState("failed",gen,message))return false;
+  // A lightweight pin marks itself pending while it waits for variance to release pin=1. Failure
+  // must settle that flag before the card is refreshed; refreshDrawnRoute may then set it again only
+  // for the real, owned structural-enrichment request, whose success/error paths both clear it.
+  if(routePin!=null){const cached=BDCACHE.get(routePin);if(cached)cached._pinPending=false;}
+  toast(message||"Bad-day estimates unavailable. Route choices will still load.");
+  if(!skipActive){refreshOpenInfo();refreshDrawnRoute();}
+  return true;
+}
+async function loadVariance(opts){if(!DESTLL)return;const myGen=GEN,skipActive=!!(opts&&opts.skipActive);
+  if(!setVarianceState("loading",myGen))return;
   const doFetch=()=>fetch(`/variance?dlat=${DESTLL[0]}&dlon=${DESTLL[1]}${ridesParam()}${speedParam()}`);
   try{let r=await doFetch();
     if(myGen!==GEN)return;
-    if(r.status===503){                                 // rate-limited or busy — one retry like /attribution
+    if(r.status===429||r.status===503){                 // rate-limited or busy — one Retry-After retry
       const wait=retryAfter(r);await sleep(wait);if(myGen!==GEN)return;
       r=await doFetch();if(myGen!==GEN)return;
-      if(r.status===503){toast("Realistic times unavailable — try again in a moment.");return;}
     }
-    if(!r.ok)return;const d=await r.json();if(myGen!==GEN)return;
-    if(d.realistic&&Object.keys(d.realistic).length){
-      REAL=d.realistic;VAR=d.variance||{};aggregate();redraw();refreshOpenInfo();   // realistic now drives metric="r"; refresh any open tooltip to add the bad-day line
-      refreshDrawnRoute();}                                // MC built -> /itinerary now returns alts; refresh the active cell's drawn route so they appear
-  }catch(e){}}
+    if(!r.ok){failVariance(myGen,skipActive,"Bad-day estimates unavailable. Route choices will still load.");return;}
+    const d=await r.json();if(myGen!==GEN)return;
+    if(!applyVariancePayload(d)){
+      failVariance(myGen,skipActive,"Bad-day estimates unavailable. Route choices will still load.");return;}
+    if(!setVarianceState("ready",myGen))return;
+    aggregate();redraw();
+    if(!skipActive){refreshOpenInfo();             // realistic/frag now drive the open cards; refresh any open tooltip to add the bad-day line
+      refreshDrawnRoute();}                        // MC built -> /itinerary now returns alts; refresh the active (pinned/hovered) cell so they appear
+  }catch(e){failVariance(myGen,skipActive,"Bad-day estimates unavailable. Route choices will still load.");}}
 // ---- small shared utils for busy handling + toasts --------------------------------------
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function retryAfter(r){const h=r.headers.get("Retry-After");const s=h?parseFloat(h):NaN;
@@ -1793,6 +2961,29 @@ function retryAfter(r){const h=r.headers.get("Retry-After");const s=h?parseFloat
 let toastTimer;
 function toast(msg,ms){const t=document.getElementById("toast");t.textContent=msg;t.style.display="block";
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>{t.style.display="none";},ms||3500);}
+const helpTip=document.getElementById("helptip");
+document.querySelectorAll(".help").forEach(h=>{if(h.title){h.dataset.title=h.title;h.removeAttribute("title");}});
+function showHelpTip(el){
+  const txt=el&&el.dataset&&(el.dataset.tip||el.dataset.title);if(!txt||!helpTip)return;
+  helpTip.textContent=txt;helpTip.classList.add("open");
+  helpTip.style.left="8px";helpTip.style.top="8px";
+  const r=el.getBoundingClientRect(), tr=helpTip.getBoundingClientRect(), gap=8;
+  let left=r.right+gap;
+  if(left+tr.width>window.innerWidth-gap)left=r.left-tr.width-gap;
+  left=Math.max(gap,Math.min(left,window.innerWidth-tr.width-gap));
+  let top=r.top+(r.height-tr.height)/2;
+  if(top<gap)top=r.bottom+gap;
+  if(top+tr.height>window.innerHeight-gap)top=Math.max(gap,r.top-tr.height-gap);
+  helpTip.style.left=`${left}px`;helpTip.style.top=`${top}px`;
+}
+function hideHelpTip(){if(helpTip)helpTip.classList.remove("open");}
+document.addEventListener("mouseover",e=>{const h=e.target.closest&&e.target.closest(".help");if(h)showHelpTip(h);});
+document.addEventListener("mouseout",e=>{const h=e.target.closest&&e.target.closest(".help");if(!h)return;
+  if(e.relatedTarget&&h.contains(e.relatedTarget))return;hideHelpTip();});
+document.addEventListener("focusin",e=>{const h=e.target.closest&&e.target.closest(".help");if(h)showHelpTip(h);});
+document.addEventListener("focusout",e=>{if(e.target.closest&&e.target.closest(".help"))hideHelpTip();});
+document.getElementById("panel").addEventListener("scroll",hideHelpTip,{passive:true});
+window.addEventListener("resize",hideHelpTip);
 function seg(id,set){document.querySelectorAll(`#${id} button`).forEach(b=>b.onclick=()=>{
   setSeg(id,b.dataset.v);
   set(b.dataset.v);aggregate();redraw();refreshOpenInfo();syncHash();});}   // re-render open tooltip with new metric/cmode
@@ -1805,10 +2996,16 @@ function setSeg(id,v){document.querySelectorAll(`#${id} button`).forEach(b=>{con
 // BADGE must follow too, so re-render it with the now-selected metric. redrawCurrentRoute no-ops
 // when nothing is drawn, and handles both hover (drawPrimary) + pinned (drawSelected) routes.
 seg("metric",v=>{metric=v;redrawCurrentRoute();});
-seg("cmode",v=>{cmode=v;if(v=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
+seg("cmode",v=>{cmode=v;if(v=="line"&&mapcolors==="on"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
+seg("mapcolors",v=>{mapcolors=v;if(v=="on"&&cmode=="line"&&Object.keys(ATTR).length==0&&DESTLL)loadAttribution();});
+document.getElementById("opacity").oninput=e=>{
+  heatOpacity=+e.target.value/100;applyHeatOpacity();
+  try{localStorage.setItem("map_opacity_v1",String(Math.round(heatOpacity*100)));}catch(err){}
+  syncHash();
+};
 // stamp the initial aria-pressed state on every segmented control (the HTML only carries .on);
 // theme gets its setSeg in bootTheme below.
-setSeg("metric",metric);setSeg("cmode",cmode);setSeg("maxrides",maxxfers);setSeg("speed",walkspeed);
+setSeg("metric",metric);setSeg("cmode",cmode);setSeg("mapcolors",mapcolors);setSeg("maxrides",maxxfers);setSeg("speed",walkspeed);
 // Max transfers / Walk speed are NOT client-only restyles: a new cap/pace changes the colored
 // TIMES, so each must re-run the map (re-/compute + the atomic /variance) and invalidate the
 // stale breakdowns. Shared driver so both controls behave identically. Always syncHash so the
@@ -1822,7 +3019,10 @@ function applyRecomputeParam(){
   // Keep the pin only under RAPTOR (the only stack with a traced drawn route to preserve). In legacy
   // R5 there's no geom, so fall through to the normal unpin path.
   const keepId=(CFG.raptor&&routePin!=null)?routePin:null;
-  BDCACHE={};                                              // breakdowns were for the old cap/pace
+  // A request for the old speed/ride cap must never commit after this recompute's final pin=1
+  // response. Keep-pin has its own gen/bdToken request below; invalidate the progressive upgrader.
+  cancelPinPrefetch();pinUpgradeSeq++;pinUpgradeKey="";
+  BDCACHE.clear();                                         // breakdowns were for the old cap/pace
   if(keepId!=null){closeHoverKeepPin();setPinLoading(true);}// keep the pin; dim the strips while it recomputes
   else closeOpenInfo();                                    // hover mode (or no pin / legacy R5): close stale tooltip + unpin; next hover fetches with the new param
   syncHash();
@@ -1877,6 +3077,10 @@ const addrEl=document.getElementById("addr"),acEl=document.getElementById("ac");
 let acItems=[],acIdx=-1,acTimer,acToken=0;
 function closeAC(){acEl.classList.remove("open");acEl.innerHTML="";acItems=[];acIdx=-1;
   addrEl.setAttribute("aria-expanded","false");addrEl.removeAttribute("aria-activedescendant");}
+function consumeAutocompleteEscape(e,open,close){
+  if(!open||!e||e.key!=="Escape")return false;
+  e.stopPropagation();close();return true;
+}
 function renderAC(){if(!acItems.length){closeAC();return;}
   acEl.innerHTML=acItems.map((it,i)=>`<div class="ac-item${i===acIdx?" hl":""}" id="ac-item-${i}" role="option" aria-selected="${i===acIdx}" data-i="${i}">${escapeHTML(it.label)}</div>`).join("");
   acEl.classList.add("open");addrEl.setAttribute("aria-expanded","true");
@@ -1900,7 +3104,7 @@ addrEl.addEventListener("keydown",e=>{
   else if(e.key==="Enter"){e.preventDefault();
     if(open&&acIdx>=0&&acItems[acIdx])chooseAC(acItems[acIdx]);
     else geocodeSet(addrEl.value);}                   // fall back to /geocode of typed text
-  else if(e.key==="Escape"){closeAC();}});
+  else if(e.key==="Escape"){if(!consumeAutocompleteEscape(e,open,closeAC))closeAC();}});
 addrEl.addEventListener("blur",()=>setTimeout(closeAC,120));  // allow click/mousedown to land first
 
 /* ============ onboarding-modal address input ============ */
@@ -1938,7 +3142,7 @@ obAddrEl.addEventListener("keydown",e=>{
   else if(e.key==="Enter"){e.preventDefault();
     if(open&&obAcIdx>=0&&obAcItems[obAcIdx])obChoose(obAcItems[obAcIdx]);
     else obSubmit(obAddrEl.value);}                  // plain geocode of typed text
-  else if(e.key==="Escape"){obCloseAC();}});
+  else if(e.key==="Escape"){if(!consumeAutocompleteEscape(e,open,obCloseAC))obCloseAC();}});
 obAddrEl.addEventListener("blur",()=>setTimeout(obCloseAC,120));
 document.getElementById("obgo").onclick=()=>obSubmit(obAddrEl.value);
 
@@ -1966,30 +3170,57 @@ function csvCell(s){s=String(s);return /[",\n]/.test(s)?`"${s.replace(/"/g,'""')
 // ×, or Esc closes the open one. The footer tabs open them; the h1 "How it works" link is kept
 // for the existing deep-link/e2e contract.
 const howModal=document.getElementById("howmodal"), aboutModal=document.getElementById("aboutmodal");
-function openModal(m){closeModals();m.classList.add("open");}
-function closeModals(){howModal.classList.remove("open");aboutModal.classList.remove("open");}
-function openHow(){openModal(howModal);}function closeHow(){howModal.classList.remove("open");}
+let modalReturnFocus=null;
+function activeModal(){return howModal.classList.contains("open")?howModal:
+  (aboutModal.classList.contains("open")?aboutModal:null);}
+function modalFocusable(m){return Array.from(m.querySelectorAll(
+  'button:not([disabled]),[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'))
+  .filter(el=>!el.hidden&&getComputedStyle(el).visibility!=="hidden");}
+function focusModal(m){const card=m.querySelector(".card");(modalFocusable(m)[0]||card)?.focus({preventScroll:true});}
+function openModal(m){
+  if(!modalReturnFocus)modalReturnFocus=document.activeElement;
+  closeModals(false);m.classList.add("open");requestAnimationFrame(()=>focusModal(m));
+}
+function closeModals(restore=true){
+  howModal.classList.remove("open");aboutModal.classList.remove("open");
+  if(restore){const target=modalReturnFocus;modalReturnFocus=null;
+    if(target&&document.contains(target))requestAnimationFrame(()=>target.focus({preventScroll:true}));}
+}
+function trapModalTab(e){
+  const m=activeModal();if(!m||e.key!=="Tab")return;
+  const items=modalFocusable(m);if(!items.length){e.preventDefault();m.querySelector(".card")?.focus();return;}
+  const first=items[0],last=items[items.length-1];
+  if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+}
+function openHow(){openModal(howModal);}function closeHow(){closeModals();}
 document.getElementById("howbtn").onclick=openHow;
 document.getElementById("aboutbtn").onclick=()=>openModal(aboutModal);
 document.getElementById("howlink").onclick=openHow;
-document.getElementById("howlink").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();openHow();}});
 document.getElementById("howx").onclick=closeHow;
-document.getElementById("howx").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();closeHow();}});  // role=button on a span doesn't fire click on Enter/Space
-document.getElementById("aboutx").onclick=()=>aboutModal.classList.remove("open");
-document.getElementById("aboutx").addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();aboutModal.classList.remove("open");}});
-howModal.addEventListener("click",e=>{if(e.target===howModal)closeHow();});
-aboutModal.addEventListener("click",e=>{if(e.target===aboutModal)aboutModal.classList.remove("open");});
+document.getElementById("aboutx").onclick=closeModals;
+howModal.addEventListener("click",e=>{if(e.target===howModal)closeModals();});
+aboutModal.addEventListener("click",e=>{if(e.target===aboutModal)closeModals();});
 // Esc closes (in order of priority) an open modal, then the pinned route card.
-document.addEventListener("keydown",e=>{if(e.key!=="Escape")return;
-  if(howModal.classList.contains("open")||aboutModal.classList.contains("open")){closeModals();return;}
+document.addEventListener("keydown",e=>{trapModalTab(e);if(e.defaultPrevented)return;if(e.key!=="Escape")return;
+  if(activeModal()){closeModals();return;}
+  if(touchPeek.classList.contains("open")){closeTouchPreview();return;}
   closePin();});
 
 /* ============ Feature 5: mobile bottom-sheet toggle ============ */
 const panelEl=document.getElementById("panel"),sheetBtn=document.getElementById("sheetbtn");
-sheetBtn.onclick=()=>sheetBtn.setAttribute("aria-expanded",String(panelEl.classList.toggle("open")));
+sheetBtn.onclick=()=>{
+  if(document.body.classList.contains("route-adjusting")){
+    document.body.classList.remove("route-adjusting");panelEl.classList.remove("open");
+    sheetBtn.textContent="Controls";sheetBtn.setAttribute("aria-expanded","false");
+    const adjust=document.getElementById("pinadjust");if(adjust)adjust.setAttribute("aria-expanded","false");
+    requestAnimationFrame(()=>map.invalidateSize({pan:false}));return;
+  }
+  sheetBtn.setAttribute("aria-expanded",String(panelEl.classList.toggle("open")));
+};
 
 /* ============ Feature 4: shareable permalink (URL hash) ============ */
-// Format: #wp=<lat>,<lon>,<encodedLabel>&ideal=<n>&thr=<n>&metric=<r|b>&cmode=<time|line>&mt=<0|1|2|any>
+// Format: #wp=<lat>,<lon>,<encodedLabel>&ideal=<n>&thr=<n>&metric=<r|b>&cmode=<time|line>&colors=<on|off>&mt=<0|1|2|any>
 let hashTimer;
 // No re-entrancy guard needed: replaceState never fires hashchange, there is no hashchange
 // listener (applyHash runs only at boot), and the hash-equality check below makes the write
@@ -1999,7 +3230,8 @@ function syncHash(){clearTimeout(hashTimer);
   hashTimer=setTimeout(()=>{
     const parts=[];
     if(DESTLL)parts.push(`wp=${DESTLL[0].toFixed(6)},${DESTLL[1].toFixed(6)},${encodeURIComponent(CURLABEL)}`);
-    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`,`mt=${maxxfers}`,`sp=${walkspeed}`,`th=${themePref}`);
+    parts.push(`ideal=${ideal}`,`thr=${thr}`,`metric=${metric}`,`cmode=${cmode}`,`colors=${mapcolors}`,
+      `op=${Math.round(heatOpacity*100)}`,`mt=${maxxfers}`,`sp=${walkspeed}`,`th=${themePref}`);
     const h="#"+parts.join("&");
     if(("#"+location.hash.replace(/^#/,""))!==h){history.replaceState(null,"",h);}
   },300);}
@@ -2014,6 +3246,9 @@ function applyHash(o){
     document.getElementById("thr").value=thr;document.getElementById("thrval").textContent=thr;}
   if(o.metric==="r"||o.metric==="b"){metric=o.metric;setSeg("metric",metric);}
   if(o.cmode==="time"||o.cmode==="line"){cmode=o.cmode;setSeg("cmode",cmode);}
+  if(o.colors==="on"||o.colors==="off"){mapcolors=o.colors;setSeg("mapcolors",mapcolors);}
+  if(o.op!=null&&Number.isFinite(+o.op)){
+    heatOpacity=Math.min(1,Math.max(.2,+o.op/100));applyHeatOpacity();}
   if(["0","1","2","any"].includes(o.mt)){maxxfers=o.mt;setSeg("maxrides",maxxfers);}
   if(["slow","med","fast"].includes(o.sp)){walkspeed=o.sp;setSeg("speed",walkspeed);}
   // Hash theme applies for the SESSION only — like wp's {persist:false}, a shared link must
@@ -2039,20 +3274,35 @@ function applyHash(o){
   // departure in the window, typical = median departure on the published schedule, bad-day = the same
   // trip when service runs late. (Arrive-by keeps its "perfect timing ~0 wait / committed-plan" copy.)
   if(DEPARTAFTER){
+    const r=document.querySelector('#metric [data-v="r"]'), b=document.querySelector('#metric [data-v="b"]');
+    if(r)r.textContent="Scheduled";
+    if(b)b.textContent="Best-case";
+    const metricHelp=document.querySelector('#metric')?.closest('.ctl')?.querySelector('.help');
+    if(metricHelp)metricHelp.dataset.tip=
+      "Scheduled is the normal scheduled trip after excluding controllable starting wait. Best-case is the fastest scheduled option. Bad-day adds service delay.";
     document.getElementById("howmetric").innerHTML=
-      "<b>Best-case</b> is the luckiest departure in the morning window — the schedule lines up for the "+
-      "fastest possible trip. <b>Realistic</b> (typical) is the median departure: the time you'd usually "+
-      "see leaving around then. The <b>bad-day</b> chip adds the delay when service runs late (a late "+
-      "vehicle, a missed transfer).";
+      "<b>Scheduled</b> is the normal scheduled trip after excluding controllable starting wait. "+
+      "<b>Best-case</b> is the fastest scheduled option in the window. The <b>bad-day</b> chip "+
+      "shows the absolute commute under service delays plus the added minutes.";
   }
   if(CFG.raptor){
     document.getElementById("refinebox").style.display="none";
     document.getElementById("estnote").style.display="block";
   }
 })();
+// Heatmap opacity is independent of route computation. A hash value wins for this session;
+// otherwise use the user's saved preference, with 65% as the street-readable default.
+(function bootOpacity(){
+  let value=null;const o=parseHash();
+  if(o&&o.op!=null&&Number.isFinite(+o.op))value=+o.op;
+  if(value==null){try{const saved=+localStorage.getItem("map_opacity_v1");
+    if(Number.isFinite(saved)&&saved>0)value=saved;}catch(e){}}
+  if(value!=null)heatOpacity=Math.min(1,Math.max(.2,value/100));
+  applyHeatOpacity();
+})();
 // First-paint theming already happened in the tiny <head> script (data-theme is set before
 // the CSS applies — no FOUC). bootTheme only reconciles JS state with it: themePref, the
-// seg control, cell opacity, and the (already-correct, so swap-free) basemap. It uses the
+// seg control, and the (already-correct, so swap-free) basemap. It uses the
 // SAME precedence as the head script — hash th= (session-only) > saved pref > OS — so the
 // boot-time applyTheme is a no-op for the tiles and applyHash's th branch just re-affirms.
 (function bootTheme(){

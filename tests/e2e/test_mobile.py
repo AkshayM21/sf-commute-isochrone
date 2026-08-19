@@ -80,7 +80,8 @@ def test_12_mobile_address_autocomplete_and_compute(page):
     # Tap the first suggestion -> map computes.
     page.tap("#ac .ac-item")
     wait_for_fast_map(page)
-    assert "fast ~" in page.inner_text("#dest"), "selecting a mobile suggestion should compute the fast map"
+    assert page.inner_text("#dest").strip(), (
+        "selecting a mobile suggestion should retain the destination label after computing the map")
     assert page.eval_on_selector_all("#list .nb", "els => els.length") > 0
     shot(page, "mobile_12_computed")
 
@@ -100,21 +101,32 @@ def test_13_mobile_tap_to_breakdown(page):
     page.tap("#sheetbtn")
     page.wait_for_function("() => !document.getElementById('panel').classList.contains('open')", timeout=3_000)
 
-    # TAP a colored cell -> a popup breakdown (.bd inside a leaflet popup) must appear.
+    # First tap gives a compact, touch-native preview instead of depending on hover or a tiny popup.
     hit = find_colored_cell_tap(page)
-    assert hit is not None, "tapping the map did not open any breakdown popup (.bd)"
-    page.wait_for_selector(".leaflet-popup .bd", timeout=8_000)
+    assert hit is not None, "tapping the map did not open the commute preview"
+    page.wait_for_selector("#touchpeek.open #peekinspect", timeout=8_000)
     page.wait_for_function(
-        "() => { const e = document.querySelector('.bd'); return e && !e.textContent.includes('loading route'); }",
+        """() => { const e=document.getElementById('peekbody');
+          return e && !e.textContent.includes('Loading commute'); }""",
         timeout=8_000,
     )
-    bd = page.inner_text(".bd")
-    assert "min" in bd, f"tap breakdown should show a time + route, got: {bd!r}"
-    assert page.eval_on_selector_all(".bd .leg", "els => els.length") > 0, "tap breakdown should list route legs"
+    preview = page.inner_text("#peekbody")
+    assert "min" in preview, f"tap preview should show a commute time, got: {preview!r}"
 
-    # Confirm it is NOT relying on hover: no sticky desktop tooltip (.leaflet-tooltip.tt) is used.
+    # Inspect promotes the cached preview immediately to the full route sheet, then enriches it.
+    page.tap("#peekinspect")
+    page.wait_for_function(
+        """() => document.getElementById('pincard').classList.contains('open') &&
+          document.querySelectorAll('#pinbody .route-row').length > 0""",
+        timeout=30_000,
+    )
+    assert "min" in page.inner_text("#pinbody"), "route sheet should retain the commute time"
+
+    # Confirm it relies on neither hover nor a small Leaflet popup.
     assert page.query_selector(".leaflet-tooltip.tt") is None, \
-        "mobile must use tap->popup, not a hover tooltip"
+        "mobile must use the touch preview, not a hover tooltip"
+    assert page.query_selector(".leaflet-popup") is None, \
+        "mobile should use the touch preview and route sheet, not a tiny map popup"
     shot(page, "mobile_13_tap_breakdown")
 
 
@@ -124,10 +136,15 @@ def test_14_mobile_controls_reachable(page):
     _open_sheet(page)
     set_address(page, ADDR_MARKET, via="go", tap=True)
 
-    # Refine reachable + usable inside the sheet.
+    # Legacy R5 exposes Refine; RAPTOR is already exact and hides the no-op control.
     refine = page.locator("#refine")
-    refine.scroll_into_view_if_needed()
-    assert refine.is_visible() and refine.is_enabled(), "Refine should be reachable + enabled in the sheet"
+    if page.is_visible("#refinebox"):
+        refine.scroll_into_view_if_needed()
+        assert refine.is_visible() and refine.is_enabled(), (
+            "legacy Refine should be reachable + enabled in the sheet")
+    else:
+        assert not refine.is_visible() and not refine.is_enabled(), (
+            "RAPTOR's hidden Refine control should remain inert")
 
     # Color-by-line toggle reachable + togglable.
     line_btn = page.locator("#cmode button[data-v='line']")

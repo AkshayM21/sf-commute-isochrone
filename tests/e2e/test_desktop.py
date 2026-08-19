@@ -3,9 +3,8 @@ Desktop end-to-end specs (viewport 1280x800) for the SF Commute Explorer.
 
 Specs 1-10 from the brief. Run against the live server at $E2E_BASE_URL (default
 http://127.0.0.1:8000). Each test is isolated via fresh_load() (localStorage + hash
-cleared). Tests assert the CORRECT expectation; where a feature is broken the test is
-written to fail honestly (see test_06_color_by_line -> known empty-attribution bug, and
-test_02 dedup flag).
+cleared). Tests assert current user-visible behavior for both the featured RAPTOR app and the
+remaining legacy R5-only refine surface.
 """
 import time
 import pytest
@@ -74,11 +73,7 @@ def test_02_autocomplete_opens_navigates_selects(page):
 
 
 def test_02b_autocomplete_dedup_FLAG(page):
-    """KNOWN SUSPECTED BUG: autocomplete suggestions are NOT deduplicated.
-    The /autocomplete endpoint returns exact-duplicate rows (same label + lat/lon)
-    and the frontend renders d.results verbatim (index.html: acItems = d.results.slice).
-    Correct behavior: no duplicate labels in the dropdown. This test asserts that and
-    is EXPECTED TO FAIL until dedup is added — surfacing the bug instead of hiding it."""
+    """Autocomplete suggestions remain deduplicated by their visible place identity."""
     fresh_load(page)
     page.fill("#addr", ADDR_FERRY)
     page.wait_for_selector("#ac.open .ac-item", timeout=10_000)
@@ -95,12 +90,18 @@ def test_03_set_fast_map(page):
     fresh_load(page)
     set_address(page, ADDR_MARKET, via="go")
 
-    dest = page.inner_text("#dest")
-    assert "fast ~" in dest and "ms" in dest, f"#dest should show 'fast ~Nms', got: {dest!r}"
+    dest = page.inner_text("#dest").strip()
+    assert dest, "#dest should retain the selected workplace label after the map renders"
     assert ADDR_MARKET in dest, "#dest should echo the typed workplace label"
 
-    # Refine becomes enabled once the fast map lands.
-    assert page.get_attribute("#refine", "disabled") is None, "Refine must enable after fast map"
+    # Legacy R5 exposes an approximate-map refine pass. RAPTOR is already exact and deliberately
+    # hides/disables that control, so both served configurations get an honest assertion.
+    if page.is_visible("#refinebox"):
+        assert page.get_attribute("#refine", "disabled") is None, (
+            "legacy Refine must enable after the first map")
+    else:
+        assert page.get_attribute("#refine", "disabled") is not None, (
+            "RAPTOR's hidden no-op Refine control must stay disabled")
 
     # Neighborhood list populated, prompt dismissed.
     assert page.eval_on_selector_all("#list .nb", "els => els.length") > 0
@@ -113,6 +114,9 @@ def test_03_set_fast_map(page):
 def test_04_refine_is_opt_in_then_exact(page):
     fresh_load(page)
     set_address(page, ADDR_MARKET, via="go")
+
+    if not page.is_visible("#refinebox"):
+        pytest.skip("RAPTOR /compute is already exact; the legacy approximate-map refiner is absent")
 
     # It must NOT auto-run: immediately after fast map, #dest still says 'fast', not 'exact'.
     assert "exact" not in page.inner_text("#dest"), "exact refine must NOT run automatically"
@@ -178,14 +182,7 @@ def test_05_hover_breakdown_tooltip(page):
 
 # ---- Spec 6: Color-by-line -------------------------------------------------------------
 def test_06_color_by_line(page):
-    """Toggle Color by -> 'Primary line'. CORRECT expectation: cells recolor by their
-    dominant transit line, i.e. /attribution returns a non-empty cell->line map and the
-    legend lists lines.
-
-    KNOWN BUG (observed): /attribution returns {} (0 cells) for both '1 Market St' and
-    'ferry building' after a ~36s build, so NO cells recolor. The legend title flips to
-    'Primary transit line per area' but the legend body never lists any lines. This test
-    asserts the correct behavior and is EXPECTED TO FAIL, flagging the broken feature."""
+    """Primary-line mode returns attribution, recolors cells, and populates its legend."""
     fresh_load(page)
     set_address(page, ADDR_MARKET, via="go")
 

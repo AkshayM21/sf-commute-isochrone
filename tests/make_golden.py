@@ -10,9 +10,9 @@ TWO GOLDENS (one per RAPTOR semantic) since the 2026-06-17 default flip to depar
   * tests/golden_exact_ferry.json            — ARRIVE-BY (RAPTOR_SEMANTIC=arriveby), the
     in-process suite's pinned engine (conftest.py setdefault); the opt-in path.
   * tests/golden_exact_ferry_departafter.json — DEPART-AFTER (RAPTOR_SEMANTIC=departafter),
-    the SERVED DEFAULT since 2026-06-17 (R5-validated p5/p50 map, true-zero walk-speed
-    monotone). Its test boots a depart-after server in a subprocess so the served-default
-    map has real golden coverage (NOT a skip).
+    the SERVED DEFAULT since 2026-06-17 (planned, first-boarding-anchored schedule metric).
+    Its test boots a depart-after server in a subprocess so the served-default map has real
+    golden coverage (NOT a skip).
 
 Each snapshot records the engine identity ("engine": {use_raptor, raptor_semantic,
 use_walk_graph, gtfs_fp}). The golden tests SKIP (not fail) when the booted engine differs
@@ -58,12 +58,16 @@ def engine_identity(server):
     """The engine config that determines /compute_exact's output, recorded in the golden
     and compared by test_compute_exact_matches_golden[_departafter] (skip-on-mismatch, like
     service_date). gtfs_fp is the boot-time GTFS fingerprint (name:size:mtime of every feed)
-    that already keys the baked structures — the right staleness signal alongside service_date."""
+    that already keys the baked structures. Walking configuration is part of the identity too:
+    changing the product's default pace legitimately changes almost every cell."""
     return {
         "use_raptor": bool(server.USE_RAPTOR),
         "raptor_semantic": str(server.RAPTOR_SEMANTIC),
         "use_walk_graph": bool(server.USE_WALK_GRAPH),
         "gtfs_fp": server._gtfs_fp(),
+        "walk_reference_kmh": float(server.config.WALK_KMH),
+        "walk_speeds": {key: float(value) for key, value in sorted(server.WALK_SPEEDS.items())},
+        "default_walk_speed": str(server.DEFAULT_SPEED),
     }
 
 

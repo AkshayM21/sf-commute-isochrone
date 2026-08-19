@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mint a Cloudflare Origin CA certificate for sfcommutemap.com (+ wildcard).
+"""Mint a Cloudflare Origin CA certificate for the sfcommutemap.com apex and www hosts.
 
 Reads CF_API_TOKEN from the repo-root .env (gitignored). The token never appears in
 argv — only in the Authorization header sent over TLS to Cloudflare. The signed cert
@@ -29,9 +29,8 @@ ENV_FILE = REPO_ROOT / ".env"
 CSR_PATH = REPO_ROOT / "deploy/cf/origin.csr"
 CERT_PATH = REPO_ROOT / "deploy/cf/origin-cert.pem"
 
-HOSTNAMES = ["sfcommutemap.com", "www.sfcommutemap.com"]   # apex + www; no wildcard
-# (wildcard requires Zone:Read on the user token to validate; we don't need it for this deploy.
-# If we ever add other subdomains we can re-mint or extend the token's scope.)
+HOSTNAMES = ["sfcommutemap.com", "www.sfcommutemap.com"]
+# The co-hosted bus app owns a separate vhost and dedicated Origin CA certificate.
 VALIDITY_DAYS = 5475  # 15 years — Origin CA max
 
 

@@ -300,6 +300,18 @@ def reverse_raptor_traced(data, egress_g, egress_t, egress_w, max_rounds=8, boar
                 nd_depth=np.asarray(nd_depth, np.int16), nd_next=np.asarray(nd_next, np.int32))
 
 
+def reverse_raptor_traced_fast(data, egress_g, egress_t, egress_w, max_rounds=8,
+                               board_slack=60):
+    """Production traced tree: compiled compact kernel when available, Python oracle otherwise."""
+    if _select_kernel() == "numba":
+        from . import raptor_numba
+        return raptor_numba.reverse_raptor_traced(
+            data, egress_g, egress_t, egress_w, board_slack, max_rounds)
+    return reverse_raptor_traced(
+        data, egress_g, egress_t, egress_w,
+        max_rounds=max_rounds, board_slack=board_slack)
+
+
 def reverse_profile(data, egress_g, egress_w, deadlines, board_slack=60, max_rounds=8,
                     kernel=None):
     """Run reverse RAPTOR for each arrival deadline in ``deadlines`` (seconds).
@@ -579,6 +591,98 @@ def select_departafter(access_off, access_to, access_w, purewalk, arrivalW, dep_
     return painted, s_star, aw_sel, Dstar, Tstar, is_walk
 
 
+def select_planned_departafter(access_off, access_to, access_w, purewalk, arrivalW, dep_grid,
+                               cell_deps, max_min):
+    """Per-cell first-boarding-anchored scheduled selection.
+
+    For each cell, choose the access stop and first-boarding anchor ``B`` that minimizes
+    ``access_walk + arrivalW[stop, B] - B``. This removes controllable pre-board wait from the
+    metric by deriving home departure from the chosen first vehicle (``Dstar = B - access_walk``).
+
+    ANCHOR SEMANTIC (the python fallback, non-uniform grids): every scored candidate ``B`` is a
+    POINT OF ``dep_grid`` — each requested minute in ``cell_deps`` maps to its ceiling grid point
+    ``B_eff = dep_grid[searchsorted(dep_grid, B, 'left')]`` and is scored/anchored there
+    (``cost = arrivalW[stop, B_eff] - B_eff + w``, ``Dstar = B_eff - w``, tie-breaks on
+    ``B_eff``). Rationale: ``arrivalW[s, k]`` means "earliest arrival departing the stop no
+    earlier than ``dep_grid[k]``", so charging from the requested ``B < B_eff`` would re-add the
+    phantom platform wait ``[B, B_eff)`` this metric exists to exclude, and ``Dstar`` would claim
+    a boarding no profile column represents (breaking downstream trace re-anchoring). On the
+    engine's uniform grids (``cell_deps`` shares ``dep_grid``'s origin/step) ``B_eff == B``
+    always, so this path is byte-equal to its LOCKSTEP SIBLING
+    ``raptor_numba.select_planned_departafter_arith`` (which gates on uniformity and never sees a
+    non-grid ``B``).
+
+    Like the legacy ``select_departafter``, ``is_walk``/the synthetic walk ``Dstar`` are written
+    ONLY when the cell is actually painted (``pm < max_min``); unreachable cells keep the
+    untouched sentinels (is_walk False, Dstar NEG).
+    """
+    n_cells = len(access_off) - 1
+    dep_grid = np.asarray(dep_grid, dtype=np.int64)
+    cell_deps = np.asarray(cell_deps, dtype=np.int64)
+    if _select_kernel() == "numba":
+        from . import raptor_numba
+        access_w_arr = np.asarray(access_w, np.int64)
+        if len(dep_grid) >= 2 and len(cell_deps) >= 1:
+            step = int(dep_grid[1] - dep_grid[0])
+            uniform = (step > 0
+                       and bool(np.all(np.diff(dep_grid) == step))
+                       and int(dep_grid[0]) == int(cell_deps[0])
+                       and bool(np.all(np.diff(cell_deps) == step)))
+            if uniform:
+                assert access_w_arr.size == 0 or int(access_w_arr.min()) >= 0, \
+                    "select_planned_departafter: access_w contains negative walk seconds"
+                return raptor_numba.select_planned_departafter_arith(
+                    np.asarray(access_off, np.int64), np.asarray(access_to, np.int64),
+                    access_w_arr, np.asarray(purewalk, np.int64), arrivalW,
+                    np.int64(dep_grid[0]), np.int64(step), np.int64(len(dep_grid)),
+                    cell_deps, np.int64(max_min))
+    access_to = np.asarray(access_to, np.int64)
+    access_w = np.asarray(access_w, np.int64)
+    purewalk = np.asarray(purewalk, np.int64)
+    painted = np.full(n_cells, -1, np.int32)
+    s_star = np.full(n_cells, -1, np.int64)
+    aw_sel = np.zeros(n_cells, np.int64)
+    Dstar = np.full(n_cells, NEG, np.int64)
+    Tstar = np.full(n_cells, -1, np.int64)
+    is_walk = np.zeros(n_cells, bool)
+    kk = np.searchsorted(dep_grid, cell_deps, side="left")
+    for ci in range(n_cells):
+        a0, a1 = int(access_off[ci]), int(access_off[ci + 1])
+        best = int(INF); best_s = -1; best_aw = 0; best_B = int(NEG); best_T = -1
+        for a in range(a0, a1):
+            s = int(access_to[a]); w = int(access_w[a]); row = arrivalW[s]
+            for k in kk:
+                if k >= len(row):
+                    continue
+                T = int(row[k])
+                if T >= INF:
+                    continue
+                # anchor at the grid point the profile column actually represents (B_eff);
+                # == the requested cell_deps minute on the engine's uniform grids
+                B = int(dep_grid[k])
+                cost = T - B + w
+                if (cost < best
+                        or (cost == best and (B > best_B
+                            or (B == best_B and (w < best_aw
+                                or (w == best_aw and s < best_s)))))):
+                    best = cost; best_s = s; best_aw = w; best_B = B; best_T = T
+        pw = int(purewalk[ci])
+        walk_won = False
+        if pw >= 0 and pw < best:
+            best = pw; best_s = -1; best_aw = pw
+            best_B = int(cell_deps[-1]) if len(cell_deps) else int(dep_grid[0])
+            best_T = -1; walk_won = True
+        pm = int((best + 59) // 60)
+        if pm < int(max_min):
+            painted[ci] = pm
+            s_star[ci] = best_s
+            aw_sel[ci] = best_aw
+            Dstar[ci] = best_B - best_aw
+            Tstar[ci] = best_T
+            is_walk[ci] = walk_won
+    return painted, s_star, aw_sel, Dstar, Tstar, is_walk
+
+
 # --------------------------------------------------------------- kernel selection
 _NUMBA = None
 
@@ -640,11 +744,13 @@ def perturbed_data(data, delta0, slope, off=None):
 
 
 def _mc_flat_args(data):
-    """The schedule CSR as the int64 tuple the MC kernel takes positionally: n_stops, the pattern
-    arrays (incl. ``pat_trip_off`` for per-trip delay indexing), the routes-at-stop CSR, and the
-    footpath CSR. One source of truth for the kernel's flat-arg contract (kept in sync with
-    ``raptor_numba.montecarlo_committed`` parameter order; ``_draw_profile`` consumes the same
-    prefix)."""
+    """Return the int64 positional contract for the compiled MC kernels.
+
+    This intentionally remains a direct conversion at the kernel boundary.  A prior prepared-ABI
+    cache saved only a fraction of a millisecond while retaining copied schedule arrays, an LRU,
+    and concurrency plumbing; the measured trade-off was not worth its memory or maintenance
+    cost.
+    """
     return (np.int64(data["n_stops"]),
             data["pat_nstops"].astype(np.int64), data["pat_ntrips"].astype(np.int64),
             data["pat_stop_off"].astype(np.int64), data["pat_mat_off"].astype(np.int64),
@@ -658,7 +764,8 @@ def _mc_flat_args(data):
 
 
 def montecarlo_commute_committed(data, egress_g, egress_w, deadlines, legs, perfect, max_min,
-                                 delta0_all, slope_all, board_slack=60, max_rounds=8, kernel=None):
+                                 delta0_all, slope_all, board_slack=60, max_rounds=8, kernel=None,
+                                 capture_tail=False):
     """COMMITTED-PLAN commute_all[n_cells, R] in float minutes. ``legs`` is the per-cell committed
     first leg from ``raptor_journey.JourneyTree.committed_first_legs`` (departure + first board fixed
     from the unperturbed plan). Each draw perturbs the schedule, then per transit cell: board the
@@ -670,7 +777,7 @@ def montecarlo_commute_committed(data, egress_g, egress_w, deadlines, legs, perf
     if kernel == "numba":
         from . import raptor_numba
         with _MC_KERNEL_LOCK:                          # serialize the non-threadsafe parallel kernel
-            return raptor_numba.montecarlo_committed(
+            result = raptor_numba.montecarlo_committed(
                 *_mc_flat_args(data),
                 np.asarray(egress_g, np.int64), np.asarray(egress_w, np.int64),
                 np.asarray(deadlines, np.int64), np.int64(board_slack), np.int64(max_rounds),
@@ -680,13 +787,37 @@ def montecarlo_commute_committed(data, egress_g, egress_w, deadlines, legs, perf
                 np.asarray(legs["commit_as"], np.int64), np.asarray(perfect, np.int64),
                 np.int64(max_min),
                 np.ascontiguousarray(delta0_all, np.float64),
-                np.ascontiguousarray(slope_all, np.float64))
+                np.ascontiguousarray(slope_all, np.float64), bool(capture_tail))
+        return result if capture_tail else result[0]
     return _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perfect,
-                                        max_min, delta0_all, slope_all, board_slack, max_rounds)
+                                        max_min, delta0_all, slope_all, board_slack, max_rounds,
+                                        capture_tail=capture_tail)
+
+
+def _encode_tail_lag(latest, deadlines):
+    """Losslessly encode one reverse profile relative to its deadline columns.
+
+    ``65535`` is reserved for ``NEG`` (unreachable).  Any reachable lag outside uint16's remaining
+    0..65534 range rejects the *whole draw*: callers must never retain a partially lossy profile.
+    The encoded bytes are still returned to keep the capture loop allocation-free; ``valid`` is the
+    authoritative gate.
+    """
+    latest = np.asarray(latest, np.int64)
+    deadlines = np.asarray(deadlines, np.int64)
+    if latest.ndim != 2 or deadlines.ndim != 1 or latest.shape[1] != deadlines.size:
+        raise ValueError("latest/deadline shape mismatch")
+    out = np.full(latest.shape, np.uint16(65535), dtype=np.uint16)
+    reachable = latest != NEG
+    lag = deadlines[None, :] - latest
+    valid = bool(np.all((~reachable) | ((lag >= 0) & (lag < 65535))))
+    encodable = reachable & (lag >= 0) & (lag < 65535)
+    out[encodable] = lag[encodable].astype(np.uint16)
+    return out, valid
 
 
 def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perfect, max_min,
-                                 delta0_all, slope_all, board_slack, max_rounds):
+                                 delta0_all, slope_all, board_slack, max_rounds,
+                                 capture_tail=False):
     """Slow pure-numpy reference for ``montecarlo_commute_committed`` (test/no-numba path)."""
     off = pat_trip_off(data)
     deadlines = np.asarray(deadlines, np.int64)
@@ -699,11 +830,17 @@ def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perf
     n_cells = len(home)
     Rn = delta0_all.shape[0]
     cm = np.empty((n_cells, Rn), dtype=np.float64)
+    tail_lag = (np.empty((Rn, int(data["n_stops"]), nd), dtype=np.uint16)
+                if capture_tail else None)
+    tail_valid = np.ones(Rn, dtype=np.uint8)
     capf = float(max_min)
     for r in range(Rn):
         pdata, dep, arr = perturbed_data(data, delta0_all[r], slope_all[r], off)
         latest = reverse_profile(pdata, egress_g, egress_w, deadlines,
                                  board_slack=board_slack, max_rounds=max_rounds, kernel="python")
+        if capture_tail:
+            tail_lag[r], valid = _encode_tail_lag(latest, deadlines)
+            tail_valid[r] = np.uint8(valid)
         for ci in range(n_cells):
             k = int(kind[ci])
             if k != 2:
@@ -724,4 +861,96 @@ def _montecarlo_committed_python(data, egress_g, egress_w, deadlines, legs, perf
                 cm[ci, r] = capf; continue
             tt = (int(deadlines[lo2]) - int(home[ci])) / 60.0
             cm[ci, r] = min(max(tt, 0.0), capf)
-    return cm
+    return (cm, tail_lag, tail_valid) if capture_tail else cm
+
+
+def montecarlo_commute_committed_from_tail(data, deadlines, tail_lag, legs, perfect, max_min,
+                                           delta0_all, slope_all, board_slack=60, kernel=None):
+    """Score committed routes from losslessly retained per-draw reverse profiles.
+
+    This is the pin-time accelerator sibling of :func:`montecarlo_commute_committed`.  It rebuilds
+    only the requested pattern's boarding and alighting columns; the FIFO clamp is independent per
+    position, so those columns and the resulting scores are exact copies of the full kernel path.
+    """
+    if kernel is None:
+        kernel = _select_kernel()
+    deadlines = np.asarray(deadlines, np.int64)
+    tail_lag = np.ascontiguousarray(tail_lag, np.uint16)
+    delta0_all = np.ascontiguousarray(delta0_all, np.float64)
+    slope_all = np.ascontiguousarray(slope_all, np.float64)
+    if kernel == "numba":
+        from . import raptor_numba
+        flat = _mc_flat_args(data)
+        return raptor_numba.montecarlo_committed_from_tail(
+            flat[1], flat[2], flat[4], flat[5], flat[7], flat[8], deadlines, tail_lag,
+            np.int64(board_slack),
+            np.asarray(legs["commit_home"], np.int64),
+            np.asarray(legs["commit_kind"], np.int64),
+            np.asarray(legs["commit_walk0"], np.int64),
+            np.asarray(legs["commit_pi"], np.int64),
+            np.asarray(legs["commit_bpos"], np.int64),
+            np.asarray(legs["commit_apos"], np.int64),
+            np.asarray(legs["commit_as"], np.int64),
+            np.asarray(perfect, np.int64), np.int64(max_min), delta0_all, slope_all)
+    return _montecarlo_committed_from_tail_python(
+        data, deadlines, tail_lag, legs, perfect, max_min, delta0_all, slope_all, board_slack)
+
+
+def _montecarlo_committed_from_tail_python(data, deadlines, tail_lag, legs, perfect, max_min,
+                                            delta0_all, slope_all, board_slack):
+    """Pure-numpy exact oracle for ``montecarlo_commute_committed_from_tail``."""
+    deadlines = np.asarray(deadlines, np.int64)
+    tail_lag = np.asarray(tail_lag, np.uint16)
+    home = np.asarray(legs["commit_home"], np.int64)
+    kind = np.asarray(legs["commit_kind"], np.int64)
+    walk0 = np.asarray(legs["commit_walk0"], np.int64)
+    pic = np.asarray(legs["commit_pi"], np.int64)
+    bpos = np.asarray(legs["commit_bpos"], np.int64)
+    apos = np.asarray(legs["commit_apos"], np.int64)
+    as_ = np.asarray(legs["commit_as"], np.int64)
+    perfect = np.asarray(perfect, np.int64)
+    pat_ns = np.asarray(data["pat_nstops"], np.int64)
+    pat_nt = np.asarray(data["pat_ntrips"], np.int64)
+    pat_mo = np.asarray(data["pat_mat_off"], np.int64)
+    pat_dep = np.asarray(data["pat_dep"], np.int64)
+    pat_arr = np.asarray(data["pat_arr"], np.int64)
+    trip_off = pat_trip_off(data)
+    out = np.empty((home.size, delta0_all.shape[0]), np.float64)
+    capf = float(max_min)
+    for row in range(home.size):
+        for r in range(delta0_all.shape[0]):
+            if kind[row] != 2:
+                out[row, r] = (capf if kind[row] == 0 or perfect[row] < 0
+                               else min(float(perfect[row]), capf))
+                continue
+            pi = int(pic[row]); ns = int(pat_ns[pi]); nt = int(pat_nt[pi])
+            mb = int(pat_mo[pi]); tb = int(trip_off[pi])
+            prev_dep = int(NEG); prev_arr = int(NEG); arr_as = None
+            for trip in range(nt):
+                g = tb + trip; base = mb + trip * ns; dep0 = int(pat_dep[base])
+                boff = base + int(bpos[row]); aoff = base + int(apos[row])
+                binc = int(delta0_all[r, g] + slope_all[r, g] *
+                           max(int(pat_dep[boff]) - dep0, 0))
+                ainc = int(delta0_all[r, g] + slope_all[r, g] *
+                           max(int(pat_dep[aoff]) - dep0, 0))
+                dep_value = max(int(pat_dep[boff]) + binc, prev_dep)
+                arr_value = max(int(pat_arr[aoff]) + ainc, prev_arr)
+                prev_dep, prev_arr = dep_value, arr_value
+                if dep_value >= int(home[row] + walk0[row]):
+                    arr_as = arr_value
+                    break
+            if arr_as is None:
+                out[row, r] = capf
+                continue
+            # A retained scenario may carry a longer deadline horizon than this route batch.
+            # Replay reads only the exact compatible prefix (the compiled sibling bounds every
+            # search by ``deadlines.size`` too), avoiding a large contiguous tensor copy at pin time.
+            codes = tail_lag[r, int(as_[row]), :deadlines.size]
+            latest = np.where(codes == 65535, NEG,
+                              deadlines - codes.astype(np.int64))
+            d = int(np.searchsorted(latest, arr_as + int(board_slack), side="left"))
+            if d >= deadlines.size:
+                out[row, r] = capf
+            else:
+                out[row, r] = min(max((int(deadlines[d]) - int(home[row])) / 60.0, 0.0), capf)
+    return out

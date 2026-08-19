@@ -124,17 +124,24 @@ def _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
                     pa = prev[s]
                     if pa > NEG:
                         key = pa - board_slack
-                        lo = 0
-                        hi = nt
-                        while lo < hi:                  # searchsorted(arr_col, key, 'right')
-                            mid = (lo + hi) >> 1
-                            if pat_arr[mbase + mid * ns + pos] <= key:
-                                lo = mid + 1
-                            else:
-                                hi = mid
-                        idx = lo - 1
-                        if idx >= 0 and (trip < 0 or idx > trip):
-                            trip = idx
+                        # `trip` only moves upward as this pattern is scanned backwards.
+                        # Anything at or below it can therefore never improve the selected
+                        # vehicle.  The FIFO arrival column is sorted, so one successor probe
+                        # proves that no later trip can win; otherwise search only the suffix.
+                        # This is exactly the old right-side search followed by max(trip, idx),
+                        # including the case where the old trip is not boardable at this stop.
+                        if trip < nt - 1:
+                            first = trip + 1
+                            if pat_arr[mbase + first * ns + pos] <= key:
+                                lo = first + 1
+                                hi = nt
+                                while lo < hi:          # upper_bound(arr_col, key), suffix only
+                                    mid = (lo + hi) >> 1
+                                    if pat_arr[mbase + mid * ns + pos] <= key:
+                                        lo = mid + 1
+                                    else:
+                                        hi = mid
+                                trip = lo - 1
             # commit prev for pattern-marked stops
             for ii in range(nn):
                 prev[new[ii]] = best[new[ii]]
@@ -184,6 +191,200 @@ def _profile(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
             else:
                 latest[s, ti] = run
     return latest
+
+
+@njit(cache=True, nogil=True)
+def _traced_compact(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off,
+                    pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos,
+                    tr_off, tr_to, tr_time, egress_g, egress_t, egress_w,
+                    board_slack, max_rounds):
+    """Compiled single-deadline traced RAPTOR with deferred winning-parent materialization.
+
+    Times and tie order mirror ``raptor.reverse_raptor_traced``.  During one pattern or footpath
+    pass, a stop's intermediate strict improvements cannot be consumed: boards read the frozen
+    ``prev`` label and footpaths read the frozen source snapshot.  Materialize only the final
+    winning node per stop/pass, reducing the append-only table from hundreds of thousands of
+    Python objects to at most ``(2 + 2*rounds) * n_stops`` compact numeric rows.
+    """
+    n_pat = pat_nstops.shape[0]
+    best = np.full(n_stops, NEG, dtype=np.int64)
+    prev = np.full(n_stops, NEG, dtype=np.int64)
+    par_kind = np.full(n_stops, -1, dtype=np.int8)
+    par_pat = np.full(n_stops, -1, dtype=np.int32)
+    par_trip = np.full(n_stops, -1, dtype=np.int32)
+    par_board = np.full(n_stops, -1, dtype=np.int32)
+    par_alight = np.full(n_stops, -1, dtype=np.int32)
+    par_from = np.full(n_stops, -1, dtype=np.int32)
+    par_nxfer = np.zeros(n_stops, dtype=np.int16)
+    egress_sec = np.full(n_stops, -1, dtype=np.int32)
+    best_node = np.full(n_stops, -1, dtype=np.int32)
+    prev_node = np.full(n_stops, -1, dtype=np.int32)
+
+    cap = (2 + 2 * max_rounds) * n_stops + egress_g.shape[0] + 1
+    nd_kind = np.empty(cap, dtype=np.int8)
+    nd_stop = np.empty(cap, dtype=np.int32)
+    nd_pat = np.empty(cap, dtype=np.int32)
+    nd_trip = np.empty(cap, dtype=np.int32)
+    nd_board = np.empty(cap, dtype=np.int32)
+    nd_alight = np.empty(cap, dtype=np.int32)
+    nd_to = np.empty(cap, dtype=np.int32)
+    nd_egress = np.empty(cap, dtype=np.int32)
+    nd_depth = np.empty(cap, dtype=np.int16)
+    nd_next = np.empty(cap, dtype=np.int32)
+    node_n = 0
+
+    flag = np.zeros(n_stops, dtype=np.uint8)
+    cur = np.empty(n_stops, dtype=np.int64)
+    new = np.empty(n_stops, dtype=np.int64)
+    q_pos = np.full(n_pat, -1, dtype=np.int64)
+    srcv = np.empty(n_stops, dtype=np.int64)
+    srcnode = np.empty(n_stops, dtype=np.int32)
+
+    tr_pending = np.zeros(n_stops, dtype=np.uint8)
+    tr_pi = np.empty(n_stops, dtype=np.int32)
+    tr_trip_v = np.empty(n_stops, dtype=np.int32)
+    tr_board_v = np.empty(n_stops, dtype=np.int32)
+    tr_alight_v = np.empty(n_stops, dtype=np.int32)
+    tr_next_v = np.empty(n_stops, dtype=np.int32)
+    tr_depth_v = np.empty(n_stops, dtype=np.int16)
+
+    foot_pending = np.zeros(n_stops, dtype=np.uint8)
+    foot_from_v = np.empty(n_stops, dtype=np.int32)
+    foot_next_v = np.empty(n_stops, dtype=np.int32)
+    foot_depth_v = np.empty(n_stops, dtype=np.int16)
+    foot_round_v = np.empty(n_stops, dtype=np.int16)
+
+    # Egress seeds are terminal nodes and may be consumed by the frozen initial footpath pass.
+    for e in range(egress_g.shape[0]):
+        g = int(egress_g[e]); t = int(egress_t[e])
+        if t > best[g]:
+            best[g] = t; prev[g] = t; par_kind[g] = 0; egress_sec[g] = int(egress_w[e])
+            nd_kind[node_n] = 0; nd_stop[node_n] = g; nd_depth[node_n] = 0
+            nd_next[node_n] = -1; nd_pat[node_n] = -1; nd_trip[node_n] = -1
+            nd_board[node_n] = -1; nd_alight[node_n] = -1; nd_to[node_n] = -1
+            nd_egress[node_n] = int(egress_w[e])
+            best_node[g] = node_n; prev_node[g] = node_n; node_n += 1
+            flag[g] = 1
+
+    cn = 0
+    for s in range(n_stops):
+        if flag[s] != 0:
+            cur[cn] = s; srcv[cn] = best[s]; srcnode[cn] = best_node[s]; cn += 1
+    seed_n = cn
+    for ii in range(seed_n):
+        s = int(cur[ii])
+        source_depth = int(nd_depth[int(srcnode[ii])])
+        for k in range(int(tr_off[s]), int(tr_off[s + 1])):
+            j = int(tr_to[k]); cand = int(srcv[ii]) - int(tr_time[k])
+            if cand > best[j]:
+                best[j] = cand; prev[j] = cand
+                par_kind[j] = 2; par_from[j] = s; par_nxfer[j] = 0
+                par_pat[j] = -1; par_trip[j] = -1; par_board[j] = -1; par_alight[j] = -1
+                foot_pending[j] = 1; foot_from_v[j] = s; foot_next_v[j] = srcnode[ii]
+                foot_depth_v[j] = source_depth; foot_round_v[j] = 0; flag[j] = 1
+    for j in range(n_stops):
+        if foot_pending[j] != 0:
+            nd_kind[node_n] = 2; nd_stop[node_n] = j; nd_depth[node_n] = foot_depth_v[j]
+            nd_next[node_n] = foot_next_v[j]; nd_pat[node_n] = -1; nd_trip[node_n] = -1
+            nd_board[node_n] = -1; nd_alight[node_n] = -1; nd_to[node_n] = foot_from_v[j]
+            nd_egress[node_n] = -1
+            best_node[j] = node_n; prev_node[j] = node_n; node_n += 1
+            foot_pending[j] = 0
+    cn = 0
+    for s in range(n_stops):
+        if flag[s] != 0:
+            cur[cn] = s; cn += 1
+
+    for rnd in range(1, max_rounds + 1):
+        if cn == 0:
+            break
+        for ii in range(cn):
+            s = int(cur[ii])
+            for k in range(int(ras_off[s]), int(ras_off[s + 1])):
+                pi = int(ras_pat[k]); pos = int(ras_pos[k])
+                if pos > q_pos[pi]:
+                    q_pos[pi] = pos
+            flag[s] = 0
+
+        for pi in range(n_pat):
+            end_pos = int(q_pos[pi])
+            if end_pos < 0:
+                continue
+            q_pos[pi] = -1
+            ns = int(pat_nstops[pi]); nt = int(pat_ntrips[pi])
+            sbase = int(pat_stop_off[pi]); mbase = int(pat_mat_off[pi])
+            trip = -1; cur_alight = -1; cont_node = -1; cont_depth = 0
+            for pos in range(end_pos, -1, -1):
+                s = int(pat_stops[sbase + pos])
+                if trip >= 0:
+                    d = int(pat_dep[mbase + trip * ns + pos])
+                    if d > best[s]:
+                        best[s] = d
+                        par_kind[s] = 1; par_pat[s] = pi; par_trip[s] = trip
+                        par_board[s] = pos; par_alight[s] = cur_alight
+                        par_nxfer[s] = rnd; par_from[s] = -1
+                        tr_pending[s] = 1; tr_pi[s] = pi; tr_trip_v[s] = trip
+                        tr_board_v[s] = pos; tr_alight_v[s] = cur_alight
+                        tr_next_v[s] = cont_node; tr_depth_v[s] = cont_depth; flag[s] = 1
+                pa = int(prev[s])
+                if pa > NEG:
+                    key = pa - int(board_slack)
+                    lo = 0; hi = nt
+                    while lo < hi:
+                        mid = (lo + hi) >> 1
+                        if int(pat_arr[mbase + mid * ns + pos]) <= key:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    idx = lo - 1
+                    if idx >= 0 and (trip < 0 or idx > trip):
+                        trip = idx; cur_alight = pos; cont_node = int(prev_node[s])
+                        cont_depth = (int(nd_depth[cont_node]) if cont_node >= 0 else 0)
+
+        nn = 0
+        for s in range(n_stops):
+            if tr_pending[s] != 0:
+                nd_kind[node_n] = 1; nd_stop[node_n] = s
+                nd_depth[node_n] = tr_depth_v[s] + 1; nd_next[node_n] = tr_next_v[s]
+                nd_pat[node_n] = tr_pi[s]; nd_trip[node_n] = tr_trip_v[s]
+                nd_board[node_n] = tr_board_v[s]; nd_alight[node_n] = tr_alight_v[s]
+                nd_to[node_n] = -1; nd_egress[node_n] = -1
+                best_node[s] = node_n; node_n += 1; tr_pending[s] = 0
+            if flag[s] != 0:
+                new[nn] = s; nn += 1
+        for ii in range(nn):
+            s = int(new[ii]); prev[s] = best[s]; prev_node[s] = best_node[s]
+            srcv[ii] = best[s]; srcnode[ii] = best_node[s]
+
+        for ii in range(nn):
+            s = int(new[ii]); source_node = int(srcnode[ii])
+            source_depth = int(nd_depth[source_node])
+            for k in range(int(tr_off[s]), int(tr_off[s + 1])):
+                j = int(tr_to[k]); cand = int(srcv[ii]) - int(tr_time[k])
+                if cand > best[j]:
+                    best[j] = cand; prev[j] = cand
+                    par_kind[j] = 2; par_from[j] = s; par_nxfer[j] = par_nxfer[s]
+                    par_pat[j] = -1; par_trip[j] = -1; par_board[j] = -1; par_alight[j] = -1
+                    foot_pending[j] = 1; foot_from_v[j] = s; foot_next_v[j] = source_node
+                    foot_depth_v[j] = source_depth; foot_round_v[j] = par_nxfer[s]; flag[j] = 1
+        for j in range(n_stops):
+            if foot_pending[j] != 0:
+                nd_kind[node_n] = 2; nd_stop[node_n] = j; nd_depth[node_n] = foot_depth_v[j]
+                nd_next[node_n] = foot_next_v[j]; nd_pat[node_n] = -1; nd_trip[node_n] = -1
+                nd_board[node_n] = -1; nd_alight[node_n] = -1; nd_to[node_n] = foot_from_v[j]
+                nd_egress[node_n] = -1
+                best_node[j] = node_n; prev_node[j] = node_n; node_n += 1
+                foot_pending[j] = 0
+        cn = 0
+        for s in range(n_stops):
+            if flag[s] != 0:
+                cur[cn] = s; cn += 1
+
+    return (best, par_kind, par_pat, par_trip, par_board, par_alight, par_from,
+            par_nxfer, egress_sec, best_node,
+            nd_kind[:node_n], nd_stop[:node_n], nd_pat[:node_n], nd_trip[:node_n],
+            nd_board[:node_n], nd_alight[:node_n], nd_to[:node_n], nd_egress[:node_n],
+            nd_depth[:node_n], nd_next[:node_n])
 
 
 INF = 1 << 60
@@ -552,6 +753,81 @@ def select_departafter_arith(access_off, access_to, access_w, purewalk, arrivalW
 
 
 @njit(cache=True, nogil=True)
+def select_planned_departafter_arith(access_off, access_to, access_w, purewalk, arrivalW,
+                                     dep0, step, ndg, cell_deps, max_min):
+    """First-boarding-anchored scheduled commute.
+
+    For each access stop and each first-boarding minute B in ``cell_deps``, score the journey as
+    ``access_walk + arrivalW[stop, B] - B``. That treats the home departure as derived from the
+    selected first vehicle (home = B - access_walk), so the controllable pre-board wait is not part
+    of the displayed commute. The candidate set of B minutes is identical across walk speeds; faster
+    walking can only reduce walk terms / unlock feasibility, so the value is monotone.
+
+    LOCKSTEP SIBLING of ``raptor.select_planned_departafter``'s python fallback: byte-equal on the
+    shared uniform-grid domain (this kernel gates on uniformity; every B is a dep_grid point here).
+    Like the legacy kernels, ``is_walk``/the synthetic walk ``Dstar`` are written ONLY when the
+    cell is actually painted (``pm < max_min``); unreachable cells keep the untouched sentinels.
+    """
+    n_cells = access_off.shape[0] - 1
+    nd = cell_deps.shape[0]
+    painted = np.full(n_cells, -1, dtype=np.int32)
+    s_star = np.full(n_cells, -1, dtype=np.int64)
+    aw_sel = np.zeros(n_cells, dtype=np.int64)
+    Dstar = np.full(n_cells, NEG, dtype=np.int64)      # home departure = selected B - access walk
+    Tstar = np.full(n_cells, -1, dtype=np.int64)       # workplace arrival from arrivalW
+    is_walk = np.zeros(n_cells, dtype=np.bool_)
+    for ci in range(n_cells):
+        a0 = access_off[ci]
+        a1 = access_off[ci + 1]
+        best = INF
+        best_s = -1
+        best_aw = 0
+        best_B = NEG
+        best_T = -1
+        for a in range(a0, a1):
+            w = access_w[a]
+            row = arrivalW[access_to[a]]
+            for di in range(nd):
+                # cell_deps and dep_grid share origin/step in the engine, so B's row index is di.
+                if di >= ndg:
+                    continue
+                T = row[di]
+                if T >= INF:
+                    continue
+                B = cell_deps[di]
+                cost = T - B + w
+                # Determinism/tie-break: same displayed time -> later first boarding (less platform
+                # slack under minute discretization), then shorter access walk, then lower stop id.
+                if (cost < best
+                        or (cost == best and (B > best_B
+                            or (B == best_B and (w < best_aw
+                                or (w == best_aw and access_to[a] < best_s)))))):
+                    best = cost
+                    best_s = access_to[a]
+                    best_aw = w
+                    best_B = B
+                    best_T = T
+        pw = purewalk[ci]
+        walk_won = False
+        if pw >= 0 and pw < best:
+            best = pw
+            best_s = -1
+            best_aw = pw
+            best_B = cell_deps[nd - 1] if nd > 0 else dep0
+            best_T = -1
+            walk_won = True
+        pm = (best + 59) // 60
+        if pm < max_min:
+            painted[ci] = np.int32(pm)
+            s_star[ci] = best_s
+            aw_sel[ci] = best_aw
+            Dstar[ci] = best_B - best_aw
+            Tstar[ci] = best_T
+            is_walk[ci] = walk_won
+    return painted, s_star, aw_sel, Dstar, Tstar, is_walk
+
+
+@njit(cache=True, nogil=True)
 def assemble_arriveby(access_off, access_to, access_w, purewalk, latest, deadlines,
                       max_min, pct, beta, eps):
     """``beta``/``eps`` = the walk-reluctance multiplier + the true-time cap (decision-only). Among
@@ -624,13 +900,35 @@ def reverse_profile(data, egress_g, egress_w, deadlines, board_slack, max_rounds
         np.int64(board_slack), np.int64(max_rounds))
 
 
+def reverse_raptor_traced(data, egress_g, egress_t, egress_w, board_slack, max_rounds):
+    """Expected traced-parent dict via the compiled compact single-deadline kernel."""
+    values = _traced_compact(
+        np.int64(data["n_stops"]),
+        np.asarray(data["pat_nstops"]), np.asarray(data["pat_ntrips"]),
+        np.asarray(data["pat_stop_off"]), np.asarray(data["pat_mat_off"]),
+        np.asarray(data["pat_stops"]), np.asarray(data["pat_dep"]),
+        np.asarray(data["pat_arr"]), np.asarray(data["ras_off"]),
+        np.asarray(data["ras_pat"]), np.asarray(data["ras_pos"]),
+        np.asarray(data["tr_off"]), np.asarray(data["tr_to"]),
+        np.asarray(data["tr_time"]), np.asarray(egress_g, dtype=np.int64),
+        np.asarray(egress_t, dtype=np.int64), np.asarray(egress_w, dtype=np.int64),
+        np.int64(board_slack), np.int64(max_rounds))
+    keys = ("best", "par_kind", "par_pat", "par_trip", "par_board", "par_alight",
+            "par_from", "par_nxfer", "egress_sec", "best_node", "nd_kind", "nd_stop",
+            "nd_pat", "nd_trip", "nd_board", "nd_alight", "nd_to", "nd_egress",
+            "nd_depth", "nd_next")
+    return dict(zip(keys, values))
+
+
 # ============================================================== service-noise Monte-Carlo
 # Perturb the schedule (per-trip cumulative delay) and re-run the SAME validated reverse sweep
 # per draw. Each draw fills its column of commute_all[n_cells, R] under COMMITTED-PLAN semantics:
 # the first leg is fixed to the published plan (board the next trip on the committed pattern, no
 # optimal re-route), and only the TAIL re-optimizes from the actual late arrival — see the
 # committed banner below. Draws run in `prange` across cores (nogil), each thread holding only
-# ONE perturbed schedule + ONE latest profile at a time (never R x n_stops).
+# ONE perturbed schedule + ONE working latest profile at a time.  The optional pin accelerator
+# additionally writes a compact uint16 R x n_stops x deadlines snapshot, bounded out-of-band by
+# the server; the normal path allocates its capture array with zero dimensions.
 
 @njit(cache=True, nogil=True)
 def _perturb(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off, pat_dep, pat_arr,
@@ -705,6 +1003,92 @@ def _first_ge(row, n, key):
     return lo
 
 
+# The two helpers below deliberately mirror pieces of ``montecarlo_committed`` rather than
+# being called by it.  They exist solely for the offline stage profiler
+# (scripts/mc_kernel_stage_benchmark.py): splitting the production parallel loop to collect
+# timings would itself change the thing being measured.  Keeping the production kernel's hot
+# path untouched is also useful as a direct array-equality oracle for that profiler.
+@njit(nogil=True, cache=True)
+def _mc_stage_score_committed_draw(pat_nstops, pat_ntrips, pat_mat_off, deadlines,
+                                   board_slack, commit_home, commit_kind, commit_walk0,
+                                   commit_pi, commit_bpos, commit_apos, commit_as, perfect,
+                                   max_min, latest, dep_r, arr_r, commute_out):
+    """Score one already-profiled MC draw into ``commute_out``.
+
+    Offline stage-profiling seam only.  It must remain lockstep with the committed scoring
+    block in :func:`montecarlo_committed`; production intentionally keeps that block inlined in
+    its parallel draw loop.
+    """
+    n_cells = commit_home.shape[0]
+    nd = deadlines.shape[0]
+    capf = np.float64(max_min)
+    for ci in range(n_cells):
+        k = commit_kind[ci]
+        if k != 2:
+            p = perfect[ci]
+            if k == 0 or p < 0:
+                commute_out[ci] = capf
+            else:
+                commute_out[ci] = capf if p > capf else np.float64(p)
+            continue
+        pi = commit_pi[ci]
+        ns = pat_nstops[pi]
+        nt = pat_ntrips[pi]
+        mbase = pat_mat_off[pi]
+        bpos = commit_bpos[ci]
+        apos = commit_apos[ci]
+        key = commit_home[ci] + commit_walk0[ci]
+        lo = 0
+        hi = nt
+        while lo < hi:
+            mid = (lo + hi) >> 1
+            off = mbase + mid * ns + bpos
+            if dep_r[off] < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo >= nt:
+            commute_out[ci] = capf
+            continue
+        off = mbase + lo * ns + apos
+        arr_as = arr_r[off]
+        d = _first_ge(latest[commit_as[ci]], nd, arr_as + board_slack)
+        if d >= nd:
+            commute_out[ci] = capf
+            continue
+        tt = (deadlines[d] - commit_home[ci]) / 60.0
+        if tt < 0.0:
+            tt = 0.0
+        if tt > capf:
+            tt = capf
+        commute_out[ci] = tt
+
+
+@njit(nogil=True, cache=True)
+def _mc_stage_encode_tail(latest, deadlines, tail_out):
+    """Encode one profiled draw exactly as ``capture_tail=True`` does.
+
+    Offline stage-profiling seam only; returns the same per-draw validity byte the production
+    capture loop writes.  ``tail_out`` is caller-owned to keep allocation out of the stage.
+    """
+    valid = np.uint8(1)
+    n_stops = latest.shape[0]
+    nd = deadlines.shape[0]
+    for s in range(n_stops):
+        for d in range(nd):
+            value = latest[s, d]
+            if value == NEG:
+                tail_out[s, d] = np.uint16(65535)
+            else:
+                lag = deadlines[d] - value
+                if lag < 0 or lag >= 65535:
+                    valid = np.uint8(0)
+                    tail_out[s, d] = np.uint16(65535)
+                else:
+                    tail_out[s, d] = np.uint16(lag)
+    return valid
+
+
 # ----------------------------------------------- committed-plan Monte-Carlo (forward sim)
 # You commit the FIRST leg from the unperturbed plan (departure + line + board stop, no
 # foreknowledge of delays), then per draw: board the next available trip on the committed line,
@@ -719,7 +1103,7 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
                          tr_off, tr_to, tr_time, egress_g, egress_w, deadlines, board_slack,
                          max_rounds, commit_home, commit_kind, commit_walk0, commit_pi,
                          commit_bpos, commit_apos, commit_as, perfect, max_min,
-                         delta0_all, slope_all):
+                         delta0_all, slope_all, capture_tail=False):
     """commute_all[n_cells, R] float minutes for R draws, COMMITTED-PLAN semantics. Per draw:
     perturb -> reverse profile; per transit cell: catch the next trip on the committed pattern at
     the committed board position, ride to the committed alight, then read the earliest workplace
@@ -730,12 +1114,19 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
     n_cells = commit_home.shape[0]
     nd = deadlines.shape[0]
     commute_all = np.empty((n_cells, R), dtype=np.float64)
+    # Optional accelerator capture.  uint16 stores an exact deadline-relative lag; 65535 is the
+    # unreachable sentinel.  A per-draw validity byte prevents any overflow from being retained —
+    # commute_all remains authoritative and byte-unchanged even when capture is rejected.
+    tail_lag = (np.empty((R, n_stops, nd), dtype=np.uint16) if capture_tail
+                else np.empty((0, 0, 0), dtype=np.uint16))
+    tail_valid = np.ones(R, dtype=np.uint8)
     capf = np.float64(max_min)
     for r in prange(R):
         latest, dep_r, arr_r = _draw_profile(
             n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_trip_off,
             pat_stops, pat_dep, pat_arr, ras_off, ras_pat, ras_pos, tr_off, tr_to, tr_time,
-            egress_g, egress_w, deadlines, board_slack, max_rounds, delta0_all[r], slope_all[r])
+            egress_g, egress_w, deadlines, board_slack, max_rounds,
+            delta0_all[r], slope_all[r])
         for ci in range(n_cells):
             k = commit_kind[ci]
             if k != 2:                                   # unreachable (0) or deterministic walk (1)
@@ -760,14 +1151,16 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
             hi = nt
             while lo < hi:                               # first trip with perturbed dep >= key
                 mid = (lo + hi) >> 1
-                if dep_r[mbase + mid * ns + bpos] < key:
+                off = mbase + mid * ns + bpos
+                if dep_r[off] < key:
                     lo = mid + 1
                 else:
                     hi = mid
             if lo >= nt:                                 # missed the last trip on the committed line
                 commute_all[ci, r] = capf
                 continue
-            arr_as = arr_r[mbase + lo * ns + apos]       # ACTUAL (late) arrival at the transfer stop
+            off = mbase + lo * ns + apos
+            arr_as = arr_r[off]                          # ACTUAL (late) arrival at the transfer stop
             # Consume the tail at arr_as + board_slack: the sweep charges board_slack at every
             # transit-alight -> onward seam (`pa - board_slack` in _profile), so the stressed
             # transfer must pay the same 60s the perfect-timing sweep paid for it.
@@ -781,4 +1174,118 @@ def montecarlo_committed(n_stops, pat_nstops, pat_ntrips, pat_stop_off, pat_mat_
             if tt > capf:
                 tt = capf
             commute_all[ci, r] = tt
-    return commute_all
+        if capture_tail:
+            valid = np.uint8(1)
+            for s in range(n_stops):
+                for d in range(nd):
+                    value = latest[s, d]
+                    if value == NEG:
+                        tail_lag[r, s, d] = np.uint16(65535)
+                    else:
+                        lag = deadlines[d] - value
+                        if lag < 0 or lag >= 65535:
+                            valid = np.uint8(0)
+                            tail_lag[r, s, d] = np.uint16(65535)
+                        else:
+                            tail_lag[r, s, d] = np.uint16(lag)
+            tail_valid[r] = valid
+    return commute_all, tail_lag, tail_valid
+
+
+@njit(nogil=True, cache=True)
+def montecarlo_committed_from_tail(pat_nstops, pat_ntrips, pat_mat_off, pat_trip_off,
+                                   pat_dep, pat_arr, deadlines, tail_lag, board_slack,
+                                   commit_home, commit_kind, commit_walk0, commit_pi,
+                                   commit_bpos, commit_apos, commit_as, perfect, max_min,
+                                   delta0_all, slope_all):
+    """Score a small committed-route batch from retained per-draw tail profiles.
+
+    Only the requested pattern's board and alight columns are reconstructed.  `_perturb`'s FIFO
+    clamp is independent per pattern position, so the two running maxima below are exactly the
+    corresponding columns of the full perturbed schedule used by ``montecarlo_committed``.
+    """
+    R = delta0_all.shape[0]
+    n_rows = commit_home.shape[0]
+    nd = deadlines.shape[0]
+    out = np.empty((n_rows, R), dtype=np.float64)
+    capf = np.float64(max_min)
+    for row in range(n_rows):
+        kind = commit_kind[row]
+        for r in range(R):
+            if kind != 2:
+                p = perfect[row]
+                if kind == 0 or p < 0:
+                    out[row, r] = capf
+                else:
+                    out[row, r] = capf if p > capf else np.float64(p)
+                continue
+            pi = commit_pi[row]
+            ns = pat_nstops[pi]
+            nt = pat_ntrips[pi]
+            mbase = pat_mat_off[pi]
+            tbase = pat_trip_off[pi]
+            bpos = commit_bpos[row]
+            apos = commit_apos[row]
+            key = commit_home[row] + commit_walk0[row]
+            prev_dep = np.int64(NEG)
+            prev_arr = np.int64(NEG)
+            arr_as = np.int64(NEG)
+            found = False
+            for trip in range(nt):
+                g = tbase + trip
+                base = mbase + trip * ns
+                dep0 = pat_dep[base]
+
+                boff = base + bpos
+                belapsed = pat_dep[boff] - dep0
+                if belapsed < 0:
+                    belapsed = 0
+                binc = np.int64(delta0_all[r, g] + slope_all[r, g] * belapsed)
+                dep_value = pat_dep[boff] + binc
+                if dep_value < prev_dep:
+                    dep_value = prev_dep
+                prev_dep = dep_value
+
+                aoff = base + apos
+                aelapsed = pat_dep[aoff] - dep0
+                if aelapsed < 0:
+                    aelapsed = 0
+                ainc = np.int64(delta0_all[r, g] + slope_all[r, g] * aelapsed)
+                arr_value = pat_arr[aoff] + ainc
+                if arr_value < prev_arr:
+                    arr_value = prev_arr
+                prev_arr = arr_value
+
+                if dep_value >= key:
+                    arr_as = arr_value
+                    found = True
+                    break
+            if not found:
+                out[row, r] = capf
+                continue
+
+            tail_key = arr_as + board_slack
+            lo = 0
+            hi = nd
+            s = commit_as[row]
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                code = tail_lag[r, s, mid]
+                if code == np.uint16(65535):
+                    before = True
+                else:
+                    before = deadlines[mid] - np.int64(code) < tail_key
+                if before:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo >= nd:
+                out[row, r] = capf
+                continue
+            tt = (deadlines[lo] - commit_home[row]) / 60.0
+            if tt < 0.0:
+                tt = 0.0
+            if tt > capf:
+                tt = capf
+            out[row, r] = tt
+    return out

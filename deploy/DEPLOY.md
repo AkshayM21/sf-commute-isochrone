@@ -18,8 +18,9 @@ deploy/push.sh opc@<oracle-public-ip>
 (Oracle Linux uses `opc` as the default user; Ubuntu uses `ubuntu`.)
 
 Rsyncs the repo to `/opt/sfci/` excluding the venv, `__pycache__`, the personal `.dest_cache.json`,
-the numba cache (rebuilt on the box), `out/`, and the test golden oracles. Keeps `.git` so you can
-`git pull` for incremental updates later.
+the numba cache (rebuilt on the box), `out/`, and the test golden oracles. It also copies `.git`,
+but ordinary updates and recovery use `deploy/push.sh` from the laptop; do not assume Git is
+installed on the host.
 
 ## 2. Run install on the box
 
@@ -28,14 +29,15 @@ ssh opc@<ip> 'sudo bash /opt/sfci/deploy/install.sh'
 ```
 
 Does, idempotently:
-- Adds the Caddy COPR + EPEL repos; installs `python3.12`, `caddy`, `stress-ng`, `ufw`, build tools.
+- Adds the Caddy COPR + EPEL repos; installs `python3.12`, `caddy`, `stress-ng`, `firewalld`, build tools.
 - Creates the `sfci` system user + Python venv at `/opt/sfci/.venv`.
 - Writes `/etc/sfci.env` with sensible defaults (you fill in tokens next).
 - Installs the systemd units: `sfci`, `sfci-keepalive.timer`, `cloudflare-ufw.timer`.
-- Initializes ufw allowing 22/80/443 from anywhere (cloudflare-ufw.timer narrows 80/443 later).
+- Initializes firewalld with 22/80/443 temporarily open (cloudflare-ufw.timer narrows 80/443 later).
 - Starts the Flask app on `localhost:8000`.
 - Enables Caddy but doesn't start it yet (waits for the Origin CA cert in step 4).
 - Sets up `logrotate` for the app logs.
+- Sends Caddy's JSON access records to systemd-journald (view with `journalctl -u caddy`).
 
 Verify the Flask side is up locally on the box:
 
@@ -50,7 +52,10 @@ ssh opc@<ip> 'curl -s -o /dev/null -w "HTTP %{http_code}\n" http://localhost:800
 ssh opc@<ip> 'sudo vi /etc/sfci.env'
 ```
 
-Paste your `API511_TOKEN` and `GEOAPIFY_KEY` from your laptop's `.env`. Save, then:
+Paste your `API511_TOKEN` and, if desired, `GEOAPIFY_KEY` from your laptop's `.env`. For Oracle
+production, set `GEOCODER=photon` even when retaining a `GEOAPIFY_KEY`: the host can reach Photon
+but has timed out reaching `api.geoapify.com`, and without an explicit provider the key selects
+Geoapify. Save, then:
 
 ```
 ssh opc@<ip> 'sudo systemctl restart sfci && sudo journalctl -u sfci -n 30 --no-pager'
@@ -58,13 +63,34 @@ ssh opc@<ip> 'sudo systemctl restart sfci && sudo journalctl -u sfci -n 30 --no-
 
 You should see the `[boot] RAPTOR engine ON … WALK GRAPH ON` line.
 
+Verify provider reachability through the application, rather than merely checking that a key is
+present:
+
+```
+ssh opc@<ip> 'curl -fsS "http://localhost:8000/geocode?q=Ferry%20Building"'
+```
+
+This must return a JSON result with `lat`, `lon`, and `label`; a 502 means the selected upstream
+geocoder is not reachable from the host.
+
+> **Existing boxes (installed before 2026-07-11):** the old `/etc/sfci.env` template pinned
+> `RAPTOR_SEMANTIC=arriveby`, which predates the 2026-06-17 default flip to **departafter**
+> (the R5-validated served map). install.sh preserves user edits, so re-running it will NOT
+> fix this — do a one-time edit: delete the `RAPTOR_SEMANTIC=arriveby` line from
+> `/etc/sfci.env` (the code default, departafter, then rules) and `sudo systemctl restart
+> sfci`. Verify with `curl -s localhost:8000/healthz` → `"semantic": "departafter"`.
+> Likewise delete any `DEFAULT_ADDRESS=` line — the served page stopped injecting a default
+> workplace on 2026-06-13 (privacy invariant); the setting has no effect.
+
 ## 4. Cloudflare Origin CA cert (end-to-end HTTPS without port 80 exposure)
 
 This is what lets us drop port 80 entirely (no Let's Encrypt HTTP-01 challenge dependency) and
 keep 80/443 locked to Cloudflare IPs only.
 
 1. Cloudflare dashboard → SSL/TLS → **Origin Server** → **Create Certificate**.
-2. Hostnames: `sfcommutemap.com, *.sfcommutemap.com`. Validity: **15 years** (default). Key: RSA.
+2. Hostnames: `sfcommutemap.com, www.sfcommutemap.com`. Keep this exact list synchronized with
+   `deploy/Caddyfile`. Validity: **15 years** (default). Key: RSA. The co-hosted bus app uses its
+   own `bus.sfcommutemap.com` vhost and dedicated Origin CA certificate.
 3. Click Create. Cloudflare shows two text blocks. Save them locally as:
    - `origin-cert.pem` (the Origin Certificate)
    - `origin-key.pem` (the Private Key — **you only see this once**, copy carefully)
@@ -121,11 +147,11 @@ the map then snap once.
 
 ## 8. Lock down origin to Cloudflare-only
 
-`cloudflare-ufw.timer` fires ~2 min after boot and weekly thereafter; it pulls CF's current IP
-ranges and rewrites ufw so only those CIDRs can reach 80/443. To force it now:
+`cloudflare-ufw.timer` fires ~2 min after boot and weekly thereafter; despite its historic name,
+it refreshes a dedicated firewalld zone so only Cloudflare CIDRs can reach 80/443. To force it now:
 
 ```
-ssh opc@<ip> 'sudo systemctl start cloudflare-ufw && sudo ufw status numbered | head -30'
+ssh opc@<ip> 'sudo systemctl start cloudflare-ufw && sudo firewall-cmd --zone=public --list-services && sudo firewall-cmd --zone=cloudflare --list-sources'
 ```
 
 After this, an attacker who learns the Oracle IP can't bypass Cloudflare to hit the origin
@@ -153,9 +179,31 @@ deploy/push.sh opc@<ip>
 ssh opc@<ip> 'sudo systemctl restart sfci'
 ```
 
-`push.sh` only rsyncs the diff. Restart cycles the Python process (~3 s downtime per restart;
-Caddy returns 502 during that window). For zero-downtime in v2 we'd add gunicorn + systemd
-socket activation; skipped for v1 because the audience is tiny and the restart is rare.
+`push.sh` only rsyncs the diff. Restart runs `scripts/warm_numba.py` through the unit's
+`ExecStartPre` before accepting traffic, so changed compiled signatures are populated in the same
+Numba cache on every ordinary redeploy rather than by the first visitor. Its public pin covers the
+normal journey flow, and a separate tiny synthetic schedule warms the optional planned one-transfer
+dispatcher even on a service day with no matching transfer topology. Caddy returns 502 during the
+restart; its duration is warmup-dependent rather than a fixed ~3 seconds. For zero-downtime in v2
+we'd add gunicorn + systemd socket activation;
+skipped for v1 because the audience is tiny and the restart is rare.
+
+When an update changes `deploy/Caddyfile`, apply it through `install.sh`, which preserves the
+co-hosted bus app's fenced vhost. Then validate the merged live file and restart Caddy:
+
+```
+ssh opc@<ip> 'sudo bash /opt/sfci/deploy/install.sh && sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl restart caddy'
+```
+
+Do not install the sfci base Caddyfile directly over `/etc/caddy/Caddyfile`; doing so removes
+co-hosted fenced vhosts such as `bus.sfcommutemap.com`.
+
+The Caddyfile deliberately sets `admin off`; the packaged `ExecReload` posts to the default
+admin endpoint (`localhost:2019`), so `systemctl reload caddy` is unavailable. A restart is
+therefore the supported, validated configuration-apply path.
+
+Caddy access records remain JSON and are retained by journald; inspect them with
+`sudo journalctl -u caddy -f`.
 
 ## Health checks
 
@@ -164,17 +212,23 @@ socket activation; skipped for v1 because the audience is tiny and the restart i
 | `journalctl -u sfci -f` | live app logs |
 | `journalctl -u caddy -f` | live HTTPS access log |
 | `systemctl status sfci caddy sfci-keepalive.timer cloudflare-ufw.timer` | service health |
+| `ssh opc@<ip> 'curl -fsS "http://localhost:8000/geocode?q=Ferry%20Building"'` | application-to-geocoder reachability; JSON coordinates/label, not 502 |
 | `curl https://sfcommutemap.com/` (from anywhere) | end-to-end probe |
 | Cloudflare dashboard → Analytics | edge traffic / cache hit ratio |
 | `ssh opc@<ip> 'free -h'` | RSS sanity (sfci ~250 MB warm) |
 
 ## Rollback
 
+To roll back, restore the saved known-good file set or redeploy that release with
+`deploy/push.sh`, then restart the service:
+
 ```
-ssh opc@<ip> 'cd /opt/sfci && git reset --hard HEAD~1 && sudo systemctl restart sfci'
+deploy/push.sh opc@<ip>
+ssh opc@<ip> 'sudo systemctl restart sfci'
 ```
 
-(Works because `push.sh` includes `.git/`.)
+`push.sh` can rsync an uncommitted working tree; therefore do not use blind `HEAD~1` as a rollback
+target. Keep a saved known-good export (or an identified clean local checkout) for recovery.
 
 ## Component layout
 
@@ -193,5 +247,4 @@ ssh opc@<ip> 'cd /opt/sfci && git reset --hard HEAD~1 && sudo systemctl restart 
                   sfci-keepalive.{service,timer}
                   cloudflare-ufw.{service,timer}
 /var/log/sfci/                      # app logs (logrotate weekly, 4 rotations)
-/var/log/caddy/                     # access logs (Caddy-managed rotation)
 ```

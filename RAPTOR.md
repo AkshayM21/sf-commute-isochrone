@@ -3,12 +3,12 @@
 A self-built reverse **range-RAPTOR** router that replaces the expensive per-cell R5 pass for
 the map's travel-time coloring. It computes door-to-door times from every grid cell to a
 workplace **in one reverse search + a precomputed walk-access table**, near-exact vs R5 and
-~200–700× faster, with no heavy per-visitor compute. R5 stays in-process only for the on-demand
-hover breakdown (Phase 2 moves that to RAPTOR too).
+~200–700× faster, with no heavy per-visitor compute. R5 is retained for offline validation bakes,
+not normal map or hover handling.
 
-Flag-gated: `USE_RAPTOR=1` is the **DEFAULT** (since 2026-05-25). The default SEMANTIC is
-**`departafter`** (since 2026-06-17 — flipped from `arriveby`; see "Default semantic" below);
-opt into arrive-by with `RAPTOR_SEMANTIC=arriveby`.
+Flag-gated: `USE_RAPTOR=1` is the **DEFAULT**. The server's default `RAPTOR_SEMANTIC=departafter`
+serves the **planned scheduled** metric: one first-boarding-anchored journey, not a p5/p50
+percentile. `RAPTOR_SEMANTIC=arriveby` remains the legacy perfect-timing alternative.
 
 ## How it works
 1. **Build** (`core/raptor_build.py`, JVM-free, ~2 s, disk-cached by feed fingerprint): parse
@@ -21,49 +21,27 @@ opt into arrive-by with `RAPTOR_SEMANTIC=arriveby`.
    kernel (byte-equivalent to the pure-python reference, **120× faster**: 1.66 s → 14 ms).
 3. **Assemble** per cell = `min( pure_walk, min over access stops [ access_walk + stop_time_to_work ] )`,
    using the **baked cell→stop walk-access table** (`scripts/raptor_oracle.py`, the one-time R5
-   walk-matrix precompute; the grid is fixed). Two semantics off the same profile:
-   - **depart-after** p5/p50 over [08:35, 09:05] — bit-comparable to R5's window model (validated);
-     **THE DEFAULT** (since 2026-06-17).
-   - **arrive-by-09:00** — the best-case perfect-timing read; opt-in (`RAPTOR_SEMANTIC=arriveby`).
+   walk-matrix precompute; the grid is fixed). Three engine modes share these inputs:
+   - **planned scheduled depart-after** — the served map: a single scheduled, first-boarding-
+     anchored value whose itinerary and map value are derived from the same planned tree.
+   - **legacy depart-after p5/p50** — the R5-comparable validation/comparison percentile model.
+   - **legacy arrive-by-09:00** — a perfect-timing alternative.
 
-## Default semantic: depart-after (the 2026-06-17 flip)
-The served default flipped `arriveby` → `departafter`. WHY: depart-after is the **R5-validated**
-read (MAE 0.75 vs R5's window model) and is **TRUE-ZERO walk-speed monotone** — the
-percentile-over-window value has no single-departure "latest run before 09:00" jiggle, so a
-faster walk can NEVER lengthen the commute (measured 0/11449 faster-walk-longer cells over the
-default workplace subset; `test_departafter_walkspeed_monotonicity` asserts STRICT 0). The map is
-best-case (p5) / typical (p50) over the window with no deadline buffer. Both semantics stay
-**JVM-free** (`_NEED_R5` False) and serve map + hover + color-by-line from RAPTOR back-pointers;
-depart-after traces the window's per-T* trees (`DepartAfterJourneyTree`, ~15-17 distinct T* per
-workplace), so **hover==map holds PER PERCENTILE** (p5 journey total == map p5, p50 journey total
-== map p50). Color-by-line under depart-after builds those per-T* trees lazily (~0.9 s the first
-toggle), the multi-tree cost vs arrive-by's single 09:00 tree.
+## Default product metric
 
-**Metric model (depart-after):** best-case (p5) and typical (p50) are DIFFERENT percentiles →
-DIFFERENT journeys → possibly DIFFERENT routes; `/itinerary` returns both. The map/headline shows
-the bare percentile the map paints (selector-driven). The **service-noise MC is a bad-day chip +
-alt-lines ONLY** — `/variance` carries `{frag, stuck, alt}`, NO `realistic` headline (the typical
-headline IS the served p50, never the committed MC value). Fragility reconciles: a route's `frag`
-= `committed_p90 − the served p50` (same per-workplace seed), so `served_p50 + frag` is the
-consistent bad-day clock; the primary pinned strip's frag == that cell's `/variance` frag. (Under
-`arriveby`, `/variance` keeps the committed `realistic` headline — the split doesn't apply.)
+The server routes `RAPTOR_SEMANTIC=departafter` through the planned scheduled model. The headline
+is therefore neither a best-case nor a median percentile: it is the selected scheduled branch.
+`/itinerary`, color-by-line, and the map use the same planned tree, so the displayed route totals
+match the painted value. The legacy percentile model remains available through the engine API for
+R5 comparison, but it is not the served map metric. All product requests are JVM-free when the
+walk graph is enabled.
 
-**Arrive-by vs depart-after fragility can't be unified:** arrive-by floors/measures with `ceil`
-on the perfect-timing base while depart-after rounds the served p50, so the two derivations
-differ by a sub-minute rounding and are deliberately kept separate per semantic.
+`RAPTOR_SEMANTIC=arriveby` is retained for the perfect-timing arrive-by alternative. It is a
+different metric and should not be described as the default or compared directly to the planned
+headline as though it were a percentile.
 
-The opt-in **arrive-by** is the best-case PERFECT-TIMING commute (~6 min rosier, ~1.7%
-non-monotone, ~46% dominant-route match to R5's depart-after) — inherent, not a bug. The arrive-by
-path is byte-unchanged by the flip (the in-process test suite pins `arriveby` to keep it covered).
-
-**Goldens (one per semantic):** `tests/make_golden.py` writes BOTH
-`golden_exact_ferry.json` (arrive-by, the opt-in / in-process suite path) AND
-`golden_exact_ferry_departafter.json` (depart-after, the served default). The depart-after golden
-is tested by a child-process boot (`test_compute_exact_matches_golden_departafter`) so the DEFAULT
-path has real golden coverage that does not skip under the arrive-by-pinned in-process fixture.
-
-Per request the server computes the workplace's egress (W→stops) + pure-walk (W→cells) via **one
-light R5 walk matrix**, then runs the engine. The only R5 use on the map path; no per-cell pass.
+Per request the server computes workplace egress (W→stops) + pure-walk (W→cells) with the
+hill-aware walk graph, then runs the engine. R5 is not on the served map path.
 
 ### Hard-won modeling facts (preserved from the spike)
 - **60 s board slack** (reach a stop ≥60 s before departure) — without it the router runs ~2.7 min
@@ -242,13 +220,11 @@ Knobs (env): `USE_RAPTOR`, `RAPTOR_SEMANTIC` (departafter|arriveby), `RAPTOR_ACC
 `RAPTOR_WALK_RELUCTANCE` (1.15) + `RAPTOR_WALK_PRIOR_EPS` (60) — the mild walk prior (see Hard-won facts).
 Tests: `pytest tests/test_raptor.py` (JVM-free).
 
-## Two semantics (RAPTOR_SEMANTIC), and what each ships
-- **`departafter`** — map = depart-after p5/p50 (the R5-validated MAE 0.75 above); breakdown +
-  color-by-line stay on R5 recorded paths. **This is the validated, R5-consistent Phase-1 ship.**
-- **`arriveby`** (default, per review) — map = the *actual commute* of the latest-feasible journey
-  arriving by 09:00, AND the breakdown + color-by-line come from the same RAPTOR traced tree
-  (Phase 2). Internally consistent (hover == map exact) and deterministic, but see the route
-  caveat below.
+## Server semantics (`RAPTOR_SEMANTIC`)
+
+- **`departafter`** (default) — serves the planned scheduled map and its matching planned tree.
+  The separately callable legacy p5/p50 model is for validation/comparison, not this map.
+- **`arriveby`** — opt-in perfect-timing arrive-by routing, with a matching traced tree.
 
 ## Phase 2: journey reconstruction from RAPTOR — status
 Design: `prototypes/spike_raptor/PHASE2_DESIGN.md`. Implemented: `raptor.reverse_raptor_traced`
@@ -431,8 +407,8 @@ next local), so the spread captures missed-transfer **re-routing**, not a naive 
   committed_p50 > served_p50 — mean +3.2, max +16) + `test_api.py::test_itinerary_equals_map_departafter`
   (the subprocess driver now asserts the both-journey hover==map + the `{frag,stuck,alt}`-only `/variance`
   + per-route p5≤p50 + that the primary pinned strip's frag == the served `/variance` frag). The
-  frontend wiring is a SEPARATE follow-up. RAPTOR_SEMANTIC default stays `arriveby`; the arrive-by MC
-  + `/itinerary` + `/variance` paths are byte-unchanged.
+  frontend wiring is a SEPARATE follow-up. The served default remains planned `departafter`; the
+  arrive-by MC + `/itinerary` + `/variance` paths remain available as the opt-in alternative.
 
 **Validation** (`scripts/raptor_validate_mc.py`, `tests/test_raptor.py::test_mc_*`): committed vs R5's
 *schedule-perfect* p50 (NOT ground truth for a delayed commute — committed should sit ABOVE it).
@@ -474,10 +450,12 @@ pedestrian router. SF is steep and R5 ignores grade, so this is **more accurate*
   (alight→work) + pure-walk (home→work) route on the **transposed** graph so uphill≠downhill (on a
   real 16% block: uphill 126 s vs downhill 89 s). `scripts/bake_walk_access.py` rebakes the
   cell→stop access table from the router (same CSR format the engine consumes).
-- **Speed toggle** (slow 4.0 / **med 4.8** / fast 5.6 km/h): a `walk_scalar = 4.8/pace` threaded
-  through `engine.{departafter,arriveby,journey_tree,montecarlo}` (`_scale_walk` multiplies every
-  walk reference-second) + the server (`?speed=`, in the cache keys) + the frontend (`#speed`
-  control, `&sp=` hash). The access table + egress stay reference seconds, cached once.
+- **Speed toggle** (slow 3.4 / **med 4.2** / fast 5.2 km/h): a `walk_scalar = 4.8/pace` threads
+  through access, transfer footpaths, egress, and pure walking in every engine tree/commute path
+  (and therefore Monte Carlo through its tree) + the server (`?speed=`, in the cache keys) + the
+  frontend (`#speed` control, `&sp=` hash). The access table + egress stay reference seconds,
+  cached once. The engine API's `walk_scalar=1.0` default intentionally means the **4.8 km/h bake
+  reference**, not served Medium; the server passes Medium's calibrated `4.8/4.2` scalar explicitly.
 - **JVM drop:** with `USE_RAPTOR=1 USE_WALK_GRAPH=1` + arrive-by, the server parses flags up top and
   skips the r5py/`com.conveyal` import + the `NET` build (`_NEED_R5=False`); cell coords come from
   the JVM-free grid (`ORIGIN_LL`). Verified: 0 libjvm handles in-process, **RSS ~333 MB** (was

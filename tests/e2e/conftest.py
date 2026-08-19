@@ -1,8 +1,8 @@
 """
 Shared fixtures + helpers for the SF Commute Explorer end-to-end browser suite.
 
-These tests drive the ALREADY-RUNNING Flask+R5 server at http://127.0.0.1:8000
-(the real featured server — they do NOT boot their own R5). Run the server first:
+These tests drive the ALREADY-RUNNING JVM-free Flask + RAPTOR + walk-graph server at
+http://127.0.0.1:8000. They do not boot their own application process. Run the server first:
 
     .venv/bin/python scripts/server.py
 
@@ -14,8 +14,9 @@ Design notes / why things look the way they do:
     detect the resulting Leaflet tooltip/popup. `find_colored_cell_hover` scans a grid of
     points until one opens the `.bd` breakdown — this is robust to map recentering.
   * The page's JS state lives in MODULE scope (`let TT={}` etc.), NOT on `window`. So we
-    detect "map computed" via the user-visible `#dest` text ("fast ~Nms") and the
-    neighborhood list populating — exactly what a user sees — rather than poking globals.
+    detect "map computed" via the user-visible destination label and neighborhood list
+    populating — exactly what a user sees — rather than poking globals. The RAPTOR backend
+    deliberately omits the legacy implementation-timing string ("fast ~Nms").
   * PRIVACY: tests only ever type neutral public addresses ("ferry building" / "1 Market
     St"). Never the user's saved workplace. Every test starts from a clean slate
     (localStorage cleared, location.hash cleared) for isolation.
@@ -66,7 +67,7 @@ def set_address(page: Page, addr: str, *, via="go", tap=False):
 
     via="go"    -> fill the box and click/tap the Set button (#go)
     via="enter" -> fill the box and press Enter (falls back to /geocode of typed text)
-    Waits until the fast map lands (#dest shows 'fast ~Nms' and the neighborhood
+    Waits until the first map lands (#dest has the selected label and the neighborhood
     list populates), i.e. the user-visible "computed" signal.
     """
     page.fill("#addr", addr)
@@ -88,14 +89,14 @@ def set_address(page: Page, addr: str, *, via="go", tap=False):
 
 
 def wait_for_fast_map(page: Page):
-    """Block until the fast (#compute) map has rendered: #dest reads 'fast ~..ms'
-    and at least one neighborhood row exists in #list."""
+    """Block until the first /compute map has visibly rendered.
+
+    A populated neighborhood list is the durable completion signal. ``#dest`` must retain a
+    non-empty selected-place label; RAPTOR intentionally does not expose the legacy timing text.
+    """
     page.wait_for_function(
-        "() => document.querySelector('#dest').textContent.includes('fast')",
-        timeout=COMPUTE_TIMEOUT,
-    )
-    page.wait_for_function(
-        "() => document.querySelectorAll('#list .nb').length > 0",
+        """() => document.querySelector('#dest').textContent.trim().length > 0 &&
+          document.querySelectorAll('#list .nb').length > 0""",
         timeout=COMPUTE_TIMEOUT,
     )
 
@@ -125,14 +126,12 @@ def find_colored_cell_hover(page: Page):
 
 
 def find_colored_cell_tap(page: Page):
-    """Tap across a grid of map pixels until a Leaflet popup breakdown opens over a cell.
-    Returns (x, y) of the hit, or None. Used for the mobile tap-to-breakdown path
-    (touch has no hover, so the cell breakdown must come from a TAP -> popup).
+    """Tap across the map until the touch-first commute preview opens over a colored cell.
 
-    A tap on a colored cell opens a Leaflet popup (placeholder '…' first, then the .bd
-    content after the async /itinerary fetch). A tap on empty ocean/edge opens nothing, so
-    we use the popup appearing as the cell-hit signal, then give the fetch time to fill .bd.
-    Bias the scan toward the marker/cell band rather than the corners."""
+    Touch intentionally has no hover or tiny Leaflet popup: the first tap opens ``#touchpeek``
+    with a lightweight cached itinerary, and its explicit Inspect action opens the full route
+    sheet. A tap on ocean/empty map opens nothing. Returns the hit point or ``None``.
+    """
     import time
     box = map_box(page)
     x0, y0 = int(box["x"]), int(box["y"])
@@ -141,14 +140,17 @@ def find_colored_cell_tap(page: Page):
         for y in range(y0 + 150, y0 + h - 200, 28):
             page.touchscreen.tap(x, y)
             time.sleep(0.12)
-            if page.query_selector(".leaflet-popup"):
-                # Cell hit — let the breakdown fetch land.
+            if page.query_selector("#touchpeek.open"):
+                # Cell hit — let the lightweight preview fetch land.
                 try:
-                    page.wait_for_selector(".bd", timeout=4_000)
+                    page.wait_for_function(
+                        """() => { const e=document.getElementById('peekbody');
+                          return e && !e.textContent.includes('Loading commute'); }""",
+                        timeout=4_000,
+                    )
                     return (x, y)
                 except Exception:
-                    # popup opened but breakdown failed to fill; treat as a hit location and
-                    # let the caller assert on .bd so the failure is reported precisely.
+                    # Preview opened but failed to fill; let the caller report the precise state.
                     return (x, y)
     return None
 

@@ -32,9 +32,9 @@ if ! curl -sf -o /dev/null "$BASE/"; then
   exit 1
 fi
 
-EXTRA=()
-[[ "${HEADED:-0}" == "1" ]] && EXTRA+=(--headed)
-
 # Run from tests/e2e so pytest.ini + conftest.py apply and `import conftest` works.
 cd "$HERE"
-exec "$PY" -m pytest "${EXTRA[@]}" "$@"
+if [[ "${HEADED:-0}" == "1" ]]; then
+  exec "$PY" -m pytest --headed "$@"
+fi
+exec "$PY" -m pytest "$@"
