@@ -161,6 +161,49 @@ function templateConstValue(...names) {
 }
 const T_ALT_CASING = templateConstValue("ALT_CASING");   // the live identity-casing palette
 
+// Startup state is deliberately classified in the synchronous <head> script so a returning user
+// or shared commute link never paints the first-run address card before normal boot begins.
+function _startupClassifier() {
+  return new Function(`"use strict";${templateFn("classifyStartupState")};return classifyStartupState;`)();
+}
+
+test("startup classifier: valid shared wp wins, validates both coordinates, and otherwise uses valid saved workplace", () => {
+  const classify = _startupClassifier();
+  const saved = JSON.stringify({ lat: 37.7749, lon: -122.4194, label: "Private label" });
+  assert.equal(classify("#wp=37.79,-122.39,Shared%20workplace", saved), "restoring");
+  assert.equal(classify("#wp=37.79,,Malformed", saved), "restoring",
+    "an invalid hash falls back to the user's valid saved workplace");
+  assert.equal(classify("#wp=37.79,,Malformed", "not json"), "onboarding");
+  assert.equal(classify("#wp=37.79,-122.39,First&wp=,0,Last", saved), "restoring",
+    "the last wp follows the late hash parser and valid saved data remains the fallback");
+  assert.equal(classify("#wp=NaN,-122.39,Nope", JSON.stringify({ lat: 37.7, lon: "-122.4" })), "onboarding");
+});
+
+test("startup restore shell is selected before paint and failures remain actionable", () => {
+  const head = TSRC.slice(0, TSRC.indexOf('<link rel="stylesheet"'));
+  assert.match(head, /document\.documentElement\.dataset\.startup=classifyStartupState\(location\.hash,wp\)/,
+    "the privacy-safe state word is set synchronously before CSS loads");
+  assert.doesNotMatch(head, /dataset\.startup\s*=\s*[^;]*(?:lat|lon|label)/,
+    "the root startup attribute never leaks a saved workplace into the DOM");
+  assert.match(TSRC, /:root\[data-startup="restoring"\] #prompt \.ob-onboarding/);
+  assert.match(TSRC, /:root\[data-startup="restoring"\] #prompt \.ob-restoring/);
+  assert.match(TSRC, /id="startup-title">Opening your commute/);
+  assert.match(TSRC, /id="startupretry"[^>]*>Retry/);
+  assert.match(TSRC, /id="startupchange"[^>]*>Change workplace/);
+  assert.match(TSRC, /document\.getElementById\("startupretry"\)\.onclick=retryStartupRestore/);
+  assert.match(TSRC, /document\.getElementById\("startupchange"\)\.onclick=chooseStartupWorkplace/);
+
+  const restore = templateFn("setWorkplace");
+  assert.match(restore, /const startup=!!opts\.startup/);
+  assert.match(restore, /if\(startup\)\{startupRetry=null;setStartupPrompt\("restoring"/);
+  assert.match(restore, /if\(!r\.ok\)throw new Error/,
+    "HTTP failures cannot masquerade as a usable commute payload");
+  assert.match(restore, /startupRetry=\(\)=>setWorkplace\(lat,lon,label,Object\.assign\(\{\},opts,\{startup:true\}\)\)/);
+  assert.match(restore, /setStartupPrompt\("error","We couldn’t open this commute/);
+  assert.match(restore, /if\(myGen===GEN&&startup\)hideStartupPrompt\(\)/,
+    "the shell leaves only after the restored route has painted");
+});
+
 function _daHelpers() {
   const defs = ["stableRouteKey", "routeChoiceKey", "bdFrag", "_daPick", "normalizeBD", "optDA", "optLegs", "optTotal",
     "optRead", "buildCompare", "hoverAltChipData"].map(templateFn).join("\n");
@@ -253,7 +296,10 @@ test("depart-after: optRead/optLegs/optTotal re-pick by the live metric (compare
   assert.equal(H.optTotal(altK), 22, "alt K best-case total");
   assert.equal(H.optRead(prim).head, 20, "optRead head = best-case");
   assert.equal(H.optRead(prim).waitExtra, 0, "no +wait reconciliation");
-  assert.equal(H.optRead(prim).frag, 0, "no per-route frag in Best-case");
+  assert.equal(H.optRead(prim).frag, 6,
+    "bad-day data remains available while the headline shows Best-case");
+  assert.equal(H.optRead(prim).badDayBase, 26,
+    "bad-day stays anchored to the scheduled journey, not the Best-case headline");
   // Toggle to Typical — the SAME (stale) list must now resolve the typical journeys + per-route frag.
   H.metric = "r";
   assert.equal(H.optTotal(prim), 26, "primary typical total after toggle (no re-fetch)");
@@ -1178,9 +1224,9 @@ test("route disclosure: duplicate structural family names gain stop or direction
     family:{key:family,meta:{name}},branch:{key:key,meta:{name:"Walk finish"}}}));
   const html=H.additionalChoicesHTML(choices,choices[0]);
   assert.match(html,/boarding-place">Board at A Street</);
-  assert.match(html,/boarding-detail">Toward Downtown · Services: Northbound/);
+  assert.match(html,/boarding-detail">Toward Downtown, Services: Northbound/);
   assert.match(html,/boarding-place">Board at B Street/);
-  assert.match(html,/boarding-detail">Toward Uptown · Services: Northbound/);
+  assert.match(html,/boarding-detail">Toward Uptown, Services: Northbound/);
 });
 
 test("route disclosure: one family is split by discovered boarding stop and direction", () => {
@@ -1194,9 +1240,9 @@ test("route disclosure: one family is split by discovered boarding stop and dire
   assert.equal((html.match(/data-family="north"/g)||[]).length,2,
     "a single service family never mixes separate boarding contexts in one outer group");
   assert.match(html,/boarding-place">Board at A Street/);
-  assert.match(html,/boarding-detail">Toward Downtown · Services: Northbound/);
+  assert.match(html,/boarding-detail">Toward Downtown, Services: Northbound/);
   assert.match(html,/boarding-place">Board at B Street/);
-  assert.match(html,/boarding-detail">Toward Uptown · Services: Northbound/);
+  assert.match(html,/boarding-detail">Toward Uptown, Services: Northbound/);
 });
 
 test("route disclosure: refresh preserves only the two native disclosure states", () => {
@@ -1215,7 +1261,10 @@ test("route disclosure: refresh preserves only the two native disclosure states"
 
 test("route selection fallback survives rerender and is announced through the dedicated polite status node", () => {
   const render=templateFn("renderPin"),announce=templateFn("announceRouteSelection"),compare=templateFn("compareHTML");
-  assert.match(render,/selectionReplaced=!findChoice\(selKey\)/);
+  assert.match(render,/selectionReplaced=!selectionLocked\|\|!findChoice\(selKey\)/,
+    "only an unlocked initial selection or a removed exact route may be replaced by enrichment");
+  assert.match(render,/if\(selectionLocked&&!findChoice\(selKey\)\)selectionLocked=false/,
+    "a user lock is released only when its exact route disappeared");
   assert.match(render,/pendingSelectionAnnouncement=`Route changed to /);
   assert.ok(render.indexOf("setPinHTML(pinHTML(d))")<render.indexOf("fallbackAnnouncement=pendingSelectionAnnouncement"),
     "fallback copy is published only after replacement inspector markup contains its live node");
@@ -1224,15 +1273,23 @@ test("route selection fallback survives rerender and is announced through the de
   assert.match(announce,/formatMinutes\(choice\.r\.head\)/);
 });
 
-test("route inspector hierarchy has compact choices and exactly one selected route directions disclosure", () => {
+test("route inspector separates compact Choices from a Route Plan with one directions disclosure", () => {
   const compare=templateFn("compareHTML"),row=templateFn("routeRowHTML"),selected=templateFn("selectedRouteHTML");
+  const pin=templateFn("pinHTML");
+  assert.match(compare,/id="route-choices-panel"/);
+  assert.match(selected,/id="route-plan-panel"/);
+  assert.match(compare,/id="view-route-plan"/,
+    "the Choices pane has an explicit route-plan handoff for compact/mobile use");
+  assert.match(pin,/data-inspector-view="choices"/);
+  assert.match(pin,/data-inspector-view="plan"/);
+  assert.match(pin,/data-inspector-view="map"/);
   assert.match(compare,/Recommended route/);
   assert.match(compare,/Good alternatives/);
   assert.match(compare,/See \$\{more\.length\} additional route choice/);
-  assert.match(compare,/selectedRouteHTML\(selected,recommended,d\)/);
   assert.doesNotMatch(row,/routeActionsHTML/,"route rows must not contain inline directions");
   assert.match(selected,/<details class="selected-directions" id="route-directions"/);
-  assert.match(selected,/Step-by-step directions \(\$\{stepCount\} step/);
+  assert.match(selected,/Step-by-step directions/);
+  assert.match(selected,/direction-sequence/);
   assert.match(selected,/<ol class="route-directions">/);
 });
 
@@ -1247,7 +1304,7 @@ function _lockRowHelpers() {
   const defs=["effectiveChoiceKey","lockRow"].map(templateFn).join("\n");
   const harness=`
 "use strict";
-let routePin=7,selKey="__primary__",previewKey=null,directionsOpen=true,draws=0,marks=0,refreshes=0,announcements=0;
+let routePin=7,selKey="__primary__",previewKey=null,directionsOpen=true,selectionLocked=false,draws=0,marks=0,refreshes=0,announcements=0;
 const valid=new Set(["__primary__","alt0","alt1"]);
 function findChoice(key){return valid.has(key)?{o:{key}}:null;}
 function drawSelected(){draws++;}
@@ -1258,7 +1315,7 @@ ${defs}
 return {
   lockRow,
   setState(selected,preview=null){selKey=selected;previewKey=preview;},
-  get state(){return {selKey,previewKey,directionsOpen,draws,marks,refreshes,announcements};},
+  get state(){return {selKey,previewKey,directionsOpen,selectionLocked,draws,marks,refreshes,announcements};},
 };`;
   return new Function(harness)();
 }
@@ -1267,35 +1324,87 @@ test("route locking reuses an already-previewed draw and redraws only a genuinel
   const H=_lockRowHelpers();
   H.setState("__primary__","alt1");
   H.lockRow("alt1");
-  assert.deepEqual(H.state,{selKey:"alt1",previewKey:null,directionsOpen:false,draws:0,marks:1,refreshes:1,announcements:1},
-    "locking the currently previewed route keeps its draw but commits the detail and announcement");
+  assert.deepEqual(H.state,{selKey:"alt1",previewKey:null,directionsOpen:true,selectionLocked:true,draws:0,marks:1,refreshes:1,announcements:1},
+    "locking the currently previewed route keeps its draw, preserves open directions, and records an explicit user lock");
 
   H.lockRow("alt1");
   assert.equal(H.state.draws,0,"re-clicking the locked route stays a no-op");
 
   H.lockRow("alt0");
-  assert.deepEqual(H.state,{selKey:"alt0",previewKey:null,directionsOpen:false,draws:1,marks:2,refreshes:2,announcements:2},
-    "changing route keys redraws, updates summary/detail, and announces exactly once");
+  assert.deepEqual(H.state,{selKey:"alt0",previewKey:null,directionsOpen:true,selectionLocked:true,draws:1,marks:2,refreshes:2,announcements:2},
+    "changing route keys redraws, updates the Plan, preserves directions, and announces exactly once");
+});
+
+function _selectionEnrichmentHelpers() {
+  const harness=`
+"use strict";
+let routePin=7,selKey="manual",previewKey=null,selectionLocked=true,metric="r";
+let mapChoiceKey=null,recommendedChoiceKey=null,recommendedChoiceKeys={},compareList=[],restoreRouteFocusKey=null;
+let pendingSelectionAnnouncement="",resetPinScroll=false,pendingFitId=null;
+const PRIMARY_KEY="primary",pinBody={scrollTop:0},pinCard={querySelector(){return null;}};
+const choices=[
+  {o:{key:"map",isPrimary:true},r:{head:22}},
+  {o:{key:"recommended",isPrimary:false},r:{head:22}},
+  {o:{key:"manual",isPrimary:false},r:{head:24}},
+];
+function captureRouteDisclosureState(){} function buildCompare(){return choices.map(c=>c.o);}
+function routeChoices(){return choices;} function findChoice(key){return choices.find(c=>c.o.key===key)||null;}
+function recommendedChoice(){return findChoice(recommendedChoiceKey)||findChoice(mapChoiceKey)||choices[0];}
+function routeTitle(choice){return choice.o.key;} function formatMinutes(value){return value+" min";}
+function setPinHTML(){} function pinHTML(){return "";} function restoreRouteDisclosureState(){}
+function maybeRoute(){} function requestAnimationFrame(fn){fn();} function fitToCompare(){}
+${templateFn("renderPin")}
+return {
+  render(d){renderPin({properties:{id:7}},d);},
+  setLocked(v){selectionLocked=v;},
+  setMetric(v){metric=v;},
+  get state(){return {selKey,mapChoiceKey,recommendedChoiceKey,selectionLocked};}
+};`;
+  return new Function(harness)();
+}
+
+test("manual route selection survives a later enriched server recommendation", () => {
+  const H=_selectionEnrichmentHelpers();
+  H.render({map_choice_key:"map",recommended_choice_key:"recommended"});
+  assert.deepEqual(H.state,{selKey:"manual",mapChoiceKey:"map",recommendedChoiceKey:"recommended",selectionLocked:true},
+    "the server may refine its recommendation without overriding an explicit choice");
+  H.setLocked(false);
+  H.render({map_choice_key:"map",recommended_choice_key:"recommended"});
+  assert.equal(H.state.selKey,"recommended",
+    "an untouched initial selection adopts the server recommendation when enrichment lands");
+});
+
+test("an untouched selection follows the recommendation for the active time mode", () => {
+  const H=_selectionEnrichmentHelpers();
+  H.setLocked(false);
+  const payload={map_choice_key:"map",recommended_choice_key:"recommended",
+    recommended_choice_keys:{r:"recommended",b:"map"}};
+  H.render(payload);
+  assert.equal(H.state.selKey,"recommended");
+  H.setMetric("b");
+  H.render(payload);
+  assert.equal(H.state.selKey,"map");
 });
 
 function _routeChoiceHelpers() {
-  const defs = ["routeChoices", "recommendedChoice", "routeServices", "serviceNames", "naturalList",
+  const defs = ["choiceMatchesKey", "routeChoices", "recommendedChoice", "mapChoice", "routeServices", "serviceNames", "naturalList",
     "branchServiceRows", "formatMinutes", "legPhysicalMin", "legScheduleAllowanceMin", "optionWalk", "optionScheduleAllowance",
-    "optionTransfers", "routeTitle", "representativeChoices", "routeReason", "practicalChoices", "featuredChoices", "moreRouteChoices",
-    "displayStopName", "routeActionsHTML", "routeRowHTML"].map(templateFn).join("\n");
+    "optionTransfers", "routeTitle", "representativeChoices", "routeReasonParts", "routeReason", "routeBadDay", "routeFactsHTML", "routeTradeoffsHTML",
+    "practicalChoices", "featuredChoices", "moreRouteChoices", "displayStopName", "routeActionsHTML", "routeRowHTML"].map(templateFn).join("\n");
   const harness = `
 "use strict";
 let FAMILIES=[];
-let selKey="__primary__",previewKey=null;
+let selKey="__primary__",previewKey=null,mapChoiceKey=null,recommendedChoiceKey=null;
 function buildFamilies(){return FAMILIES;}
 function optLegs(o){return o.legs||[];}
+function optTotal(o){return o.total;}
 function tlegs(o){return optLegs(o).filter(g=>g&&g.mode==="transit"&&(g.name||g.line));}
 function lname(g){return String((g&&g.name)||(g&&g.line)||"");}
 function uniq(a){const out=[];(a||[]).forEach(x=>{if(x&&!out.includes(x))out.push(x);});return out;}
 function escapeHTML(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function primaryCasing(){return "#fff";}
 ${defs}
-return {setFamilies(f){FAMILIES=f;},routeChoices,recommendedChoice,branchServiceRows,
+return {setFamilies(f){FAMILIES=f;},setKeys(map,recommended){mapChoiceKey=map;recommendedChoiceKey=recommended;},routeChoices,recommendedChoice,mapChoice,branchServiceRows,
   practicalChoices,featuredChoices,moreRouteChoices,optionWalk,optionScheduleAllowance,routeTitle,routeActionsHTML,routeRowHTML};`;
   return new Function(harness)();
 }
@@ -1303,7 +1412,7 @@ return {setFamilies(f){FAMILIES=f;},routeChoices,recommendedChoice,branchService
 function _routeChoiceFamilies() {
   const x=(key,primary,total,line)=>({o:{key,isPrimary:primary,total,identityColor:"#fff",
     legs:[{mode:"transit",name:line,min:total,board:{name:"Fixture Platform"},
-      toward:"Representative Terminal"}]},r:{head:total,frag:0}});
+      toward:"Representative Terminal"}]},r:{head:total,frag:0,fragKnown:true,badDayBase:total}});
   const p=x("__primary__",true,27,"Aurora");
   const sibling=x("alt0",false,22,"Borealis");
   const tail=x("alt1",false,25,"Cedar");
@@ -1320,13 +1429,15 @@ function _routeChoiceFamilies() {
   return [famA,famB];
 }
 
-test("route choices: every exact stable key remains selectable while server primary remains recommended", () => {
+test("route choices: server recommendation can differ from the map choice without hiding either exact route", () => {
   const H=_routeChoiceHelpers();H.setFamilies(_routeChoiceFamilies());
+  H.setKeys("__primary__","alt0");
   const choices=H.routeChoices();
   assert.equal(choices.length,4,"non-representative exact options remain reachable in Additional choices");
   assert.ok(choices.some(choice=>choice.o.key==="alt0"),"exact sibling key survives client rendering");
   const recommended=H.recommendedChoice(choices);
-  assert.equal(recommended.o.key,"__primary__","a faster alternate must not replace server primary");
+  assert.equal(H.mapChoice(choices).o.key,"__primary__","the map keeps its own generating itinerary identity");
+  assert.equal(recommended.o.key,"alt0","the server's practical recommendation is authoritative over map-primary order");
   const row=H.routeRowHTML(recommended,recommended,"recommended");
   assert.match(row,/^<button type="button" class="[^"]*route-choice/);
   assert.equal((row.match(/<button\b/g)||[]).length,1,"a generated route row has one native button");
@@ -1334,6 +1445,38 @@ test("route choices: every exact stable key remains selectable while server prim
   assert.doesNotMatch(row,/aria-label=/,
     "the native button's visible directions must remain its accessible content");
   assert.equal((row.match(/<\/button>/g)||[]).length,1);
+});
+
+test("route choices use compact labeled fact nodes instead of one dense punctuation-separated sentence", () => {
+  const H=_routeChoiceHelpers();H.setFamilies(_routeChoiceFamilies());
+  H.setKeys("__primary__","alt0");
+  const recommended=H.recommendedChoice();
+  const row=H.routeRowHTML(recommended,recommended,"recommended");
+  assert.match(row,/data-choice-key="alt0"/);
+  assert.deepEqual([...row.matchAll(/data-fact="([^"]+)"/g)].map(match=>match[1]),
+    ["walk","transfers","bad-day"],
+    "a choice carries the comparison facts users need before opening its Route Plan");
+  assert.match(row,/route-fact-label">Walking/);
+  assert.match(row,/route-fact-label">Transfers/);
+  assert.match(row,/route-fact-label">Bad day/);
+  assert.match(row,/data-route-reason/);
+  assert.doesNotMatch(row,/ · /,
+    "fact grouping is visual/semantic, not a brittle centered-dot prose run-on");
+});
+
+test("route choices distinguish unavailable bad-day data from a real zero-delay estimate", () => {
+  const H=_routeChoiceHelpers();
+  const families=_routeChoiceFamilies();
+  const choice=families[0].opts[0];
+  choice.r.frag=null;choice.r.fragKnown=false;
+  H.setFamilies(families);
+  let exact=H.routeChoices().find(item=>item.o.key==="__primary__");
+  let row=H.routeRowHTML(exact,H.recommendedChoice(),"recommended");
+  assert.match(row,/route-fact-value">Not available/);
+  choice.r.frag=0;choice.r.fragKnown=true;
+  exact=H.routeChoices().find(item=>item.o.key==="__primary__");
+  row=H.routeRowHTML(exact,H.recommendedChoice(),"recommended");
+  assert.match(row,/route-fact-value">27 min/);
 });
 
 test("route choices: featured rows use one representative per branch while Additional retains exact siblings", () => {
@@ -1361,11 +1504,11 @@ test("route choices: a walk-finish title does not repeat the exact discovered se
   assert.equal(H.routeTitle({
     family:{meta:{name:"Aurora / Borealis / Cedar"}},
     branch:{meta:{name:"walk after Aurora / Borealis / Cedar"}},
-  }),"Aurora / Borealis / Cedar · walk to destination");
+  }),"Aurora / Borealis / Cedar → walk to destination");
   assert.equal(H.routeTitle({
     family:{meta:{name:"Aurora / Borealis"}},
     branch:{meta:{name:"walk after Aurora"}},
-  }),"Aurora / Borealis · walk after Aurora",
+  }),"Aurora / Borealis → walk after Aurora",
   "a branch backed by only part of the corridor catalog remains explicit");
 });
 
@@ -1395,16 +1538,16 @@ test("route actions include alight stops and name the destination of every walk"
 
   assert.match(html,/Walk 4 min to First Platform/,
     "the access walk names the first boarding place");
-  assert.match(html,/Ride 3 min · get off at Transfer Landing &amp; 1st/,
+  assert.match(html,/Ride 3 min, get off at Transfer Landing &amp; 1st/,
     "a ride keeps its normalized alight instruction inside the same numbered action");
   assert.match(html,/Walk 2 min to Second Platform/,
     "a transfer walk names the next boarding place");
-  assert.match(html,/Ride 5 min · get off at Workplace Stop/);
+  assert.match(html,/Ride 5 min, get off at Workplace Stop/);
   assert.match(html,/Walk 6 min to your workplace/,
     "the final walk retains its destination");
   assert.equal((html.match(/class="route-step"/g)||[]).length,5,
     "alight detail must not inflate the numbered step count");
-  assert.match(html,/<small class="route-detail">Ride 3 min · get off at Transfer Landing &amp; 1st<\/small>/,
+  assert.match(html,/<small class="route-detail">Ride 3 min, get off at Transfer Landing &amp; 1st<\/small>/,
     "alight copy is native text, not an aria-only duplicate");
 });
 
@@ -1522,7 +1665,7 @@ test("C7: static metric tip matches the static Realistic/Best-case labels; DEPAR
 // #pincard used to be the scroller (overflow-y:auto) with the × absolutely positioned INSIDE it,
 // so scrolling a tall compare card carried the close button off-screen. Now the card is a
 // non-scrolling shell (flex column, overflow clipped) and only #pinbody scrolls.
-test("C3: #pincard shell doesn't scroll; #pinbody is the scroller", () => {
+test("C3: inspector shell doesn't scroll; the active Choices or Plan pane owns scrolling", () => {
   // Anchor at a standalone root selector: an earlier desktop-state rule also contains
   // `#pincard{...}` as the tail of `body.route-pinned ... #pincard`, which is not the shell rule.
   const cardRule = TSRC.match(/\n\s{2}#pincard\{[^}]*\}/)[0];
@@ -1531,7 +1674,10 @@ test("C3: #pincard shell doesn't scroll; #pinbody is the scroller", () => {
   assert.ok(!/overflow-y:auto/.test(cardRule),
     "#pincard itself must not scroll — the absolutely-positioned × would scroll away with it");
   assert.match(TSRC, /#pincard\.open\{display:flex;flex-direction:column\}/);
-  assert.match(TSRC, /#pinbody\{[^}]*overflow-y:auto/);
+  assert.match(TSRC, /#pinbody\{[^}]*overflow:hidden/,
+    "the shell body remains non-scrolling so the close control never scrolls away");
+  assert.match(TSRC, /\.route-choices-pane,\.route-plan-pane\{[^}]*overflow-y:auto/,
+    "each independently switchable content surface owns its own scroll position");
   assert.match(TSRC, /body\.route-pinned #legend\{display:none\}/,
     "route inspection must not compete with the broad map legend");
   assert.match(TSRC, /body\.route-pinned:not\(\.route-adjusting\) #panel\{display:none\}/,
@@ -1539,7 +1685,8 @@ test("C3: #pincard shell doesn't scroll; #pinbody is the scroller", () => {
   assert.match(TSRC, /body\.route-pinned\.route-adjusting #panel\{display:flex/,
     "Adjust can deliberately reveal controls without losing the pinned route");
   assert.ok(TSRC.includes('document.body.classList.add("route-pinned")'));
-  assert.match(TSRC, /document\.body\.classList\.remove\("route-pinned"(?:,"route-adjusting","pin-map-view")?\)/);
+  assert.match(TSRC, /document\.body\.classList\.remove\("route-pinned","route-adjusting","pin-map-view","pin-plan-view"\)/,
+    "closing the inspector clears all three Choices/Plan/Map view states");
   assert.ok(TSRC.includes("resetPinScroll=true"),
     "a new pin must arm a reset through the async placeholder/final-card replacement");
   assert.match(TSRC, /requestAnimationFrame\(\(\)=>\{\s*if\(routePin===f\.properties\.id\)pinBody\.scrollTop=0;/,
@@ -1567,7 +1714,7 @@ test("touch route inspection uses first-tap preview and same-cell second-tap ins
     "the preview exposes an explicit Inspect routes action");
   assert.match(TSRC,/Show all \$\{count\} routes on map/,
     "collapsed-map action names the exact routes it will reveal");
-  assert.match(templateFn("pinHTML"),/mapRouteToggleHTML\(choices,recommended,selected\)/,
+  assert.match(templateFn("compareHTML"),/mapRouteToggleHTML\(choices,recommended,selected\)/,
     "the map expansion control is omitted when compact mode already contains every route");
   assert.match(TSRC,/Show featured routes on map/,
     "expanded-map action names the compact route set it restores");
@@ -1716,18 +1863,17 @@ test("hover keeps heatmap opacity unchanged while explicit selection gets an opa
 });
 
 test("mobile pin settings are compact tokens that wrap instead of clipping the active mode", () => {
-  assert.match(TSRC,/\.pin-context>\.pin-settings\{[^}]*flex:1 1 154px[^}]*flex-wrap:wrap/);
-  assert.doesNotMatch(TSRC,/\.pin-context span\{[^}]*text-overflow:ellipsis/,
-    "the settings summary must not hide its active mode behind an ellipsis");
+  assert.match(TSRC,/\.pin-settings\{display:grid;grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
+  assert.match(TSRC,/#pincard \.pin-context\{grid-template-columns:1fr;align-items:start;gap:9px\}/,
+    "on mobile, settings take their own row instead of competing with the Adjust control");
   const pin=templateFn("pinHTML");
   assert.doesNotThrow(()=>new Function(pin),"the tokenized header remains valid browser JavaScript");
   assert.match(pin,/const settings=\[/);
   assert.match(pin,/"Scheduled"/);
   assert.match(pin,/"Medium"/);
   assert.match(pin,/class="pin-settings" aria-label="Route settings:/);
-  assert.match(pin,/settings\.map\(setting=>`<span>/,
+  assert.match(pin,/settings\.map\(\(\[label,value\]\)=>`<span/,
     "each setting is a separately wrappable, readable token");
-  assert.match(TSRC,/#pincard \.pin-context\{align-items:flex-start;flex-wrap:wrap\}/);
 });
 
 test("route-row focus previews are desktop-only; touch cannot trigger focus redraws", () => {
@@ -1920,7 +2066,7 @@ function _closeDuringLightJsonHarness() {
 let GEN=1,maxxfers="any",walkspeed="med",routePin=7,EXACT=true,REAL={},VAR={};
 let bdTimer=null,bdActive=null,bdToken=0,bdLightFlight=null,pinFeature=null;
 let pinUpgradeSeq=0,pinUpgradeKey="",pendingFitId=null,resetPinScroll=false;
-let compareList=[],selKey="primary",previewKey=null,allRoutesOpen=false,showAllRoutes=false,hoverCell=null;
+let compareList=[],selKey="primary",previewKey=null,mapChoiceKey=null,recommendedChoiceKey=null,recommendedChoiceKeys={},selectionLocked=false,allRoutesOpen=false,showAllRoutes=false,hoverCell=null;
 const PRIMARY_KEY="primary",DESTLL=[37.7,-122.4],html=[],routes=[];
 function resetRouteDisclosureState(){allRoutesOpen=false;}
 const f={properties:{id:7,n:"Closing area"}};
@@ -2080,13 +2226,12 @@ test("mobile Map view reserves the bottom sheet and refits the loaded route into
   const insets=templateFn("viewInsets");
   assert.match(insets,/classList\.contains\('pin-map-view'\)[\s\S]*bottom=Math\.max\(bottom,sz\.y-qc\.t\)/,
     "compact mobile Map mode treats the inspector as a bottom occluder");
-  const switcher=TSRC.slice(TSRC.indexOf('const view=e.target.closest'),
-    TSRC.indexOf('const all=e.target.closest'));
-  assert.match(switcher,/const showMap=view\.dataset\.view==="map"/);
+  const switcher=templateFn("setInspectorView");
+  assert.match(switcher,/const showPlan=view==="plan",showMap=view==="map"/);
   assert.match(switcher,/if\(showMap\)fitToCompare\(\)/,
     "revealing the map must refit route geometry after the sheet changes size");
-  assert.match(TSRC,/body\.pin-map-view #pincard \.pin-head\{[^}]*safe-area-inset-bottom/,
-    "compact Map controls must clear the device home-indicator safe area");
+  assert.match(TSRC,/body\.pin-map-view #pincard \.pin-map-summary\{[^}]*safe-area-inset-bottom/,
+    "the compact Map summary clears the device home-indicator safe area");
 });
 
 test("the route inspector region is stable while dedicated status nodes announce updates", () => {

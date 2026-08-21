@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 import pytest
 
-from conftest import BASE_URL
+from conftest import BASE_URL, shot
 from route_family_hotspots import (
     ARTIFACT_PATH,
     DEFAULT_SEED,
@@ -96,6 +96,34 @@ def _expand_all_route_disclosures(page):
     )
     page.wait_for_function(
         "() => document.querySelectorAll('#all-routes-panel .route-choice').length > 0"
+    )
+
+
+def _open_route_plan(page, *, touch=False):
+    """Open the selected route plan through the surface appropriate to this viewport."""
+    plan = page.locator("#route-plan-panel")
+    if plan.is_visible():
+        return
+    cta = page.locator("#view-route-plan")
+    control = cta if cta.is_visible() else page.locator('#pinview [data-view="plan"]')
+    (control.tap if touch else control.click)()
+    page.wait_for_function(
+        "() => document.getElementById('route-plan-panel') && "
+        "getComputedStyle(document.getElementById('route-plan-panel')).display !== 'none'"
+    )
+
+
+def _open_route_choices(page, *, touch=False):
+    """Return a narrow/mobile inspector from detail or map to the choice surface."""
+    choices = page.locator("#route-choices-panel")
+    if choices.is_visible():
+        return
+    control = page.locator('#pinview [data-view="choices"]')
+    (control.tap if touch else control.click)()
+    page.wait_for_function(
+        "() => !document.body.classList.contains('pin-map-view') && "
+        "!document.body.classList.contains('pin-plan-view') && "
+        "getComputedStyle(document.getElementById('route-choices-panel')).display !== 'none'"
     )
 
 
@@ -353,7 +381,8 @@ def test_saved_hotspot_family_card_matches_api_and_fits(new_context, context_arg
         assert peek_sizes and min(peek_sizes) >= 43.5, peek_sizes
         page.locator("#peekinspect").tap()
 
-    page.wait_for_selector("#pincard.open .route-recommendations .route-choice", timeout=30_000)
+    page.wait_for_selector("#pincard.open #route-choices-panel .route-recommendations .route-choice", timeout=30_000)
+    page.wait_for_selector("#pincard.open #route-plan-panel", state="attached", timeout=30_000)
     # The inspector intentionally paints its cached/lightweight response immediately, then swaps in
     # the complete pinned branch set. Compare the final DOM to pin=1 only after that enrichment has
     # committed; waiting on the unrelated settings-recompute class can race this transition.
@@ -376,6 +405,13 @@ def test_saved_hotspot_family_card_matches_api_and_fits(new_context, context_arg
     assert not api_errors, api_errors
     metrics = route_metrics(body)
     assert metrics["routes"] >= 2, f"saved hotspot lost all alternatives: {metrics}"
+    viewport_width = context_args["viewport"]["width"]
+    shot(page, f"route_inspector_v2_{viewport_width}_choices")
+    if viewport_width in {1280, 390}:
+        page.evaluate("() => { themePref='dark'; applyTheme(); }")
+        page.wait_for_timeout(250)
+        shot(page, f"route_inspector_v2_{viewport_width}_choices_dark")
+        page.evaluate("() => { themePref='auto'; applyTheme(); }")
 
     # Expand the remaining-choice surface before comparing the disjoint union of recommendation,
     # practical, and remaining rows with the API and measuring whether its last route is reachable.
@@ -383,6 +419,10 @@ def test_saved_hotspot_family_card_matches_api_and_fits(new_context, context_arg
         _expand_all_route_disclosures(page)
     snapshot = dom_family_snapshot(page)
     assert_api_matches_dom(body, snapshot)
+    if context_args["viewport"]["width"] >= 1240:
+        assert snapshot["choices_visible"] and snapshot["plan_visible"], snapshot
+    else:
+        assert snapshot["choices_visible"] and not snapshot["plan_visible"], snapshot
     crowding = measure_family_card(page)
     assert crowding["families"] == metrics["families"]
     assert crowding["branches"] == metrics["branches"]
@@ -408,7 +448,7 @@ def test_saved_hotspot_family_card_matches_api_and_fits(new_context, context_arg
     # Every input path uses the exact route key advertised by one flat route-choice row. Desktop
     # covers transient pointer preview, keyboard focus preview, and click lock; touch covers tap.
     choice = page.locator("#pincard .route-choice").last
-    expected_key = choice.get_attribute("data-key")
+    expected_key = choice.get_attribute("data-choice-key")
     expected_family = choice.get_attribute("data-family")
     expected_branch = choice.get_attribute("data-branch")
     expected_time = choice.locator(".route-time").evaluate(
@@ -441,7 +481,30 @@ def test_saved_hotspot_family_card_matches_api_and_fits(new_context, context_arg
             arg=[expected_key, expected_family, expected_branch], timeout=5_000,
         )
     assert choice.get_attribute("aria-pressed") == "true"
-    assert page.locator('#pincard [data-summary="time"]').inner_text().strip() == expected_time
+    _open_route_plan(page, touch=touch)
+    shot(page, f"route_inspector_v2_{viewport_width}_plan")
+    if viewport_width in {1280, 390}:
+        page.evaluate("() => { themePref='dark'; applyTheme(); }")
+        page.wait_for_timeout(250)
+        shot(page, f"route_inspector_v2_{viewport_width}_plan_dark")
+        page.evaluate("() => { themePref='auto'; applyTheme(); }")
+    assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == expected_key
+    assert page.locator('#route-plan-panel [data-fact="time"] .route-fact-value').inner_text().strip() == expected_time
+    directions = page.locator("#route-directions")
+    (directions.locator("summary").tap if touch else directions.locator("summary").click)()
+    page.wait_for_function("() => document.getElementById('route-directions')?.open")
+
+    # Detail disclosure is an intentional reader state, not something a selection refresh is
+    # allowed to erase. Select the recommendation when it differs from the expert row above.
+    _open_route_choices(page, touch=touch)
+    alternative = page.locator("#route-choices-panel .route-recommendations .route-choice")
+    alternative_key = alternative.get_attribute("data-choice-key")
+    if alternative_key != expected_key:
+        (alternative.tap if touch else alternative.click)()
+        page.wait_for_function("key => selKey===key", arg=alternative_key, timeout=5_000)
+        _open_route_plan(page, touch=touch)
+        assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == alternative_key
+        assert page.locator("#route-directions").evaluate("el => el.open")
 
 
 def test_mobile_inspector_reuses_preview_and_keeps_one_stable_selection(new_context):
@@ -551,7 +614,7 @@ def test_mobile_inspector_reuses_preview_and_keeps_one_stable_selection(new_cont
         choice = page.locator("#all-routes-panel .route-choice").last
     else:
         choice = page.locator("#pincard .route-choice:not(.recommended)").last
-    expected_key = choice.get_attribute("data-key")
+    expected_key = choice.get_attribute("data-choice-key")
     assert expected_key and choice.get_attribute("aria-pressed") == "false"
 
     page.evaluate(
@@ -591,7 +654,27 @@ def test_mobile_inspector_reuses_preview_and_keeps_one_stable_selection(new_cont
     assert selected["layers"] > 0
     assert selected["pressed"] == [expected_key]
 
-    # Compact Map mode preserves the locked route.  Start Routes from scrollTop=0 so the selected
+    # Mobile keeps comparison and directions distinct: the sticky CTA opens a readable plan, and
+    # a later choice change must preserve an intentionally expanded directions disclosure.
+    _open_route_plan(page, touch=True)
+    assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == expected_key
+    page.locator("#route-directions summary").tap()
+    page.wait_for_function("() => document.getElementById('route-directions')?.open")
+    _open_route_choices(page, touch=True)
+    recommended = page.locator("#route-choices-panel .route-recommendations .route-choice")
+    recommended_key = recommended.get_attribute("data-choice-key")
+    assert recommended_key and recommended_key != expected_key
+    recommended.tap()
+    page.wait_for_function(
+        "key => selKey===key && selectionLocked && DRAWN && DRAWN.key===key",
+        arg=recommended_key, timeout=5_000,
+    )
+    _open_route_plan(page, touch=True)
+    assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == recommended_key
+    assert page.locator("#route-directions").evaluate("el => el.open")
+    expected_key = recommended_key
+
+    # Compact Map mode preserves the locked route.  Start Choices from scrollTop=0 so the selected
     # expert row can only become visible if the view-switch restoration explicitly finds it.
     page.evaluate("() => { window.__e2eRouteDraws=0; }")
     page.locator('#pinview [data-view="map"]').tap()
@@ -613,18 +696,18 @@ def test_mobile_inspector_reuses_preview_and_keeps_one_stable_selection(new_cont
         timeout=5_000,
     )
     assert page.locator('#pinview [data-view="map"]').get_attribute("aria-pressed") == "true"
-    page.evaluate("() => { document.getElementById('pinbody').scrollTop=0; }")
+    page.evaluate("() => { document.getElementById('route-choices-panel').scrollTop=0; }")
     map_state = page.evaluate(
         "() => ({key:selKey,drawn:DRAWN?.key||null,layers:routeLayer.getLayers().length})"
     )
     assert map_state["key"] == map_state["drawn"] == expected_key
     assert map_state["layers"] > 0
 
-    page.locator('#pinview [data-view="routes"]').tap()
+    page.locator('#pinview [data-view="choices"]').tap()
     page.wait_for_function(
         """key => {
           if(document.body.classList.contains("pin-map-view"))return false;
-          const body=document.getElementById("pinbody");
+          const body=document.getElementById("route-choices-panel");
           const row=[...document.querySelectorAll("#pincard .route-choice")]
             .find(candidate=>candidate.dataset.key===key);
           if(!row)return false;
@@ -650,7 +733,7 @@ def test_mobile_inspector_reuses_preview_and_keeps_one_stable_selection(new_cont
     assert final_state["layers"] > 0
     assert final_state["draws"] == 0
     assert final_state["pressed"] == [expected_key]
-    assert page.locator('#pinview [data-view="routes"]').get_attribute("aria-pressed") == "true"
+    assert page.locator('#pinview [data-view="choices"]').get_attribute("aria-pressed") == "true"
 
     assert len(itinerary_requests) == request_count_after_inspect, itinerary_requests
     assert not request_failures, request_failures
@@ -737,7 +820,7 @@ def test_mobile_adjust_then_new_cell_owns_one_preview_and_survives_resize(new_co
         }; }"""
     )
     assert card["display"] != "none" and card["width"] > 0 and card["height"] > 0, card
-    assert card["close"] and card["views"] == 2, card
+    assert card["close"] and card["views"] == 3, card
 
 
 def test_mobile_speed_change_cancels_stale_pin_enrichment(new_context):

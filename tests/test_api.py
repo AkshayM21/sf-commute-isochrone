@@ -1026,6 +1026,11 @@ def test_omitted_walk_speed_matches_explicit_medium_across_product_endpoints(cli
     options = [default_itinerary, *(default_itinerary.get("alts") or [])]
     choice_keys = [option.get("choice_key") for option in options]
     assert all(choice_keys) and len(choice_keys) == len(set(choice_keys))
+    assert default_itinerary["map_choice_key"] == default_itinerary["choice_key"]
+    assert default_itinerary["recommended_choice_key"] in choice_keys
+    assert set(default_itinerary["recommended_choice_keys"]) == {"r", "b"}
+    assert all(key in choice_keys
+               for key in default_itinerary["recommended_choice_keys"].values())
 
 
 # --------------------------------------------------------------------------------------

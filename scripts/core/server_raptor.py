@@ -1301,6 +1301,27 @@ def _alt_total(a):
     return int(nested.get("total", a.get("min", a.get("total", 10 ** 6))))
 
 
+def _alt_metric_total(a, metric="r"):
+    """Return the minute the compare UI displays for one selectable time mode.
+
+    The canonical selector continues to use ``_alt_total``.  Recommendations are different: they
+    must answer for the user's active metric.  Arrive-by realistic minutes land in ``real`` after
+    committed replay, while depart-after publishes explicit ``typical`` and ``best`` journeys.
+    """
+    if metric == "b":
+        nested = a.get("best") or a.get("typical") or {}
+        value = nested.get("total", a.get("min", a.get("total")))
+    else:
+        value = a.get("real")
+        if value is None:
+            nested = a.get("typical") or a.get("best") or {}
+            value = nested.get("total", a.get("min", a.get("total")))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 10 ** 6
+
+
 def _leg_name(leg):
     return str((leg or {}).get("name") or (leg or {}).get("line") or "")
 
@@ -2101,6 +2122,45 @@ def _alt_quality_rank(a):
     )
 
 
+def _alt_recommendation_rank(a, metric="r"):
+    """Server-owned practical recommendation rank for a pinned route choice.
+
+    This deliberately differs from ``_alt_quality_rank``.  The latter is a selector/internal
+    representative rank, while this is the user-facing answer to "which of these should I take?"
+    Routes first compete on the *displayed active minute*.  Once that is tied, less actual walking
+    is more useful than sub-minute schedule precision.  The physical-walk helper excludes a folded
+    first-platform/schedule allowance, so changing that presentation allowance cannot make an
+    otherwise identical route win or lose.  The final structural key keeps a fully tied answer
+    deterministic without encoding any route-name knowledge.
+    """
+    return (
+        _alt_metric_total(a, metric),
+        _alt_physical_walk_min(a),
+        _alt_transfers(a),
+        _alt_fragility(a),
+        _alt_exact_seconds(a),
+        -_alt_latest_board_anchor(a),
+        _alt_selection_tie_key(a),
+    )
+
+
+def _recommend_route_choice(primary, alternatives, metric="r"):
+    """Return the best practical route from an already-pruned pinned universe.
+
+    ``primary`` is the canonical map itinerary and remains in this comparison: the map route is
+    not presumed to be the best practical recommendation once the pin has discovered all
+    non-dominated structural alternatives.
+    """
+    options = ([primary] if primary is not None else []) + list(alternatives or ())
+    return min(options, key=lambda option: _alt_recommendation_rank(option, metric)) if options else None
+
+
+def _recommend_route_choices(primary, alternatives):
+    """Return complete-universe recommendations for both selectable UI metrics."""
+    return {metric: _recommend_route_choice(primary, alternatives, metric)
+            for metric in ("r", "b")}
+
+
 # Compatibility alias for internal callers/tests added during the ranking migration.
 _alt_representative_rank = _alt_quality_rank
 
@@ -2208,7 +2268,8 @@ def _build_family_service_catalog(routes, family_keys):
     return catalog
 
 
-def _select_diverse_alts(alts, cap, primary=None, complete_selected_families=False):
+def _select_diverse_alts(alts, cap, primary=None, complete_selected_families=False,
+                         force_include=None):
     """Filter after tracing while preserving generic corridor and tail diversity.
 
     Distinct boarding corridors get first claim on the bounded card. Remaining slots are assigned
@@ -2219,7 +2280,10 @@ def _select_diverse_alts(alts, cap, primary=None, complete_selected_families=Fal
     contribute one representative for every other non-dominated destination-facing branch inside
     both the existing per-family near-tie and generic reservation ceilings.  The result may
     therefore exceed ``cap`` without admitting another boarding corridor.  Hover chips and legacy
-    callers keep the strict cap.
+    callers keep the strict cap.  ``force_include`` accepts one route or a collection selected by
+    the separate recommendation ranks from the complete deduped/dominance-pruned pin universe.
+    Missing recommendations are appended: neither time mode may advertise a route the card hid
+    merely because its display cap spent the available slots on corridor coverage.
     """
     alts = list(alts)
     universe = ([primary] if primary else []) + alts
@@ -2391,6 +2455,16 @@ def _select_diverse_alts(alts, cap, primary=None, complete_selected_families=Fal
     result = sorted(selected, key=_alt_quality_rank)
     if not complete_selected_families:
         result = result[:cap]
+    forced = (list(force_include)
+              if isinstance(force_include, (list, tuple, set)) else [force_include])
+    for forced_option in forced:
+        if (forced_option is not None
+                and any(forced_option is option for option in alts)
+                and not any(forced_option is option for option in result)):
+            # Do not evict a useful corridor/branch merely to make room for a recommendation. The
+            # pin card has a small explicit cap escape hatch (at most one route per time mode).
+            result.append(forced_option)
+    result.sort(key=_alt_quality_rank)
     for option in result:
         option["_family_seed"] = _alt_family_key(option, family_keys)
         option["_family_catalog"] = family_catalog
@@ -2662,7 +2736,7 @@ def _alt_route_preamble(ci, dlat, dlon, max_rides, speed, cache_key=None):
     return ("ready", (geom_cache, cell_alt_stop, chips))
 
 
-def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None):
+def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None, pin=False):
     """The drawn alternative routes for cell ``ci``: for each alt chip line the MC overlay surfaced
     for this cell (the dominance-window alts, after the SAME primary-exclusion + cap /variance
     applies), trace that line's journey from the access stop the window picked (the bundle's per-cell
@@ -2681,12 +2755,23 @@ def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None):
     Performance: warm (alt_geom cached) returns immediately; the tree is the one /compute already
     built + cached for this workplace, so no extra RAPTOR work."""
     speed, walk_scalar = _resolve_walk_speed(speed)
-    status, payload = _alt_route_preamble(ci, dlat, dlon, max_rides, speed)
+    # A pinned response must enumerate the full server-known alternate universe before its
+    # recommendation rank runs.  Keep that richer result under a distinct cache key so a cheap
+    # prior hover (which intentionally traces only the bounded chip list) cannot hide options
+    # from the pin or poison its recommendation marker.
+    status, payload = _alt_route_preamble(
+        ci, dlat, dlon, max_rides, speed,
+        cache_key=(ci, "pinned") if pin else None)
     if status in ("empty", "chipless"):                 # no MC yet / no chip lines for this cell
         return []
     if status == "cached":
         return payload
     geom_cache, cell_alt_stop, chips = payload          # each chip line -> its access stop
+    if pin:
+        # ``alt_stop`` is the complete MC-proven per-cell alternate map; ``alt_chips`` is only a
+        # bounded hover-display slice.  Insertion order comes from the engine's deterministic
+        # near-window ordering, while final order remains server-owned below.
+        chips = list(cell_alt_stop)
     entry = raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)         # cache hit (same tree)
     tree = entry["tree"]
     primary = entry.get("geom", {}).get(ci) or {}
@@ -2715,9 +2800,43 @@ def _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=None):
     primary_option = {"line": _route_label(primary.get("geom")) or "primary",
                       "min": primary.get("total", 10 ** 6),
                       "legs": primary.get("geom") or []}
-    out = _select_diverse_alts(out, RAPTOR_ALT_CHIP_CAP, primary=primary_option)
+    recommendation_candidates = {}
+    if pin:
+        family_keys = _discover_family_keys([primary_option] + out)
+        recommendation_universe = _prune_dominated_alts(
+            out, [primary_option], family_keys)
+        # Normal production trees can score every structural alternative against the retained MC
+        # scenario before presentation caps.  The hasattr guard preserves sparse unit fixtures
+        # which exercise geometry/caching without a complete route-typicals implementation.
+        entry_for_recommendation = raptor_tree(dlat, dlon, max_rides, speed, walk_scalar)
+        full_typicals = (
+            _itinerary_alt_typicals(ci, dlat, dlon, max_rides, speed,
+                                    recommendation_universe)
+            if hasattr(entry_for_recommendation.get("tree"), "_select") else None)
+        if full_typicals is not None:
+            primary_typical = full_typicals.get("prim")
+            if primary_typical is not None:
+                primary_option["real"], primary_option["frag"] = primary_typical
+            for option, typical in zip(recommendation_universe,
+                                       full_typicals.get("alts", ())):
+                if typical is not None:
+                    option["real"], option["frag"] = typical
+        recommendation_candidates = _recommend_route_choices(
+            primary_option, recommendation_universe)
+    forced_recommendations = [
+        candidate for candidate in recommendation_candidates.values()
+        if candidate is not None and candidate is not primary_option
+    ]
+    out = _select_diverse_alts(
+        out, RAPTOR_ALT_CHIP_CAP, primary=primary_option,
+        force_include=forced_recommendations)
+    for option in out:
+        metrics = [metric for metric, candidate in recommendation_candidates.items()
+                   if option is candidate]
+        if metrics:
+            option["_recommendation_metrics"] = metrics
     with _ALT_LOCK:                                      # cache the assembled alts for this cell
-        geom_cache[ci] = out
+        geom_cache[(ci, "pinned") if pin else ci] = out
     return out
 
 
@@ -3013,12 +3132,49 @@ def _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed, prov50,
     }
     if branch_cache:
         _assert_primary_minimum(primary_option, best_by_label.values())
+    # The pinned recommendation is decided from the entire structural candidate universe, before
+    # presentation breadth/caps.  This is deliberately separate from the card selector: the
+    # canonical map itinerary can lose to a same-minute route with less physical walking, and a
+    # useful recommendation must be retained even if its corridor was not otherwise selected.
+    #
+    # Planned branch proxies retain their raw walk durations, so this pruning/ranking phase does
+    # not need to hydrate a street polyline for every candidate.  When MC data exists, score
+    # fragility across that same complete universe before comparison; without it the absent
+    # bad-day field is an honest neutral tie rather than a fabricated estimate.
+    recommendation_universe = list(best_by_label.values())
+    recommendation_candidates = {}
+    if branch_cache:
+        recommendation_families = _discover_family_keys(
+            [primary_option] + recommendation_universe)
+        recommendation_universe = _prune_dominated_alts(
+            recommendation_universe, [primary_option], recommendation_families)
+        # Sparse/offline journey fixtures expose the structural branch API but intentionally omit
+        # the MC tree's per-stop selector. They still receive the deterministic no-frag fallback;
+        # production trees always provide it, so the normal pin includes bad-day impact.
+        full_fragility = (
+            _itinerary_alt_typicals_departafter(
+                ci, entry, dlat, dlon, max_rides, speed, recommendation_universe, perf=perf)
+            if hasattr(tree50, "_select") else None)
+        if full_fragility is not None:
+            if full_fragility.get("prim_frag") is not None:
+                primary_option["frag"] = full_fragility["prim_frag"]
+            for option, frag in zip(recommendation_universe,
+                                    full_fragility.get("alt_frags", ())):
+                if frag is not None:
+                    option["frag"] = frag
+        recommendation_candidates = _recommend_route_choices(
+            primary_option, recommendation_universe)
+    forced_recommendations = [
+        candidate for candidate in recommendation_candidates.values()
+        if candidate is not None and candidate is not primary_option
+    ]
     out = _select_diverse_alts(
         list(best_by_label.values()), RAPTOR_ALT_CHIP_CAP, primary=primary_option,
         # The recommendation-first UI keeps only a few practical rows visible. Its expanded expert
         # disclosure, unlike hover chips, should be complete for every family the breadth selector
         # admitted. Branch enumeration/dominance already bounds the candidate universe.
-        complete_selected_families=branch_cache)
+        complete_selected_families=branch_cache,
+        force_include=forced_recommendations)
     _perf_add(perf, "pin.selection_ms", t_select)
     if perf is not None:
         perf["pin.selection_candidates"] = len(best_by_label)
@@ -3049,6 +3205,14 @@ def _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed, prov50,
         if sig in final_seen or ((psig[0] or psig[1]) and sig == psig):
             continue
         final_seen.add(sig)
+        recommendation_metrics = [
+            metric for metric, candidate in recommendation_candidates.items()
+            if a is candidate
+        ]
+        if recommendation_metrics:
+            # Internal transit from structural selection to the response assembler below.  The
+            # metadata annotator strips underscore fields before JSON serialization.
+            a["_recommendation_metrics"] = recommendation_metrics
         final.append(a)
     out = final
     _perf_add(perf, "pin.hydration_geometry_ms", t_hydrate)
@@ -3136,6 +3300,40 @@ def _itinerary_alt_typicals_departafter(ci, entry, dlat, dlon, max_rides, speed,
     return out
 
 
+def _publish_choice_recommendation(res, primary_route, pin, recommended_route=None,
+                                   recommended_routes=None):
+    """Publish distinct canonical-map and pinned-practical selection identities.
+
+    ``choice_key`` remains the backwards-compatible primary/map choice.  ``map_choice_key``
+    names that role explicitly for new clients.  On a pinned response, the structural branch
+    selector may have marked one force-retained alternative as the complete-universe practical
+    recommendation; otherwise the canonical map route won that comparison.  Never make the
+    browser infer either identity from response order.
+    """
+    map_choice_key = primary_route.get("choice_key") or res.get("choice_key")
+    if map_choice_key:
+        res["map_choice_key"] = map_choice_key
+    if not pin:
+        return
+    recommendations = dict(recommended_routes or {})
+    if recommended_route is not None:
+        recommendations.setdefault("r", recommended_route)
+    for metric in ("r", "b"):
+        recommendations.setdefault(
+            metric, _recommend_route_choice(primary_route, res.get("alts") or (), metric))
+    recommended_choice_keys = {}
+    for metric, recommendation in recommendations.items():
+        key = (recommendation or {}).get("choice_key") or map_choice_key
+        if key:
+            recommended_choice_keys[metric] = key
+    if recommended_choice_keys:
+        res["recommended_choice_keys"] = recommended_choice_keys
+    # Backwards-compatible default: realistic/scheduled remains the initial time mode.
+    recommended_choice_key = recommended_choice_keys.get("r") or map_choice_key
+    if recommended_choice_key:
+        res["recommended_choice_key"] = recommended_choice_key
+
+
 def itinerary_departafter(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scalar, pin=False,
                           perf=None):
     """Assemble the DEPART-AFTER /itinerary response.
@@ -3217,6 +3415,13 @@ def itinerary_departafter(cid, olat, olon, dlat, dlon, max_rides, speed, walk_sc
         "best": {"total": (best_j or typ_j)["total"],
                  "legs": (best_j or typ_j).get("geom") or []},
     }
+    # Keep this object reference while annotation removes private selector fields.  A marked alt
+    # was chosen from the full pin universe and force-retained through the display cap.
+    recommended_alts = {
+        metric: alt
+        for alt in res["alts"]
+        for metric in alt.get("_recommendation_metrics", ())
+    }
     t_annotation = time.perf_counter() if perf is not None else None
     _annotate_route_families(primary_route, res["alts"])
     res["family"] = primary_route["family"]
@@ -3230,9 +3435,12 @@ def itinerary_departafter(cid, olat, olon, dlat, dlon, max_rides, speed, walk_sc
         if fr is not None:
             if fr.get("prim_frag") is not None:
                 res["frag"] = fr["prim_frag"]
+                primary_route["frag"] = fr["prim_frag"]
             for a, f in zip(res["alts"], fr.get("alt_frags", [])):
                 if f is not None:
                     a["frag"] = f
+    _publish_choice_recommendation(res, primary_route, pin,
+                                   recommended_routes=recommended_alts)
     _perf_add(perf, "pin.assembly_ms", t_assembly)
     if perf is not None:
         perf["pin.options"] = 1 + len(res["alts"])
@@ -3273,12 +3481,18 @@ def itinerary_arriveby(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scala
     # COPIES of the cached alt dicts (the pin path annotates real/frag below; mutating the
     # shared cached objects raced concurrent requests and leaked pin-only fields onto hovers).
     res["alts"] = ([dict(a) for a in
-                    _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=provider)]
+                    _itinerary_alts(ci, dlat, dlon, max_rides, speed, provider=provider,
+                                    pin=pin)]
                    if ci is not None and "error" not in res else [])
     if "error" not in res:
         t_annotation = time.perf_counter() if perf is not None else None
         primary_route = {"line": _route_label(res.get("geom")) or "primary",
                          "min": res.get("total", 10 ** 6), "legs": res.get("geom") or []}
+        recommended_alts = {
+            metric: alt
+            for alt in res["alts"]
+            for metric in alt.get("_recommendation_metrics", ())
+        }
         _annotate_route_families(primary_route, res["alts"])
         res["family"] = primary_route["family"]
         res["branch"] = primary_route["branch"]
@@ -3297,9 +3511,13 @@ def itinerary_arriveby(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scala
             prim = typ.get("prim")
             if prim is not None:
                 res["real"], res["frag"] = prim[0], prim[1]
+                primary_route["frag"] = prim[1]
             for a, p in zip(res["alts"], typ.get("alts", [])):
                 if p is not None:
                     a["real"], a["frag"] = p[0], p[1]
+    if "error" not in res:
+        _publish_choice_recommendation(res, primary_route, pin,
+                                       recommended_routes=recommended_alts)
     _perf_add(perf, "pin.assembly_ms", t_assembly)
     if perf is not None:
         perf["pin.options"] = 1 + len(res.get("alts") or ())

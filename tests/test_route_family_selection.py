@@ -506,6 +506,162 @@ def test_exact_equivalent_prefers_less_physical_access_not_schedule_allowance():
     assert selected == [short_access]
 
 
+def _with_physical_walks(route, *walks):
+    """Attach physical walking legs for recommendation-rank fixtures.
+
+    ``min`` deliberately includes a variable schedule allowance; recommendation must compare the
+    explicit ``physical_min`` values instead.
+    """
+    route["typical"]["legs"] = [*walks, *route["typical"]["legs"]]
+    route["best"]["legs"] = [dict(walk) for walk in walks] + route["best"]["legs"]
+    return route
+
+
+def test_recommendation_same_displayed_minute_prefers_less_total_physical_walking():
+    map_route = _with_physical_walks(_route(["ALPHA"], 22, [_HEAD]),
+        {"mode": "walk", "min": 8, "physical_min": 5},
+        {"mode": "walk", "min": 8, "physical_min": 5})
+    less_walk = _with_physical_walks(_route(["BETA"], 22, [_MID]),
+        {"mode": "walk", "min": 4, "physical_min": 2},
+        {"mode": "walk", "min": 3, "physical_min": 1})
+
+    assert server_raptor._recommend_route_choice(map_route, [less_walk]) is less_walk
+
+
+def test_recommendation_never_trades_an_extra_displayed_minute_for_less_walking():
+    map_route = _with_physical_walks(_route(["ALPHA"], 22, [_HEAD]),
+        {"mode": "walk", "min": 12, "physical_min": 12})
+    quicker = _with_physical_walks(_route(["BETA"], 23, [_MID]),
+        {"mode": "walk", "min": 1, "physical_min": 1})
+
+    assert server_raptor._recommend_route_choice(map_route, [quicker]) is map_route
+
+
+def test_recommendation_is_ranked_independently_for_each_displayed_time_mode():
+    best_case_winner = _route(["ALPHA"], 24, [_HEAD])
+    best_case_winner["best"]["total"] = 20
+    realistic_winner = _route(["BETA"], 22, [_MID])
+    realistic_winner["best"]["total"] = 21
+
+    recommendations = server_raptor._recommend_route_choices(
+        best_case_winner, [realistic_winner])
+
+    assert recommendations["r"] is realistic_winner
+    assert recommendations["b"] is best_case_winner
+
+
+def test_recommendation_excludes_schedule_allowance_from_physical_walking():
+    # The map route's display leg has ten minutes of extra allowable boarding time but only two
+    # minutes of actual walking. It must beat a three-minute physical walk at the same displayed
+    # commute minute.
+    map_route = _with_physical_walks(_route(["ALPHA"], 22, [_HEAD]),
+        {"mode": "walk", "min": 12, "physical_min": 2,
+         "schedule_allowance_min": 10})
+    more_actual_walking = _with_physical_walks(_route(["BETA"], 22, [_MID]),
+        {"mode": "walk", "min": 3, "physical_min": 3})
+
+    assert server_raptor._recommend_route_choice(map_route, [more_actual_walking]) is map_route
+
+
+def test_recommendation_uses_bad_day_impact_after_time_walk_and_transfers():
+    stable = _route(["ALPHA"], 22, [_HEAD])
+    fragile = _route(["BETA"], 22, [_MID])
+    stable["frag"] = 3
+    fragile["frag"] = 9
+
+    assert server_raptor._recommend_route_choice(fragile, [stable]) is stable
+
+
+def test_recommendation_uses_exact_seconds_then_later_boarding_as_tie_breaks():
+    first = _route(["ALPHA"], 22, [_HEAD])
+    second = _route(["BETA"], 22, [_MID])
+    first["_branch"] = {"metric_sec": 1_300,
+                        "raw": [("ride", 0, 500, 900, 0, 1, 2)]}
+    second["_branch"] = {"metric_sec": 1_290,
+                         "raw": [("ride", 0, 520, 900, 0, 1, 2)]}
+    assert server_raptor._recommend_route_choice(first, [second]) is second
+
+    # With equal real duration, a later feasible board leaves the user less early dead time.
+    second["_branch"]["metric_sec"] = 1_300
+    assert server_raptor._recommend_route_choice(first, [second]) is second
+
+
+def test_recommendation_is_force_retained_when_breadth_cap_would_omit_it():
+    first = _route(["ALPHA"], 20, [_HEAD])
+    recommended = _route(["BETA"], 21, [_MID])
+
+    selected = _select_diverse_alts([first, recommended], cap=1,
+                                    force_include=recommended)
+
+    assert selected == [first, recommended]
+
+
+def test_recommendations_for_both_time_modes_are_force_retained():
+    first = _route(["ALPHA"], 20, [_HEAD])
+    realistic = _route(["BETA"], 21, [_MID])
+    best = _route(["GAMMA"], 22, [_OTHER_TAIL])
+
+    selected = _select_diverse_alts(
+        [first, realistic, best], cap=1, force_include=[realistic, best])
+
+    assert selected == [first, realistic, best]
+
+
+def test_arriveby_pin_uses_full_alt_stop_universe_and_retains_recommendation(monkeypatch):
+    """The pin must not inherit the hover chip cap when deciding/revealing its recommendation."""
+    monkeypatch.setattr(server_raptor, "RAPTOR_ALT_CHIP_CAP", 1)
+    mc = {
+        "alt_geom": {},
+        "alt_chips": {0: ["hover-only"]},
+        "alt_bundle": {"alt_stop": [{"hover-only": 1, "less-walk": 2}]},
+        "typ": {},
+    }
+    monkeypatch.setattr(server_raptor, "mc_peek", lambda *args: mc)
+    calls = []
+
+    def walk(minutes):
+        return {"mode": "walk", "min": minutes, "physical_min": minutes, "pts": []}
+
+    class FakeTree:
+        # Omit _select deliberately: this is a geometry/cap fixture, so recommendation falls
+        # back honestly without MC fragility rather than requiring a full simulation kernel.
+        def itinerary_via_stop(self, ci, stop, geom_provider=None):
+            calls.append(stop)
+            if stop == 1:
+                return {"total": 22, "geom": [walk(1), _leg("B", _MID), walk(10)]}
+            return {"total": 22, "geom": [walk(5), _leg("C", _OTHER_TAIL), walk(1)]}
+
+    entry = {"tree": FakeTree(), "geom": {
+        0: {"total": 22, "geom": [walk(11), _leg("A", _HEAD), walk(11)]}
+    }}
+    monkeypatch.setattr(server_raptor, "raptor_tree", lambda *args: entry)
+
+    out = server_raptor._itinerary_alts(
+        0, 37.77, -122.40, 8, "med", provider=object(), pin=True)
+
+    assert calls == [1, 2]  # pin enumerated the whole alt_stop universe, not just hover chips
+    assert [route["line"] for route in out] == ["hover-only", "less-walk"]
+    assert out[-1]["_recommendation_metrics"] == ["r", "b"]
+
+
+def test_pinned_response_publishes_distinct_map_and_recommended_choice_keys():
+    map_route = _route(["ALPHA"], 22, [_HEAD])
+    recommended = _route(["BETA"], 22, [_MID])
+    server_raptor._annotate_route_families(map_route, [recommended])
+    response = {"choice_key": map_route["choice_key"], "alts": [recommended]}
+
+    server_raptor._publish_choice_recommendation(
+        response, map_route, pin=True,
+        recommended_routes={"r": recommended, "b": map_route})
+
+    assert response["map_choice_key"] == map_route["choice_key"]
+    assert response["recommended_choice_key"] == recommended["choice_key"]
+    assert response["recommended_choice_keys"] == {
+        "r": recommended["choice_key"],
+        "b": map_route["choice_key"],
+    }
+
+
 def test_route_label_preserves_real_same_service_reboarding_legs():
     legs = [
         _leg("ALPHA", _HEAD, route_id="route-a"),

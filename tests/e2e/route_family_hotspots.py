@@ -285,6 +285,23 @@ def validate_route_response(body, destination):
                 errors.append(
                     f"{prefix}: route total {route_total} is faster than primary {primary_total}")
 
+    # A pinned response deliberately separates the route that first painted the map from the
+    # route the server recommends for decision-making.  Both are public, durable keys and may be
+    # different; neither may point outside the advertised choice set.
+    map_choice_key = str(body.get("map_choice_key") or body.get("choice_key") or "")
+    recommended_choice_key = str(body.get("recommended_choice_key") or "")
+    if not map_choice_key:
+        errors.append("pinned response: missing map_choice_key")
+    elif map_choice_key not in public_choice_keys:
+        errors.append(f"pinned response: map_choice_key {map_choice_key!r} is not a public choice")
+    # Unpinned hover responses have no recommendation role.  Pinned responses must make it
+    # explicit so clients never infer it from option order.
+    if "recommended_choice_key" in body and not recommended_choice_key:
+        errors.append("pinned response: empty recommended_choice_key")
+    elif recommended_choice_key and recommended_choice_key not in public_choice_keys:
+        errors.append(
+            f"pinned response: recommended_choice_key {recommended_choice_key!r} is not a public choice")
+
     primary_family = str((body.get("family") or {}).get("key") or "")
     primary_marked = [key for key, value in families.items()
                       if value["meta"].get("sub") == "primary boarding corridor"]
@@ -672,6 +689,7 @@ def measure_family_card(page):
     return page.evaluate(
         """() => {
           const card=document.getElementById('pincard'), body=document.getElementById('pinbody');
+          const choices=document.getElementById('route-choices-panel'),plan=document.getElementById('route-plan-panel');
           const close=document.getElementById('pinx'), panel=document.getElementById('panel');
           const legend=document.getElementById('legend');
           const rect=el=>{const r=el.getBoundingClientRect();return {l:r.left,t:r.top,r:r.right,b:r.bottom,w:r.width,h:r.height};};
@@ -679,15 +697,15 @@ def measure_family_card(page):
           const visible=el=>{const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;};
           // Destination/settings use intentional one-line ellipsis. Audit route decision copy,
           // which must remain readable rather than treating that designed truncation as clipping.
-          const labels=[...card.querySelectorAll('.pin-place,.route-name,.route-why,.route-action,.route-time,.family-heading span')];
+          const labels=[...card.querySelectorAll('.pin-place,.route-name,.route-tradeoffs,.route-action,.route-time,.route-fact-value,.boarding-heading span')];
           const clipped=labels.filter(el=>{const s=getComputedStyle(el);return visible(el)&&((['hidden','clip'].includes(s.overflowX)&&el.scrollWidth>el.clientWidth+1)||(['hidden','clip'].includes(s.overflowY)&&el.scrollHeight>el.clientHeight+1));}).map(el=>el.textContent.trim());
-          const targets=[...card.querySelectorAll('.route-choice,#pinx,#pinadjust,#pinview button,#all-routes-toggle,.show-routes')].filter(visible);
+          const targets=[...card.querySelectorAll('.route-choice,#pinx,#pinadjust,#pinview button,#all-routes-toggle,.show-routes,#view-route-plan,#route-directions summary')].filter(visible);
           const sizes=targets.map(el=>{const r=el.getBoundingClientRect();return Math.min(r.width,r.height);});
           const interactives=[...card.querySelectorAll('.route-choice')].filter(visible);
-          const oldTop=body.scrollTop;body.scrollTop=body.scrollHeight;
-          const br=body.getBoundingClientRect(), last=interactives.length?interactives[interactives.length-1].getBoundingClientRect():null;
+          const scrollHost=visible(choices)?choices:body,oldTop=scrollHost.scrollTop;scrollHost.scrollTop=scrollHost.scrollHeight;
+          const br=scrollHost.getBoundingClientRect(), last=interactives.length?interactives[interactives.length-1].getBoundingClientRect():null;
           const reachesLast=!last||(last.bottom<=br.bottom+1&&last.top>=br.top-1);
-          body.scrollTop=oldTop;
+          scrollHost.scrollTop=oldTop;
           const cr=rect(card),pr=rect(panel),lr=rect(legend),xr=rect(close);
           const interactiveSelector='button,a[href],summary,[role="button"]';
           const nested=[...card.querySelectorAll(interactiveSelector)].filter(el=>{
@@ -695,7 +713,7 @@ def measure_family_card(page):
             return parent&&card.contains(parent);
           });
           const selectedKeys=[...new Set([...card.querySelectorAll('.route-choice[aria-pressed="true"]')]
-            .map(el=>el.dataset.key).filter(Boolean))];
+            .map(el=>el.dataset.choiceKey||el.dataset.key).filter(Boolean))];
           const offscreenRight=[...document.body.querySelectorAll('*')].map(el=>{
             const r=el.getBoundingClientRect(),s=getComputedStyle(el);
             return {tag:el.tagName.toLowerCase(),id:el.id||'',cls:String(el.className||'').slice(0,80),
@@ -712,8 +730,8 @@ def measure_family_card(page):
             recommended_rows:card.querySelectorAll('.route-recommendations .route-choice.recommended').length,
             selected_keys:selectedKeys,
             nested_interactives:nested.length,
-            scroll_debt:Math.max(0,body.scrollHeight-body.clientHeight),
-            horizontal_overflow:Math.max(0,body.scrollWidth-body.clientWidth),
+            scroll_debt:Math.max(0,scrollHost.scrollHeight-scrollHost.clientHeight),
+            horizontal_overflow:Math.max(0,scrollHost.scrollWidth-scrollHost.clientWidth),
             document_horizontal_overflow:Math.max(0,document.documentElement.scrollWidth-innerWidth),
             offscreen_right:offscreenRight,
             clipped_labels:clipped,
@@ -724,6 +742,7 @@ def measure_family_card(page):
             legend_overlap_px2:visible(legend)?overlap(cr,lr):0,
             close_visible:visible(close)&&xr.l>=cr.l&&xr.r<=cr.r&&xr.t>=cr.t&&xr.b<=cr.b,
             card_in_view:cr.l>=-1&&cr.t>=-1&&cr.r<=innerWidth+1&&cr.b<=innerHeight+1,
+            choices_visible:visible(choices),plan_visible:visible(plan),
           };
         }"""
     )
@@ -739,22 +758,32 @@ def dom_family_snapshot(page):
           return ({
           families,
           choices:rows.map(b=>({
-            key:b.dataset.key,family:b.dataset.family,branch:b.dataset.branch,
+            key:b.dataset.choiceKey||b.dataset.key,family:b.dataset.family,branch:b.dataset.branch,
             family_name:b.dataset.familyName||'',branch_name:b.dataset.branchName||'',
             name:(b.querySelector('.route-name')||{}).textContent?.trim()||'',
             time:(b.querySelector('.route-time')||{}).childNodes?.[0]?.textContent?.trim()||'',
-            pressed:b.getAttribute('aria-pressed'),
+            facts:Object.fromEntries([...b.querySelectorAll('[data-fact]')].map(f=>[
+              f.dataset.fact,(f.querySelector('.route-fact-value')||{}).textContent?.trim()||''
+            ])),pressed:b.getAttribute('aria-pressed'),
           })),
           recommended:[...document.querySelectorAll('#pincard .route-recommendations .route-choice.recommended')].map(r=>({
-            key:r.dataset.key,family:r.dataset.family,branch:r.dataset.branch,
+            key:r.dataset.choiceKey||r.dataset.key,family:r.dataset.family,branch:r.dataset.branch,
           })),
           selected_keys:[...new Set([...document.querySelectorAll('#pincard .route-choice[aria-pressed="true"]')]
-            .map(r=>r.dataset.key).filter(Boolean))],
+            .map(r=>r.dataset.choiceKey||r.dataset.key).filter(Boolean))],
           nested_interactives:[...document.querySelectorAll('#pincard button,#pincard a[href],#pincard summary,#pincard [role="button"]')]
             .filter(el=>{const p=el.parentElement&&el.parentElement.closest('button,a[href],summary,[role="button"]');return p&&document.getElementById('pincard').contains(p);}).length,
           stale_controls:document.querySelectorAll('#pincard .cmp .family,#pincard .cmp .branch,#pincard .cmp .strip').length,
           all_routes_present:!!document.getElementById('allroutes'),
           all_routes_expanded:document.getElementById('allroutes')?.open||false,
+          map_choice_key:document.querySelector('#pincard .pin-shell')?.dataset.mapChoiceKey||null,
+          recommended_choice_key:document.querySelector('#pincard .pin-shell')?.dataset.recommendedChoiceKey||null,
+          selected_choice_key:document.querySelector('#route-plan-panel')?.dataset.selectedChoiceKey||
+            document.querySelector('#pincard .pin-shell')?.dataset.selectedChoiceKey||null,
+          choices_visible:!!document.getElementById('route-choices-panel')&&
+            getComputedStyle(document.getElementById('route-choices-panel')).display!=='none',
+          plan_visible:!!document.getElementById('route-plan-panel')&&
+            getComputedStyle(document.getElementById('route-plan-panel')).display!=='none',
           drawn:(typeof DRAWN!=='undefined'&&DRAWN)?{multi:!!DRAWN.multi,key:DRAWN.key||null,family:DRAWN.famKey||null,branch:DRAWN.branchKey||null}:null,
           route_layers:(typeof routeLayer!=='undefined')?routeLayer.getLayers().length:0,
         })}"""
@@ -770,8 +799,8 @@ def _display_route_title(family, branch):
     normalized_branch = compact(branch_name)
     if (normalized_branch.startswith(prefix)
             and normalized_branch[len(prefix):] == compact(family_name)):
-        return f"{family_name} · walk to destination"
-    return (f"{family_name} · {branch_name}"
+        return f"{family_name} → walk to destination"
+    return (f"{family_name} → {branch_name}"
             if branch_name and branch_name != family_name else family_name)
 
 
@@ -816,14 +845,20 @@ def assert_api_matches_dom(body, snapshot):
         assert dom["name"] == expected_name
         assert (dom["family"], dom["branch"]) == key
         assert dom["time"] == f"{_active_total(route)} min"
+        assert dom["facts"].get("walk"), f"route {key} is missing compact walking fact"
+        assert dom["facts"].get("transfers") is not None, f"route {key} is missing transfers fact"
+        assert dom["facts"].get("bad-day"), f"route {key} is missing bad-day fact"
         assert dom["key"], f"expert route {key} has no authoritative option key"
         assert dom["pressed"] in {"true", "false"}, f"route {key} lacks aria-pressed state"
 
     assert len(snapshot["recommended"]) == 1, "expected one recommendation-first row"
     recommended = snapshot["recommended"][0]
-    primary_key = (str(body["family"]["key"]), str(body["branch"]["key"]))
-    assert (recommended["family"], recommended["branch"]) == primary_key
-    assert recommended["key"] == str(body["choice_key"])
+    map_choice_key = str(body.get("map_choice_key") or body["choice_key"])
+    recommended_choice_key = str(body.get("recommended_choice_key") or map_choice_key)
+    assert snapshot["map_choice_key"] == map_choice_key
+    assert snapshot["recommended_choice_key"] == recommended_choice_key
+    assert recommended["key"] == recommended_choice_key
     assert snapshot["selected_keys"] == [recommended["key"]], (
         f"expected one selected route key, got {snapshot['selected_keys']}")
+    assert snapshot["selected_choice_key"] == recommended_choice_key
     assert snapshot["drawn"]["key"] == recommended["key"]

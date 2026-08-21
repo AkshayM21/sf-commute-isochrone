@@ -2,10 +2,25 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SF Commute Explorer — set your own workplace</title>
 <script>
+/* First-paint startup classification: decide whether this visitor already has a valid
+   workplace BEFORE the document body and CSS can paint.  The root carries only a
+   state word, never the workplace, coordinates, or label.  A valid shared-link wp=
+   wins over local storage, matching the late boot path below. */
+function classifyStartupState(hash,saved){
+  var wp=null,parts=String(hash||"").replace(/^#/,"").split("&");
+  for(var i=0;i<parts.length;i++){var at=parts[i].indexOf("=");
+    if(at>=0&&parts[i].slice(0,at)==="wp")wp=parts[i].slice(at+1);}
+  if(wp!=null){var bits=wp.split(","),lat=+bits[0],lon=+bits[1];
+    if(bits.length>=2&&bits[0]!==""&&bits[1]!==""&&Number.isFinite(lat)&&Number.isFinite(lon))return "restoring";}
+  try{var own=JSON.parse(saved||"null");
+    if(own&&Number.isFinite(own.lat)&&Number.isFinite(own.lon))return "restoring";}catch(e){}
+  return "onboarding";
+}
 /* First-paint theming: set data-theme synchronously BEFORE any CSS applies so a
    light-preference visitor never sees a flash of the dark default chrome. Precedence
    matches the app (bootTheme/applyHash): hash th= (session-only) > saved pref > OS. */
 (function(){try{var m=location.hash.match(/(?:^#|&)th=(light|dark|auto)(?:&|$)/);var p=m?m[1]:null;if(!p){try{p=localStorage.getItem("theme_v1");}catch(e){}}var t=(p==="light"||p==="dark")?p:(window.matchMedia&&matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");document.documentElement.dataset.theme=t;}catch(e){}})();
+(function(){try{var wp=null;try{wp=localStorage.getItem("wp_v1");}catch(e){}document.documentElement.dataset.startup=classifyStartupState(location.hash,wp);}catch(e){document.documentElement.dataset.startup="onboarding";}})();
 </script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
   integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
@@ -120,11 +135,11 @@
      card (including its persistent close control) above the visible page. */
   #pincard{position:fixed;top:18px;right:344px;z-index:1200;background:var(--panel);color:var(--ink);
     border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-pop);display:none;
-    width:min(430px,calc(100vw - 36px));max-height:calc(100dvh - 36px);overflow:hidden;
+    width:min(470px,calc(100vw - 36px));height:calc(100dvh - 36px);max-height:calc(100dvh - 36px);overflow:hidden;
     animation:pincard-in .18s cubic-bezier(.25,1,.5,1);transition:right .22s cubic-bezier(.25,1,.5,1)}
   #pincard.open{display:flex;flex-direction:column}
   body.route-pinned #legend{display:none}
-  #pinbody{overflow-y:auto;overscroll-behavior:contain;min-height:0}
+  #pinbody{display:flex;flex:1 1 auto;min-height:0;overflow:hidden;overscroll-behavior:contain}
   @keyframes pincard-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
   #pincard .pinx{position:absolute;top:6px;right:6px;cursor:pointer;color:var(--mut);font-size:22px;
     line-height:1;width:44px;height:44px;display:flex;align-items:center;justify-content:center;
@@ -178,46 +193,61 @@
   .bd .altfoot .ahint{display:block}
   /* Recommendation-first route inspector. Rows are the only route controls: family headings and
      expert disclosures are plain structure, so interactive elements never nest. */
-  .pin-head{position:sticky;top:0;z-index:3;background:rgb(var(--panel-rgb) / .97);
-    border-bottom:1px solid var(--line);padding:16px 54px 12px 16px;backdrop-filter:blur(10px)}
+  .pin-shell{display:flex;flex:1 1 auto;min-width:0;min-height:0;flex-direction:column}
+  .pin-head{flex:0 0 auto;z-index:3;background:var(--panel);border-bottom:1px solid var(--line);
+    padding:16px 54px 13px 16px}
   .pin-place{font-size:1.05rem;font-weight:750;line-height:1.25;letter-spacing:-.01em}
   .pin-dest{margin-top:3px;color:var(--mut);font-size:.8125rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .pin-stats{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;margin-top:10px;color:var(--mut);font-size:.75rem}
-  .pin-stats strong{color:var(--ink);font-size:1.25rem;font-variant-numeric:tabular-nums}
-  .pin-context{display:flex;align-items:center;gap:8px;margin-top:10px}
-  /* Settings are compact tokens rather than one clipped sentence.  In a narrow inspector they
-     wrap before the Adjust action, so the active time mode and walking pace stay legible. */
-  .pin-context>.pin-settings{display:flex;flex:1 1 154px;flex-wrap:wrap;gap:2px 0;min-width:0;
-    color:var(--mut);font-size:.71875rem;line-height:1.35}
-  .pin-settings>span{white-space:nowrap}
-  .pin-settings>span+span:before{content:" · ";color:var(--mut)}
-  .pin-context>.quiet-action{flex:0 0 auto;white-space:nowrap}
-  .quiet-action,.pin-view button{min-height:36px;border:1px solid var(--line);border-radius:8px;
-    padding:0 10px;background:var(--bg-button);color:var(--ink);cursor:pointer;font-size:.75rem;font-weight:650}
-  .pin-view{display:none;grid-template-columns:1fr 1fr;gap:5px;margin-top:10px}
+  .pin-context{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:12px;margin-top:12px}
+  .pin-settings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));min-width:0;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .pin-setting{min-width:0;padding:7px 8px;border-right:1px solid var(--line)}
+  .pin-setting:first-child{padding-left:0}.pin-setting:last-child{padding-right:0;border-right:0}
+  .pin-setting-label,.route-fact-label{display:block;color:var(--mut);font-size:.625rem;line-height:1.25;
+    text-transform:uppercase;letter-spacing:.055em;font-weight:650}
+  .pin-setting-value{display:block;margin-top:2px;color:var(--ink);font-size:.75rem;line-height:1.3;
+    font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .quiet-action,.pin-view button{min-height:38px;border:1px solid var(--line);border-radius:8px;
+    padding:0 11px;background:var(--bg-button);color:var(--ink);cursor:pointer;font-size:.75rem;font-weight:650}
+  .pin-view{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:8px 12px;border-bottom:1px solid var(--line);
+    background:var(--panel)}
   .pin-view button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--ink-on-accent)}
-  .cmp{padding:0 16px 16px}
-  .route-section{padding-top:18px}
-  .route-section-title{margin:0 0 8px;color:var(--ink);font-size:.875rem;font-weight:750;line-height:1.3}
+  .pin-view [data-view="map"]{display:none}
+  .pin-workspace{display:block;flex:1 1 auto;min-height:0;overflow:hidden}
+  .route-choices-pane,.route-plan-pane{height:100%;overflow-y:auto;overscroll-behavior:contain;padding:0 16px 18px}
+  .route-plan-pane{display:none}
+  body.pin-plan-view .route-choices-pane{display:none}
+  body.pin-plan-view .route-plan-pane{display:block}
+  .route-section{padding-top:20px}
+  .route-section-title{margin:0 0 9px;color:var(--ink);font-size:.875rem;font-weight:750;line-height:1.3}
   .route-section-title span{color:var(--mut);font-weight:600}
   .choice-list{border-top:1px solid var(--line)}
   .route-row{position:relative;display:grid;grid-template-columns:12px minmax(0,1fr) auto;width:100%;
-    gap:10px;min-height:56px;padding:11px 0;border:0;border-bottom:1px solid var(--line);border-radius:0;
+    gap:10px;min-height:76px;padding:13px 2px;border:0;border-bottom:1px solid var(--line);border-radius:0;
     background:transparent;color:var(--ink);text-align:left;cursor:pointer}
   .route-row:last-child{border-bottom:0}
   .route-row:hover,.route-row:focus-visible{background:var(--bg-hover)}
-  .route-row[aria-pressed="true"]{background:var(--bg-hover)}
+  .route-row[aria-pressed="true"]{background:var(--bg-hover);border-radius:8px;
+    box-shadow:inset 0 0 0 1px var(--accent);padding-left:9px;padding-right:9px}
   .route-dot{width:10px;height:10px;border-radius:50%;margin-top:5px;border:1px solid rgba(0,0,0,.35);
     box-shadow:0 0 0 1px rgba(255,255,255,.18)}
   .route-main{min-width:0}
   .route-name{display:block;font-size:.875rem;font-weight:750;line-height:1.3;overflow-wrap:anywhere}
-  .route-why{display:block;margin-top:3px;color:var(--mut);font-size:.75rem;line-height:1.4;overflow-wrap:anywhere}
   .route-time{text-align:right;white-space:nowrap;font-size:.9375rem;font-weight:800;font-variant-numeric:tabular-nums}
-  .route-time small{display:block;margin-top:3px;color:var(--mut);font-size:.6875rem;font-weight:550}
   .route-selected-label{display:block;margin-top:3px;color:var(--accent);font-size:.6875rem;font-weight:750}
-  .alternatives{padding-top:20px}
+  .route-facts{grid-column:2/-1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-top:1px;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .route-fact{min-width:0;padding:7px 8px;border-right:1px solid var(--line)}
+  .route-fact:first-child{padding-left:0}.route-fact:last-child{padding-right:0;border-right:0}
+  .route-fact-value{display:block;margin-top:2px;font-size:.75rem;line-height:1.3;font-weight:700;
+    font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+  .route-tradeoffs{grid-column:2/-1;display:flex;flex-wrap:wrap;gap:5px 0;color:var(--mut);
+    font-size:.75rem;line-height:1.4;overflow-wrap:anywhere}
+  .route-tradeoffs>span{padding-right:8px}
+  .route-tradeoffs>span+span{padding-left:8px;border-left:1px solid var(--line)}
+  .alternatives{padding-top:22px}
   .expert{border-top:1px solid var(--line);margin-top:18px}
-  .expert>summary{min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:8px;
+  .expert>summary{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:8px;
     list-style:none;color:var(--ink);cursor:pointer;font-size:.8125rem;font-weight:700}
   .expert>summary::-webkit-details-marker{display:none}
   .expert>summary:after{content:"+";color:var(--mut);font-size:1rem}
@@ -227,9 +257,18 @@
   .boarding-heading{margin:0 0 8px;line-height:1.35}
   .boarding-place{display:block;color:var(--ink);font-size:.8125rem;font-weight:750}
   .boarding-detail{display:block;margin-top:2px;color:var(--mut);font-size:.6875rem;font-weight:600}
-  .selected-route{margin-top:22px;padding-top:18px;border-top:1px solid var(--line)}
+  .selected-route{padding-top:20px}
   .selected-route-summary{display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:10px;align-items:start}
-  .selected-route-summary .route-why{margin-top:4px}
+  .selected-route-summary .route-tradeoffs{grid-column:auto;margin-top:5px}
+  .plan-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin-top:14px;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .plan-facts .route-fact:nth-child(2n){border-right:0}
+  .plan-facts .route-fact:nth-child(n+3){border-top:1px solid var(--line)}
+  .plan-facts .route-fact:nth-child(3){padding-left:0}
+  .plan-note{margin:12px 0 0;color:var(--mut);font-size:.75rem;line-height:1.45}
+  .plan-timing{margin-top:11px;padding:9px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+    color:var(--mut);font-size:.75rem;line-height:1.4}
+  .plan-timing strong{color:var(--ink)}
   .route-directions{margin:10px 0 0;padding:0;list-style:none;border-top:1px solid var(--line)}
   .route-directions li{display:flex;gap:8px;padding:10px 0;border-bottom:1px solid var(--line);font-size:.8125rem;line-height:1.4}
   .route-directions li:last-child{border-bottom:0}
@@ -238,12 +277,20 @@
     font-size:.625rem;font-weight:750;margin-top:1px}
   .route-copy{min-width:0}.route-detail{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
   .route-allowance{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
-  .selected-directions{border-top:1px solid var(--line);margin-top:13px}
-  .selected-directions>summary{min-height:44px;display:flex;align-items:center;justify-content:space-between;gap:8px;
+  .selected-directions{border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin-top:14px}
+  .selected-directions>summary{min-height:58px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;
     list-style:none;cursor:pointer;color:var(--ink);font-size:.8125rem;font-weight:700}
   .selected-directions>summary::-webkit-details-marker{display:none}
   .selected-directions>summary:after{content:"+";color:var(--mut);font-size:1rem}
   .selected-directions[open]>summary:after{content:"−"}
+  .direction-sequence{display:block;margin-top:3px;color:var(--mut);font-size:.7rem;font-weight:550;line-height:1.4}
+  .selected-plan-cta{position:sticky;bottom:-18px;z-index:2;width:calc(100% + 32px);margin:18px -16px -18px;
+    min-height:58px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 16px;
+    border:0;border-top:1px solid var(--line);background:var(--accent);color:var(--ink-on-accent);text-align:left;cursor:pointer}
+  .selected-plan-cta small{display:block;font-size:.6875rem;font-weight:600;opacity:.82}
+  .selected-plan-cta strong{overflow-wrap:anywhere}
+  .pin-map-summary{display:none;padding:10px 16px;border-top:1px solid var(--line)}
+  .pin-map-summary strong{display:block;font-size:.875rem}.pin-map-summary span{color:var(--mut);font-size:.75rem}
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
   .cmploading{padding:10px 0;color:var(--mut);font-size:.75rem}
   .pin-links{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px 16px;
@@ -267,7 +314,7 @@
   /* The "updating…" line sits at the top of the card; the compare strips dim + go inert so the
      user sees it's recalculating while the card stays put (same position/size) and the OLD route
      stays drawn until the new one lands. */
-  #pincard.pinloading .cmp{opacity:.42;pointer-events:none;transition:opacity .12s}
+  #pincard.pinloading .pin-workspace{opacity:.42;pointer-events:none;transition:opacity .12s}
   #pincard .pinupd{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--mut);
     margin:0 0 7px;font-variant-numeric:tabular-nums}
   #pincard .pinupd .spin{flex:0 0 auto;width:12px;height:12px;border-radius:50%;
@@ -325,6 +372,18 @@
     color:var(--ink);padding:26px 30px 24px;border:1px solid var(--line);border-radius:16px;
     box-shadow:var(--shadow-strong);animation:obIn .45s cubic-bezier(.2,.7,.3,1) both;
     pointer-events:auto}  /* re-enable interaction on the card (the wrapper is pointer-events:none) */
+  /* Returning visitors and valid shared links are classified synchronously in <head>.  Keep the
+     first visible shell truthful while app JS restores their commute; `data-startup` holds only
+     this state, never an address or coordinates. */
+  #prompt .ob-restoring{display:none}
+  :root[data-startup="restoring"] #prompt .ob-onboarding,
+  :root[data-startup="error"] #prompt .ob-onboarding{display:none}
+  :root[data-startup="restoring"] #prompt .ob-restoring,
+  :root[data-startup="error"] #prompt .ob-restoring{display:block}
+  #prompt[data-state="restoring"] .ob-onboarding,
+  #prompt[data-state="error"] .ob-onboarding{display:none}
+  #prompt[data-state="restoring"] .ob-restoring,
+  #prompt[data-state="error"] .ob-restoring{display:block}
   @keyframes obIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
   #prompt .ob h2{margin:0 0 10px;font-size:19px;line-height:1.25;font-weight:700;letter-spacing:-.2px}
   #prompt .ob p{margin:0;font-size:13.5px;line-height:1.5;color:var(--mut)}
@@ -343,11 +402,28 @@
   #prompt #obaddr::placeholder{color:var(--mut)}
   #prompt #obgo{flex:0 0 auto;background:var(--accent);color:var(--ink-on-accent);border:0;
     padding:0 16px;border-radius:9px;font-weight:600;font-size:14px;cursor:pointer;font-family:inherit}
+  #prompt .startup-actions{display:none;justify-content:center;gap:8px;margin-top:18px}
+  #prompt[data-state="error"] .startup-actions{display:flex}
+  #prompt .startup-actions button{min-height:40px;padding:0 13px;border-radius:9px;cursor:pointer;
+    font-family:inherit;font-size:14px;font-weight:650}
+  #startupretry{border:0;background:var(--accent);color:var(--ink-on-accent)}
+  #startupchange{border:1px solid var(--line);background:var(--bg-button);color:var(--ink)}
   /* onboarding autocomplete dropdown — reuses .ac-item visuals from the panel's #ac */
   #prompt #obac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:1200;background:var(--bg-input);
     border:1px solid var(--line);border-radius:9px;overflow:hidden;display:none;box-shadow:var(--shadow-ac);text-align:left}
   #prompt #obac.open{display:block}
-  /* ============ responsive layer (<=719px): desktop >=720px stays byte-identical ============ */
+  /* Wide screens keep comparison and detail visible together. The map still owns the remaining
+     canvas; this is intentionally a workspace, not a centered modal. */
+  @media (min-width:1240px){
+    #pincard{width:min(820px,calc(100vw - 380px))}
+    #pincard .pin-view{display:none}
+    #pincard .pin-workspace{display:grid;grid-template-columns:minmax(310px,.9fr) minmax(370px,1.1fr)}
+    #pincard .route-plan-pane,#pincard .route-choices-pane{display:block;height:100%}
+    #pincard .route-plan-pane{grid-column:2;border-left:1px solid var(--line)}
+    #pincard .route-choices-pane{grid-column:1;grid-row:1}
+    #pincard .selected-plan-cta{display:none}
+  }
+  /* ============ responsive layer (<=719px): focused full-screen inspector ============ */
   @media (max-width:719px){
     #map{inset:0}
     /* panel becomes a collapsible bottom sheet */
@@ -386,19 +462,24 @@
     #pincard{top:0;right:0;left:0;bottom:0;width:100vw;max-height:100dvh;height:100dvh;border-radius:0;
       border-width:0;transition:transform .24s cubic-bezier(.25,1,.5,1)}
     #pincard .pin-head{padding-top:max(16px,env(safe-area-inset-top))}
-    #pincard .pin-view{display:grid}
+    #pincard .pin-view{display:grid;grid-template-columns:repeat(3,1fr)}
+    #pincard .pin-view [data-view="map"]{display:block}
     #pincard .route-row{min-height:64px}
-    #pincard .route-name{font-size:1rem}
-    #pincard .route-why,#pincard .route-directions li{font-size:.875rem}
+    #pincard .route-name{font-size:.9375rem}
+    #pincard .route-tradeoffs,#pincard .route-directions li{font-size:.8125rem}
     #pincard .quiet-action,#pincard .pin-view button{min-height:44px;font-size:.875rem}
-    #pincard .pin-context{align-items:flex-start;flex-wrap:wrap}
-    #pincard .pin-settings{line-height:1.45}
+    #pincard .pin-context{grid-template-columns:1fr;align-items:start;gap:9px}
+    #pincard .quiet-action{justify-self:start}
+    #pincard .pin-setting{padding-top:9px;padding-bottom:9px}
     #pincard .pin-links{padding-bottom:max(18px,env(safe-area-inset-bottom))}
-    body.pin-map-view #pincard{top:auto;height:auto;max-height:calc(230px + env(safe-area-inset-bottom));border:1px solid var(--line);
+    body.pin-map-view #pincard{top:auto;height:auto;max-height:calc(280px + env(safe-area-inset-bottom));border:1px solid var(--line);
       border-radius:16px 16px 0 0}
     body.pin-map-view #pincard #pinbody{overflow:hidden}
-    body.pin-map-view #pincard .cmp,body.pin-map-view #pincard .pin-links{display:none}
-    body.pin-map-view #pincard .pin-head{border-bottom:0;padding-bottom:max(12px,env(safe-area-inset-bottom))}
+    body.pin-map-view #pincard .pin-workspace,body.pin-map-view #pincard .pin-links{display:none}
+    body.pin-map-view #pincard .pin-map-summary{display:block;padding-bottom:max(12px,env(safe-area-inset-bottom))}
+    body.pin-map-view #pincard .pin-settings,body.pin-map-view #pincard .quiet-action{display:none}
+    body.pin-map-view #pincard .pin-context{display:none}
+    body.pin-map-view #pincard .pin-head{padding-top:13px;padding-bottom:8px}
     /* Pinning is a focused route-inspection mode. The controls sheet and broad map legend add no
        value behind a two-screen route card and otherwise compete for the same bottom pixels. */
     body.route-pinned:not(.route-adjusting) #panel{display:none}
@@ -413,7 +494,7 @@
   }
   @media (prefers-reduced-motion:reduce){
     /* Keep state changes immediate without globally clobbering third-party/map transitions. */
-    #pincard,#panel,.leaflet-cells-pane canvas,#pincard.pinloading .cmp{
+    #pincard,#panel,.leaflet-cells-pane canvas,#pincard.pinloading .pin-workspace{
       transition-duration:.01ms!important}
     #pincard,#prompt .ob,#prompt .cta .arr,#pincard .spin{
       animation:none!important}
@@ -423,8 +504,8 @@
 <body>
 <a class="skip-link" href="#panel">Skip to commute controls</a>
 <div id="map" role="region" aria-label="Commute-time map. Route details appear in the route inspector."></div><div id="busy" role="status" aria-live="polite" aria-atomic="true">computing…</div>
-<div id="prompt">
-  <div class="ob" role="dialog" aria-label="Get started">
+<div id="prompt" data-state="onboarding">
+  <div class="ob ob-onboarding" role="dialog" aria-label="Get started">
     <h2>Where can you live and still get to work?</h2>
     <p>Enter your <b>workplace address</b> below to map every neighborhood you could
       reach by walk&nbsp;+&nbsp;Muni&nbsp;+&nbsp;BART&nbsp;+&nbsp;Caltrain.</p>
@@ -433,6 +514,14 @@
         role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="obac"
         aria-label="Workplace address"><div id="obac" role="listbox"></div></div>
       <button id="obgo" type="button" aria-label="Map this workplace">Go <span class="arr" aria-hidden="true">→</span></button>
+    </div>
+  </div>
+  <div class="ob ob-restoring" role="status" aria-live="polite" aria-atomic="true">
+    <h2 id="startup-title">Opening your commute</h2>
+    <p id="startup-copy">Opening your commute map…</p>
+    <div class="startup-actions">
+      <button id="startupretry" type="button">Retry</button>
+      <button id="startupchange" type="button">Change workplace</button>
     </div>
   </div></div>
 <aside id="panel" aria-label="Commute controls" tabindex="-1">
@@ -1004,11 +1093,15 @@ function compareHTML(d){
     `aria-expanded="${allRoutesOpen}" aria-controls="all-routes-panel">See ${more.length} additional route choice${more.length===1?"":"s"}</summary>`+
     `<div id="all-routes-panel">${morePanel}</div></details>`:"";
   const selected=findChoice(selKey)||recommended;
-  return `<div class="cmp"><section class="route-section recommended route-recommendations" aria-labelledby="routes-title">`+
+  return `<section class="route-choices-pane" id="route-choices-panel" aria-labelledby="routes-title">`+
+    `<section class="route-section recommended route-recommendations">`+
     `<h2 class="route-section-title" id="routes-title">Recommended route</h2><div class="choice-list">`+
     (recommended?routeRowHTML(recommended,recommended,"recommended"):"")+`</div></section>`+
-    alternatives+loading+degraded+moreDetails+selectedRouteHTML(selected,recommended,d)+
-    `<div id="route-selection-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div></div>`;
+    alternatives+loading+degraded+moreDetails+mapRouteToggleHTML(choices,recommended,selected)+
+    (selected?`<button type="button" class="selected-plan-cta" id="view-route-plan">`+
+      `<span><small>Selected route</small><strong data-selected-title>${escapeHTML(routeTitle(selected))}</strong></span>`+
+      `<span><strong data-selected-time>${formatMinutes(selected.r.head)}</strong><small>View plan</small></span></button>`:"")+
+    `<div id="route-selection-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div></section>`;
 }
 function resetVarianceState(gen){varianceState={status:"idle",gen,error:""};}
 function setVarianceState(status,gen,error){if(gen!==GEN)return false;
@@ -1022,33 +1115,29 @@ function pinHTML(d){
   if(d.error)return `<div class="bd"><span style="color:var(--mut)">No transit route within ~75 min.</span></div>`;
   const choices=routeChoices(),recommended=recommendedChoice(choices);
   const selected=choices.find(c=>c.o.key===selKey)||recommended;
-  const r=recommended?recommended.r:{head:normalizeBD(d).total,frag:bdFrag(d)};
-  const o=recommended&&recommended.o;
-  const transferCount=o?optionTransfers(o):normalizeBD(d).xfers;
-  const walk=o?optionWalk(o):0;
-  const allowance=o?optionScheduleAllowance(o):0;
-  const risk=(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:"low schedule risk";
   const settings=[
-    DEPARTAFTER?(metric==="r"?"Scheduled":"Best-case"):(metric==="r"?"Realistic":"Best-case"),
-    `${walkspeed==="med"?"Medium":walkspeed[0].toUpperCase()+walkspeed.slice(1)} walk`,
-    maxxfers==="any"?"Any transfers":`${maxxfers} max transfer${maxxfers==="1"?"":"s"}`,
+    ["Estimate",DEPARTAFTER?(metric==="r"?"Scheduled":"Best-case"):(metric==="r"?"Realistic":"Best-case")],
+    ["Walk pace",walkspeed==="med"?"Medium":walkspeed[0].toUpperCase()+walkspeed.slice(1)],
+    ["Transfers",maxxfers==="any"?"Any":`Up to ${maxxfers}`],
   ];
+  const planView=document.body.classList.contains("pin-plan-view");
+  const mapView=document.body.classList.contains("pin-map-view");
   const head=`<header class="pin-head pin-summary"><div class="pin-place">${escapeHTML(d.name||"Selected area")}</div>`+
     `<div class="pin-dest">to ${escapeHTML(CURLABEL||"your workplace")}</div>`+
-    `<div class="pin-stats"><strong data-summary="time">${formatMinutes(r.head)}</strong>`+
-    `<span data-summary="risk">${escapeHTML(risk)}</span>`+
-    `<span data-summary="walk">${formatMinutes(walk)} walk</span>`+
-    `<span data-summary="allowance"${allowance>0?"":" hidden"}>${allowance>0?`allow ${formatMinutes(allowance)} before boarding`:""}</span>`+
-    `<span data-summary="transfers">${transferCount} transfer${transferCount===1?"":"s"}</span></div>`+
-    `<div class="pin-context"><span class="pin-settings" aria-label="Route settings: ${escapeHTML(settings.join(", "))}">`+
-    settings.map(setting=>`<span>${escapeHTML(setting)}</span>`).join("")+`</span>`+
-    `<button type="button" class="quiet-action" id="pinadjust" aria-controls="panel" aria-expanded="${document.body.classList.contains("route-adjusting")}">Adjust settings</button></div>`+
+    `<div class="pin-context"><span class="pin-settings" aria-label="Route settings: ${escapeHTML(settings.map(s=>s.join(" ")).join(", "))}">`+
+    settings.map(([label,value])=>`<span class="pin-setting"><span class="pin-setting-label">${escapeHTML(label)}</span>`+
+      `<span class="pin-setting-value">${escapeHTML(value)}</span></span>`).join("")+`</span>`+
+    `<button type="button" class="quiet-action" id="pinadjust" aria-controls="panel" aria-expanded="${document.body.classList.contains("route-adjusting")}">Adjust settings</button></div></header>`+
     `<div class="pin-view" id="pinview" role="group" aria-label="Route inspector view">`+
-    `<button type="button" data-view="routes" aria-pressed="${!document.body.classList.contains("pin-map-view")}">Routes</button>`+
-    `<button type="button" data-view="map" aria-pressed="${document.body.classList.contains("pin-map-view")}">Map</button></div></header>`;
-  return `<div class="bd">${head}${compareHTML(d)}`+
-    mapRouteToggleHTML(choices,recommended,selected)+
-    `<div class="foot" style="padding:0 16px 16px">${BD_FOOT}</div></div>`;}
+    `<button type="button" data-view="choices" data-inspector-view="choices" aria-pressed="${!planView&&!mapView}">Choices</button>`+
+    `<button type="button" data-view="plan" data-inspector-view="plan" aria-pressed="${planView&&!mapView}">Route plan</button>`+
+    `<button type="button" data-view="map" data-inspector-view="map" aria-pressed="${mapView}">Map</button></div>`;
+  const mapKey=mapChoiceKey||"",recommendedKey=recommendedChoiceKey||mapKey,selectedKey=selected?selected.o.key:"";
+  return `<div class="bd pin-shell" data-map-choice-key="${escapeHTML(mapKey)}" `+
+    `data-recommended-choice-key="${escapeHTML(recommendedKey)}" data-selected-choice-key="${escapeHTML(selectedKey)}">${head}`+
+    `<div class="pin-workspace">${selectedRouteHTML(selected,recommended,d)}${compareHTML(d)}</div>`+
+    (selected?`<div class="pin-map-summary"><strong data-selected-title>${escapeHTML(routeTitle(selected))}</strong>`+
+      `<span><span data-selected-time>${formatMinutes(selected.r.head)}</span> selected</span></div>`:"")+`</div>`;}
 function touchPreviewHTML(d){
   d=normalizeBD(d);
   if(!d||d.error)return `<div class="peek-title">No transit route from this area</div>`;
@@ -1387,8 +1476,9 @@ function openHoverInPlace(l,d){
 }
 /* ---- compare model: build the strip list + draw the selected/previewed route ---------------- */
 let compareList=[];     // pinned cell's route options [{key,line,identityColor,legs,total,isPrimary}]
-let selKey=PRIMARY_KEY; // locked exact route choice; server primary on each new pin
+let selKey=PRIMARY_KEY; // exact route shown on the map and in Route Plan
 let previewKey=null;    // pointer/keyboard preview overrides selKey until the row is left
+let mapChoiceKey=null,recommendedChoiceKey=null,recommendedChoiceKeys={},selectionLocked=false;
 let allRoutesOpen=false,directionsOpen=false,showAllRoutes=false;
 let restoreRouteFocusKey=null,pendingSelectionAnnouncement="";
 function resetRouteDisclosureState(){
@@ -1518,14 +1608,18 @@ function optTotal(o){const j=optDA(o);return j?j.total:(o&&o.total);}
 function optRead(o){
   if(o&&o.da){
     const head=optTotal(o);
-    const frag=(metric=="r" && o.da.frag!=null)?o.da.frag:0;
-    return {showR:(metric=="r"),head,waitExtra:0,frag};
+    const fragKnown=o.da.frag!=null,frag=fragKnown?Number(o.da.frag):null;
+    const typical=o.da.typical||o.da.best||{};
+    return {showR:(metric=="r"),head,waitExtra:0,frag,fragKnown,
+      badDayBase:Number(typical.total!=null?typical.total:head)};
   }
   const real=(o&&o.real!=null)?o.real:null;
   const showR=(metric=="r" && real!=null);
   const head=showR?real:o.total;
-  // per-route bad-day (p90−p50), shown only in Typical mode where it's meaningful
-  return {showR,head,waitExtra:showR?Math.max(0,real-o.total):0,frag:(showR&&o.frag!=null)?o.frag:0};
+  // Bad-day remains anchored to the route's committed/realistic baseline in either view.
+  const fragKnown=real!=null&&o&&o.frag!=null,frag=fragKnown?Number(o.frag):null;
+  return {showR,head,waitExtra:showR?Math.max(0,real-o.total):0,frag,fragKnown,
+    badDayBase:Number(real!=null?real:head)};
 }
 function uniq(a){const out=[];(a||[]).forEach(x=>{if(x&&!out.includes(x))out.push(x);});return out;}
 function tlegs(o){return (optLegs(o)||[]).filter(g=>g&&g.mode==="transit"&&(g.name||g.line));}
@@ -1659,11 +1753,28 @@ function routeChoices(){
   buildFamilies().forEach(f=>f.branches.forEach(b=>{
     (b.opts||[]).forEach(x=>{if(x)out.push({family:f,branch:b,o:x.o,r:x.r});});
   }));
-  return out.sort((a,b)=>(a.o.isPrimary?-1:b.o.isPrimary?1:
-    (a.r.head-b.r.head)||(a.r.frag-b.r.frag)||String(a.o.key).localeCompare(String(b.o.key))));
+  return out.sort((a,b)=>{
+    const ar=choiceMatchesKey(a,recommendedChoiceKey),br=choiceMatchesKey(b,recommendedChoiceKey);
+    if(ar!==br)return ar?-1:1;
+    return (a.r.head-b.r.head)||(optionWalk(a.o)-optionWalk(b.o))||
+      (optionTransfers(a.o)-optionTransfers(b.o))||
+      ((a.r.fragKnown?a.r.frag:Number.MAX_SAFE_INTEGER)-
+       (b.r.fragKnown?b.r.frag:Number.MAX_SAFE_INTEGER))||
+      (Number(optTotal(a.o)||0)-Number(optTotal(b.o)||0))||
+      String(a.o.key).localeCompare(String(b.o.key));
+  });
 }
-function recommendedChoice(choices){return (choices||routeChoices()).find(c=>c.o.isPrimary)||
-  (choices||routeChoices())[0]||null;}
+function choiceMatchesKey(choice,key){return !!(choice&&key!=null&&
+  (String(choice.o.key)===String(key)||String(choice.o.choiceKey||"")===String(key)));}
+function recommendedChoice(choices){
+  choices=choices||routeChoices();
+  return choices.find(c=>choiceMatchesKey(c,recommendedChoiceKey))||
+    choices.find(c=>choiceMatchesKey(c,mapChoiceKey))||choices.find(c=>c.o.isPrimary)||choices[0]||null;
+}
+function mapChoice(choices){
+  choices=choices||routeChoices();
+  return choices.find(c=>choiceMatchesKey(c,mapChoiceKey))||choices.find(c=>c.o.isPrimary)||choices[0]||null;
+}
 function representativeChoices(choices){
   const grouped=new Map();
   (choices||routeChoices()).forEach(choice=>{
@@ -1694,26 +1805,33 @@ function routeTitle(choice){
   const compact=s=>String(s||"").replace(/\s+/g," ").trim().toLowerCase();
   if(compact(branch).startsWith(walkPrefix)&&
       compact(branch).slice(walkPrefix.length)===compact(fam)){
-    return `${fam} · walk to destination`;
+    return `${fam} → walk to destination`;
   }
-  return branch&&branch!==fam?`${fam} · ${branch}`:fam;
+  return branch&&branch!==fam?`${fam} → ${branch}`:fam;
 }
-function routeReason(choice,recommended){
-  if(choice===recommended){
-    const min=Math.min(...routeChoices().map(c=>c.r.head));
-    return choice.r.head===min?"Fastest route shown by the planner":"Planner's recommended route";
-  }
-  const delta=choice.r.head-recommended.r.head;
-  const prefix=delta>0?`${formatMinutes(delta)} slower`:delta<0?`${formatMinutes(-delta)} faster`:"Similar time";
-  if(choice.family.key!==recommended.family.key)return `${prefix} · different boarding corridor`;
-  if(choice.branch.key!==recommended.branch.key)return `${prefix} · different destination approach`;
-  const transfers=optionTransfers(choice.o), recTransfers=optionTransfers(recommended.o);
-  if(transfers<recTransfers)return `${prefix} · ${recTransfers-transfers} fewer transfer${recTransfers-transfers===1?"":"s"}`;
-  const walk=optionWalk(choice.o), recWalk=optionWalk(recommended.o);
-  if(walk<recWalk)return `${prefix} · ${formatMinutes(recWalk-walk)} less walking`;
-  if((choice.r.frag||0)<(recommended.r.frag||0))return `${prefix} · lower bad-day delay`;
-  return `${prefix} · a distinct route choice`;
+function routeReasonParts(choice,recommended){
+  if(!choice||!recommended)return [];
+  const baseline=choice===recommended?(mapChoice()||recommended):recommended;
+  if(choice===recommended&&baseline===recommended)return ["Best overall balance"];
+  const parts=[],delta=choice.r.head-baseline.r.head;
+  parts.push(delta>.05?`${formatMinutes(delta)} slower`:delta<-.05?`${formatMinutes(-delta)} faster`:"Same trip time");
+  const walk=optionWalk(choice.o),baseWalk=optionWalk(baseline.o),walkDelta=baseWalk-walk;
+  const transfers=optionTransfers(choice.o),baseTransfers=optionTransfers(baseline.o);
+  if(walkDelta>.45)parts.push(`${formatMinutes(walkDelta)} less walking`);
+  else if(walkDelta<-.45)parts.push(`${formatMinutes(-walkDelta)} more walking`);
+  else if(transfers<baseTransfers)parts.push(`${baseTransfers-transfers} fewer transfer${baseTransfers-transfers===1?"":"s"}`);
+  else if(transfers>baseTransfers)parts.push(`${transfers-baseTransfers} more transfer${transfers-baseTransfers===1?"":"s"}`);
+  else if(choice.r.fragKnown&&baseline.r.fragKnown&&choice.r.frag<baseline.r.frag)
+    parts.push("Lower bad-day delay");
+  else if(choice.r.fragKnown&&baseline.r.fragKnown&&choice.r.frag>baseline.r.frag)
+    parts.push("Higher bad-day delay");
+  else if(choice===recommended)return ["Best overall balance"];
+  else if(choice.family.key!==baseline.family.key)parts.push("Different boarding corridor");
+  else if(choice.branch.key!==baseline.branch.key)parts.push("Different destination approach");
+  else parts.push("Distinct itinerary");
+  return parts;
 }
+function routeReason(choice,recommended){return routeReasonParts(choice,recommended).join(". ");}
 function displayStopName(name){
   return String(name||"").replace(/\s*&\s*/g," & ").replace(/\s+/g," ").trim();
 }
@@ -1735,7 +1853,7 @@ function routeActionsHTML(choice){
       copy=`${verb}${board}${toward}`;
       const ride=Number.isFinite(+g.min)?`Ride ${formatMinutes(g.min)}`:"";
       const alight=g.alight&&g.alight.name?`get off at ${displayStopName(g.alight.name)}`:"";
-      detail=[ride,alight].filter(Boolean).join(" · ");
+      detail=[ride,alight].filter(Boolean).join(", ");
       lastService=service;rideIndex++;
     }else if(g.mode==="walk"){
       const next=legs.slice(index+1).find(leg=>leg&&leg.mode==="transit");
@@ -1753,22 +1871,38 @@ function routeActionsHTML(choice){
       (detail?`<small class="route-detail">${escapeHTML(detail)}</small>`:"")+`</span></li>`;
   }).join("");
 }
+function routeBadDay(choice){
+  return choice&&choice.r.fragKnown?
+    Number(choice.r.badDayBase||choice.r.head||0)+Number(choice.r.frag||0):null;
+}
+function routeFactsHTML(choice,includeTime){
+  const transfers=optionTransfers(choice.o),facts=[],badDay=routeBadDay(choice);
+  if(includeTime)facts.push(["time","Trip time",formatMinutes(choice.r.head)]);
+  facts.push(["walk","Walking",formatMinutes(optionWalk(choice.o))]);
+  facts.push(["transfers","Transfers",String(transfers)]);
+  facts.push(["bad-day","Bad day",badDay==null?"Not available":formatMinutes(badDay)]);
+  return facts.map(([key,label,value])=>`<span class="route-fact" data-fact="${key}">`+
+    `<span class="route-fact-label">${label}</span><span class="route-fact-value">${escapeHTML(value)}</span></span>`).join("");
+}
+function routeTradeoffsHTML(choice,recommended){
+  const parts=routeReasonParts(choice,recommended);
+  return `<span class="route-tradeoffs" data-route-reason>${parts.map(p=>`<span>${escapeHTML(p)}</span>`).join("")}</span>`;
+}
 function routeRowHTML(choice,recommended,where){
   const o=choice.o,r=choice.r,selected=selKey===o.key;
-  const walk=optionWalk(o),allowance=optionScheduleAllowance(o);
-  const bad=(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:`${formatMinutes(walk)} walk`;
-  const reason=routeReason(choice,recommended);
   const classes=["route-row","route-choice",choice===recommended?"recommended":"",where||""].filter(Boolean).join(" ");
   return `<button type="button" class="${classes}" data-key="${escapeHTML(o.key)}" `+
+    `data-choice-key="${escapeHTML(o.key)}" `+
     `data-family="${escapeHTML(choice.family.key)}" data-branch="${escapeHTML(choice.branch.key)}" `+
     `data-family-name="${escapeHTML(choice.family.meta.name||"Route")}" `+
     `data-branch-name="${escapeHTML(choice.branch.meta.name||"")}" `+
     `aria-pressed="${selected}">`+
     `<span class="route-dot" aria-hidden="true" style="background:${o.identityColor||primaryCasing()}"></span>`+
     `<span class="route-main"><span class="route-name">${escapeHTML(routeTitle(choice))}</span>`+
-    `<span class="route-why">${escapeHTML(reason)}${allowance>0?` · allow ${formatMinutes(allowance)} before boarding`:""}</span>`+
     (selected?`<span class="route-selected-label">Selected</span>`:"")+`</span>`+
-    `<span class="route-time">${formatMinutes(r.head)}<small>${escapeHTML(bad)}</small></span></button>`;
+    `<span class="route-time">${formatMinutes(r.head)}</span>`+
+    `<span class="route-facts">${routeFactsHTML(choice,false)}</span>`+
+    routeTradeoffsHTML(choice,recommended)+`</button>`;
 }
 function practicalChoices(choices,recommended){
   const candidates=representativeChoices(choices).filter(c=>c!==recommended).sort((a,b)=>(a.r.head-b.r.head)||(a.r.frag-b.r.frag));
@@ -1823,14 +1957,14 @@ function choiceBoardingContext(choice){
   const parts=choiceBoardingParts(choice);
   const board=parts.board?`Board at ${parts.board}`:"";
   const toward=parts.toward?`toward ${parts.toward}`:"";
-  return [board,toward].filter(Boolean).join(" · ");
+  return [board,toward].filter(Boolean).join(", ");
 }
 function boardingGroupLabel(family,members,duplicateName){
   const name=(family&&family.meta&&family.meta.name)||"Additional boarding option";
   const context=choiceBoardingContext((members||[])[0]);
   const sub=family&&family.meta&&family.meta.sub;
-  if(context)return `${context} · ${name}`;
-  if(duplicateName&&sub)return `${sub} · ${name}`;
+  if(context)return `${context}, ${name}`;
+  if(duplicateName&&sub)return `${sub}, ${name}`;
   return name;
 }
 function boardingHeadingHTML(family,members,duplicateName){
@@ -1838,7 +1972,7 @@ function boardingHeadingHTML(family,members,duplicateName){
   const parts=choiceBoardingParts((members||[])[0]);
   if(parts.board){
     const detail=[parts.toward?`Toward ${parts.toward}`:"",`Services: ${name}`]
-      .filter(Boolean).join(" · ");
+      .filter(Boolean).join(", ");
     return `<span class="boarding-place">${escapeHTML(`Board at ${parts.board}`)}</span>`+
       `<span class="boarding-detail">${escapeHTML(detail)}</span>`;
   }
@@ -1868,21 +2002,41 @@ function additionalChoicesHTML(choices,recommended){
       group.members.map(c=>routeRowHTML(c,recommended,"additional-route")).join("")+`</div></section>`;
   }).join("");
 }
+function routeSequence(choice){
+  const sequence=[],legs=optLegs(choice&&choice.o)||[];
+  const firstServices=serviceNames({services:branchServiceRows(choice)});
+  let rideIndex=0;
+  legs.forEach(g=>{
+    if(!g)return;
+    let label="";
+    if(g.mode==="transit"){
+      label=rideIndex===0&&firstServices.length?firstServices.join(" / "):lname(g);
+      rideIndex++;
+    }else if(g.mode==="walk"&&legPhysicalMin(g)>.05)label="Walk";
+    if(label&&sequence[sequence.length-1]!==label)sequence.push(label);
+  });
+  return sequence.join(" → ")||"Route details";
+}
 function selectedRouteHTML(choice,recommended,d){
   if(!choice)return "";
-  const o=choice.o,r=choice.r,walk=optionWalk(o),allowance=optionScheduleAllowance(o);
+  const o=choice.o,r=choice.r,allowance=optionScheduleAllowance(o);
+  const meaningfulAllowance=allowance>=1?allowance:0;
   const directions=routeActionsHTML(choice),stepCount=(directions.match(/<li\b/g)||[]).length;
-  const risk=(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:"low schedule risk";
-  return `<section class="selected-route" id="selected-route-panel" aria-labelledby="selected-route-title">`+
-    `<h2 class="route-section-title" id="selected-route-title">Selected route</h2>`+
+  return `<section class="route-plan-pane selected-route" id="route-plan-panel" data-selected-choice-key="${escapeHTML(o.key)}" aria-labelledby="selected-route-title">`+
+    `<h2 class="route-section-title" id="selected-route-title">Route plan</h2>`+
     `<div class="selected-route-summary"><span class="route-dot" aria-hidden="true" style="background:${o.identityColor||primaryCasing()}"></span>`+
-      `<div><span class="route-name">${escapeHTML(routeTitle(choice))}</span><span class="route-why">${escapeHTML(routeReason(choice,recommended))}</span>`+
-      (allowance>0?`<span class="route-allowance">Allow ${formatMinutes(allowance)} before boarding</span>`:"")+`</div>`+
-      `<div class="route-time">${formatMinutes(r.head)}<small>${formatMinutes(walk)} walk · ${escapeHTML(risk)}</small></div></div>`+
+      `<div><span class="route-name">${escapeHTML(routeTitle(choice))}</span>${routeTradeoffsHTML(choice,recommended)}</div>`+
+      `<div class="route-time">${formatMinutes(r.head)}</div></div>`+
+    `<div class="plan-facts">${routeFactsHTML(choice,true)}</div>`+
+    `<p class="plan-note">${choice===recommended?"Why we recommend it: ":"Compared with the recommended route: "}${escapeHTML(routeReason(choice,recommended))}.</p>`+
+    (meaningfulAllowance?`<div class="plan-timing"><strong>Boarding allowance</strong><br>Leave ${formatMinutes(meaningfulAllowance)} before the first scheduled vehicle.</div>`:"")+
     `<details class="selected-directions" id="route-directions"${directionsOpen?" open":""}>`+
-      `<summary aria-expanded="${directionsOpen}">Step-by-step directions (${stepCount} step${stepCount===1?"":"s"})</summary>`+
+      `<summary aria-expanded="${directionsOpen}"><span>Step-by-step directions`+
+        `<span class="direction-sequence">${escapeHTML(routeSequence(choice))}</span></span>`+
+        `<span>${stepCount} step${stepCount===1?"":"s"}</span></summary>`+
       `<ol class="route-directions">${directions||"<li>No detailed steps are available for this route.</li>"}</ol></details>`+
-    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank" rel="noopener">Open in Google Maps ↗</a></section>`;
+    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank" rel="noopener">Open in Google Maps ↗</a>`+
+    `<div class="foot">${BD_FOOT}</div></section>`;
 }
 // The dominant transit line of a geom leg list (the longest in-vehicle leg) — labels the primary
 // strip when there's no single "line" field. Falls back to "walk only".
@@ -2095,11 +2249,17 @@ function renderPin(f,d){
   const focusKey=restoreRouteFocusKey;
   const priorSelection=selKey;
   compareList=buildCompare(d);
+  const primary=compareList.find(o=>o.isPrimary)||compareList[0]||{};
+  mapChoiceKey=d.map_choice_key||d.choice_key||primary.key||PRIMARY_KEY;
+  recommendedChoiceKeys=d.recommended_choice_keys||{};
+  recommendedChoiceKey=recommendedChoiceKeys[metric]||d.recommended_choice_key||mapChoiceKey;
   const choices=routeChoices(),recommended=recommendedChoice(choices);
-  const selectionReplaced=!findChoice(selKey);
-  if(selectionReplaced)selKey=recommended?recommended.o.key:(compareList[0]||{}).key||PRIMARY_KEY;
+  const selectionReplaced=!selectionLocked||!findChoice(selKey);
   if(selectionReplaced){
-    directionsOpen=false;
+    if(selectionLocked&&!findChoice(selKey))selectionLocked=false;
+    selKey=recommended?recommended.o.key:primary.key||PRIMARY_KEY;
+  }
+  if(selectionReplaced){
     const replacement=findChoice(selKey);
     if(priorSelection!==selKey&&replacement)
       pendingSelectionAnnouncement=`Route changed to ${routeTitle(replacement)}, ${formatMinutes(replacement.r.head)}.`;
@@ -2153,9 +2313,10 @@ function openPin(f,l){
   // while pinned. The mouseover handler rebinds a fresh tooltip on the next (post-unpin) hover.
   layer.eachLayer(ll=>{if(ll.getTooltip&&ll.getTooltip())ll.unbindTooltip();});
   pinFeature=f;routePin=f.properties.id;
-  compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;mapChoiceKey=null;recommendedChoiceKey=null;recommendedChoiceKeys={};selectionLocked=false;
+  resetRouteDisclosureState();showAllRoutes=false;
   resetPinScroll=true;      // keep reset armed until the async final card has laid out
-  document.body.classList.add("route-pinned");document.body.classList.remove("route-adjusting","pin-map-view");
+  document.body.classList.add("route-pinned");document.body.classList.remove("route-adjusting","pin-map-view","pin-plan-view");
   showCellFocus(f);
   pinCard.classList.add("open");
   setPinHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b></div><div style="color:var(--mut)">loading route…</div></div>`);
@@ -2176,8 +2337,9 @@ function closePin(){
   pinUpgradeSeq++;pinUpgradeKey="";
   pinCard.classList.remove("open");pinFeature=null;routePin=null;pendingFitId=null;
   resetPinScroll=false;pinBody.scrollTop=0;
-  document.body.classList.remove("route-pinned","route-adjusting","pin-map-view");
-  compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
+  document.body.classList.remove("route-pinned","route-adjusting","pin-map-view","pin-plan-view");
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;mapChoiceKey=null;recommendedChoiceKey=null;recommendedChoiceKeys={};selectionLocked=false;
+  resetRouteDisclosureState();showAllRoutes=false;
   clearCellFocus();
   // If the mouse is parked over another cell with a cached breakdown, fall back to its hover
   // route immediately; otherwise clear the drawn route.
@@ -2356,9 +2518,8 @@ touchPeek.addEventListener("click",e=>{
 function previewRow(key){if(routePin==null||effectiveChoiceKey()===key)return;previewKey=key;drawSelected();}
 function clearPreview(){if(routePin==null||previewKey==null)return;previewKey=null;drawSelected();}
 function lockRow(key){if(routePin==null||!findChoice(key))return;
-  const before=effectiveChoiceKey(),selectionChanged=selKey!==key;selKey=key;previewKey=null;
+  const before=effectiveChoiceKey(),selectionChanged=selKey!==key;selKey=key;previewKey=null;selectionLocked=true;
   if(!selectionChanged)return;
-  directionsOpen=false;
   if(before!==key)drawSelected();
   markRouteChoices();refreshSelectedRoutePanel();announceRouteSelection(findChoice(selKey));}
 function markRouteChoices(){
@@ -2369,16 +2530,14 @@ function markRouteChoices(){
     if(sel&&!label){const el=document.createElement("span");el.className="route-selected-label";el.textContent="Selected";s.querySelector(".route-main")?.appendChild(el);}
     if(!sel&&label)label.remove();});
   const choice=findChoice(selKey)||recommendedChoice();
-  if(choice){const r=choice.r,transfers=optionTransfers(choice.o),walk=optionWalk(choice.o);
-    const values={time:formatMinutes(r.head),risk:(r.frag||0)>0?`bad-day +${formatMinutes(r.frag)}`:"low schedule risk",
-      walk:`${formatMinutes(walk)} walk`,transfers:`${transfers} transfer${transfers===1?"":"s"}`};
-    const allowance=optionScheduleAllowance(choice.o),allowanceEl=pinCard.querySelector('[data-summary="allowance"]');
-    if(allowanceEl){allowanceEl.hidden=allowance<=0;allowanceEl.textContent=allowance>0?`allow ${formatMinutes(allowance)} before boarding`:"";}
-    Object.entries(values).forEach(([key,value])=>{const el=pinCard.querySelector(`[data-summary="${key}"]`);
-      if(el)el.textContent=value;});}
+  if(choice){
+    pinCard.querySelectorAll("[data-selected-choice-key]").forEach(el=>el.setAttribute("data-selected-choice-key",choice.o.key));
+    pinCard.querySelectorAll("[data-selected-title]").forEach(el=>el.textContent=routeTitle(choice));
+    pinCard.querySelectorAll("[data-selected-time]").forEach(el=>el.textContent=formatMinutes(choice.r.head));
+  }
 }
 function refreshSelectedRoutePanel(){
-  const panel=pinCard.querySelector("#selected-route-panel"),choice=findChoice(selKey),recommended=recommendedChoice();
+  const panel=pinCard.querySelector("#route-plan-panel"),choice=findChoice(selKey),recommended=recommendedChoice();
   const d=routePin!=null?BDCACHE.get(routePin):null;
   if(panel&&choice&&d)panel.outerHTML=selectedRouteHTML(choice,recommended,d);
 }
@@ -2433,8 +2592,22 @@ function handleRouteDisclosureToggle(e){
   }
 }
 document.addEventListener("toggle",handleRouteDisclosureToggle,true);
+function setInspectorView(view){
+  const showPlan=view==="plan",showMap=view==="map";
+  document.body.classList.toggle("pin-plan-view",showPlan);
+  document.body.classList.toggle("pin-map-view",showMap);
+  pinCard.querySelectorAll("#pinview [data-view]").forEach(button=>
+    button.setAttribute("aria-pressed",String(button.dataset.view===view)));
+  requestAnimationFrame(()=>{
+    map.invalidateSize({pan:false});
+    if(showMap)fitToCompare();
+    else if(showPlan)pinCard.querySelector("#route-directions > summary")?.focus({preventScroll:true});
+    else pinCard.querySelector(`.route-choice[data-key="${CSS.escape(selKey)}"]`)?.scrollIntoView({block:"nearest"});
+  });
+}
 document.addEventListener("click",e=>{
   const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(row){lockRow(row.dataset.key);return;}
+  if(e.target.closest&&e.target.closest("#view-route-plan")){setInspectorView("plan");return;}
   if(e.target.closest&&e.target.closest("#pinadjust")){
     const open=!document.body.classList.contains("route-adjusting");
     document.body.classList.toggle("route-adjusting",open);
@@ -2444,13 +2617,7 @@ document.addEventListener("click",e=>{
     requestAnimationFrame(()=>map.invalidateSize({pan:false}));return;
   }
   const view=e.target.closest&&e.target.closest("#pinview [data-view]");if(view){
-    const showMap=view.dataset.view==="map";
-    document.body.classList.toggle("pin-map-view",showMap);
-    pinCard.querySelectorAll("#pinview [data-view]").forEach(b=>b.setAttribute("aria-pressed",String(b===view)));
-    requestAnimationFrame(()=>{map.invalidateSize({pan:false});
-      if(showMap)fitToCompare();
-      else pinCard.querySelector(`.route-choice[data-key="${CSS.escape(selKey)}"]`)?.scrollIntoView({block:"nearest"});
-    });return;
+    setInspectorView(view.dataset.view);return;
   }
   const all=e.target.closest&&e.target.closest(".show-routes");if(all){
     showAllRoutes=!showAllRoutes;all.setAttribute("aria-pressed",String(showAllRoutes));
@@ -2638,8 +2805,9 @@ function closeOpenInfo(){
   bdToken++; pinUpgradeSeq++; pinUpgradeKey=""; clearTimeout(bdTimer);
   routePin=null; hoverCell=null; hoverLayer=null; lastTipDir=null; lastTipAx=null; lastTipPerp=0; pendingFitId=null; clearRoute();   // drawn route is stale with the open cards
   pinCard.classList.remove("open"); pinFeature=null;   // close the pinned corner card too
-  compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
-  document.body.classList.remove("route-pinned","route-adjusting","pin-map-view");clearCellFocus();closeTouchPreview(false);
+  compareList=[];selKey=PRIMARY_KEY;previewKey=null;mapChoiceKey=null;recommendedChoiceKey=null;recommendedChoiceKeys={};selectionLocked=false;
+  resetRouteDisclosureState();showAllRoutes=false;
+  document.body.classList.remove("route-pinned","route-adjusting","pin-map-view","pin-plan-view");clearCellFocus();closeTouchPreview(false);
   layer.eachLayer(l=>{
     const tip=l.getTooltip&&l.getTooltip(); if(tip&&tip.isOpen())l.closeTooltip();
   });
@@ -2772,6 +2940,25 @@ function aggregate(){const acc={};CELLS.features.forEach(f=>{const v=val(f.prope
   if(v==null||!n)return;(acc[n]=acc[n]||[]).push(v);});NB={};
   for(const n in acc){acc[n].sort((a,b)=>a-b);NB[n]=acc[n][Math.floor(acc[n].length/2)];}}
 function busy(t){const b=document.getElementById("busy");if(t){b.textContent=t;b.style.display="block";}else b.style.display="none";}
+// The head classifier prevents the onboarding flash.  These late-boot helpers reconcile that
+// prediction with the real compute request and keep a failed restore recoverable instead of
+// leaving the visitor with a hidden prompt and an empty map.
+let startupRetry=null;
+function setStartupPrompt(state,message){
+  const prompt=document.getElementById("prompt");
+  document.documentElement.dataset.startup=state;prompt.dataset.state=state;prompt.style.display="";
+  if(message)document.getElementById("startup-copy").textContent=message;
+}
+function hideStartupPrompt(){
+  startupRetry=null;document.documentElement.dataset.startup="ready";
+  const prompt=document.getElementById("prompt");prompt.dataset.state="ready";prompt.style.display="none";
+}
+function retryStartupRestore(){const retry=startupRetry;if(retry)retry();}
+function chooseStartupWorkplace(){
+  startupRetry=null;++GEN;resetVarianceState(GEN);busy(false);DESTLL=null;CURLABEL="";TT={};ATTR={};LINECOLOR={};REAL={};VAR={};
+  if(pin){map.removeLayer(pin);pin=null;}clearRoute();closeOpenInfo();redraw();
+  setStartupPrompt("onboarding");requestAnimationFrame(()=>obAddrEl.focus({preventScroll:true}));
+}
 async function setWorkplace(lat,lon,label,opts){
   // Three independent opts (default behaviour = "fresh address"):
   //   atomic   true  -> wait for /variance then paint once (no expand→contract on param tweaks).
@@ -2791,9 +2978,11 @@ async function setWorkplace(lat,lon,label,opts){
   const recenter=opts.recenter!==false;
   const persist=opts.persist!==false;
   const keepPinId=opts.keepPinId!=null?opts.keepPinId:null;
+  const startup=!!opts.startup;
   const myGen=++GEN;                                 // bump: cancels stale in-flight responses
   resetVarianceState(myGen);                         // destination/settings get a fresh lifecycle
-  document.getElementById("prompt").style.display="none";
+  if(startup){startupRetry=null;setStartupPrompt("restoring",opts.startupMessage||"Restoring your saved workplace…");}
+  else hideStartupPrompt();
   DESTLL=[lat,lon];CURLABEL=label||"";ATTR={};LINECOLOR={};BDCACHE.clear();REAL={};VAR={};
   if(recenter)TT={};                                 // new workplace -> drop OLD times so a hover before /compute lands doesn't show last workplace's commute under the new name (param tweaks keep TT visible during the load window — same workplace, just new speed)
   if(keepPinId==null)closeOpenInfo();                // workplace changed -> any open tooltip is stale (a keepPin recompute keeps the pin + its drawn route; the caller already closed the hover affordances)
@@ -2805,14 +2994,19 @@ async function setWorkplace(lat,lon,label,opts){
   }
   if(persist){try{localStorage.setItem("wp_v1",JSON.stringify({lat,lon,label}))}catch(e){}}
   busy(atomic?"updating estimates…":"estimating…");
-  try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}${speedParam()}`);const d=await r.json();
+  try{const r=await fetch(`/compute?lat=${lat}&lon=${lon}${ridesParam()}${speedParam()}`);
+    if(!r.ok)throw new Error(`compute request failed (${r.status})`);
+    const d=await r.json();if(!d||!d.cells||!d.dest)throw new Error("compute returned no commute map");
     if(myGen!==GEN)return;                            // a newer address took over → drop this
     // RAPTOR: the map IS the engine result (exact-by-construction) -> breakdown is shown
     // immediately (no "refining…" placeholder). Legacy R5: stays the fast approx until refine().
     TT=d.cells;EXACT=CFG.raptor;DESTLL=d.dest;
     document.getElementById("dest").textContent=(label||"")+(CFG.raptor?"":`  ·  fast ~${d.ms}ms`);
-    if(!atomic){aggregate();redraw();}                // progressive paint of perfect; realistic overlays after
-  }catch(e){if(myGen===GEN){busy(false);alert("compute failed: "+e);}return;}
+    if(!atomic){aggregate();redraw();if(startup)hideStartupPrompt();} // progressive paint of perfect; realistic overlays after
+  }catch(e){if(myGen===GEN){busy(false);
+      if(startup){startupRetry=()=>setWorkplace(lat,lon,label,Object.assign({},opts,{startup:true}));
+        setStartupPrompt("error","We couldn’t open this commute. Check your connection, then retry or choose another workplace.");
+      }else alert("compute failed: "+e);}return;}
   if(myGen!==GEN)return;
   if(!CFG.raptor)document.getElementById("refine").disabled=false;  // re-refinable via the button (R5 only)
   syncHash();
@@ -2823,6 +3017,7 @@ async function setWorkplace(lat,lon,label,opts){
     await loadVariance({skipActive:keepPinId!=null});
     if(myGen===GEN && Object.keys(REAL).length===0 && Object.keys(VAR).length===0){aggregate();redraw();}   // /variance genuinely empty (MC off) -> fall back to perfect (a non-empty payload already painted inside loadVariance)
   } else loadVariance();
+  if(myGen===GEN&&startup)hideStartupPrompt();
   if(myGen===GEN)busy(false);
   // KEEP-PIN re-render (RAPTOR route-viz path): the new map (+ atomic /variance) has landed for
   // these params; re-fetch the pinned cell's /itinerary with the NEW params and re-render the card +
@@ -2867,7 +3062,8 @@ async function refreshPinForParams(id,gen){
 // intact) with a clear settings-specific message + the cell name, drop the now-stale compare list,
 // and clear the drawn route. The user can close it via ×/Esc/background-click as usual.
 function pinNoRoute(f){
-  setPinLoading(false);compareList=[];selKey=PRIMARY_KEY;previewKey=null;resetRouteDisclosureState();showAllRoutes=false;
+  setPinLoading(false);compareList=[];selKey=PRIMARY_KEY;previewKey=null;mapChoiceKey=null;recommendedChoiceKey=null;recommendedChoiceKeys={};selectionLocked=false;
+  resetRouteDisclosureState();showAllRoutes=false;
   setPinHTML(`<div class="bd"><div class="h"><b>${escapeHTML(f.properties.n||"")}</b></div>`+
     `<div style="color:var(--mut);font-size:12px;margin-top:4px">No route within these settings.</div>`+
     `<div class="foot" style="margin-top:8px">Try raising Max transfers or the Max-commute limit.</div></div>`);
@@ -3145,6 +3341,8 @@ obAddrEl.addEventListener("keydown",e=>{
   else if(e.key==="Escape"){if(!consumeAutocompleteEscape(e,open,obCloseAC))obCloseAC();}});
 obAddrEl.addEventListener("blur",()=>setTimeout(obCloseAC,120));
 document.getElementById("obgo").onclick=()=>obSubmit(obAddrEl.value);
+document.getElementById("startupretry").onclick=retryStartupRestore;
+document.getElementById("startupchange").onclick=chooseStartupWorkplace;
 
 /* ============ Feature 6: neighborhoods export ============ */
 function exportRows(){return nbUnder().map(([n,v])=>[n,v]);}
@@ -3239,7 +3437,7 @@ function parseHash(){const h=location.hash.replace(/^#/,"");if(!h)return null;
   const o={};h.split("&").forEach(kv=>{const i=kv.indexOf("=");if(i<0)return;
     o[kv.slice(0,i)]=kv.slice(i+1);});
   return o;}
-function applyHash(o){
+function applyHash(o,opts){
   if(o.ideal!=null&&Number.isFinite(+o.ideal)){ideal=Math.min(45,Math.max(10,+o.ideal));
     document.getElementById("ideal").value=ideal;document.getElementById("idval").textContent=ideal;}
   if(o.thr!=null&&Number.isFinite(+o.thr)){thr=Math.min(70,Math.max(10,+o.thr));
@@ -3262,7 +3460,7 @@ function applyHash(o){
     // which would slip past Number.isFinite and compute a bogus lon=0; reject it.
     if(wseg.length>=2&&wseg[0]!==""&&wseg[1]!==""&&Number.isFinite(lat)&&Number.isFinite(lon)){
       document.getElementById("addr").value=label||"";
-      setWorkplace(lat,lon,label,{persist:false});return true;}}   // a one-time deep link must not clobber the user's saved workplace
+      setWorkplace(lat,lon,label,Object.assign({persist:false},opts||{}));return true;}}   // a one-time deep link must not clobber the user's saved workplace
   return false;}
 
 // Apply CFG: with the RAPTOR stack the map IS the engine result, so drop the R5 "Refine" button
@@ -3316,17 +3514,22 @@ legend();   // draw the legend; map stays blank until you set an address
 // Boot: hash takes precedence over localStorage (Feature 4).
 (function boot(){
   const o=parseHash();
+  const restoring=document.documentElement.dataset.startup==="restoring";
   // applyHash returns true only when a VALID wp was applied (setWorkplace drives its own
   // compute/paint). A malformed wp= must fall through to the saved/default workplace below
   // — applyHash already restored sliders/metric/cmode/theme either way.
-  if(o&&applyHash(o))return;
+  if(o&&applyHash(o,{startup:restoring,startupMessage:"Opening this shared commute…"}))return;
   let wp=null;
   try{wp=JSON.parse(localStorage.getItem("wp_v1")||"null");}catch(e){}        // a returning user's OWN previously-typed workplace
   // No .env/baked default: a first-time visitor (no hash, no saved wp) gets NO pre-filled
   // address and NO auto-compute — the onboarding prompt shows over an empty map instead.
   if(wp&&Number.isFinite(wp.lat)&&Number.isFinite(wp.lon)){
-    document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label);
+    document.getElementById("addr").value=wp.label||"";setWorkplace(wp.lat,wp.lon,wp.label,{startup:restoring});
   } else {
+    // The pre-paint check and this late check deliberately use the same valid-workplace shape.
+    // If storage changed between them, reconcile to honest first-run onboarding instead of leaving
+    // a restoration shell on screen without a request behind it.
+    setStartupPrompt("onboarding");
     // First-time visitor: the onboarding card is showing — focus its address input so the user can
     // just start typing. (No autofocus when a hash/saved wp already drove setWorkplace, which hides
     // #prompt.) Guard on the prompt actually being visible in case anything above hid it.

@@ -11,7 +11,7 @@ import pytest
 from playwright.sync_api import expect
 
 from conftest import (
-    ADDR_MARKET, ADDR_FERRY, HEAVY_TIMEOUT, COMPUTE_TIMEOUT,
+    ADDR_MARKET, ADDR_FERRY, BASE_URL, HEAVY_TIMEOUT, COMPUTE_TIMEOUT,
     fresh_load, set_address, wait_for_fast_map, find_colored_cell_hover, shot,
 )
 
@@ -47,6 +47,106 @@ def test_01_load_no_errors_prompt_refine_disabled(page):
     assert page.is_visible("#legend")
     shot(page, "desktop_01_load")
     assert errors == [], f"console/page errors on load: {errors}"
+
+
+def test_01b_returning_visitor_gets_restore_shell_without_onboarding_flash(page):
+    """A saved commute is truthful from first paint even while compute is deliberately held."""
+    page.add_init_script(
+        """localStorage.setItem('wp_v1', JSON.stringify({
+          lat:37.7714154,lon:-122.4030885,label:'650 Townsend St'
+        }));"""
+    )
+    held = []
+    page.route("**/compute?*", lambda route: held.append(route))
+    page.goto(BASE_URL, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "() => document.documentElement.dataset.startup === 'restoring' && "
+        "document.querySelector('#prompt .ob-restoring') && "
+        "getComputedStyle(document.querySelector('#prompt .ob-restoring')).display !== 'none'"
+    )
+    for _ in range(40):
+        if held:
+            break
+        page.wait_for_timeout(25)
+    assert held, "startup compute was not intercepted"
+    assert page.locator("#prompt .ob-restoring").is_visible()
+    assert not page.locator("#prompt .ob-onboarding").is_visible()
+    expect(page.locator("#prompt .ob-restoring")).to_contain_text("Opening your commute")
+    shot(page, "desktop_01b_restoring")
+
+    held.pop(0).continue_()
+    page.wait_for_function("() => document.querySelectorAll('#list .nb').length > 0", timeout=COMPUTE_TIMEOUT)
+    page.wait_for_function("() => getComputedStyle(document.getElementById('prompt')).display === 'none'")
+
+
+def test_01c_failed_startup_restore_offers_retry_and_recovers(page):
+    """A failed saved-workplace restore stays actionable, then Retry starts a fresh compute."""
+    page.add_init_script(
+        """localStorage.setItem('wp_v1', JSON.stringify({
+          lat:37.7714154,lon:-122.4030885,label:'650 Townsend St'
+        }));"""
+    )
+    attempts = []
+
+    def fail_once(route):
+        attempts.append(route.request.url)
+        if len(attempts) == 1:
+            route.fulfill(status=503, content_type="text/plain", body="temporarily unavailable")
+        else:
+            route.continue_()
+
+    page.route("**/compute?*", fail_once)
+    page.goto(BASE_URL, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "() => document.documentElement.dataset.startup === 'error' && "
+        "document.getElementById('prompt').dataset.state === 'error' && "
+        "getComputedStyle(document.getElementById('startupretry')).display !== 'none'"
+    )
+    expect(page.locator("#startup-copy")).to_contain_text("couldn’t open this commute")
+    assert page.locator("#startupretry").is_visible()
+    assert page.locator("#startupchange").is_visible()
+    assert len(attempts) == 1
+
+    page.click("#startupretry")
+    page.wait_for_function("() => document.documentElement.dataset.startup === 'restoring'")
+    page.wait_for_function("() => document.querySelectorAll('#list .nb').length > 0", timeout=COMPUTE_TIMEOUT)
+    page.wait_for_function(
+        "() => document.documentElement.dataset.startup === 'ready' && "
+        "getComputedStyle(document.getElementById('prompt')).display === 'none'"
+    )
+    assert len(attempts) == 2, attempts
+
+
+def test_01d_change_workplace_after_failed_restore_returns_to_focused_onboarding(page):
+    """Change workplace abandons the failed restore without leaving error-state UI behind."""
+    page.add_init_script(
+        """localStorage.setItem('wp_v1', JSON.stringify({
+          lat:37.7714154,lon:-122.4030885,label:'650 Townsend St'
+        }));"""
+    )
+    page.route(
+        "**/compute?*",
+        lambda route: route.fulfill(
+            status=503, content_type="text/plain", body="temporarily unavailable"),
+    )
+    page.goto(BASE_URL, wait_until="domcontentloaded")
+    page.wait_for_function(
+        "() => document.documentElement.dataset.startup === 'error' && "
+        "document.getElementById('prompt').dataset.state === 'error'"
+    )
+
+    page.click("#startupchange")
+    page.wait_for_function(
+        """() => document.documentElement.dataset.startup === 'onboarding' &&
+          document.getElementById('prompt').dataset.state === 'onboarding' &&
+          getComputedStyle(document.querySelector('#prompt .ob-onboarding')).display !== 'none' &&
+          getComputedStyle(document.querySelector('#prompt .ob-restoring')).display === 'none' &&
+          document.activeElement === document.getElementById('obaddr')"""
+    )
+    assert not page.locator("#startupretry").is_visible()
+    assert not page.locator("#startupchange").is_visible()
+    assert page.locator("#obaddr").input_value() == ""
+    assert page.locator("#dest").inner_text().strip() == ""
 
 
 # ---- Spec 2: Autocomplete (incl. dedup flag) -------------------------------------------
