@@ -133,7 +133,8 @@ trap 'rm -f "$DATA"/*.part 2>/dev/null || true' EXIT
 # match so it only accepts a real top-level or nested routes.txt entry.
 valid_gtfs_zip () {
   local f="$1"
-  [ -s "$f" ] && unzip -l "$f" >/dev/null 2>&1 && unzip -l "$f" | grep -qE '(^|/)routes\.txt$'
+  [ -s "$f" ] && unzip -t "$f" >/dev/null 2>&1 \
+    && unzip -Z1 "$f" | grep -E '(^|/)routes\.txt$' >/dev/null
 }
 
 # Validate a file is non-empty JSON/GeoJSON.

@@ -35,7 +35,8 @@ trap 'rm -f "$DATA"/*.part 2>/dev/null || true' EXIT
 # A zip is a valid GTFS feed if it lists a (top-level or nested) routes.txt.
 valid_gtfs_zip () {
   local f="$1"
-  [ -s "$f" ] && unzip -l "$f" >/dev/null 2>&1 && unzip -l "$f" | grep -qE '(^|/)routes\.txt$'
+  [ -s "$f" ] && unzip -t "$f" >/dev/null 2>&1 \
+    && unzip -Z1 "$f" | grep -E '(^|/)routes\.txt$' >/dev/null
 }
 
 fetch_op () {
