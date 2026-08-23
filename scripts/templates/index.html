@@ -197,6 +197,8 @@ function classifyStartupState(hash,saved){
     padding:16px 54px 13px 16px}
   .pin-place{font-size:1.05rem;font-weight:750;line-height:1.25;letter-spacing:-.01em}
   .pin-dest{margin-top:3px;color:var(--mut);font-size:.8125rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pin-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;min-width:0}
+  .pin-title-copy{min-width:0;flex:1}
   .pin-context{display:flex;flex-direction:column;align-items:stretch;gap:10px;margin-top:12px}
   .pin-settings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));min-width:0;
     border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
@@ -206,11 +208,10 @@ function classifyStartupState(hash,saved){
     text-transform:uppercase;letter-spacing:.055em;font-weight:650}
   .pin-setting-value{display:block;margin-top:2px;color:var(--ink);font-size:.75rem;line-height:1.3;
     font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .quiet-action,.pin-view button{min-height:38px;border:1px solid var(--line);border-radius:8px;
+  .quiet-action{min-height:44px;border:1px solid var(--line);border-radius:8px;
     padding:0 11px;background:var(--bg-button);color:var(--ink);cursor:pointer;font-size:.75rem;font-weight:650}
-  .pin-view{display:grid;grid-template-columns:1fr 1fr;gap:5px;padding:8px 12px;border-bottom:1px solid var(--line);
-    background:var(--panel)}
-  .pin-view button[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:var(--ink-on-accent)}
+  #pinadjust{border-color:color-mix(in srgb,var(--accent) 55%,var(--line));color:var(--accent)}
+  .quiet-action:hover{background:var(--bg-hover);border-color:var(--accent)}
   .pin-workspace{display:block;flex:1 1 auto;min-height:0;overflow:hidden}
   .route-choices-pane,.route-plan-pane{height:100%;overflow-y:auto;overscroll-behavior:contain;padding:0 16px 18px}
   .route-plan-pane{display:none}
@@ -218,13 +219,20 @@ function classifyStartupState(hash,saved){
   .route-section-title{margin:0 0 9px;color:var(--ink);font-size:.875rem;font-weight:750;line-height:1.3}
   .route-section-title span{color:var(--mut);font-weight:600}
   .choice-list{border-top:1px solid var(--line)}
+  .route-choice-card{position:relative;border-bottom:1px solid var(--line)}
+  .route-choice-card:last-child{border-bottom:0}
   .route-row{position:relative;display:grid;grid-template-columns:12px minmax(0,1fr) auto;width:100%;
-    gap:10px;min-height:76px;padding:13px 2px;border:0;border-bottom:1px solid var(--line);border-radius:0;
+    gap:10px;min-height:76px;padding:13px 2px;border:0;border-radius:0;
     background:transparent;color:var(--ink);text-align:left;cursor:pointer}
-  .route-row:last-child{border-bottom:0}
   .route-row:hover,.route-row:focus-visible{background:var(--bg-hover)}
   .route-row[aria-pressed="true"]{background:var(--bg-hover);border-radius:8px;
     box-shadow:inset 0 0 0 1px var(--accent);padding-left:9px;padding-right:9px}
+  .route-plan-entry{display:none;align-items:center;justify-content:space-between;width:calc(100% - 24px);
+    min-height:44px;margin:-5px 12px 10px;padding:0 11px;border:1px solid var(--line);border-radius:8px;
+    background:var(--bg-button);color:var(--ink);font-size:.75rem;font-weight:750;cursor:pointer;text-align:left}
+  .route-plan-entry:after{content:"\2192";color:var(--accent);font-size:1rem}
+  .route-choice-card[data-selected="true"] .route-plan-entry{display:flex}
+  .route-plan-entry:hover{background:var(--bg-hover);border-color:var(--accent)}
   .route-dot{width:10px;height:10px;border-radius:50%;margin-top:5px;border:1px solid rgba(0,0,0,.35);
     box-shadow:0 0 0 1px rgba(255,255,255,.18)}
   .route-main{min-width:0}
@@ -253,18 +261,21 @@ function classifyStartupState(hash,saved){
   .boarding-heading{margin:0 0 8px;line-height:1.35}
   .boarding-place{display:block;color:var(--ink);font-size:.8125rem;font-weight:750}
   .boarding-detail{display:block;margin-top:2px;color:var(--mut);font-size:.6875rem;font-weight:600}
-  .selected-route{padding-top:20px}
-  .selected-route-summary{display:grid;grid-template-columns:12px minmax(0,1fr) auto;gap:10px;align-items:start}
-  .selected-route-summary .route-tradeoffs{grid-column:auto;margin-top:5px}
-  .plan-facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));margin-top:14px;
-    border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
-  .plan-facts .route-fact:nth-child(2n){border-right:0}
-  .plan-facts .route-fact:nth-child(n+3){border-top:1px solid var(--line)}
-  .plan-facts .route-fact:nth-child(3){padding-left:0}
-  .plan-note{margin:12px 0 0;color:var(--mut);font-size:.75rem;line-height:1.45}
-  .plan-timing{margin-top:11px;padding:9px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);
-    color:var(--mut);font-size:.75rem;line-height:1.4}
-  .plan-timing strong{color:var(--ink)}
+  .selected-route{padding-top:0}
+  .plan-head{position:sticky;top:0;z-index:2;display:flex;align-items:flex-start;justify-content:space-between;
+    gap:12px;padding:2px 0 13px;background:var(--panel);border-bottom:1px solid var(--line)}
+  .plan-heading{min-width:0}
+  .plan-title{margin:0;color:var(--ink);font-size:.9375rem;line-height:1.3}
+  .plan-route-context{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;margin-top:5px;
+    color:var(--mut);font-size:.75rem;line-height:1.35;font-weight:650}
+  .plan-route-name{min-width:0;overflow-wrap:anywhere}
+  .plan-trip-time{white-space:nowrap;font-variant-numeric:tabular-nums}
+  .plan-close{flex:0 0 auto;min-height:44px;border:1px solid var(--line);border-radius:8px;padding:0 10px;
+    background:var(--bg-button);color:var(--ink);font-size:.75rem;font-weight:750;cursor:pointer}
+  .plan-close-mobile{display:none}
+  .plan-directions-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding-top:15px}
+  .plan-directions-head h3{margin:0;font-size:.8125rem;line-height:1.3}
+  .plan-step-count{color:var(--mut);font-size:.6875rem;font-weight:700;white-space:nowrap}
   .route-directions{margin:10px 0 0;padding:0;list-style:none;border-top:1px solid var(--line)}
   .route-directions li{display:flex;gap:8px;padding:10px 0;border-bottom:1px solid var(--line);font-size:.8125rem;line-height:1.4}
   .route-directions li:last-child{border-bottom:0}
@@ -273,18 +284,12 @@ function classifyStartupState(hash,saved){
     font-size:.625rem;font-weight:750;margin-top:1px}
   .route-copy{min-width:0}.route-detail{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
   .route-allowance{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
-  .selected-directions{border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin-top:14px}
-  .selected-directions>summary{min-height:58px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;
-    list-style:none;cursor:pointer;color:var(--ink);font-size:.8125rem;font-weight:700}
-  .selected-directions>summary::-webkit-details-marker{display:none}
-  .selected-directions>summary:after{content:"+";color:var(--mut);font-size:1rem}
-  .selected-directions[open]>summary:after{content:"−"}
-  .direction-sequence{display:block;margin-top:3px;color:var(--mut);font-size:.7rem;font-weight:550;line-height:1.4}
-  .selected-plan-cta{position:sticky;bottom:-18px;z-index:2;width:calc(100% + 32px);margin:18px -16px -18px;
-    min-height:58px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:10px 16px;
-    border:0;border-top:1px solid var(--line);background:var(--accent);color:var(--ink-on-accent);text-align:left;cursor:pointer}
-  .selected-plan-cta small{display:block;font-size:.6875rem;font-weight:600;opacity:.82}
-  .selected-plan-cta strong{overflow-wrap:anywhere}
+  .plan-footer{margin-top:8px;padding:12px 0 max(2px,env(safe-area-inset-bottom));
+    border-top:1px solid var(--line);background:var(--panel)}
+  .plan-google{display:flex;align-items:center;justify-content:space-between;min-height:44px;padding:0 12px;
+    border:1px solid var(--line);border-radius:8px;background:var(--bg-button);color:var(--accent);
+    font-size:.75rem;font-weight:750;text-decoration:none}
+  .plan-google:hover{background:var(--bg-hover);border-color:var(--accent)}
   .pin-map-summary{display:none;padding:10px 16px;border-top:1px solid var(--line)}
   .pin-map-summary strong{display:block;font-size:.875rem}.pin-map-summary span{color:var(--mut);font-size:.75rem}
   .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -447,11 +452,10 @@ function classifyStartupState(hash,saved){
     #pincard{top:0;right:0;left:0;bottom:0;width:100vw;max-height:100dvh;height:100dvh;border-radius:0;
       border-width:0;transition:transform .24s cubic-bezier(.25,1,.5,1)}
     #pincard .pin-head{padding-top:max(16px,env(safe-area-inset-top))}
-    #pincard .pin-view{display:grid;grid-template-columns:repeat(3,1fr)}
     #pincard .route-row{min-height:64px}
     #pincard .route-name{font-size:.9375rem}
     #pincard .route-tradeoffs,#pincard .route-directions li{font-size:.8125rem}
-    #pincard .quiet-action,#pincard .pin-view button{min-height:44px;font-size:.875rem}
+    #pincard .quiet-action{min-height:44px;font-size:.875rem}
     #pincard .pin-context{grid-template-columns:1fr;align-items:start;gap:9px}
     #pincard .quiet-action{justify-self:start}
     #pincard .pin-setting{padding-top:9px;padding-bottom:9px}
@@ -471,11 +475,11 @@ function classifyStartupState(hash,saved){
      panes; this layer only decides where those panes can live. */
   #settingsdone{display:none}
   #route-sidecar{position:fixed;right:calc(clamp(380px,32vw,460px) + 30px);bottom:18px;z-index:1190;
-    display:none;width:clamp(286px,24vw,340px);max-height:min(55dvh,480px);overflow:hidden;
+    display:none;width:clamp(320px,25vw,400px);max-height:min(68dvh,620px);overflow:hidden;
     background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:12px;
     box-shadow:var(--shadow-pop)}
   #route-sidecar[data-open="true"]{display:flex;flex-direction:column}
-  #route-sidecar .route-plan-pane{display:block;height:auto;max-height:min(55dvh,480px);padding:16px;
+  #route-sidecar .route-plan-pane{display:block;height:auto;max-height:min(68dvh,620px);padding:16px;
     overflow-y:auto;overscroll-behavior:contain}
   #pincard[data-layout-capability="single-card"],#pincard[data-layout-capability="wide-sidecar"]{
     top:18px;right:18px;left:auto;bottom:auto;width:clamp(380px,32vw,460px);height:calc(100dvh - 36px);
@@ -490,62 +494,58 @@ function classifyStartupState(hash,saved){
   #pincard[data-layout-capability="single-card"] .route-plan-pane{order:2;display:none;flex:0 0 min(42%,380px);
     height:auto;min-height:170px;padding:16px;overflow-y:auto;border-top:1px solid var(--line);background:var(--panel)}
   #pincard[data-layout-capability="single-card"][data-plan-open="true"] .route-plan-pane{display:block}
-  #pincard[data-layout-capability="wide-sidecar"] .selected-plan-cta{display:grid}
-  #pincard[data-layout-capability="single-card"] .selected-plan-cta{display:grid}
-  #pincard[data-layout-capability="wide-sidecar"] .pin-view,
-  #pincard[data-layout-capability="single-card"] .pin-view{display:none}
-  .route-plan-toggle{display:inline-flex;align-items:center;justify-content:center;min-height:44px;border:1px solid var(--line);
-    border-radius:8px;padding:0 11px;background:var(--bg-button);color:var(--ink);cursor:pointer;font-size:.75rem;font-weight:650}
   .pin-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
   .pin-actions .quiet-action,.pin-map-focus{min-height:44px;min-width:44px;padding:0 9px}
-  .pin-sheet-handle,.pin-peek-actions{display:none}
+  .pin-sheet-handle{display:none}
   #pincard[data-presentation="map-focus"]{top:auto;bottom:18px;height:auto;min-height:0;max-height:none;width:min(470px,calc(100vw - 36px))}
-  #pincard[data-presentation="map-focus"] .pin-head,#pincard[data-presentation="map-focus"] .pin-workspace,
-  #pincard[data-presentation="map-focus"] .pin-view{display:none}
-  #pincard[data-presentation="map-focus"] .pin-map-summary{display:flex;align-items:center;gap:10px;padding:10px 12px}
-  .pin-map-summary .map-focus-copy{min-width:0;flex:1}.pin-map-summary .map-focus-actions{display:flex;gap:5px}
+  #pincard[data-presentation="map-focus"] .pin-head,#pincard[data-presentation="map-focus"] .pin-workspace{display:none}
+  #pincard[data-presentation="map-focus"] .pin-map-summary{display:flex;align-items:center;gap:10px;padding:10px 58px 10px 12px}
+  .pin-map-summary .map-focus-copy{min-width:0;flex:1;border:0;background:transparent;color:var(--ink);
+    padding:0;text-align:left;cursor:pointer}.pin-map-summary .map-focus-actions{display:flex;gap:5px}
   .pin-map-summary button{min-height:44px;border:1px solid var(--line);border-radius:8px;background:var(--bg-button);color:var(--ink);padding:0 10px;cursor:pointer;font-weight:700;font-size:.75rem}
+  .pin-map-summary button.map-focus-copy{border:0;background:transparent;padding:0}
   html[data-inspector-surface="settings"] #pincard,html[data-inspector-surface="settings"] #route-sidecar{visibility:hidden;pointer-events:none}
   html[data-inspector-surface="settings"] #panel{opacity:1;visibility:visible;pointer-events:auto}
-  html[data-inspector-surface="settings"] #settingsdone{display:block;min-height:44px;border:0;border-bottom:1px solid var(--line);
-    background:var(--panel);color:var(--accent);text-align:left;padding:0 16px;font-weight:750;cursor:pointer}
+  html[data-inspector-surface="settings"] #settingsdone{display:flex;position:fixed;top:18px;right:318px;z-index:1220;
+    align-items:center;min-height:44px;border:1px solid var(--line);border-radius:22px;background:var(--panel);
+    color:var(--accent);box-shadow:var(--shadow);text-align:left;padding:0 14px;font-weight:750;cursor:pointer}
   @media (max-width:719px){
     #route-sidecar{display:none!important}
-    #pincard[data-layout-capability="bottom-sheet"]{top:auto;right:0;bottom:0;left:0;width:100%;height:var(--sheet-height,calc(100dvh - env(safe-area-inset-top)));
-      max-height:none;border-radius:16px 16px 0 0;border-width:1px 0 0;transform:translate3d(0,var(--sheet-offset,0px),0);
-      animation:none;transition:transform .24s cubic-bezier(.25,1,.5,1);will-change:transform}
+    #pincard[data-layout-capability="bottom-sheet"]{top:auto;right:0;bottom:0;left:0;width:100%;height:var(--sheet-height,132px);
+      max-height:calc(100dvh - 8px);border-radius:16px 16px 0 0;border-width:1px 0 0;transform:none;
+      animation:none;transition:height .24s cubic-bezier(.25,1,.5,1)}
     #pincard[data-layout-capability="bottom-sheet"][data-dragging="true"]{transition:none}
     #pincard[data-layout-capability="bottom-sheet"] .pin-shell{min-height:0}
     #pincard[data-layout-capability="bottom-sheet"] .pin-sheet-handle{display:flex;align-items:center;justify-content:center;
-      width:100%;min-height:44px;border:0;background:transparent;color:var(--mut);cursor:grab;touch-action:none}
+      width:calc(100% - 54px);margin-right:54px;min-height:44px;border:0;background:transparent;color:var(--mut);cursor:grab;touch-action:none}
     #pincard[data-layout-capability="bottom-sheet"] .pin-sheet-handle:before{content:"";width:36px;height:4px;border-radius:4px;background:var(--bg-handle)}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-head{padding:4px 54px 10px 16px}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-context{display:block;margin-top:8px}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-settings,.pin-actions .pin-map-focus{display:none}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-actions{margin-top:8px}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-actions .route-plan-toggle{display:none}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-view{display:grid;grid-template-columns:1fr 1fr;padding:8px 12px}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-head{padding:2px 54px 10px 16px}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-title-row{align-items:center;gap:8px}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-place{font-size:1rem}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-dest{font-size:.75rem}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-context{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-actions{flex:0 0 auto}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-actions .pin-map-focus{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-actions .quiet-action{min-height:44px;padding:0 9px;font-size:.75rem}
     #pincard[data-layout-capability="bottom-sheet"] .pin-workspace{display:flex;flex:1;min-height:0;overflow:hidden}
     #pincard[data-layout-capability="bottom-sheet"] .route-choices-pane,
-    #pincard[data-layout-capability="bottom-sheet"] .route-plan-pane{display:none;flex:1;min-height:0;height:auto;padding-bottom:max(18px,env(safe-area-inset-bottom));overflow-y:auto}
+    #pincard[data-layout-capability="bottom-sheet"] .route-plan-pane{display:none;flex:1;min-height:0;height:auto;
+      padding-bottom:calc(max(24px,env(safe-area-inset-bottom)) + 12px);overflow-y:auto}
     #pincard[data-layout-capability="bottom-sheet"][data-sheet-content="choices"] .route-choices-pane,
     #pincard[data-layout-capability="bottom-sheet"][data-sheet-content="plan"] .route-plan-pane{display:block}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-peek-actions{display:flex;gap:8px;margin-top:10px}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-peek-actions button{flex:1;min-height:44px;border-radius:8px;border:1px solid var(--line);background:var(--bg-button);color:var(--ink);font-weight:750;cursor:pointer}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-peek-actions button:first-child{background:var(--accent);border-color:var(--accent);color:var(--ink-on-accent)}
-    #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="browse"] [data-sheet-snap-action="browse"],
-    #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="expanded"] [data-sheet-snap-action="expanded"]{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .route-choice-card .route-plan-entry{display:flex}
     #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-head,
-    #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-view,
-    #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-peek-actions,
     #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-workspace{display:none}
     #pincard[data-layout-capability="bottom-sheet"] .pin-map-summary{display:none}
     #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-map-summary{display:flex;align-items:center;gap:10px;padding:8px 54px 12px 16px;border-top:0}
-    #pincard[data-layout-capability="bottom-sheet"] .pin-map-summary [data-close-pin]{display:none}
-    html[data-inspector-surface="settings"] #panel{top:auto;right:0;bottom:0;left:0;width:100%;height:var(--sheet-height,calc(100dvh - env(safe-area-inset-top)));
-      max-height:none;border-left:0;border-radius:16px 16px 0 0;transform:translate3d(0,var(--settings-sheet-offset,0px),0);transition:transform .24s cubic-bezier(.25,1,.5,1)}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-map-summary .map-focus-actions{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .plan-close-desktop{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .plan-close-mobile{display:inline}
+    html[data-inspector-surface="settings"] #panel{top:auto;right:0;bottom:0;left:0;width:100%;height:var(--settings-sheet-height,58dvh);
+      max-height:calc(100dvh - 8px);border-left:0;border-radius:16px 16px 0 0;transform:none;transition:height .24s cubic-bezier(.25,1,.5,1)}
     html[data-inspector-surface="settings"] #sheetbtn{display:none}
-    html[data-inspector-surface="settings"] #settingsdone{display:block;position:sticky;top:0;z-index:2}
+    html[data-inspector-surface="settings"] #settingsdone{display:flex;position:sticky;top:0;right:auto;z-index:2;
+      border-width:0 0 1px;border-radius:0;box-shadow:none;padding:0 16px}
   }
   @media (prefers-reduced-motion:reduce){
     /* Keep state changes immediate without globally clobbering third-party/map transitions. */
@@ -581,7 +581,7 @@ function classifyStartupState(hash,saved){
   </div></div>
 <aside id="panel" aria-label="Commute controls" tabindex="-1">
   <button id="sheetbtn" aria-label="Toggle controls" aria-expanded="false">Controls</button>
-  <button id="settingsdone" type="button" data-settings-return>Back to route</button>
+  <button id="settingsdone" type="button" data-settings-return>&larr; Back to route</button>
   <h1>Commute to your workplace <button class="info-link" id="howlink" type="button">How it works</button></h1>
   <div class="sub">Enter your workplace address to begin. <b>Hover or tap</b> any area to see its time + the
     route drawn on the map — the lines you'd ride, the transfers, where you'd walk; <b>click</b> to pin
@@ -661,7 +661,8 @@ function classifyStartupState(hash,saved){
 <!-- pinned route card: a fixed corner panel that holds the clicked cell's breakdown so it
      never covers the route drawn on the map (replaces the old on-cell popup pin). -->
 <!-- #pincard publishes data-layout-capability, data-surface, data-plan-open, data-presentation,
-     data-sheet-content, data-sheet-snap, and data-dragging through applyInspectorUI. -->
+     data-sheet-content, data-sheet-snap, and data-dragging through applyInspectorUI. Route-choice
+     cards publish data-selected while their sibling data-route-plan-for control owns directions. -->
 <aside id="pincard" role="region" aria-label="Route inspector" tabindex="-1">
   <button class="pinx" id="pinx" type="button" aria-label="Close route inspector">&times;</button>
   <div id="pinbody"></div>
@@ -1159,9 +1160,6 @@ function compareHTML(d){
     `<h2 class="route-section-title" id="routes-title">Recommended route</h2><div class="choice-list">`+
     (recommended?routeRowHTML(recommended,recommended,"recommended"):"")+`</div></section>`+
     alternatives+loading+degraded+moreDetails+mapRouteToggleHTML(choices,recommended,selected)+
-    (selected?`<button type="button" class="selected-plan-cta" id="view-route-plan" data-route-plan-toggle aria-controls="route-plan-panel" aria-expanded="${!!inspectorUI.planOpen}">`+
-      `<span><small>Selected route</small><strong data-selected-title>${escapeHTML(routeTitle(selected))}</strong></span>`+
-      `<span><strong data-selected-time>${formatMinutes(selected.r.head)}</strong><small data-route-plan-action-label>View plan</small></span></button>`:"")+
     `<div id="route-selection-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div></section>`;
 }
 function resetVarianceState(gen){varianceState={status:"idle",gen,error:""};}
@@ -1181,29 +1179,24 @@ function pinHTML(d){
     ["Walk pace",walkspeed==="med"?"Medium":walkspeed[0].toUpperCase()+walkspeed.slice(1)],
     ["Transfers",maxxfers==="any"?"Any":`Up to ${maxxfers}`],
   ];
-  const planView=!!inspectorUI.planOpen;
   const mapView=inspectorUI.presentation==="map-focus";
   const head=`<button type="button" class="pin-sheet-handle" data-sheet-handle aria-label="Show route choices" aria-controls="route-choices-panel"></button>`+
-    `<header class="pin-head pin-summary"><div class="pin-place">${escapeHTML(d.name||"Selected area")}</div>`+
-    `<div class="pin-dest">to ${escapeHTML(CURLABEL||"your workplace")}</div>`+
+    `<header class="pin-head pin-summary"><div class="pin-title-row"><div class="pin-title-copy">`+
+    `<div class="pin-place">${escapeHTML(d.name||"Selected area")}</div>`+
+    `<div class="pin-dest">to ${escapeHTML(CURLABEL||"your workplace")}</div></div>`+
+    `<span class="pin-actions"><button type="button" class="quiet-action" id="pinadjust" data-settings-toggle aria-controls="panel" aria-expanded="${inspectorUI.surface==="settings"}">Adjust settings</button>`+
+    `<button type="button" class="quiet-action pin-map-focus" data-map-focus-toggle aria-pressed="${mapView}" aria-label="Focus map">Focus map</button></span></div>`+
     `<div class="pin-context"><span class="pin-settings" aria-label="Route settings: ${escapeHTML(settings.map(s=>s.join(" ")).join(", "))}">`+
     settings.map(([label,value])=>`<span class="pin-setting"><span class="pin-setting-label">${escapeHTML(label)}</span>`+
-      `<span class="pin-setting-value">${escapeHTML(value)}</span></span>`).join("")+`</span>`+
-    `<span class="pin-actions"><button type="button" class="quiet-action" id="pinadjust" data-settings-toggle aria-controls="panel" aria-expanded="${inspectorUI.surface==="settings"}">Adjust settings</button>`+
-    `<button type="button" class="route-plan-toggle" data-route-plan-control aria-controls="route-plan-panel" aria-expanded="${planView}">Route plan</button>`+
-    `<button type="button" class="quiet-action pin-map-focus" data-map-focus-toggle aria-pressed="${mapView}" aria-label="Focus map">Focus map</button></span></div></header>`+
-    `<div class="pin-view" id="pinview" role="group" aria-label="Route inspector content">`+
-    `<button type="button" data-sheet-content-toggle="choices" aria-pressed="${inspectorUI.sheetContent==="choices"}">Choices</button>`+
-    `<button type="button" data-sheet-content-toggle="plan" aria-pressed="${inspectorUI.sheetContent==="plan"}">Route plan</button></div>`+
-    `<div class="pin-peek-actions"><button type="button" data-sheet-snap-action="browse">Browse with map</button>`+
-    `<button type="button" data-sheet-snap-action="expanded">Expand</button><button type="button" data-sheet-snap-action="peek">Show map</button></div>`;
+      `<span class="pin-setting-value">${escapeHTML(value)}</span></span>`).join("")+`</span></div></header>`;
   const mapKey=mapChoiceKey||"",recommendedKey=recommendedChoiceKey||mapKey,selectedKey=selected?selected.o.key:"";
   return `<div class="bd pin-shell" data-map-choice-key="${escapeHTML(mapKey)}" `+
     `data-recommended-choice-key="${escapeHTML(recommendedKey)}" data-selected-choice-key="${escapeHTML(selectedKey)}">${head}`+
     `<div class="pin-workspace">${selectedRouteHTML(selected,recommended,d)}${compareHTML(d)}</div>`+
-    (selected?`<div class="pin-map-summary" data-map-focus-strip><div class="map-focus-copy"><strong data-selected-title>${escapeHTML(routeTitle(selected))}</strong>`+
-      `<span><span data-selected-time>${formatMinutes(selected.r.head)}</span> selected</span></div><div class="map-focus-actions">`+
-      `<button type="button" data-show-choices>Show choices</button><button type="button" data-close-pin>Close</button></div></div>`:"")+`</div>`;}
+    (selected?`<div class="pin-map-summary" data-map-focus-strip><button type="button" class="map-focus-copy" data-show-choices aria-label="Show route choices">`+
+      `<strong data-selected-title>${escapeHTML(routeTitle(selected))}</strong>`+
+      `<span><span data-selected-time>${formatMinutes(selected.r.head)}</span> selected</span></button>`+
+      `<div class="map-focus-actions"><button type="button" data-show-choices>Show choices</button></div></div>`:"")+`</div>`;}
 function touchPreviewHTML(d){
   d=normalizeBD(d);
   if(!d||d.error)return `<div class="peek-title">No transit route from this area</div>`;
@@ -1545,10 +1538,10 @@ let compareList=[];     // pinned cell's route options [{key,line,identityColor,
 let selKey=PRIMARY_KEY; // exact route shown on the map and in Route Plan
 let previewKey=null;    // pointer/keyboard preview overrides selKey until the row is left
 let mapChoiceKey=null,recommendedChoiceKey=null,recommendedChoiceKeys={},selectionLocked=false;
-let allRoutesOpen=false,directionsOpen=false,showAllRoutes=false;
+let allRoutesOpen=false,showAllRoutes=false;
 let restoreRouteFocusKey=null,pendingSelectionAnnouncement="";
 function resetRouteDisclosureState(){
-  allRoutesOpen=false;directionsOpen=false;restoreRouteFocusKey=null;pendingSelectionAnnouncement="";
+  allRoutesOpen=false;restoreRouteFocusKey=null;pendingSelectionAnnouncement="";
 }
 function stableRouteKey(family,branch,fallback){
   if(family&&family.key!=null&&branch&&branch.key!=null)
@@ -1957,7 +1950,8 @@ function routeTradeoffsHTML(choice,recommended){
 function routeRowHTML(choice,recommended,where){
   const o=choice.o,r=choice.r,selected=selKey===o.key;
   const classes=["route-row","route-choice",choice===recommended?"recommended":"",where||""].filter(Boolean).join(" ");
-  return `<button type="button" class="${classes}" data-key="${escapeHTML(o.key)}" `+
+  return `<article class="route-choice-card" data-choice-card-key="${escapeHTML(o.key)}" data-selected="${selected}">`+
+    `<button type="button" class="${classes}" data-key="${escapeHTML(o.key)}" `+
     `data-choice-key="${escapeHTML(o.key)}" `+
     `data-family="${escapeHTML(choice.family.key)}" data-branch="${escapeHTML(choice.branch.key)}" `+
     `data-family-name="${escapeHTML(choice.family.meta.name||"Route")}" `+
@@ -1968,7 +1962,10 @@ function routeRowHTML(choice,recommended,where){
     (selected?`<span class="route-selected-label">Selected</span>`:"")+`</span>`+
     `<span class="route-time">${formatMinutes(r.head)}</span>`+
     `<span class="route-facts">${routeFactsHTML(choice,false)}</span>`+
-    routeTradeoffsHTML(choice,recommended)+`</button>`;
+    routeTradeoffsHTML(choice,recommended)+`</button>`+
+    `<button type="button" class="route-plan-entry" data-route-plan-for="${escapeHTML(o.key)}" `+
+      `aria-controls="route-plan-panel" aria-expanded="${selected&&typeof inspectorUI!=="undefined"&&inspectorUI.planOpen}" `+
+      `aria-label="Open route plan for ${escapeHTML(routeTitle(choice))}">Route plan</button></article>`;
 }
 function practicalChoices(choices,recommended){
   const candidates=representativeChoices(choices).filter(c=>c!==recommended).sort((a,b)=>(a.r.head-b.r.head)||(a.r.frag-b.r.frag));
@@ -2085,24 +2082,19 @@ function routeSequence(choice){
 }
 function selectedRouteHTML(choice,recommended,d){
   if(!choice)return "";
-  const o=choice.o,r=choice.r,allowance=optionScheduleAllowance(o);
-  const meaningfulAllowance=allowance>=1?allowance:0;
+  const o=choice.o,r=choice.r;
   const directions=routeActionsHTML(choice),stepCount=(directions.match(/<li\b/g)||[]).length;
   return `<section class="route-plan-pane selected-route" id="route-plan-panel" data-selected-choice-key="${escapeHTML(o.key)}" aria-labelledby="selected-route-title">`+
-    `<h2 class="route-section-title" id="selected-route-title">Route plan <button type="button" class="route-plan-toggle" data-route-plan-control aria-controls="route-plan-panel" aria-expanded="${!!inspectorUI.planOpen}">Hide</button></h2>`+
-    `<div class="selected-route-summary"><span class="route-dot" aria-hidden="true" style="background:${o.identityColor||primaryCasing()}"></span>`+
-      `<div><span class="route-name">${escapeHTML(routeTitle(choice))}</span>${routeTradeoffsHTML(choice,recommended)}</div>`+
-      `<div class="route-time">${formatMinutes(r.head)}</div></div>`+
-    `<div class="plan-facts">${routeFactsHTML(choice,true)}</div>`+
-    `<p class="plan-note">${choice===recommended?"Why we recommend it: ":"Compared with the recommended route: "}${escapeHTML(routeReason(choice,recommended))}.</p>`+
-    (meaningfulAllowance?`<div class="plan-timing"><strong>Boarding allowance</strong><br>Leave ${formatMinutes(meaningfulAllowance)} before the first scheduled vehicle.</div>`:"")+
-    `<details class="selected-directions" id="route-directions"${directionsOpen?" open":""}>`+
-      `<summary aria-expanded="${directionsOpen}"><span>Step-by-step directions`+
-        `<span class="direction-sequence">${escapeHTML(routeSequence(choice))}</span></span>`+
-        `<span>${stepCount} step${stepCount===1?"":"s"}</span></summary>`+
-      `<ol class="route-directions">${directions||"<li>No detailed steps are available for this route.</li>"}</ol></details>`+
-    `<a class="gm" href="${gmaps(d.olat,d.olon)}" target="_blank" rel="noopener">Open in Google Maps ↗</a>`+
-    `<div class="foot">${BD_FOOT}</div></section>`;
+    `<header class="plan-head"><div class="plan-heading"><h2 class="plan-title" id="selected-route-title" tabindex="-1">Route plan</h2>`+
+      `<div class="plan-route-context"><span class="plan-route-name">${escapeHTML(routeTitle(choice))}</span>`+
+      `<span class="plan-trip-time">${formatMinutes(r.head)}</span></div></div>`+
+      `<button type="button" class="plan-close" data-route-plan-close aria-controls="route-plan-panel">`+
+        `<span class="plan-close-desktop">Close directions</span><span class="plan-close-mobile">Back to choices</span></button></header>`+
+    `<div class="plan-directions-head"><h3>Step-by-step directions</h3>`+
+      `<span class="plan-step-count">${stepCount} step${stepCount===1?"":"s"}</span></div>`+
+    `<ol class="route-directions">${directions||"<li>No detailed steps are available for this route.</li>"}</ol>`+
+    `<footer class="plan-footer"><a class="plan-google" href="${gmaps(d.olat,d.olon)}" target="_blank" rel="noopener">`+
+      `<span>Open in Google Maps</span><span aria-hidden="true">↗</span></a></footer></section>`;
 }
 // The dominant transit line of a geom leg list (the longest in-vehicle leg) — labels the primary
 // strip when there's no single "line" field. Falls back to "walk only".
@@ -2216,6 +2208,7 @@ let resetPinScroll=false; // stays armed through the async placeholder -> final-
 let pinFeature=null;     // the L.geoJSON feature object currently pinned (for refresh in place)
 let justPinned=false;    // set by a cell click; the map-background click skips closePin this tick
 let pendingFitId=null;   // cell id a pin requested a one-shot fitBounds for (consumed by drawJourney)
+let initialFitToken=0;   // user interaction invalidates a queued one-shot fit before its animation starts
 /* Presentation is deliberately independent from route data.  A route refresh rebuilds its HTML,
    while this controller remounts the exact same plan pane and restores its presentation intent. */
 const inspectorUI={surface:"routes",planOpen:false,presentation:"expanded",sheetContent:"choices",
@@ -2259,17 +2252,20 @@ function restoreInspectorPaneScroll(){
   restore(false);requestAnimationFrame(()=>restore(true));
 }
 function sheetMetrics(){
-  const vv=window.visualViewport,available=Math.max(320,Math.round((vv?vv.height:window.innerHeight)-0));
-  const height=available,peek=Math.min(132,Math.max(112,Math.round(available*.15))),browse=Math.min(Math.round(available*.58),available-210);
-  return {height,visible:{peek,browse,expanded:height-8},snaps:{peek:height-peek,browse:height-browse,expanded:8}};
+  const vv=window.visualViewport,raw=Number(vv&&vv.height)||Number(window.innerHeight)||0;
+  const height=Math.max(0,Math.floor(raw)),expanded=Math.max(0,height-8);
+  const peekFloor=height<260?96:112;
+  const peek=Math.min(expanded,Math.max(peekFloor,Math.min(132,Math.round(height*.18))));
+  const browseTarget=Math.round(height*(height<480?.70:.58));
+  const browse=Math.min(expanded,Math.max(peek,browseTarget));
+  return {height,visible:{peek,browse,expanded},snaps:{peek:height-peek,browse:height-browse,expanded:height-expanded}};
 }
 function applySheetGeometry(){
   if(inspectorLayoutCapability()!=="bottom-sheet")return;
   const m=sheetMetrics(),snap=inspectorUI.sheetSnap;
-  pinCard.style.setProperty("--sheet-height",`${m.height}px`);
-  pinCard.style.setProperty("--sheet-offset",`${m.snaps[snap]}px`);
-  document.documentElement.style.setProperty("--sheet-height",`${m.height}px`);
-  if(inspectorUI.surface==="settings")document.documentElement.style.setProperty("--settings-sheet-offset",`${m.snaps.browse}px`);
+  pinCard.style.setProperty("--sheet-height",`${m.visible[snap]||m.visible.browse}px`);
+  document.documentElement.style.setProperty("--sheet-height",`${m.visible[snap]||m.visible.browse}px`);
+  if(inspectorUI.surface==="settings")document.documentElement.style.setProperty("--settings-sheet-height",`${m.visible.browse}px`);
 }
 function moveRoutePlanForCapability(capability){
   const plan=document.getElementById("route-plan-panel"),workspace=pinCard.querySelector(".pin-workspace"),sidecar=document.getElementById("route-sidecar"),sidecarContent=document.getElementById("route-sidecar-content");
@@ -2289,8 +2285,14 @@ function scheduleInspectorFit(){
   const token=++inspectorFitToken,delay=REDUCE_MOTION?0:260;
   setTimeout(()=>{if(token!==inspectorFitToken||routePin==null)return;performSettledInspectorFit(token);},delay);
 }
+function cancelPendingInitialFit(){pendingFitId=null;initialFitToken++;}
 function applyInspectorUI(reason,opts){
   opts=opts||{};const capability=inspectorLayoutCapability();
+  if(!opts.fit)inspectorFitToken++;
+  if(capability==="bottom-sheet"&&inspectorUI.surface==="routes"){
+    inspectorUI.sheetContent=inspectorUI.planOpen?"plan":"choices";
+    if(inspectorUI.planOpen&&inspectorUI.sheetSnap==="peek")inspectorUI.sheetSnap="browse";
+  }
   if(capability!=="bottom-sheet"&&inspectorUI.presentation==="map-focus"&&inspectorUI.surface==="settings")inspectorUI.presentation="expanded";
   const state={layoutCapability:capability,surface:inspectorUI.surface,planOpen:String(inspectorUI.planOpen),
     presentation:inspectorUI.presentation,sheetContent:inspectorUI.sheetContent,sheetSnap:inspectorUI.sheetSnap,dragging:String(inspectorUI.dragging)};
@@ -2301,31 +2303,35 @@ function applyInspectorUI(reason,opts){
   const routeVisible=inspectorUI.surface==="routes";
   pinCard.inert=!routeVisible;
   const sidecar=document.getElementById("route-sidecar");sidecar.inert=!routeVisible||!(capability==="wide-sidecar"&&inspectorUI.planOpen&&inspectorUI.presentation!=="map-focus");
-  const workspace=pinCard.querySelector(".pin-workspace"),view=pinCard.querySelector(".pin-view");
+  const workspace=pinCard.querySelector(".pin-workspace");
   if(capability==="bottom-sheet"&&routeVisible&&inspectorUI.sheetSnap==="peek"){
-    if(workspace)workspace.inert=true;if(view)view.inert=true;
-  }else{if(workspace)workspace.inert=false;if(view)view.inert=false;}
-  document.querySelectorAll("[data-route-plan-toggle],[data-route-plan-control]").forEach(button=>button.setAttribute("aria-expanded",String(inspectorUI.planOpen)));
-  document.querySelectorAll("[data-route-plan-action-label]").forEach(label=>label.textContent=inspectorUI.planOpen?"Hide plan":"View plan");
-  pinCard.querySelectorAll("[data-sheet-content-toggle]").forEach(button=>button.setAttribute("aria-pressed",String(button.dataset.sheetContentToggle===inspectorUI.sheetContent)));
+    if(workspace)workspace.inert=true;
+  }else if(workspace)workspace.inert=false;
+  pinCard.querySelectorAll("[data-route-plan-for]").forEach(button=>
+    button.setAttribute("aria-expanded",String(inspectorUI.planOpen&&button.dataset.routePlanFor===selKey)));
   pinCard.querySelector("[data-map-focus-toggle]")?.setAttribute("aria-pressed",String(inspectorUI.presentation==="map-focus"));
-  pinCard.querySelector("[data-sheet-handle]")?.setAttribute("aria-label",inspectorUI.sheetSnap==="peek"?"Show route choices":"Collapse route choices");
+  const handle=pinCard.querySelector("[data-sheet-handle]");if(handle){
+    const labels={peek:"Show route choices",browse:"Expand route choices",expanded:"Collapse route choices"};
+    handle.setAttribute("aria-label",labels[inspectorUI.sheetSnap]||labels.browse);
+    handle.setAttribute("aria-expanded",String(inspectorUI.sheetSnap!=="peek"));
+  }
   restoreInspectorPaneScroll();
   if(opts.fit)scheduleInspectorFit();
 }
 function transitionInspector(action,detail){
   captureInspectorPaneScroll();
   const cap=inspectorLayoutCapability(),source=detail&&detail.source,origin=detail&&detail.origin||"programmatic";
-  let restorePlanFocus=false;
-  if(action==="plan"){
-    const plan=document.getElementById("route-plan-panel");
-    const focusWasInPlan=!!(plan&&plan.contains(document.activeElement));
-    if(cap==="bottom-sheet"){
-      const next=inspectorUI.sheetContent!=="plan";inspectorUI.planOpen=next;inspectorUI.sheetContent=next?"plan":"choices";inspectorUI.sheetSnap="browse";
-    }else inspectorUI.planOpen=!inspectorUI.planOpen;
-    restorePlanFocus=cap==="wide-sidecar"&&!inspectorUI.planOpen&&(origin==="keyboard"||focusWasInPlan);
-  }else if(action==="choices"){
+  if(source)cancelPendingInitialFit();
+  let restorePlanFocus=false,focusOpenedPlan=false;
+  if(action==="plan-open"||action==="plan"){
+    const next=action==="plan-open"?true:!inspectorUI.planOpen;
+    inspectorUI.planOpen=next;
+    if(cap==="bottom-sheet"){inspectorUI.sheetContent=next?"plan":"choices";inspectorUI.sheetSnap="browse";}
+    focusOpenedPlan=next;
+    restorePlanFocus=!next&&origin==="keyboard";
+  }else if(action==="plan-close"||action==="choices"){
     inspectorUI.sheetContent="choices";inspectorUI.planOpen=false;if(cap==="bottom-sheet")inspectorUI.sheetSnap="browse";
+    restorePlanFocus=origin==="keyboard";
   }else if(action==="settings"){
     if(inspectorUI.surface!=="settings"){
       inspectorUI.settingsReturn=inspectorSnapshot();inspectorUI.returnFocus=source||document.activeElement;
@@ -2333,7 +2339,7 @@ function transitionInspector(action,detail){
       if(cap==="bottom-sheet")inspectorUI.sheetSnap="browse";
     }
   }else if(action==="settings-return"){
-    const target=inspectorUI.returnFocus,selector=inspectorUI.returnFocusSelector;restoreInspectorSnapshot(inspectorUI.settingsReturn);applyInspectorUI(action,{fit:true});
+    const target=inspectorUI.returnFocus,selector=inspectorUI.returnFocusSelector;restoreInspectorSnapshot(inspectorUI.settingsReturn);applyInspectorUI(action);
     requestAnimationFrame(()=>{const next=target&&document.contains(target)?target:(selector&&document.querySelector(selector));next?.focus({preventScroll:true});});return;
   }else if(action==="map-focus"){
     if(cap==="bottom-sheet")inspectorUI.sheetSnap="peek";
@@ -2341,11 +2347,15 @@ function transitionInspector(action,detail){
   }else if(action==="show-choices"){
     inspectorUI.sheetContent="choices";inspectorUI.sheetSnap=cap==="bottom-sheet"?"browse":inspectorUI.sheetSnap;inspectorUI.presentation="expanded";
   }else if(action==="snap")inspectorUI.sheetSnap=detail&&detail.snap||"browse";
-  applyInspectorUI(action,{fit:action==="plan"||action==="settings"||action==="settings-return"||action==="map-focus"});
+  const enteringMapFocus=action==="map-focus"&&cap!=="bottom-sheet"&&inspectorUI.presentation==="map-focus";
+  applyInspectorUI(action,{fit:enteringMapFocus});
+  if(focusOpenedPlan)requestAnimationFrame(()=>{
+    const sourceHidden=!!(source&&(!document.contains(source)||!source.getClientRects().length));
+    if(origin==="keyboard"||sourceHidden)
+      document.getElementById("selected-route-title")?.focus({preventScroll:true});
+  });
   if(restorePlanFocus)requestAnimationFrame(()=>{
-    const plan=document.getElementById("route-plan-panel"),active=document.activeElement;
-    if(origin==="keyboard"||(plan&&plan.contains(active)&&!plan.getClientRects().length))
-      pinCard.querySelector("[data-route-plan-toggle],[data-route-plan-control]")?.focus({preventScroll:true});
+    [...pinCard.querySelectorAll("[data-route-plan-for]")].find(button=>button.dataset.routePlanFor===selKey)?.focus({preventScroll:true});
   });
 }
 function setPinHTML(h){
@@ -2499,8 +2509,8 @@ function renderPin(f,d){
   // has pendingFitId already nulled → it never re-fits/lurches. Defer one frame so the card's tall
   // final layout is reflected in viewInsets' live rect measurement before we compute the fit.
   if(pendingFitId!=null&&f.properties.id===pendingFitId){
-    pendingFitId=null;
-    requestAnimationFrame(()=>{if(routePin===f.properties.id)fitToCompare();});
+    const fitToken=initialFitToken;pendingFitId=null;
+    requestAnimationFrame(()=>{if(routePin===f.properties.id&&fitToken===initialFitToken)fitToCompare();});
   }
 }
 function openPin(f,l){
@@ -2519,7 +2529,7 @@ function openPin(f,l){
   // Leaflet's internal reopen). Unbinding all of them kills every stale sticky so none can flash
   // while pinned. The mouseover handler rebinds a fresh tooltip on the next (post-unpin) hover.
   layer.eachLayer(ll=>{if(ll.getTooltip&&ll.getTooltip())ll.unbindTooltip();});
-  pinFeature=f;routePin=f.properties.id;
+  pinFeature=f;routePin=f.properties.id;initialFitToken++;
   compareList=[];selKey=PRIMARY_KEY;previewKey=null;mapChoiceKey=null;recommendedChoiceKey=null;recommendedChoiceKeys={};selectionLocked=false;
   resetRouteDisclosureState();showAllRoutes=false;
   resetPinScroll=true;      // keep reset armed until the async final card has laid out
@@ -2545,7 +2555,8 @@ function closePin(){
   // subscriber first so a late JSON body can never repopulate the cache, card, or route after close.
   bdToken++;clearTimeout(bdTimer);cancelPinPrefetch();cancelLightBreakdown();
   pinUpgradeSeq++;pinUpgradeKey="";
-  pinCard.classList.remove("open");pinFeature=null;routePin=null;pendingFitId=null;
+  pinCard.classList.remove("open");pinFeature=null;routePin=null;
+  if(typeof cancelPendingInitialFit==="function")cancelPendingInitialFit();else pendingFitId=null;
   resetPinScroll=false;pinBody.scrollTop=0;
   document.body.classList.remove("route-pinned");
   if(typeof inspectorUI!=="undefined"){
@@ -2731,6 +2742,7 @@ touchPeek.addEventListener("click",e=>{
 function previewRow(key){if(routePin==null||effectiveChoiceKey()===key)return;previewKey=key;drawSelected();}
 function clearPreview(){if(routePin==null||previewKey==null)return;previewKey=null;drawSelected();}
 function lockRow(key){if(routePin==null||!findChoice(key))return;
+  if(typeof cancelPendingInitialFit==="function")cancelPendingInitialFit();
   const before=effectiveChoiceKey(),selectionChanged=selKey!==key;selKey=key;previewKey=null;selectionLocked=true;
   if(!selectionChanged)return;
   if(before!==key)drawSelected();
@@ -2739,6 +2751,8 @@ function markRouteChoices(){
   pinCard.querySelectorAll(".route-choice").forEach(s=>{
     const sel=s.getAttribute("data-key")===selKey;
     s.setAttribute("aria-pressed",String(sel));
+    const card=s.closest(".route-choice-card");if(card)card.dataset.selected=String(sel);
+    const plan=card&&card.querySelector("[data-route-plan-for]");if(plan)plan.setAttribute("aria-expanded",String(sel&&inspectorUI.planOpen));
     const label=s.querySelector(".route-selected-label");
     if(sel&&!label){const el=document.createElement("span");el.className="route-selected-label";el.textContent="Selected";s.querySelector(".route-main")?.appendChild(el);}
     if(!sel&&label)label.remove();});
@@ -2773,7 +2787,6 @@ document.addEventListener("focusout",e=>{
   if(e.relatedTarget&&row.contains(e.relatedTarget))return;clearPreview();});
 function captureRouteDisclosureState(){
   const all=pinCard.querySelector("#allroutes");if(all)allRoutesOpen=all.open;
-  const directions=document.getElementById("route-directions");if(directions)directionsOpen=directions.open;
   const active=document.activeElement;
   const row=active&&active.closest&&active.closest("#pincard .route-choice");
   restoreRouteFocusKey=row?row.dataset.key:null;
@@ -2781,8 +2794,6 @@ function captureRouteDisclosureState(){
 function restoreRouteDisclosureState(){
   const all=pinCard.querySelector("#allroutes");
   if(all&&allRoutesOpen){all.open=true;all.querySelector("summary")?.setAttribute("aria-expanded","true");}
-  const directions=document.getElementById("route-directions");
-  if(directions&&directionsOpen){directions.open=true;directions.querySelector("summary")?.setAttribute("aria-expanded","true");}
 }
 function handleRouteDisclosureToggle(e){
   const details=e.target;
@@ -2800,38 +2811,35 @@ function handleRouteDisclosureToggle(e){
     }
     return;
   }
-  if(details.matches("#route-directions")){
-    directionsOpen=details.open;
-    details.querySelector("summary")?.setAttribute("aria-expanded",String(details.open));
-  }
 }
 document.addEventListener("toggle",handleRouteDisclosureToggle,true);
 document.addEventListener("click",e=>{
   const sheetHandle=e.target.closest&&e.target.closest("[data-sheet-handle]");
   if(sheetHandle&&suppressNextHandleClick){suppressNextHandleClick=false;e.preventDefault();e.stopImmediatePropagation();return;}
-  const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(row){lockRow(row.dataset.key);return;}
   const origin=e.detail===0?"keyboard":"pointer";
-  const plan=e.target.closest&&e.target.closest("[data-route-plan-toggle],[data-route-plan-control]");if(plan){transitionInspector("plan",{source:plan,origin});return;}
+  const planAction=e.target.closest&&e.target.closest("[data-route-plan-for]");if(planAction){
+    lockRow(planAction.dataset.routePlanFor);transitionInspector("plan-open",{source:planAction,origin});return;}
+  const planClose=e.target.closest&&e.target.closest("[data-route-plan-close]");if(planClose){
+    transitionInspector("plan-close",{source:planClose,origin});return;}
+  const row=e.target.closest&&e.target.closest("#pincard .route-choice");if(row){lockRow(row.dataset.key);return;}
   const settings=e.target.closest&&e.target.closest("[data-settings-toggle]");if(settings){transitionInspector("settings",{source:settings});requestAnimationFrame(()=>panelEl.focus({preventScroll:true}));return;}
   const settingsReturn=e.target.closest&&e.target.closest("[data-settings-return],#settingsdone");if(settingsReturn){transitionInspector("settings-return");return;}
   const mapFocus=e.target.closest&&e.target.closest("[data-map-focus-toggle]");if(mapFocus){transitionInspector("map-focus",{source:mapFocus});return;}
   const showChoices=e.target.closest&&e.target.closest("[data-show-choices]");if(showChoices){transitionInspector("show-choices",{source:showChoices});return;}
   if(sheetHandle){transitionInspector("snap",{snap:inspectorUI.sheetSnap==="peek"?"browse":"peek",source:sheetHandle,origin});return;}
-  const snap=e.target.closest&&e.target.closest("[data-sheet-snap-action]");if(snap){transitionInspector("snap",{snap:snap.dataset.sheetSnapAction,source:snap});return;}
-  const content=e.target.closest&&e.target.closest("[data-sheet-content-toggle]");if(content){
-    transitionInspector(content.dataset.sheetContentToggle==="plan"?"plan":"choices",{source:content});return;}
-  const close=e.target.closest&&e.target.closest("[data-close-pin]");if(close){closePin();return;}
   const all=e.target.closest&&e.target.closest(".show-routes");if(all){
     showAllRoutes=!showAllRoutes;all.setAttribute("aria-pressed",String(showAllRoutes));
     all.textContent=mapRouteToggleLabel();drawSelected();return;
   }
 });
-/* Bottom-sheet gestures are deliberately confined to the handle.  List and directions scrolling
-   remain native scrolling; a live drag updates only a compositor transform. */
+/* Bottom-sheet gestures are deliberately confined to the handle. List and directions scrolling
+   remain native; a live drag changes the sheet's real visible height so no scrollable content is
+   stranded below the viewport. */
 let sheetDrag=null,suppressNextHandleClick=false;
 function clampSheetOffset(value,metrics){return Math.max(metrics.snaps.expanded,Math.min(metrics.snaps.peek,value));}
 function beginSheetDrag(e,handle){
   if(inspectorLayoutCapability()!=="bottom-sheet"||inspectorUI.surface!=="routes"||e.button>0)return;
+  cancelPendingInitialFit();
   const m=sheetMetrics(),start=m.snaps[inspectorUI.sheetSnap]??m.snaps.browse;
   sheetDrag={pointerId:e.pointerId,startY:e.clientY,startOffset:start,lastY:e.clientY,lastAt:performance.now(),velocity:0,metrics:m,moved:false};
   inspectorUI.dragging=true;applyInspectorUI("drag-start");(handle||e.currentTarget).setPointerCapture(e.pointerId);e.preventDefault();
@@ -2842,7 +2850,7 @@ function moveSheetDrag(e){
   sheetDrag.velocity=(e.clientY-sheetDrag.lastY)/dt;sheetDrag.lastY=e.clientY;sheetDrag.lastAt=now;
   if(Math.abs(dy)>7)sheetDrag.moved=true;
   const offset=clampSheetOffset(sheetDrag.startOffset+dy,sheetDrag.metrics);
-  pinCard.style.setProperty("--sheet-offset",`${offset}px`);e.preventDefault();
+  pinCard.style.setProperty("--sheet-height",`${sheetDrag.metrics.height-offset}px`);e.preventDefault();
 }
 function finishSheetDrag(e,cancelled){
   if(!sheetDrag||e.pointerId!==sheetDrag.pointerId)return;
@@ -2850,19 +2858,26 @@ function finishSheetDrag(e,cancelled){
   if(!cancelled){const current=clampSheetOffset(drag.startOffset+(e.clientY-drag.startY),drag.metrics);
     inspectorUI.sheetSnap=sheetSnapForRelease(current,drag.velocity,drag.metrics);if(drag.moved)suppressNextHandleClick=true;
   }
-  applyInspectorUI("drag-end",{fit:true});
+  applyInspectorUI("drag-end");
 }
 document.addEventListener("pointerdown",e=>{const handle=e.target.closest&&e.target.closest("[data-sheet-handle]");if(handle)beginSheetDrag(e,handle);});
 document.addEventListener("pointermove",moveSheetDrag,{passive:false});
 document.addEventListener("pointerup",e=>finishSheetDrag(e,false));
 document.addEventListener("pointercancel",e=>finishSheetDrag(e,true));
 document.addEventListener("keydown",e=>{
-  const handle=e.target.closest&&e.target.closest("[data-sheet-handle]");if(!handle||!(e.key==="Enter"||e.key===" "))return;
-  e.preventDefault();transitionInspector("snap",{snap:inspectorUI.sheetSnap==="peek"?"browse":"peek",source:handle});
+  const handle=e.target.closest&&e.target.closest("[data-sheet-handle]");if(!handle)return;
+  const order=["peek","browse","expanded"],at=Math.max(0,order.indexOf(inspectorUI.sheetSnap));let snap=null;
+  if(e.key==="Enter"||e.key===" ")snap=inspectorUI.sheetSnap==="peek"?"browse":"peek";
+  else if(e.key==="ArrowUp")snap=order[Math.min(order.length-1,at+1)];
+  else if(e.key==="ArrowDown")snap=order[Math.max(0,at-1)];
+  else if(e.key==="Home")snap="peek";else if(e.key==="End")snap="expanded";else return;
+  e.preventDefault();transitionInspector("snap",{snap,source:handle,origin:"keyboard"});
 });
-function syncInspectorViewport(){if(routePin!=null){captureInspectorPaneScroll();applyInspectorUI("viewport",{fit:!inspectorUI.dragging});}}
+function syncInspectorViewport(){if(routePin!=null){captureInspectorPaneScroll();applyInspectorUI("viewport");map.invalidateSize({pan:false});}}
 window.addEventListener("resize",syncInspectorViewport);
 window.visualViewport?.addEventListener("resize",syncInspectorViewport);
+map.getContainer().addEventListener("pointerdown",()=>{if(routePin!=null)cancelPendingInitialFit();},{passive:true});
+map.getContainer().addEventListener("wheel",()=>{if(routePin!=null)cancelPendingInitialFit();},{passive:true});
 // Click-elsewhere unpins: a click on the map background (not a cell, not the card itself).
 // A cell click sets justPinned for this tick (canvas layer + map both fire click), so skip it.
 map.on("click",()=>{if(justPinned){justPinned=false;return;}
@@ -3042,7 +3057,9 @@ const layer=L.geoJSON(CELLS,{pane:"cellsPane",style,onEachFeature:(f,l)=>{
 function closeOpenInfo(){
   cancelPinPrefetch();cancelLightBreakdown();
   bdToken++; pinUpgradeSeq++; pinUpgradeKey=""; clearTimeout(bdTimer);
-  routePin=null; hoverCell=null; hoverLayer=null; lastTipDir=null; lastTipAx=null; lastTipPerp=0; pendingFitId=null; clearRoute();   // drawn route is stale with the open cards
+  routePin=null; hoverCell=null; hoverLayer=null; lastTipDir=null; lastTipAx=null; lastTipPerp=0;
+  if(typeof cancelPendingInitialFit==="function")cancelPendingInitialFit();else pendingFitId=null;
+  clearRoute();   // drawn route is stale with the open cards
   pinCard.classList.remove("open"); pinFeature=null;   // close the pinned corner card too
   compareList=[];selKey=PRIMARY_KEY;previewKey=null;mapChoiceKey=null;recommendedChoiceKey=null;recommendedChoiceKeys={};selectionLocked=false;
   resetRouteDisclosureState();showAllRoutes=false;
@@ -3646,7 +3663,7 @@ document.addEventListener("keydown",e=>{trapModalTab(e);if(e.defaultPrevented)re
   if(activeModal()){closeModals();return;}
   if(touchPeek.classList.contains("open")){closeTouchPreview();return;}
   if(routePin!=null&&inspectorUI.surface==="settings"){transitionInspector("settings-return");return;}
-  if(routePin!=null&&inspectorUI.planOpen){transitionInspector("plan");return;}
+  if(routePin!=null&&inspectorUI.planOpen){transitionInspector("plan-close",{source:document.activeElement,origin:"keyboard"});return;}
   closePin();});
 
 /* ============ Feature 5: mobile bottom-sheet toggle ============ */

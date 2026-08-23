@@ -1245,7 +1245,7 @@ test("route disclosure: one family is split by discovered boarding stop and dire
   assert.match(html,/boarding-detail">Toward Uptown, Services: Northbound/);
 });
 
-test("route disclosure: refresh preserves only the two native disclosure states", () => {
+test("route disclosure: refresh preserves the one remaining native Additional disclosure state", () => {
   const render=templateFn("renderPin"),toggle=templateFn("handleRouteDisclosureToggle");
   assert.match(TSRC,/document\.addEventListener\("toggle",handleRouteDisclosureToggle,true\)/);
   assert.ok(render.indexOf("captureRouteDisclosureState()")<render.indexOf("setPinHTML(pinHTML(d))"),
@@ -1253,7 +1253,8 @@ test("route disclosure: refresh preserves only the two native disclosure states"
   assert.ok(render.indexOf("restoreRouteDisclosureState()")>render.indexOf("setPinHTML(pinHTML(d))"),
     "the replacement restores native disclosure state immediately afterward");
   assert.match(toggle,/allRoutesOpen=details\.open/);
-  assert.match(toggle,/directionsOpen=details\.open/);
+  assert.doesNotMatch(toggle,/directionsOpen|selected-directions|route-directions/,
+    "directions are no longer a nested disclosure whose state can drift from the Plan surface");
   assert.doesNotMatch(TSRC,/expert-family|family-more|More finishes on/);
   assert.match(render,/restoreRouteFocusKey/);
   assert.match(render,/row\.focus\(\{preventScroll:true\}\)/);
@@ -1273,27 +1274,51 @@ test("route selection fallback survives rerender and is announced through the de
   assert.match(announce,/formatMinutes\(choice\.r\.head\)/);
 });
 
-test("route inspector exposes Choices and a requested Route Plan without making Map a peer view", () => {
+test("route inspector keeps Plan route-local and renders a directions-only destination", () => {
   const compare=templateFn("compareHTML"),row=templateFn("routeRowHTML"),selected=templateFn("selectedRouteHTML");
   const pin=templateFn("pinHTML");
   assert.match(compare,/id="route-choices-panel"/);
   assert.match(selected,/id="route-plan-panel"/);
-  assert.match(compare,/id="view-route-plan"/,
-    "Choices keeps an explicit Route Plan request control");
-  assert.match(TSRC,/aria-controls="route-plan-panel"/,
-    "the Route Plan control identifies the region it exposes");
-  assert.match(TSRC,/aria-expanded="\$\{[^}]*planOpen[^}]*\}"/,
-    "the Route Plan control reports its requested open state");
+  assert.match(row,/class="route-plan-entry"[^>]*data-route-plan-for="\$\{escapeHTML\(o\.key\)\}"/,
+    "each exact route owns the control that opens its own Plan");
+  assert.match(row,/aria-controls="route-plan-panel"/);
+  assert.doesNotMatch(pin,/data-route-plan-control|pin-view|pin-peek-actions|selected-plan-cta/,
+    "the inspector header and mobile shell do not duplicate route-local Plan or snap controls");
+  assert.match(pin,/data-settings-toggle/);
+  assert.match(pin,/data-map-focus-toggle/);
   assert.doesNotMatch(pin,/data-inspector-view="map"|data-view="map"/,
     "Map is permanent context, never a third mutually-exclusive inspector view");
   assert.match(compare,/Recommended route/);
   assert.match(compare,/Good alternatives/);
   assert.match(compare,/See \$\{more\.length\} additional route choice/);
   assert.doesNotMatch(row,/routeActionsHTML/,"route rows must not contain inline directions");
-  assert.match(selected,/<details class="selected-directions" id="route-directions"/);
+  assert.match(selected,/<h2 class="plan-title" id="selected-route-title" tabindex="-1">Route plan<\/h2>/,
+    "Route plan is the semantic and visual heading, not a decorative kicker");
+  assert.doesNotMatch(selected,/plan-eyebrow/);
+  assert.doesNotMatch(TSRC,/\.plan-eyebrow/,
+    "the retired kicker cannot reserve visual space through leftover CSS");
+  assert.match(selected,/<h2[^>]*>Route plan<\/h2>[\s\S]*<div class="plan-route-context"><span class="plan-route-name">\$\{escapeHTML\(routeTitle\(choice\)\)\}<\/span>[\s\S]*class="plan-trip-time"/,
+    "the exact route and trip time are subordinate context beneath the Plan heading");
   assert.match(selected,/Step-by-step directions/);
-  assert.match(selected,/direction-sequence/);
   assert.match(selected,/<ol class="route-directions">/);
+  assert.match(selected,/class="plan-google"[^>]*target="_blank"[^>]*rel="noopener"/);
+  assert.ok(selected.indexOf(`<ol class="route-directions">`)<selected.indexOf(`<footer class="plan-footer">`),
+    "the Google Maps footer follows the complete direction list in document order");
+  const footerRule=TSRC.match(/\.plan-footer\{[^}]*\}/)?.[0]||"";
+  assert.ok(footerRule,"Plan footer styling must exist");
+  assert.doesNotMatch(footerRule,/position\s*:\s*(?:sticky|fixed)/,
+    "the destination link scrolls naturally after the directions instead of obscuring the last steps");
+  assert.doesNotMatch(selected,/<details|selected-directions|plan-facts|routeFactsHTML|routeTradeoffsHTML|plan-note|plan-timing|direction-sequence|BD_FOOT/,
+    "Plan contains the expanded directions and destination link, not a second copy of Choices facts or explanatory footnotes");
+});
+
+test("route-local Plan controls are selected-only on desktop and available on every mobile route", () => {
+  assert.match(TSRC,/\.route-plan-entry\{display:none/,
+    "a route-local Plan action starts hidden in desktop layouts");
+  assert.match(TSRC,/\.route-choice-card\[data-selected="true"\] \.route-plan-entry\{display:flex\}/,
+    "desktop exposes Plan only on the selected route");
+  assert.match(TSRC,/#pincard\[data-layout-capability="bottom-sheet"\] \.route-choice-card \.route-plan-entry\{display:flex\}/,
+    "mobile exposes Plan on every route so opening directions does not require a separate selection tap");
 });
 
 test("opening Additional materializes its deferred route rows without a card rerender", () => {
@@ -1442,12 +1467,21 @@ test("route choices: server recommendation can differ from the map choice withou
   assert.equal(H.mapChoice(choices).o.key,"__primary__","the map keeps its own generating itinerary identity");
   assert.equal(recommended.o.key,"alt0","the server's practical recommendation is authoritative over map-primary order");
   const row=H.routeRowHTML(recommended,recommended,"recommended");
-  assert.match(row,/^<button type="button" class="[^"]*route-choice/);
-  assert.equal((row.match(/<button\b/g)||[]).length,1,"a generated route row has one native button");
+  assert.match(row,/^<article class="route-choice-card"[^>]*data-choice-card-key="alt0"/);
+  assert.match(row,/<button type="button" class="[^"]*route-choice[^>]*data-key="alt0"/);
+  assert.match(row,/<button type="button" class="route-plan-entry" data-route-plan-for="alt0"/);
+  assert.equal((row.match(/<button\b/g)||[]).length,2,
+    "selection and Plan are separate native controls within one route card");
+  assert.equal((row.match(/<\/button>/g)||[]).length,2);
+  const choiceClose=row.indexOf("</button>"),planStart=row.indexOf('class="route-plan-entry"');
+  assert.ok(choiceClose>=0&&planStart>choiceClose,
+    "the Plan button is a sibling after the closed route-selection button, never a nested interactive control");
   assert.doesNotMatch(row,/role="button"/);
-  assert.doesNotMatch(row,/aria-label=/,
+  assert.doesNotMatch(row.slice(0,choiceClose),/aria-label=/,
     "the native button's visible directions must remain its accessible content");
-  assert.equal((row.match(/<\/button>/g)||[]).length,1);
+  assert.match(row,/aria-label="Open route plan for [^"]+"/,
+    "the secondary action names the exact route whose directions it opens");
+  assert.match(row,/<\/button><button type="button" class="route-plan-entry"[\s\S]*<\/button><\/article>$/);
 });
 
 test("route choices use compact labeled fact nodes instead of one dense punctuation-separated sentence", () => {
@@ -1759,7 +1793,7 @@ test("responsive inspector publishes one semantic state model instead of composi
 });
 
 test("new pins start in Choices with Plan closed, while capability changes preserve requested Plan intent", () => {
-  const open=templateFn("openPin");
+  const open=templateFn("openPin"),apply=templateFn("applyInspectorUI");
   assert.match(open,/(?:planOpen\s*=\s*false|planOpen:false|planOpen\s*:\s*false)/,
     "each new pin resets transient presentation to a closed Route Plan");
   const controller=TSRC;
@@ -1769,6 +1803,10 @@ test("new pins start in Choices with Plan closed, while capability changes prese
     "the same request is rendered as sidecar, inline tray, or mobile sheet by capability");
   assert.doesNotMatch(controller,/(?:resize|visualViewport)[\s\S]{0,220}planOpen\s*=\s*false/,
     "resizing between sidecar and inline-tray capabilities never silently closes Plan");
+  assert.match(apply,/if\(capability==="bottom-sheet"&&inspectorUI\.surface==="routes"\)\{[\s\S]*inspectorUI\.sheetContent=inspectorUI\.planOpen\?"plan":"choices"/,
+    "entering the compact capability remounts a still-open Plan instead of exposing stale Choices content");
+  assert.match(apply,/if\(inspectorUI\.planOpen&&inspectorUI\.sheetSnap==="peek"\)inspectorUI\.sheetSnap="browse"/,
+    "a Plan that survives a capability change becomes visible by promoting Peek to Browse");
 });
 
 test("map focus and Settings replace active route chrome while retaining route return state", () => {
@@ -1783,16 +1821,51 @@ test("map focus and Settings replace active route chrome while retaining route r
     "neither Map focus nor Settings may clear the selected pin");
 });
 
+test("Settings return stays outside the scrolling rail and the route shell owns one close control", () => {
+  assert.equal((TSRC.match(/id="settingsdone"/g)||[]).length,1);
+  assert.match(TSRC,/<button id="settingsdone" type="button" data-settings-return>/);
+  assert.match(TSRC,/html\[data-inspector-surface="settings"\] #settingsdone\{display:flex;position:fixed/,
+    "desktop Back to route is viewport-persistent rather than scrolling away with controls");
+  assert.match(TSRC,/@media \(max-width:719px\)[\s\S]*#settingsdone\{display:flex;position:sticky/,
+    "the compact settings sheet retains a visible in-sheet return affordance");
+  assert.equal((TSRC.match(/<button class="pinx" id="pinx"/g)||[]).length,1,
+    "the route inspector shell owns exactly one close button");
+  assert.doesNotMatch(templateFn("pinHTML"),/data-close-pin|class="pinx"|id="pinx"/,
+    "route and map-focus content cannot render a second competing close control");
+});
+
 test("compact inspector is one bottom-sheet controller with Choices, Plan, and Settings content", () => {
-  const controller=TSRC;
+  const controller=TSRC,pin=templateFn("pinHTML");
   assert.match(controller,/sheetSnap[\s\S]{0,180}(?:peek|browse|expanded)|(?:peek|browse|expanded)[\s\S]{0,180}sheetSnap/,
     "compact routes have Peek, Browse, and Expanded snap states");
   assert.match(controller,/sheetContent[\s\S]{0,180}(?:choices|plan|settings)|(?:choices|plan|settings)[\s\S]{0,180}sheetContent/,
     "Choices, Plan, and Settings are content in the same sheet rather than peer pages");
-  assert.match(TSRC,/(?:View choices|Show map|Expand)/,
-    "every drag-only snap has a visible keyboard-operable alternative");
+  assert.match(TSRC,/#pincard\[data-layout-capability="bottom-sheet"\]\{[^}]*height:var\(--sheet-height[^}]*transform:none/,
+    "a compact sheet uses its real visible height instead of translating a full-height hidden scroller");
+  assert.doesNotMatch(pin,/pin-view|pin-peek-actions|data-sheet-snap-control|data-route-plan-control|selected-plan-cta/,
+    "mobile does not expose redundant Choices/Plan tabs or visible Expand/Show-map snap buttons");
   assert.doesNotMatch(TSRC,/data-inspector-view="map"|data-view="map"/,
-    "Show map collapses the sheet; it does not select an obsolete Map content screen");
+    "Map remains permanent context rather than becoming a peer content screen");
+});
+
+test("bottom-sheet snap heights use the actual short viewport and remain monotonic", () => {
+  const makeMetrics=height=>{
+    const window={innerHeight:height,visualViewport:{height}};
+    const metrics=new Function("window",`"use strict";${templateFn("sheetMetrics")};return sheetMetrics;`)(window);
+    return metrics();
+  };
+  for(const available of [240,300,320]){
+    const metrics=makeMetrics(available),visible=metrics.visible;
+    assert.equal(metrics.height,available,
+      `a ${available}px viewport cannot be inflated beyond its real visible height`);
+    assert.ok(0<visible.peek,`Peek remains positive at ${available}px`);
+    assert.ok(visible.peek<=visible.browse,`Peek <= Browse at ${available}px`);
+    assert.ok(visible.browse<=visible.expanded,`Browse <= Expanded at ${available}px`);
+    assert.ok(visible.expanded<=available,`Expanded fits within ${available}px`);
+    for(const snap of ["peek","browse","expanded"])
+      assert.equal(metrics.snaps[snap],available-visible[snap],
+        `${snap} offset is derived from its real visible height at ${available}px`);
+  }
 });
 
 test("sheet drag uses the handle only and handles threshold, velocity, cancellation, scroll boundaries, and reduced motion", () => {
@@ -1813,15 +1886,41 @@ test("sheet drag uses the handle only and handles threshold, velocity, cancellat
     "reduced motion settles sheet transitions without continued animation");
   assert.match(controller,/(?:Enter|Space|key === " "|key===" ")/,
     "the handle has a keyboard path between Peek and Browse");
+  assert.match(controller,/const order=\["peek","browse","expanded"\]/,
+    "the handle's keyboard model reaches every gesture-owned snap state");
+  for(const key of ["ArrowUp","ArrowDown","Home","End"])
+    assert.match(controller,new RegExp(`e\\.key==="${key}"`),`${key} has an explicit sheet-snap meaning`);
 });
 
-test("Route Plan and sheet controls retain accessible expanded/controlled relationships", () => {
-  assert.match(TSRC,/aria-controls="route-plan-panel"/,
-    "the Route Plan toggle names its controlled plan region");
-  assert.match(TSRC,/aria-expanded="\$\{[^}]*planOpen[^}]*\}"/,
-    "the Plan toggle exposes open/closed state to assistive technology");
+test("route-local Plan and the gesture handle retain accessible state relationships", () => {
+  const row=templateFn("routeRowHTML"),ui=templateFn("applyInspectorUI");
+  assert.match(row,/data-route-plan-for="\$\{escapeHTML\(o\.key\)\}"[\s\S]*aria-controls="route-plan-panel"/,
+    "each route-local Plan action names the shared directions region");
+  assert.match(row,/aria-expanded="\$\{selected&&[^}]*inspectorUI\.planOpen\}"/,
+    "the route-local action exposes whether its exact Plan is open");
+  assert.match(ui,/button\.dataset\.routePlanFor===selKey/,
+    "rerenders update expanded state only for the selected exact route");
+  assert.match(ui,/handle\.setAttribute\("aria-label"/);
+  assert.match(ui,/handle\.setAttribute\("aria-expanded"/);
   assert.match(TSRC,/(?:aria-hidden|inert)[\s\S]{0,180}(?:sheetSnap|peek)|(?:sheetSnap|peek)[\s\S]{0,180}(?:aria-hidden|inert)/,
     "Peek cannot leave off-screen route rows in the keyboard focus order");
+});
+
+test("bottom-sheet Plan moves keyboard focus into visible directions and returns by exact route key", () => {
+  const selected=templateFn("selectedRouteHTML"),transition=templateFn("transitionInspector");
+  assert.match(selected,/id="selected-route-title" tabindex="-1">Route plan<\/h2>/,
+    "the visible Plan heading is a programmatic focus destination without adding a tab stop");
+  assert.match(transition,/focusOpenedPlan=next/);
+  assert.ok(transition.indexOf("applyInspectorUI(action,{fit:enteringMapFocus})")<transition.indexOf("if(focusOpenedPlan)"),
+    "focus moves only after capability layout has mounted and exposed the Plan");
+  assert.match(transition,/const sourceHidden=!!\(source&&\(!document\.contains\(source\)\|\|!source\.getClientRects\(\)\.length\)\)/,
+    "mobile moves focus when opening Plan hides the originating route action");
+  assert.match(transition,/if\(origin==="keyboard"\|\|sourceHidden\)[\s\S]*document\.getElementById\("selected-route-title"\)\?\.focus\(\{preventScroll:true\}\)/,
+    "keyboard Plan activation lands on the now-visible Plan heading");
+  assert.match(transition,/restorePlanFocus=origin==="keyboard"/,
+    "keyboard close records focus-return intent without moving focus for pointer users");
+  assert.match(transition,/button\.dataset\.routePlanFor===selKey\)\?\.focus\(\{preventScroll:true\}\)/,
+    "closing Plan returns to the route-local action for the selected exact route key");
 });
 
 test("last pointerdown modality keeps hybrid pointer interactions faithful", () => {
@@ -2309,17 +2408,32 @@ test("keep-pin parameter recompute cancels old enrichment and owns the only fina
     "the generation-guarded parameter refresh remains the sole final pin=1 owner");
 });
 
-test("settled bottom-sheet geometry is measured for map occlusion without fitting during live drag", () => {
+test("bottom-sheet geometry and ordinary inspector transitions preserve the camera; explicit desktop Focus map may reframe", () => {
   const insets=templateFn("viewInsets");
   assert.match(insets,/data-layout-capability[\s\S]{0,500}bottom=Math\.max\(bottom,sz\.y-qc\.t\)/,
     "a settled bottom sheet contributes its measured rectangle as a bottom occluder");
-  const controller=TSRC;
-  assert.match(controller,/data-dragging|dragging/,
+  const transition=templateFn("transitionInspector"),apply=templateFn("applyInspectorUI"),viewport=templateFn("syncInspectorViewport");
+  assert.match(TSRC,/data-dragging|dragging/,
     "the controller can distinguish a live drag from a settled snap");
-  assert.doesNotMatch(controller,/dragging[\s\S]{0,180}fitToCompare\(/,
-    "the map must not refit on every drag frame");
-  assert.match(controller,/(?:transitionend|requestAnimationFrame)[\s\S]{0,260}fitToCompare\(/,
-    "occlusion fitting occurs after a presentation transition settles");
+  assert.doesNotMatch(transition,/scheduleInspectorFit|performSettledInspectorFit|fitToCompare/,
+    "the transition controller delegates any allowed fit instead of fitting from multiple branches");
+  assert.equal((transition.match(/fit\s*:/g)||[]).length,1,
+    "there is one auditable post-initial fit request rather than independent Plan, Settings, and snap fits");
+  assert.match(transition,/const enteringMapFocus=action==="map-focus"&&cap!=="bottom-sheet"&&inspectorUI\.presentation==="map-focus"/,
+    "only an explicit user-triggered entry into desktop Focus map qualifies for that fit");
+  assert.match(transition,/applyInspectorUI\(action,\{fit:enteringMapFocus\}\)/);
+  assert.match(apply,/if\(!opts\.fit\)inspectorFitToken\+\+/,
+    "every non-fit Plan, Settings, return, snap, render, or resize application invalidates an older delayed fit token");
+  assert.match(apply,/if\(opts\.fit\)scheduleInspectorFit\(\)/,
+    "the explicit desktop Focus-map exception remains the only path that schedules a post-initial fit");
+  assert.ok(apply.indexOf("if(!opts.fit)inspectorFitToken++")<apply.indexOf("if(opts.fit)scheduleInspectorFit()"),
+    "a non-fit state takes ownership of camera stability before any delayed fit can publish");
+  assert.doesNotMatch(viewport,/scheduleInspectorFit|performSettledInspectorFit|fitToCompare/,
+    "visualViewport and browser-chrome resize events invalidate layout without creating a delayed camera jump");
+  assert.match(templateFn("lockRow"),/cancelPendingInitialFit\(\)/,
+    "selecting a route cancels an initial one-shot fit that has not started yet");
+  assert.match(templateFn("openPin"),/pendingFitId/,
+    "route opening retains the sole automatic one-shot framing path");
 });
 
 test("the route inspector region is stable while dedicated status nodes announce updates", () => {

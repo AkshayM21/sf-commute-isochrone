@@ -686,41 +686,79 @@ def origin_container_point(page, origin):
 
 
 def measure_family_card(page):
-    """Return objective crowding, target-size, and overflow metrics for the route inspector."""
+    """Return objective crowding, reachability, and collision metrics for the inspector.
+
+    The inspector has three layouts and Plan can be reparented into the desktop sidecar.  Keep
+    this browser audit tied to the visible *active pane*, rather than assuming Choices is always
+    the scroll host or that a globally mounted Plan CTA exists.  This is deliberately a metric
+    collector: callers can record a hotspot before an individual viewport has enough content to
+    exercise every failure mode.
+    """
     return page.evaluate(
         """() => {
           const card=document.getElementById('pincard'), body=document.getElementById('pinbody');
           const choices=document.getElementById('route-choices-panel'),plan=document.getElementById('route-plan-panel');
-          const close=document.getElementById('pinx'), panel=document.getElementById('panel');
+          const panel=document.getElementById('panel');
           const legend=document.getElementById('legend');
           const rect=el=>{const r=el.getBoundingClientRect();return {l:r.left,t:r.top,r:r.right,b:r.bottom,w:r.width,h:r.height};};
           const overlap=(a,b)=>Math.max(0,Math.min(a.r,b.r)-Math.max(a.l,b.l))*Math.max(0,Math.min(a.b,b.b)-Math.max(a.t,b.t));
           const visible=el=>{const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;};
+          const visibleIn=el=>visible(el)&&el.getBoundingClientRect().bottom>0&&el.getBoundingClientRect().top<innerHeight;
+          const scrollable=el=>{if(!el||!visible(el))return false;const s=getComputedStyle(el);return /auto|scroll/.test(s.overflowY)&&el.scrollHeight>el.clientHeight+1;};
+          const activePlan=[...document.querySelectorAll('#route-sidecar .route-plan-pane,#pincard .route-plan-pane')]
+            .find(visible)||null;
+          const activeChoices=[...document.querySelectorAll('#pincard .route-choices-pane')].find(visible)||null;
+          const activePane=activePlan||activeChoices||null;
+          const scrollHost=scrollable(activePane)?activePane:
+            [activePane,body,card].find(scrollable)||activePane||body;
+          const paneKind=activePlan?'plan':activeChoices?'choices':'none';
           // Destination/settings use intentional one-line ellipsis. Audit route decision copy,
           // which must remain readable rather than treating that designed truncation as clipping.
-          const labels=[...card.querySelectorAll('.pin-place,.route-name,.route-tradeoffs,.route-action,.route-time,.route-fact-value,.boarding-heading span')];
+          const inspectorRoots=[card,document.getElementById('route-sidecar')].filter(Boolean);
+          const labels=inspectorRoots.flatMap(root=>[...root.querySelectorAll('.pin-place,.route-name,.route-tradeoffs,.route-action,.route-time,.route-fact-value,.boarding-heading span,.plan-title,.route-copy,.route-detail')]);
           const clipped=labels.filter(el=>{const s=getComputedStyle(el);return visible(el)&&((['hidden','clip'].includes(s.overflowX)&&el.scrollWidth>el.clientWidth+1)||(['hidden','clip'].includes(s.overflowY)&&el.scrollHeight>el.clientHeight+1));}).map(el=>el.textContent.trim());
-          const targets=[...card.querySelectorAll('.route-choice,#pinx,#pinadjust,#pinview button,#all-routes-toggle,.show-routes,#view-route-plan,#route-directions summary')].filter(visible);
+          const targets=inspectorRoots.flatMap(root=>[...root.querySelectorAll('button,a[href],summary,[role="button"]')]).filter(visible);
           const sizes=targets.map(el=>{const r=el.getBoundingClientRect();return Math.min(r.width,r.height);});
-          const interactives=[...card.querySelectorAll('.route-choice')].filter(visible);
-          const scrollHost=visible(choices)?choices:body,oldTop=scrollHost.scrollTop;scrollHost.scrollTop=scrollHost.scrollHeight;
-          const br=scrollHost.getBoundingClientRect(), last=interactives.length?interactives[interactives.length-1].getBoundingClientRect():null;
-          const reachesLast=!last||(last.bottom<=br.bottom+1&&last.top>=br.top-1);
+          const interactives=[...((activePane||card).querySelectorAll('.route-choice,[data-route-plan-for],.route-directions li,.plan-google'))].filter(visible);
+          const oldTop=scrollHost&&'scrollTop'in scrollHost?scrollHost.scrollTop:0;
+          if(scrollHost&&'scrollTop'in scrollHost)scrollHost.scrollTop=scrollHost.scrollHeight;
+          const br=scrollHost&&scrollHost.getBoundingClientRect?scrollHost.getBoundingClientRect():null;
+          const last=interactives.length?interactives[interactives.length-1].getBoundingClientRect():null;
+          // Fixed Plan footers remain part of the pane.  The last meaningful action/content must
+          // be entirely inside the active scroll region after a max-scroll, not merely exist below
+          // a transformed mobile sheet.
+          const reachesLast=!last||!br||(last.bottom<=br.bottom+1&&last.top>=br.top-1&&last.bottom<=innerHeight+1);
           scrollHost.scrollTop=oldTop;
-          const cr=rect(card),pr=rect(panel),lr=rect(legend),xr=rect(close);
+          const cr=rect(card),pr=rect(panel),lr=rect(legend);
           const interactiveSelector='button,a[href],summary,[role="button"]';
-          const nested=[...card.querySelectorAll(interactiveSelector)].filter(el=>{
+          const nested=inspectorRoots.flatMap(root=>[...root.querySelectorAll(interactiveSelector)]).filter(el=>{
             const parent=el.parentElement&&el.parentElement.closest(interactiveSelector);
-            return parent&&card.contains(parent);
+            return parent&&inspectorRoots.some(root=>root.contains(parent));
           });
           const selectedKeys=[...new Set([...card.querySelectorAll('.route-choice[aria-pressed="true"]')]
             .map(el=>el.dataset.choiceKey||el.dataset.key).filter(Boolean))];
+          const routePlanActions=[...card.querySelectorAll('[data-route-plan-for]')];
+          const inspectorCloseControls=inspectorRoots.flatMap(root=>[...root.querySelectorAll('[data-close-pin],#pinx')])
+            .filter((el,index,all)=>visible(el)&&all.indexOf(el)===index);
+          const planCloseControls=inspectorRoots.flatMap(root=>[...root.querySelectorAll('[data-route-plan-close]')])
+            .filter((el,index,all)=>visible(el)&&all.indexOf(el)===index);
+          const closeControls=inspectorRoots.flatMap(root=>[...root.querySelectorAll('[data-close-pin],#pinx,[data-route-plan-close],button[aria-label*="Close" i]')])
+            .filter((el,index,all)=>visible(el)&&all.indexOf(el)===index);
+          const closeRects=closeControls.map(el=>({label:(el.getAttribute('aria-label')||el.textContent||'').trim(),rect:rect(el)}));
+          const closeCollisions=[];
+          for(let i=0;i<closeRects.length;i++)for(let j=i+1;j<closeRects.length;j++){
+            const area=overlap(closeRects[i].rect,closeRects[j].rect);
+            if(area>1)closeCollisions.push({left:closeRects[i].label,right:closeRects[j].label,area});
+          }
           const offscreenRight=[...document.body.querySelectorAll('*')].map(el=>{
             const r=el.getBoundingClientRect(),s=getComputedStyle(el);
             return {tag:el.tagName.toLowerCase(),id:el.id||'',cls:String(el.className||'').slice(0,80),
                     left:Math.round(r.left),right:Math.round(r.right),width:Math.round(r.width),
                     position:s.position,transform:s.transform};
           }).filter(x=>x.width>0&&x.right>innerWidth+1).sort((a,b)=>b.right-a.right).slice(0,12);
+          const isSheet=card.dataset.layoutCapability==='bottom-sheet';
+          const visibleSheetHeight=Math.max(0,Math.min(cr.b,innerHeight)-Math.max(cr.t,0));
+          const cssSheetHeight=parseFloat(getComputedStyle(card).getPropertyValue('--sheet-height'));
           return {
             viewport:{w:innerWidth,h:innerHeight},card:cr,
             families:new Set([...card.querySelectorAll('.route-choice')].map(row=>row.dataset.family)).size,
@@ -731,17 +769,37 @@ def measure_family_card(page):
             recommended_rows:card.querySelectorAll('.route-recommendations .route-choice.recommended').length,
             selected_keys:selectedKeys,
             nested_interactives:nested.length,
-            scroll_debt:Math.max(0,scrollHost.scrollHeight-scrollHost.clientHeight),
-            horizontal_overflow:Math.max(0,scrollHost.scrollWidth-scrollHost.clientWidth),
+            active_pane:paneKind,
+            active_scroll_host:scrollHost===activePlan?'plan':scrollHost===activeChoices?'choices':scrollHost===body?'body':scrollHost===card?'card':'none',
+            scroll_debt:scrollHost?Math.max(0,scrollHost.scrollHeight-scrollHost.clientHeight):0,
+            horizontal_overflow:scrollHost?Math.max(0,scrollHost.scrollWidth-scrollHost.clientWidth):0,
             document_horizontal_overflow:Math.max(0,document.documentElement.scrollWidth-innerWidth),
             offscreen_right:offscreenRight,
             clipped_labels:clipped,
             scroll_reaches_last:reachesLast,
+            route_plan_actions:routePlanActions.length,
+            route_plan_keys:routePlanActions.map(el=>el.dataset.routePlanFor||''),
+            displayed_route_plan_keys:routePlanActions.filter(visible).map(el=>el.dataset.routePlanFor||''),
+            visible_route_plan_keys:routePlanActions.filter(visibleIn).map(el=>el.dataset.routePlanFor||''),
+            close_visible_count:closeControls.length,
+            inspector_close_visible_count:inspectorCloseControls.length,
+            plan_close_visible_count:planCloseControls.length,
+            close_controls:closeRects.map(item=>item.label),
+            close_collisions:closeCollisions,
+            sheet:{
+              is_bottom_sheet:isSheet,
+              css_height:Number.isFinite(cssSheetHeight)?cssSheetHeight:null,
+              actual_height:cr.h,
+              visible_height:visibleSheetHeight,
+              height_delta:Number.isFinite(cssSheetHeight)?Math.abs(cr.h-cssSheetHeight):null,
+              hidden_height:Math.max(0,cr.h-visibleSheetHeight),
+              bottom_delta:Math.abs(cr.b-innerHeight),
+            },
             min_target_px:sizes.length?Math.min(...sizes):0,
             label_chars:labels.reduce((n,el)=>n+(el.textContent||'').trim().length,0),
             panel_overlap_px2:visible(panel)?overlap(cr,pr):0,
             legend_overlap_px2:visible(legend)?overlap(cr,lr):0,
-            close_visible:visible(close)&&xr.l>=cr.l&&xr.r<=cr.r&&xr.t>=cr.t&&xr.b<=cr.b,
+            close_visible:closeControls.some(el=>el.id==='pinx'&&visible(el)),
             card_in_view:cr.l>=-1&&cr.t>=-1&&cr.r<=innerWidth+1&&cr.b<=innerHeight+1,
             choices_visible:visible(choices),plan_visible:visible(plan),
           };
@@ -749,10 +807,51 @@ def measure_family_card(page):
     )
 
 
+def assert_inspector_health(metrics, *, tolerance_px=1.5):
+    """Assert state-independent visual health from :func:`measure_family_card`.
+
+    Hotspot callers use this after opening the route inspector in whichever responsive state they
+    are exercising.  The assertions intentionally avoid prescribing a particular pane, snap, or
+    number of visible route-plan controls: those are presentation-specific.  They do, however,
+    catch the invariants that must hold in every applicable state.
+    """
+    assert metrics.get("nested_interactives", 0) == 0, metrics
+    assert metrics.get("horizontal_overflow", 0) <= tolerance_px, metrics
+    assert metrics.get("document_horizontal_overflow", 0) <= tolerance_px, metrics
+    assert not metrics.get("clipped_labels"), metrics
+    assert not metrics.get("close_collisions"), metrics
+
+    # A Plan's contextual close action can legitimately coexist with the inspector's close.  Only
+    # the latter is singular; never mistake two different semantic actions for a duplicate close.
+    inspector_close_count = metrics.get("inspector_close_visible_count", 0)
+    if inspector_close_count:
+        assert inspector_close_count == 1, metrics
+
+    # When a scrollable Choices or Plan pane is present, its final content/action must be reachable
+    # at max scroll.  A compact Peek has no active pane, so it is deliberately not constrained.
+    if metrics.get("active_pane") != "none":
+        assert metrics.get("scroll_reaches_last"), metrics
+
+    sheet = metrics.get("sheet") or {}
+    if sheet.get("is_bottom_sheet"):
+        # The mobile card must occupy its real visible height; transformed full-height sheets make
+        # the scroller report a false bottom before its last action is visible.
+        assert sheet.get("hidden_height", 0) <= tolerance_px, metrics
+        assert sheet.get("bottom_delta", 0) <= tolerance_px, metrics
+        css_delta = sheet.get("height_delta")
+        if css_delta is not None:
+            assert css_delta <= tolerance_px, metrics
+
+
 def dom_family_snapshot(page):
     return page.evaluate(
         """() => {
           const rows=[...document.querySelectorAll('#pincard .route-choice')];
+          const visible=el=>{const s=getComputedStyle(el),r=el.getBoundingClientRect();return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0;};
+          const cards=[...document.querySelectorAll('#pincard .route-choice-card')];
+          const planActions=[...document.querySelectorAll('#pincard [data-route-plan-for]')];
+          const plan=document.getElementById('route-plan-panel');
+          const planRoot=plan&&plan.closest('#route-sidecar,#pincard');
           const families=[...new Map(rows.map(row=>[row.dataset.family,{
             key:row.dataset.family,name:row.dataset.familyName||''
           }])).values()];
@@ -767,6 +866,17 @@ def dom_family_snapshot(page):
               f.dataset.fact,(f.querySelector('.route-fact-value')||{}).textContent?.trim()||''
             ])),pressed:b.getAttribute('aria-pressed'),
           })),
+          route_plan_actions:planActions.map(button=>({
+            key:button.dataset.routePlanFor||'',controls:button.getAttribute('aria-controls')||'',
+            expanded:button.getAttribute('aria-expanded'),visible:visible(button),
+            selected:button.closest('.route-choice-card')?.dataset.selected||'false',
+            label:(button.getAttribute('aria-label')||button.textContent||'').trim(),
+          })),
+          route_cards:cards.map(card=>({
+            key:card.dataset.choiceCardKey||'',selected:card.dataset.selected||'false',
+            route_buttons:card.querySelectorAll('.route-choice').length,
+            route_plan_actions:card.querySelectorAll('[data-route-plan-for]').length,
+          })),
           recommended:[...document.querySelectorAll('#pincard .route-recommendations .route-choice.recommended')].map(r=>({
             key:r.dataset.choiceKey||r.dataset.key,family:r.dataset.family,branch:r.dataset.branch,
           })),
@@ -777,14 +887,22 @@ def dom_family_snapshot(page):
           stale_controls:document.querySelectorAll('#pincard .cmp .family,#pincard .cmp .branch,#pincard .cmp .strip').length,
           all_routes_present:!!document.getElementById('allroutes'),
           all_routes_expanded:document.getElementById('allroutes')?.open||false,
+          legacy_global_plan_controls:document.querySelectorAll('#pincard [data-route-plan-control],#pincard [data-route-plan-toggle],#pincard #view-route-plan,#pincard #selected-plan-cta').length,
+          // `data-sheet-snap` on #pincard is the current state hook, not retired UI.  Restrict
+          // this regression guard to the former interactive tab/snap controls themselves.
+          legacy_mobile_navigation:document.querySelectorAll('#pincard .pin-view,#pincard .pin-peek-actions,#pincard [data-sheet-snap-action],#pincard [data-sheet-tab]').length,
           map_choice_key:document.querySelector('#pincard .pin-shell')?.dataset.mapChoiceKey||null,
           recommended_choice_key:document.querySelector('#pincard .pin-shell')?.dataset.recommendedChoiceKey||null,
-          selected_choice_key:document.querySelector('#route-plan-panel')?.dataset.selectedChoiceKey||
+          selected_choice_key:plan?.dataset.selectedChoiceKey||
             document.querySelector('#pincard .pin-shell')?.dataset.selectedChoiceKey||null,
           choices_visible:!!document.getElementById('route-choices-panel')&&
             getComputedStyle(document.getElementById('route-choices-panel')).display!=='none',
-          plan_visible:!!document.getElementById('route-plan-panel')&&
-            getComputedStyle(document.getElementById('route-plan-panel')).display!=='none',
+          plan_visible:!!plan&&visible(plan),
+          plan_root:planRoot?.id||null,
+          plan_selected_choice_key:plan?.dataset.selectedChoiceKey||null,
+          plan_step_count:plan?.querySelectorAll('.route-directions li').length||0,
+          plan_has_collapsed_directions:!!plan?.querySelector('#route-directions summary,details.route-directions'),
+          plan_has_google_maps_link:!!plan?.querySelector('.plan-google[href]'),
           drawn:(typeof DRAWN!=='undefined'&&DRAWN)?{multi:!!DRAWN.multi,key:DRAWN.key||null,family:DRAWN.famKey||null,branch:DRAWN.branchKey||null}:null,
           route_layers:(typeof routeLayer!=='undefined')?routeLayer.getLayers().length:0,
         })}"""
@@ -833,6 +951,8 @@ def assert_api_matches_dom(body, snapshot):
             "remaining-choice disclosure was present but not expanded for audit")
     assert snapshot["stale_controls"] == 0, "retired nested family/branch controls returned"
     assert snapshot["nested_interactives"] == 0, "route inspector nested interactive controls"
+    assert snapshot["legacy_global_plan_controls"] == 0, "retired global Route Plan control returned"
+    assert snapshot["legacy_mobile_navigation"] == 0, "retired mobile tab/snap controls returned"
     assert snapshot["drawn"] and snapshot["drawn"]["multi"], "pinned card is not a family diagram"
     assert snapshot["route_layers"] > 0, "family card advertises routes but the map drew none"
     for key, value in family_members.items():
@@ -852,6 +972,19 @@ def assert_api_matches_dom(body, snapshot):
         assert dom["key"], f"expert route {key} has no authoritative option key"
         assert dom["pressed"] in {"true", "false"}, f"route {key} lacks aria-pressed state"
 
+    cards_by_key = {item["key"]: item for item in snapshot["route_cards"]}
+    actions_by_key = {item["key"]: item for item in snapshot["route_plan_actions"]}
+    assert set(cards_by_key) == set(api_choices), "route-card/API identity mismatch"
+    assert set(actions_by_key) == set(api_choices), "each advertised route needs one local Plan action"
+    for choice_key, card in cards_by_key.items():
+        assert card["route_buttons"] == 1, f"route {choice_key} has {card['route_buttons']} selection buttons"
+        assert card["route_plan_actions"] == 1, f"route {choice_key} has {card['route_plan_actions']} Plan actions"
+        action = actions_by_key[choice_key]
+        assert action["controls"] == "route-plan-panel", (
+            f"route {choice_key} Plan action controls {action['controls']!r}, not the active Plan")
+        assert action["expanded"] in {"true", "false"}, f"route {choice_key} Plan action lacks aria-expanded"
+        assert action["label"], f"route {choice_key} Plan action lacks an accessible name"
+
     assert len(snapshot["recommended"]) == 1, "expected one recommendation-first row"
     recommended = snapshot["recommended"][0]
     map_choice_key = str(body.get("map_choice_key") or body["choice_key"])
@@ -863,3 +996,10 @@ def assert_api_matches_dom(body, snapshot):
         f"expected one selected route key, got {snapshot['selected_keys']}")
     assert snapshot["selected_choice_key"] == recommended_choice_key
     assert snapshot["drawn"]["key"] == recommended["key"]
+    selected_actions = [item for item in snapshot["route_plan_actions"] if item["selected"] == "true"]
+    assert [item["key"] for item in selected_actions] == [recommended_choice_key]
+    if snapshot["plan_visible"]:
+        assert snapshot["plan_selected_choice_key"] == recommended_choice_key
+        assert snapshot["plan_step_count"] > 0, "open Route Plan has no step-by-step directions"
+        assert not snapshot["plan_has_collapsed_directions"], "Route Plan directions are still collapsed"
+        assert snapshot["plan_has_google_maps_link"], "open Route Plan lacks Google Maps handoff"

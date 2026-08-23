@@ -13,7 +13,7 @@ from conftest import BASE_URL
 from route_family_hotspots import (
     ARTIFACT_PATH, DEFAULT_SEED, PARETO_DIMENSIONS, PUBLIC_DESTINATIONS, SAVED_HOTSPOT,
     _api_get, _rank_hotspots, _route_slots, _speed_query,
-    _stable_rank, _transit_legs, assert_api_matches_dom, dom_family_snapshot,
+    _stable_rank, _transit_legs, assert_api_matches_dom, assert_inspector_health, dom_family_snapshot,
     measure_family_card, open_destination, origin_container_point, route_metrics, scan_hotspots,
     validate_route_response, write_artifact,
 )
@@ -234,6 +234,56 @@ def _rects(page, *selectors):
     }))""", list(selectors))
 
 
+def _wait_camera_stable(page):
+    """Wait until Leaflet's center and zoom have remained unchanged for 400 ms."""
+    page.evaluate("""async () => {
+      const read=()=>{const c=map.getCenter();return {lat:c.lat,lng:c.lng,zoom:map.getZoom()};};
+      const same=(a,b)=>Math.abs(a.lat-b.lat)<1e-9&&Math.abs(a.lng-b.lng)<1e-9&&a.zoom===b.zoom;
+      let previous=read(),stableSince=performance.now();const deadline=stableSince+3500;
+      while(performance.now()<deadline){
+        await new Promise(resolve=>setTimeout(resolve,50));
+        const current=read(),now=performance.now();
+        if(!same(previous,current))stableSince=now;
+        previous=current;
+        if(now-stableSince>=400)return;
+      }
+      throw new Error('Leaflet camera did not settle');
+    }""")
+
+
+def _camera(page):
+    _wait_camera_stable(page)
+    return page.evaluate("""() => { const c=map.getCenter();
+      return {lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
+
+
+def _assert_camera_same(page, expected):
+    actual = _camera(page)
+    assert actual["zoom"] == expected["zoom"], {"expected": expected, "actual": actual}
+    assert abs(actual["lat"] - expected["lat"]) < 1e-7, {"expected": expected, "actual": actual}
+    assert abs(actual["lng"] - expected["lng"]) < 1e-7, {"expected": expected, "actual": actual}
+
+
+def _visible_plan_keys(page):
+    return page.evaluate("""() => [...document.querySelectorAll('[data-route-plan-for]')]
+      .filter(el => { const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+        return s.display!=='none'&&s.visibility!=='hidden'&&r.width>0&&r.height>0; })
+      .map(el => el.dataset.routePlanFor)""")
+
+
+def _plan_action(page, key):
+    actions = page.locator("[data-route-plan-for]")
+    keys = actions.evaluate_all("els => els.map(el => el.dataset.routePlanFor)")
+    assert key in keys, {"missing_plan_key": key, "available": keys}
+    return actions.nth(keys.index(key))
+
+
+def _open_mobile_browse(page):
+    _click(page, "[data-sheet-handle]", touch=True)
+    _wait_state(page, sheetSnap="browse", sheetContent="choices")
+    page.wait_for_selector("#route-choices-panel .route-choice", state="visible")
+
+
 def _wait_for_final_pin(page):
     # Peek intentionally hides the choice scroller visually, so mobile only requires the final
     # route rows to be mounted. Browse/Expanded tests assert their visibility after snapping.
@@ -281,8 +331,7 @@ def test_saved_hotspot_routes_match_api_and_keep_choice_identity(new_context, co
     page = context.new_page()
     _open_saved_inspector(page, touch=touch)
     if touch:
-        _click(page, '[data-show-choices]', touch=True)
-        _wait_state(page, sheetSnap="browse", sheetContent="choices")
+        _open_mobile_browse(page)
     cell_id, destination, speed = page.evaluate("() => routePin"), SAVED_HOTSPOT["destination"], SAVED_HOTSPOT["speed"]
     body = _api_get(context.request, BASE_URL,
                     f"/itinerary?id={quote(str(cell_id))}&dlat={destination['lat']}&dlon={destination['lon']}"
@@ -291,6 +340,7 @@ def test_saved_hotspot_routes_match_api_and_keep_choice_identity(new_context, co
     _expand_all_route_disclosures(page)
     snapshot, crowding = dom_family_snapshot(page), measure_family_card(page)
     assert_api_matches_dom(body, snapshot)
+    assert_inspector_health(crowding)
     assert crowding["families"] == route_metrics(body)["families"]
     assert crowding["branches"] == route_metrics(body)["branches"]
     assert crowding["route_choice_rows"] == crowding["route_options"]
@@ -301,84 +351,162 @@ def test_saved_hotspot_routes_match_api_and_keep_choice_identity(new_context, co
     assert _state(page)["selected"] == selected_key
 
 
-def test_desktop_plan_sidecar_tray_scrolls_and_remaps_across_resize(new_context):
-    """Plan is closed by default, then remains requested through sidecar/tray remapping."""
+def test_desktop_route_local_plan_is_directions_only_and_preserves_camera(new_context):
+    """Only the selected desktop route owns Plan; selecting and opening it never reframes."""
     context = new_context(viewport={"width": 1440, "height": 820})
     page = context.new_page()
     _open_saved_inspector(page, touch=False)
     _wait_state(page, layout="wide-sidecar", surface="routes", presentation="expanded", planOpen="false")
     assert not page.locator("#route-plan-panel").is_visible()
-    toggle = page.locator("#pincard .pin-head [data-route-plan-control]")
-    assert page.locator("[data-route-plan-toggle]").count() == 1
-    assert toggle.get_attribute("aria-expanded") == "false"
-    assert toggle.get_attribute("aria-controls") == "route-plan-panel"
+    assert page.locator("[data-route-plan-control], [data-route-plan-toggle]").count() == 0
+    selected_key = _state(page)["selected"]
+    assert _visible_plan_keys(page) == [selected_key]
+    camera = _camera(page)
+
     selected_key = _select_other_route(page)
-    _expand_all_route_disclosures(page)
-    page.wait_for_function("""() => { const el=document.getElementById('route-choices-panel');
-      return el.scrollHeight>el.clientHeight; }""")
-    page.evaluate("() => document.getElementById('route-choices-panel').scrollTop=80")
-    choices_scroll = page.evaluate("() => document.getElementById('route-choices-panel').scrollTop")
-    assert choices_scroll > 0
-    _click(page, "#pincard .pin-head [data-route-plan-control]")
+    assert _visible_plan_keys(page) == [selected_key]
+    _assert_camera_same(page, camera)
+
+    _plan_action(page, selected_key).click()
     _wait_state(page, planOpen="true")
-    assert toggle.get_attribute("aria-expanded") == "true"
     assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == selected_key
+    assert page.locator("#route-plan-panel").is_visible()
     wide = _rects(page, "#pincard", "#route-choices-panel", "#route-plan-panel", "#map")
     card, choices, plan, map_rect = wide["#pincard"], wide["#route-choices-panel"], wide["#route-plan-panel"], wide["#map"]
     assert plan["width"] < choices["width"] and plan["right"] <= choices["left"] + 1, wide
     assert abs(plan["bottom"] - card["bottom"]) <= 4 and map_rect["left"] <= plan["left"] < choices["left"], wide
-    page.locator("#route-directions summary").click()
-    page.wait_for_function("""() => { const panel=document.getElementById('route-plan-panel');
-      return document.getElementById('route-directions')?.open && panel.scrollHeight>panel.clientHeight; }""")
-    page.evaluate("() => document.getElementById('route-plan-panel').scrollTop=40")
-    plan_scroll = page.evaluate("() => document.getElementById('route-plan-panel').scrollTop")
-    assert plan_scroll > 0
+    assert page.locator("#route-plan-panel details, #route-plan-panel .plan-facts").count() == 0
+    assert page.locator("#route-plan-panel .plan-note, #route-plan-panel .plan-timing").count() == 0
+    assert page.locator("#route-plan-panel .bd .foot, #route-plan-panel .foot").count() == 0
+    assert page.locator("#route-plan-panel .route-directions > li").count() > 0
+    assert page.locator("#route-plan-panel .plan-google").is_visible()
+    _assert_camera_same(page, camera)
 
-    # A selection made while Plan is open must update the plan in place without destroying
-    # disclosure state or either independently scrolled pane.
-    next_row = page.locator("#route-choices-panel .route-choice[aria-pressed='false']").first
-    next_key = next_row.get_attribute("data-key")
-    assert next_key and next_key != selected_key
-    next_row.evaluate("el => el.click()")
-    page.wait_for_function("key => document.getElementById('pincard').dataset.selectedChoiceKey===key",
-                           arg=next_key)
-    page.wait_for_function("key => document.getElementById('route-plan-panel')?.dataset.selectedChoiceKey===key",
-                           arg=next_key)
-    _wait_state(page, planOpen="true")
-    assert page.locator("#route-directions").evaluate("el => el.open")
-    page.wait_for_function("expected => document.getElementById('route-choices-panel').scrollTop===expected",
-                           arg=choices_scroll)
-    page.wait_for_function("expected => document.getElementById('route-plan-panel').scrollTop===expected",
-                           arg=plan_scroll)
-    selected_key = next_key
-
-    _click(page, "#pincard .pin-head [data-route-plan-control]")
+    _click(page, "#route-plan-panel [data-route-plan-close]")
     _wait_state(page, planOpen="false")
-    page.wait_for_function("expected => document.getElementById('route-choices-panel').scrollTop===expected",
-                           arg=choices_scroll)
-    _click(page, "#pincard .pin-head [data-route-plan-control]")
-    _wait_state(page, planOpen="true")
-    page.wait_for_function("expected => document.getElementById('route-plan-panel').scrollTop===expected",
-                           arg=plan_scroll)
+    assert _plan_action(page, selected_key).is_visible()
+    _assert_camera_same(page, camera)
 
-    page.set_viewport_size({"width": 900, "height": 820})
+
+def test_narrow_desktop_plan_toggles_inline_without_replacing_choices(new_context):
+    context = new_context(viewport={"width": 900, "height": 820})
+    page = context.new_page()
+    _open_saved_inspector(page, touch=False)
+    _wait_state(page, layout="single-card", surface="routes", planOpen="false")
+    assert page.locator("#route-choices-panel").is_visible()
+    selected_key = _state(page)["selected"]
+    assert _visible_plan_keys(page) == [selected_key]
+    camera = _camera(page)
+
+    _plan_action(page, selected_key).click()
     _wait_state(page, layout="single-card", planOpen="true")
+    assert page.locator("#route-choices-panel").is_visible()
+    assert page.locator("#route-plan-panel").is_visible()
     tray = _rects(page, "#pincard", "#route-choices-panel", "#route-plan-panel")
     card, choices, plan = tray["#pincard"], tray["#route-choices-panel"], tray["#route-plan-panel"]
     assert abs(plan["top"] - choices["bottom"]) <= 2, tray
     assert plan["height"] < card["height"] and choices["height"] > plan["height"], tray
-    assert _state(page)["selected"] == selected_key
-    page.wait_for_function("expected => document.getElementById('route-choices-panel').scrollTop===expected",
-                           arg=choices_scroll)
-    page.wait_for_function("expected => document.getElementById('route-plan-panel').scrollTop===expected",
-                           arg=plan_scroll)
-    page.set_viewport_size({"width": 1440, "height": 820})
-    _wait_state(page, layout="wide-sidecar", planOpen="true")
-    assert _state(page)["selected"] == selected_key
-    page.wait_for_function("expected => document.getElementById('route-choices-panel').scrollTop===expected",
-                           arg=choices_scroll)
-    page.wait_for_function("expected => document.getElementById('route-plan-panel').scrollTop===expected",
-                           arg=plan_scroll)
+    _assert_camera_same(page, camera)
+
+    # A requested Plan survives responsive capability remapping. Reuse this loaded fixture so the
+    # resize contract does not pay for another destination compute and pinned-route enrichment.
+    page.set_viewport_size({"width": 390, "height": 844})
+    state = _wait_state(page, layout="bottom-sheet", planOpen="true", sheetContent="plan")
+    assert state["sheetSnap"] in {"browse", "expanded"}, state
+    assert page.locator("#route-plan-panel").is_visible()
+    assert page.locator("#route-plan-panel .plan-google").is_visible()
+
+    page.evaluate("""() => { const pane=document.getElementById('route-plan-panel');
+      pane.scrollTop=pane.scrollHeight-pane.clientHeight; }""")
+    page.wait_for_function("""() => { const pane=document.getElementById('route-plan-panel');
+      return pane.scrollHeight-pane.clientHeight-pane.scrollTop<=1; }""")
+    flow = page.evaluate("""() => { const pane=document.getElementById('route-plan-panel'),
+      last=pane.querySelector('.route-directions > li:last-child'),footer=pane.querySelector('.plan-footer');
+      const p=pane.getBoundingClientRect(),l=last.getBoundingClientRect(),f=footer.getBoundingClientRect();
+      return {pane:{top:p.top,bottom:p.bottom},last:{top:l.top,bottom:l.bottom},
+        footer:{top:f.top,bottom:f.bottom},scroll:pane.scrollTop,max:pane.scrollHeight-pane.clientHeight}; }""")
+    assert flow["last"]["top"] >= flow["pane"]["top"] - 1, flow
+    assert flow["footer"]["top"] >= flow["last"]["bottom"] - 1, flow
+    assert flow["footer"]["bottom"] <= flow["pane"]["bottom"] + 1, flow
+
+    # Reuse the responsive-remap fixture for a short landscape audit. The sheet's actual box must
+    # equal the controller's declared snap height; Choices must remain reachable without creating
+    # document-level overflow, and keyboard snap heights must increase monotonically.
+    page.set_viewport_size({"width": 568, "height": 320})
+    state = _wait_state(page, layout="bottom-sheet", planOpen="true", sheetContent="plan")
+    assert state["sheetSnap"] in {"browse", "expanded"}, state
+    landscape_handle = page.locator("[data-sheet-handle]")
+    landscape_handle.focus()
+    page.keyboard.press("End")
+    _wait_state(page, sheetSnap="expanded", sheetContent="plan")
+    page.wait_for_function("""key => { const card=document.getElementById('pincard');
+      return Math.abs(card.getBoundingClientRect().height-sheetMetrics().visible[key])<=1; }""", arg="expanded")
+    page.evaluate("""() => { const pane=document.getElementById('route-plan-panel');
+      pane.scrollTop=pane.scrollHeight-pane.clientHeight; }""")
+    page.wait_for_function("""() => { const pane=document.getElementById('route-plan-panel');
+      return pane.scrollHeight-pane.clientHeight-pane.scrollTop<=1; }""")
+    landscape_plan = page.evaluate("""() => { const card=document.getElementById('pincard'),
+      pane=document.getElementById('route-plan-panel'),last=pane.querySelector('.route-directions > li:last-child'),
+      footer=pane.querySelector('.plan-footer'),cr=card.getBoundingClientRect(),lr=last.getBoundingClientRect(),
+      fr=footer.getBoundingClientRect(),expected=sheetMetrics().visible[card.dataset.sheetSnap];
+      return {actual:cr.height,expected,lastBottom:lr.bottom,footerTop:fr.top,footerBottom:fr.bottom,
+        paneBottom:pane.getBoundingClientRect().bottom,overflow:pane.scrollWidth-pane.clientWidth,
+        documentOverflow:document.documentElement.scrollWidth-innerWidth}; }""")
+    assert abs(landscape_plan["actual"] - landscape_plan["expected"]) <= 1, landscape_plan
+    assert landscape_plan["footerTop"] >= landscape_plan["lastBottom"] - 1, landscape_plan
+    assert landscape_plan["footerBottom"] <= landscape_plan["paneBottom"] + 1, landscape_plan
+    assert landscape_plan["overflow"] <= 1 and landscape_plan["documentOverflow"] <= 1, landscape_plan
+
+    page.keyboard.press("Escape")
+    _wait_state(page, planOpen="false", sheetContent="choices", sheetSnap="browse")
+    handle = page.locator("[data-sheet-handle]")
+    handle.focus()
+
+    def snap_height(key, *, press=None):
+        if press:
+            page.keyboard.press(press)
+        _wait_state(page, sheetSnap=key)
+        page.wait_for_function("""key => { const card=document.getElementById('pincard');
+          return Math.abs(card.getBoundingClientRect().height-sheetMetrics().visible[key])<=1; }""", arg=key)
+        measured = page.evaluate("""key => { const card=document.getElementById('pincard'),
+          pane=document.getElementById('route-choices-panel'),r=card.getBoundingClientRect();
+          return {actual:r.height,expected:sheetMetrics().visible[key],bottom:r.bottom,
+            overflow:pane.scrollWidth-pane.clientWidth,documentOverflow:document.documentElement.scrollWidth-innerWidth}; }""", key)
+        assert abs(measured["actual"] - measured["expected"]) <= 1, measured
+        assert abs(measured["bottom"] - 320) <= 1, measured
+        assert measured["overflow"] <= 1 and measured["documentOverflow"] <= 1, measured
+        return measured["actual"]
+
+    browse_height = snap_height("browse")
+    expanded_height = snap_height("expanded", press="End")
+    browse_again = snap_height("browse", press="ArrowDown")
+    peek_height = snap_height("peek", press="Home")
+    assert abs(browse_again - browse_height) <= 1
+    assert peek_height < browse_height < expanded_height
+
+    page.keyboard.press("End")
+    _wait_state(page, sheetSnap="expanded")
+    page.evaluate("""() => { const pane=document.getElementById('route-choices-panel');
+      pane.scrollTop=pane.scrollHeight-pane.clientHeight; }""")
+    page.wait_for_function("""() => { const pane=document.getElementById('route-choices-panel');
+      return pane.scrollHeight-pane.clientHeight-pane.scrollTop<=1; }""")
+    page.evaluate("""() => { const pane=document.getElementById('route-choices-panel'),
+      visible=el=>el.getClientRects().length&&getComputedStyle(el).display!=='none',
+      actions=[...pane.querySelectorAll('button,summary,a[href]')].filter(visible),
+      p=pane.getBoundingClientRect(),last=actions.at(-1).getBoundingClientRect();
+      pane.scrollTop=Math.max(0,pane.scrollTop+(last.bottom-p.bottom)); }""")
+    page.wait_for_function("""() => { const pane=document.getElementById('route-choices-panel'),
+      visible=el=>el.getClientRects().length&&getComputedStyle(el).display!=='none',
+      actions=[...pane.querySelectorAll('button,summary,a[href]')].filter(visible),
+      p=pane.getBoundingClientRect(),last=actions.at(-1).getBoundingClientRect();
+      return last.top>=p.top-1&&last.bottom<=p.bottom+1; }""")
+    choices_end = page.evaluate("""() => { const pane=document.getElementById('route-choices-panel'),
+      visible=el=>el.getClientRects().length&&getComputedStyle(el).display!=='none',
+      actions=[...pane.querySelectorAll('button,summary,a[href]')].filter(visible),
+      p=pane.getBoundingClientRect(),last=actions.at(-1).getBoundingClientRect();
+      return {paneTop:p.top,paneBottom:p.bottom,lastTop:last.top,lastBottom:last.bottom}; }""")
+    assert choices_end["lastTop"] >= choices_end["paneTop"] - 1, choices_end
+    assert choices_end["lastBottom"] <= choices_end["paneBottom"] + 1, choices_end
 
 
 def test_desktop_map_focus_settings_and_escape_restore_then_unpin(new_context):
@@ -386,15 +514,41 @@ def test_desktop_map_focus_settings_and_escape_restore_then_unpin(new_context):
     page = context.new_page()
     _open_saved_inspector(page, touch=False)
     selected_key = _select_other_route(page)
-    _click(page, "[data-route-plan-toggle]")
+    _plan_action(page, selected_key).click()
     _wait_state(page, planOpen="true")
-    page.locator("#route-directions summary").click()
-    page.wait_for_function("() => document.getElementById('route-directions')?.open")
+
+    # Returning before the 260 ms Focus-map fit delay must cancel that pending fit. Focus itself may
+    # reframe; the assertion begins only after Choices has already been restored.
+    rapid = page.evaluate("""() => { const started=performance.now();
+      document.querySelector('[data-map-focus-toggle]').click();
+      document.querySelector('[data-show-choices]').click();
+      const c=map.getCenter();return {elapsed:performance.now()-started,lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
+    assert rapid["elapsed"] < 260, rapid
+    _wait_state(page, presentation="expanded", planOpen="true")
+    delayed = page.evaluate("""async () => { await new Promise(resolve=>setTimeout(resolve,420));
+      const c=map.getCenter();return {lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
+    assert delayed["zoom"] == rapid["zoom"], {"after_exit": rapid, "delayed": delayed}
+    assert abs(delayed["lat"] - rapid["lat"]) < 1e-7, {"after_exit": rapid, "delayed": delayed}
+    assert abs(delayed["lng"] - rapid["lng"]) < 1e-7, {"after_exit": rapid, "delayed": delayed}
+
     _click(page, "[data-map-focus-toggle]")
     _wait_state(page, presentation="map-focus", planOpen="true")
     assert page.locator("[data-map-focus-strip]").is_visible()
     assert not page.locator("#route-choices-panel").is_visible()
-    _click(page, "[data-show-choices]")
+    assert page.locator("#pincard #pinx").is_visible()
+    assert page.locator("#pincard [data-close-pin]").count() == 0
+    assert not page.evaluate("""() => [...document.querySelectorAll('#pincard button')].some(button => {
+      const r=button.getBoundingClientRect(),s=getComputedStyle(button);
+      return s.display!=='none'&&r.width>0&&r.height>0&&button.textContent.trim().includes('Close'); })""")
+    close_rect = _rects(page, "#pinx", "[data-map-focus-strip]")
+    assert close_rect["#pinx"]["left"] >= close_rect["[data-map-focus-strip]"]["left"]
+    assert close_rect["#pinx"]["right"] <= close_rect["[data-map-focus-strip]"]["right"]
+    assert not page.evaluate("""() => { const close=document.getElementById('pinx').getBoundingClientRect();
+      return [...document.querySelectorAll('[data-map-focus-strip] button')].some(button => {
+        const r=button.getBoundingClientRect();return r.width>0&&r.height>0&&
+          Math.max(0,Math.min(close.right,r.right)-Math.max(close.left,r.left))*
+          Math.max(0,Math.min(close.bottom,r.bottom)-Math.max(close.top,r.top))>1; }); }""")
+    page.locator("[data-show-choices]").first.click()
     _wait_state(page, presentation="expanded", planOpen="true")
     assert _state(page)["selected"] == selected_key
 
@@ -404,69 +558,133 @@ def test_desktop_map_focus_settings_and_escape_restore_then_unpin(new_context):
     assert not page.locator("#route-plan-panel").is_visible()
     page.keyboard.press("Escape")
     _wait_state(page, surface="routes", planOpen="true")
-    assert page.locator("#route-directions").evaluate("el => el.open")
+    assert page.locator("#route-plan-panel .route-directions").is_visible()
     page.keyboard.press("Escape")
     _wait_state(page, planOpen="false")
     page.keyboard.press("Escape")
     page.wait_for_function("() => !document.getElementById('pincard').classList.contains('open')")
 
 
-def test_mobile_sheet_is_map_first_and_preserves_plan_selection_settings_and_resize(new_context):
-    context = new_context(**MOBILE_CONTEXT)
+def test_desktop_settings_return_stays_visible_and_restores_camera_state_and_focus(new_context):
+    context = new_context(viewport={"width": 1440, "height": 820})
+    page = context.new_page()
+    _open_saved_inspector(page, touch=False)
+    selected_key = _select_other_route(page)
+    camera = _camera(page)
+    _click(page, "[data-settings-toggle]")
+    _wait_state(page, surface="settings")
+    page.evaluate("() => { const panel=document.getElementById('panel');panel.scrollTop=panel.scrollHeight; }")
+    page.wait_for_function("() => document.getElementById('panel').scrollTop>0")
+    back = page.locator("[data-settings-return]")
+    assert back.is_visible()
+    back_rect = back.bounding_box()
+    assert back_rect and 0 <= back_rect["y"] < back_rect["y"] + back_rect["height"] <= 820
+
+    back.click()
+    _wait_state(page, surface="routes", planOpen="false")
+    assert _state(page)["selected"] == selected_key
+    page.wait_for_function("() => document.activeElement?.matches('[data-settings-toggle]')")
+    _assert_camera_same(page, camera)
+
+
+@pytest.mark.parametrize("viewport", [
+    pytest.param({"width": 390, "height": 844}, id="iphone"),
+    pytest.param({"width": 320, "height": 568}, id="compact"),
+])
+def test_mobile_route_local_plan_sheet_states_camera_and_bottom_reachability(new_context, viewport):
+    context_args = {**MOBILE_CONTEXT, "viewport": viewport}
+    context = new_context(**context_args)
     page = context.new_page()
     _open_saved_inspector(page, touch=True)
     _wait_state(page, layout="bottom-sheet", surface="routes", planOpen="false", presentation="expanded",
                 sheetContent="choices", sheetSnap="peek")
+    assert page.locator("[data-route-plan-control], [data-route-plan-toggle]").count() == 0
+    assert page.locator(".pin-view, .pin-peek-actions, [data-sheet-content-toggle], [data-sheet-snap-action]").count() == 0
     assert page.locator("#pincard .pin-workspace").get_attribute("inert") is not None
     peek = _rects(page, "#map", "#pincard")
     assert peek["#map"]["top"] < peek["#pincard"]["top"] < peek["#map"]["bottom"], peek
-    _click(page, '[data-show-choices]', touch=True)
-    _wait_state(page, sheetContent="choices", sheetSnap="browse")
+    camera = _camera(page)
+
+    _open_mobile_browse(page)
     assert page.locator("#route-choices-panel").is_visible()
     assert page.locator("#pincard .pin-workspace").get_attribute("inert") is None
     browse = _rects(page, "#map", "#pincard", "#route-choices-panel")
     assert browse["#map"]["top"] < browse["#pincard"]["top"] < browse["#map"]["bottom"], browse
-    selected_key = _select_other_route(page, touch=True)
-    _click(page, '[data-sheet-content-toggle="plan"]', touch=True)
+    assert page.evaluate("""() => [...document.querySelectorAll('#route-choices-panel .route-choice-card')]
+      .filter(card => getComputedStyle(card).display!=='none' && card.getClientRects().length)
+      .every(card => { const action=card.querySelector('[data-route-plan-for]');
+        return action && getComputedStyle(action).display!=='none' && action.getBoundingClientRect().height>=44; })""")
+
+    target = page.locator("#route-choices-panel .route-choice[aria-pressed='false']").first
+    target_key = target.get_attribute("data-key")
+    assert target_key
+    page.evaluate("""key => { const pane=document.getElementById('route-choices-panel');
+      const card=document.querySelector(`[data-choice-card-key="${CSS.escape(key)}"]`);
+      pane.scrollTop=Math.max(0,card.offsetTop-pane.offsetTop); }""", target_key)
+    plan_action = _plan_action(page, target_key)
+    if viewport["width"] == 390:
+        plan_action.focus()
+        page.keyboard.press("Enter")
+    else:
+        plan_action.tap()
     _wait_state(page, planOpen="true", sheetContent="plan", sheetSnap="browse")
-    assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == selected_key
-    assert not page.locator("#route-directions").evaluate("el => el.open")
-    _click(page, '[data-sheet-snap-action="expanded"]', touch=True)
-    _wait_state(page, sheetContent="plan", sheetSnap="expanded")
-    _click(page, '[data-sheet-snap-action="browse"]', touch=True)
-    _wait_state(page, sheetContent="plan", sheetSnap="browse")
-    _click(page, '[data-sheet-content-toggle="choices"]', touch=True)
+    page.wait_for_function("key => document.getElementById('pincard').dataset.selectedChoiceKey===key && DRAWN?.key===key",
+                           arg=target_key)
+    assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == target_key
+    assert page.locator("#route-plan-panel details").count() == 0
+    assert page.locator("#route-plan-panel .route-directions > li").count() > 0
+    _assert_camera_same(page, camera)
+
+    if viewport["width"] == 390:
+        page.wait_for_function("""() => { const active=document.activeElement,
+          plan=document.getElementById('route-plan-panel'),r=active?.getBoundingClientRect();
+          return !!active&&plan?.contains(active)&&r.width>0&&r.height>0&&
+            getComputedStyle(active).visibility!=='hidden'&&getComputedStyle(active).display!=='none'; }""")
+        focused = page.evaluate("""() => { const active=document.activeElement,
+          plan=document.getElementById('route-plan-panel'),r=active?.getBoundingClientRect();
+          return {inside:!!active&&plan.contains(active),visible:!!r&&r.width>0&&r.height>0&&
+            getComputedStyle(active).visibility!=='hidden'&&getComputedStyle(active).display!=='none',
+            label:active?.getAttribute('aria-label')||active?.textContent?.trim()||active?.tagName}; }""")
+        assert focused["inside"] and focused["visible"], focused
+        page.keyboard.press("Escape")
+        _wait_state(page, planOpen="false", sheetContent="choices", sheetSnap="browse")
+        returned = _plan_action(page, target_key)
+        page.wait_for_function("""key => document.activeElement?.dataset.routePlanFor===key""", arg=target_key)
+        assert returned.is_visible()
+        assert returned.evaluate("el => document.activeElement===el")
+        page.keyboard.press("Enter")
+        _wait_state(page, planOpen="true", sheetContent="plan", sheetSnap="browse")
+
+    # Reach the real scroll boundary; do not use scroll_into_view, which could hide broken sheet
+    # geometry by moving an element independently of the pane's usable viewport.
+    page.evaluate("""() => { const pane=document.getElementById('route-plan-panel');
+      pane.scrollTop=pane.scrollHeight-pane.clientHeight; }""")
+    page.wait_for_function("""() => { const pane=document.getElementById('route-plan-panel');
+      return pane.scrollHeight-pane.clientHeight-pane.scrollTop<=1; }""")
+    reach = page.evaluate("""() => { const pane=document.getElementById('route-plan-panel'),
+      last=pane.querySelector('.route-directions > li:last-child'),link=pane.querySelector('.plan-google');
+      const p=pane.getBoundingClientRect(),l=last.getBoundingClientRect(),g=link.getBoundingClientRect();
+      return {pane:{top:p.top,bottom:p.bottom},last:{top:l.top,bottom:l.bottom},link:{top:g.top,bottom:g.bottom},
+        max:pane.scrollHeight-pane.clientHeight,scroll:pane.scrollTop}; }""")
+    assert reach["last"]["top"] >= reach["pane"]["top"] - 1, reach
+    assert reach["last"]["bottom"] <= reach["link"]["top"] + 1, reach
+    assert reach["link"]["bottom"] <= reach["pane"]["bottom"] + 1, reach
+
+    _click(page, "#route-plan-panel [data-route-plan-close]", touch=True)
     _wait_state(page, planOpen="false", sheetContent="choices", sheetSnap="browse")
-    selected_key = _select_other_route(page, touch=True)
-    _click(page, '[data-sheet-content-toggle="plan"]', touch=True)
-    _wait_state(page, planOpen="true", sheetContent="plan", sheetSnap="browse")
-    assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == selected_key
-    _click(page, '[data-sheet-snap-action="expanded"]', touch=True)
-    _wait_state(page, planOpen="true", sheetContent="plan", sheetSnap="expanded")
-    _click(page, "[data-settings-toggle]", touch=True)
-    _wait_state(page, surface="settings", sheetSnap="browse")
-    assert not page.locator("#route-plan-panel").is_visible()
-    _click(page, "[data-settings-return]", touch=True)
-    _wait_state(page, surface="routes", planOpen="true", sheetContent="plan", sheetSnap="expanded")
-    assert _state(page)["selected"] == selected_key
-    _click(page, '[data-sheet-snap-action="peek"]', touch=True)
-    _wait_state(page, sheetContent="plan", sheetSnap="peek")
-    page.set_viewport_size({"width": 320, "height": 568})
-    _wait_state(page, layout="bottom-sheet", planOpen="true", sheetContent="plan", sheetSnap="peek")
-    assert _state(page)["selected"] == selected_key
-    compact = _rects(page, "[data-sheet-handle]", "#pinx", "[data-show-choices]")
-    for selector, rect in compact.items():
-        assert rect and rect["left"] >= 0 and rect["right"] <= 320 and rect["top"] >= 0 and rect["bottom"] <= 568, compact
-        assert rect["height"] >= 43.5, compact
-    _click(page, "[data-show-choices]", touch=True)
-    _wait_state(page, sheetContent="choices", sheetSnap="browse")
-    page.wait_for_function("""() => {
-      const top=document.querySelector('[data-sheet-handle]')?.getBoundingClientRect().top;
-      return Number.isFinite(top) && Math.abs(top-sheetMetrics().snaps.browse)<3;
-    }""")
-    plan_action = _rects(page, '[data-sheet-content-toggle="plan"]')['[data-sheet-content-toggle="plan"]']
-    assert plan_action and 0 <= plan_action["left"] < plan_action["right"] <= 320
-    assert 0 <= plan_action["top"] < plan_action["bottom"] <= 568 and plan_action["height"] >= 44
+    handle = page.locator("[data-sheet-handle]")
+    handle.focus()
+    page.keyboard.press("End")
+    _wait_state(page, sheetSnap="expanded")
+    page.keyboard.press("Home")
+    _wait_state(page, sheetSnap="peek")
+    page.keyboard.press("ArrowUp")
+    _wait_state(page, sheetSnap="browse")
+    page.keyboard.press("ArrowUp")
+    _wait_state(page, sheetSnap="expanded")
+    page.keyboard.press("ArrowDown")
+    _wait_state(page, sheetSnap="browse")
+    _assert_camera_same(page, camera)
 
 
 def test_mobile_sheet_handle_drag_snaps_without_synthetic_click_toggle(new_context):
@@ -474,8 +692,7 @@ def test_mobile_sheet_handle_drag_snaps_without_synthetic_click_toggle(new_conte
     context = new_context(**MOBILE_CONTEXT)
     page = context.new_page()
     _open_saved_inspector(page, touch=True)
-    _click(page, "[data-show-choices]", touch=True)
-    _wait_state(page, sheetSnap="browse")
+    _open_mobile_browse(page)
     handle = page.locator("[data-sheet-handle]")
     page.wait_for_function("""() => {
       const top=document.querySelector('[data-sheet-handle]')?.getBoundingClientRect().top;
@@ -518,8 +735,7 @@ def test_mobile_speed_change_cancels_stale_pin_enrichment(new_context):
         return realFetch(input,init); }; }""")
     page.locator("#peekinspect").tap()
     page.wait_for_function("() => typeof window.__releaseOldPin==='function'", timeout=5_000)
-    _click(page, "[data-show-choices]", touch=True)
-    _wait_state(page, sheetSnap="browse")
+    _open_mobile_browse(page)
     _click(page, "[data-settings-toggle]", touch=True)
     _wait_state(page, surface="settings")
     page.locator('#speed [data-v="fast"]').tap()
