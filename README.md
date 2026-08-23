@@ -68,7 +68,7 @@ derived bakes. A clean clone therefore needs the raw inputs and one local bake
 cycle before it can serve the fully JVM-free path.
 
 ```bash
-git clone --branch main --single-branch <repository-url> sf-commute-isochrone
+git clone --branch main --single-branch https://github.com/AkshayM21/sf-commute-isochrone sf-commute-isochrone
 cd sf-commute-isochrone
 
 # Configure data access. This file is ignored by Git.
