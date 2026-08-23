@@ -2840,6 +2840,9 @@ function clampSheetOffset(value,metrics){return Math.max(metrics.snaps.expanded,
 function beginSheetDrag(e,handle){
   if(inspectorLayoutCapability()!=="bottom-sheet"||inspectorUI.surface!=="routes"||e.button>0)return;
   cancelPendingInitialFit();
+  // A native scroll can happen between controller transitions. Preserve that live position before
+  // drag-start reapplies layout, whose restoration pass would otherwise use a stale saved offset.
+  captureInspectorPaneScroll();
   const m=sheetMetrics(),start=m.snaps[inspectorUI.sheetSnap]??m.snaps.browse;
   sheetDrag={pointerId:e.pointerId,startY:e.clientY,startOffset:start,lastY:e.clientY,lastAt:performance.now(),velocity:0,metrics:m,moved:false};
   inspectorUI.dragging=true;applyInspectorUI("drag-start");(handle||e.currentTarget).setPointerCapture(e.pointerId);e.preventDefault();

@@ -714,6 +714,90 @@ def test_mobile_sheet_handle_drag_snaps_without_synthetic_click_toggle(new_conte
     _wait_state(page, sheetSnap="browse")
 
 
+def test_mobile_sheet_drag_preserves_choices_scroll_context_after_route_selection(new_context):
+    """Resizing the sheet must not pull a browsing user back to their selected route."""
+    context = new_context(**MOBILE_CONTEXT)
+    page = context.new_page()
+    _open_saved_inspector(page, touch=True)
+    _open_mobile_browse(page)
+    camera = _camera(page)
+    selected_key = _select_other_route(page, touch=True)
+    _expand_all_route_disclosures(page)
+
+    # Pick a distinct, lower card and place it at a repeatable position within the Choices
+    # viewport. This models selecting one route, then continuing to browse other alternatives.
+    context_key = page.evaluate("""selected => {
+      const pane=document.getElementById('route-choices-panel');
+      const cards=[...pane.querySelectorAll('.route-choice-card')]
+        .filter(card => card.dataset.choiceCardKey!==selected)
+        .sort((a,b) => a.offsetTop-b.offsetTop);
+      const selectedCard=pane.querySelector(`[data-choice-card-key="${CSS.escape(selected)}"]`);
+      const lower=cards.find(card => selectedCard && card.offsetTop-selectedCard.offsetTop>Math.max(96,pane.clientHeight*.35)) || cards.at(-1);
+      if(!lower)return null;
+      const paneRect=pane.getBoundingClientRect(),cardRect=lower.getBoundingClientRect();
+      const max=Math.max(0,pane.scrollHeight-pane.clientHeight);
+      pane.scrollTop=Math.max(0,Math.min(max,cardRect.top-paneRect.top+pane.scrollTop-pane.clientHeight*.38));
+      return lower.dataset.choiceCardKey;
+    }""", selected_key)
+    assert context_key and context_key != selected_key
+
+    def choices_context(key):
+        return page.evaluate("""key => {
+          const pane=document.getElementById('route-choices-panel');
+          const card=pane.querySelector(`[data-choice-card-key="${CSS.escape(key)}"]`);
+          const selected=pane.querySelector(`[data-choice-card-key="${CSS.escape(document.getElementById('pincard').dataset.selectedChoiceKey)}"]`);
+          const p=pane.getBoundingClientRect(),r=card?.getBoundingClientRect(),s=selected?.getBoundingClientRect();
+          return {key,selectedKey:document.getElementById('pincard').dataset.selectedChoiceKey,
+            scroll:pane.scrollTop,max:pane.scrollHeight-pane.clientHeight,
+            anchor:r&&r.top-p.top,visible:!!r&&r.bottom>p.top+2&&r.top<p.bottom-2,
+            selectedVisible:!!s&&s.bottom>p.top+2&&s.top<p.bottom-2};
+        }""", key)
+
+    page.wait_for_function("""key => { const pane=document.getElementById('route-choices-panel'),
+      card=pane.querySelector(`[data-choice-card-key="${CSS.escape(key)}"]`),p=pane.getBoundingClientRect(),r=card?.getBoundingClientRect();
+      return pane.scrollTop>80&&!!r&&r.bottom>p.top+2&&r.top<p.bottom-2; }""", arg=context_key)
+    before_up = choices_context(context_key)
+    assert before_up["max"] > 120 and before_up["visible"], before_up
+
+    def drag_handle(delta_y, expected_snap):
+        handle = page.locator("[data-sheet-handle]")
+        box = handle.bounding_box()
+        assert box and box["height"] >= 44
+        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        page.mouse.move(x, y)
+        page.mouse.down()
+        # Space the moves far enough apart to exercise distance-based snapping, not the
+        # controller's intentionally separate fast-flick-to-Peek behavior.
+        for step in range(1, 9):
+            page.mouse.move(x, y + delta_y * step / 8)
+            page.wait_for_timeout(90)
+        page.mouse.up()
+        page.wait_for_timeout(300)
+        _wait_state(page, sheetSnap=expected_snap, sheetContent="choices", planOpen="false")
+
+    drag_handle(-260, "expanded")
+    after_up = choices_context(context_key)
+    assert after_up["selectedKey"] == selected_key and after_up["visible"], {"before": before_up, "after": after_up}
+    assert abs(after_up["scroll"] - before_up["scroll"]) <= 2, {"before": before_up, "after": after_up}
+    assert abs(after_up["anchor"] - before_up["anchor"]) <= 4, {"before": before_up, "after": after_up}
+
+    # Repeat from the other direction. Re-center the same non-selected card where Browse can
+    # still display it after collapse so a clamped bottom boundary cannot mask a scroll reset.
+    page.evaluate("""key => { const pane=document.getElementById('route-choices-panel'),
+      card=pane.querySelector(`[data-choice-card-key="${CSS.escape(key)}"]`),p=pane.getBoundingClientRect(),r=card.getBoundingClientRect(),
+      max=Math.max(0,pane.scrollHeight-pane.clientHeight); pane.scrollTop=Math.max(0,Math.min(max,r.top-p.top+pane.scrollTop-150)); }""", context_key)
+    page.wait_for_function("""key => { const pane=document.getElementById('route-choices-panel'),
+      card=pane.querySelector(`[data-choice-card-key="${CSS.escape(key)}"]`),p=pane.getBoundingClientRect(),r=card?.getBoundingClientRect();
+      return pane.scrollTop>80&&!!r&&r.bottom>p.top+2&&r.top<p.bottom-2; }""", arg=context_key)
+    before_down = choices_context(context_key)
+    drag_handle(260, "browse")
+    after_down = choices_context(context_key)
+    assert after_down["selectedKey"] == selected_key and after_down["visible"], {"before": before_down, "after": after_down}
+    assert abs(after_down["scroll"] - before_down["scroll"]) <= 2, {"before": before_down, "after": after_down}
+    assert abs(after_down["anchor"] - before_down["anchor"]) <= 4, {"before": before_down, "after": after_down}
+    _assert_camera_same(page, camera)
+
+
 def test_mobile_speed_change_cancels_stale_pin_enrichment(new_context):
     """The unrelated request-cancellation contract survives the sheet replacement."""
     context = new_context(**MOBILE_CONTEXT)
