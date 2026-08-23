@@ -59,6 +59,8 @@ sfcommutemap.com, www.sfcommutemap.com {
 			request>remote_ip ip_mask 16 32
 			request>client_ip ip_mask 16 32
 			request>headers>X-Forwarded-For delete
+			# Caddy canonicalizes this name in the structured header map.
+			request>headers>Cf-Connecting-Ip delete
 			request>headers>CF-Connecting-IP delete
 			wrap json
 		}
