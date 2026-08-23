@@ -667,7 +667,8 @@ def open_destination(page, base_url, destination, speed):
     page.wait_for_function("() => document.querySelectorAll('#list .nb').length > 0", timeout=30_000)
     page.wait_for_function(
         "() => (typeof VAR !== 'undefined' && Object.keys(VAR).length > 0) "
-        "|| (typeof REAL !== 'undefined' && Object.keys(REAL).length > 0)",
+        "|| (typeof REAL !== 'undefined' && Object.keys(REAL).length > 0) "
+        "|| (typeof varianceSettled === 'function' && varianceSettled())",
         timeout=45_000,
     )
 

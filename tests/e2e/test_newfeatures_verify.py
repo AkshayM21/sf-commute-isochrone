@@ -94,7 +94,7 @@ def _cp_of(page, lat, lon):
 
 
 def test_compare_family_focus(page):
-    """Pin an alt-rich cell, then focus and lock an authoritative family/branch card."""
+    """Pin an alt-rich cell, then preview and lock an authoritative exact route choice."""
     fresh_load(page)
     set_addr_raptor(page, ADDR_MARKET)
     wait_variance(page)
@@ -109,30 +109,31 @@ def test_compare_family_focus(page):
     shot(page, "nf_02b_hover_primary_with_hint")
 
     page.mouse.click(cp["x"] + 1, cp["y"] + 1)
-    page.wait_for_selector("#pincard.open .cmp .family", timeout=COMPUTE_TIMEOUT)
+    page.wait_for_selector("#pincard.open #route-choices-panel .route-choice", timeout=COMPUTE_TIMEOUT)
     page.wait_for_timeout(500)
-    families = page.query_selector_all("#pincard .cmp .family")
-    branches = page.query_selector_all("#pincard .cmp .branch")
+    choices = page.locator("#route-choices-panel .route-choice:visible")
     options = page.evaluate("() => compareList.length")
     assert options >= 2, f"expected >=2 route options, got {options}"
-    assert families and branches, "family diagram omitted its family/branch controls"
-    assert page.query_selector("#pincard .cmp .strip") is None, "retired route strips returned"
+    assert choices.count() >= 2, "route inspector omitted its exact route-choice controls"
     drawn0 = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
-    assert drawn0, "pin should draw the multi-route family diagram"
+    assert drawn0, "pin should draw the selected route with its alternative context"
     shot(page, "nf_03_pinned_compare_list")
 
-    target = branches[-1]
+    target = page.locator("#route-choices-panel .route-choice[aria-pressed='false']:visible").last
+    expected_key = target.get_attribute("data-key")
     expected_family = target.get_attribute("data-family")
     expected_branch = target.get_attribute("data-branch")
     target.hover()
     page.wait_for_timeout(400)
     drawn1 = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
     assert drawn1 == {"f": expected_family, "b": expected_branch}, drawn1
-    assert target.evaluate("el => el.classList.contains('foc')"), "hovered branch should be focused"
+    assert target.get_attribute("aria-pressed") == "false", "hover previews without locking selection"
     shot(page, "nf_04_row_hover_swap")
 
-    # Click the branch to lock the lens; moving away from the card keeps that lens locked.
+    # Click the choice to lock it; moving away from the card keeps that exact route locked.
     target.click()
+    page.wait_for_function("""key => [...document.querySelectorAll('#route-choices-panel .route-choice')]
+      .some(row => row.dataset.key===key && row.getAttribute('aria-pressed')==='true')""", arg=expected_key)
     page.wait_for_timeout(250)
     box = page.eval_on_selector("#map", "el => { const r = el.getBoundingClientRect(); return {x:r.x,y:r.y,w:r.width,h:r.height}; }")
     page.mouse.move(int(box["x"] + 160), int(box["y"] + box["h"] - 160))

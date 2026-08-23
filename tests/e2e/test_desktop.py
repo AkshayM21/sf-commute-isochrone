@@ -108,7 +108,8 @@ def test_01c_failed_startup_restore_offers_retry_and_recovers(page):
     assert len(attempts) == 1
 
     page.click("#startupretry")
-    page.wait_for_function("() => document.documentElement.dataset.startup === 'restoring'")
+    # A warm local compute can move through `restoring` between animation frames. The durable
+    # contract is that Retry starts exactly one fresh request and reaches the ready surface.
     page.wait_for_function("() => document.querySelectorAll('#list .nb').length > 0", timeout=COMPUTE_TIMEOUT)
     page.wait_for_function(
         "() => document.documentElement.dataset.startup === 'ready' && "

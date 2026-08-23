@@ -1273,16 +1273,19 @@ test("route selection fallback survives rerender and is announced through the de
   assert.match(announce,/formatMinutes\(choice\.r\.head\)/);
 });
 
-test("route inspector separates compact Choices from a Route Plan with one directions disclosure", () => {
+test("route inspector exposes Choices and a requested Route Plan without making Map a peer view", () => {
   const compare=templateFn("compareHTML"),row=templateFn("routeRowHTML"),selected=templateFn("selectedRouteHTML");
   const pin=templateFn("pinHTML");
   assert.match(compare,/id="route-choices-panel"/);
   assert.match(selected,/id="route-plan-panel"/);
   assert.match(compare,/id="view-route-plan"/,
-    "the Choices pane has an explicit route-plan handoff for compact/mobile use");
-  assert.match(pin,/data-inspector-view="choices"/);
-  assert.match(pin,/data-inspector-view="plan"/);
-  assert.match(pin,/data-inspector-view="map"/);
+    "Choices keeps an explicit Route Plan request control");
+  assert.match(TSRC,/aria-controls="route-plan-panel"/,
+    "the Route Plan control identifies the region it exposes");
+  assert.match(TSRC,/aria-expanded="\$\{[^}]*planOpen[^}]*\}"/,
+    "the Route Plan control reports its requested open state");
+  assert.doesNotMatch(pin,/data-inspector-view="map"|data-view="map"/,
+    "Map is permanent context, never a third mutually-exclusive inspector view");
   assert.match(compare,/Recommended route/);
   assert.match(compare,/Good alternatives/);
   assert.match(compare,/See \$\{more\.length\} additional route choice/);
@@ -1665,7 +1668,7 @@ test("C7: static metric tip matches the static Realistic/Best-case labels; DEPAR
 // #pincard used to be the scroller (overflow-y:auto) with the × absolutely positioned INSIDE it,
 // so scrolling a tall compare card carried the close button off-screen. Now the card is a
 // non-scrolling shell (flex column, overflow clipped) and only #pinbody scrolls.
-test("C3: inspector shell doesn't scroll; the active Choices or Plan pane owns scrolling", () => {
+test("responsive inspector keeps an anchored shell and independently scrollable Choices and Plan content", () => {
   // Anchor at a standalone root selector: an earlier desktop-state rule also contains
   // `#pincard{...}` as the tail of `body.route-pinned ... #pincard`, which is not the shell rule.
   const cardRule = TSRC.match(/\n\s{2}#pincard\{[^}]*\}/)[0];
@@ -1676,17 +1679,15 @@ test("C3: inspector shell doesn't scroll; the active Choices or Plan pane owns s
   assert.match(TSRC, /#pincard\.open\{display:flex;flex-direction:column\}/);
   assert.match(TSRC, /#pinbody\{[^}]*overflow:hidden/,
     "the shell body remains non-scrolling so the close control never scrolls away");
-  assert.match(TSRC, /\.route-choices-pane,\.route-plan-pane\{[^}]*overflow-y:auto/,
-    "each independently switchable content surface owns its own scroll position");
+  assert.match(TSRC, /\.route-choices-pane[^}]*overflow-y:auto/,
+    "Choices retains its own scroll position when Plan opens or changes location");
+  assert.match(TSRC, /\.route-plan-pane[^}]*overflow-y:auto/,
+    "long Plan content scrolls internally rather than expanding over Choices");
   assert.match(TSRC, /body\.route-pinned #legend\{display:none\}/,
     "route inspection must not compete with the broad map legend");
-  assert.match(TSRC, /body\.route-pinned:not\(\.route-adjusting\) #panel\{display:none\}/,
-    "mobile route inspection hides controls except during the explicit Adjust flow");
-  assert.match(TSRC, /body\.route-pinned\.route-adjusting #panel\{display:flex/,
-    "Adjust can deliberately reveal controls without losing the pinned route");
   assert.ok(TSRC.includes('document.body.classList.add("route-pinned")'));
-  assert.match(TSRC, /document\.body\.classList\.remove\("route-pinned","route-adjusting","pin-map-view","pin-plan-view"\)/,
-    "closing the inspector clears all three Choices/Plan/Map view states");
+  assert.doesNotMatch(TSRC,/pin-map-view|pin-plan-view/,
+    "the retired mutually-exclusive Plan/Map body-class model cannot reappear");
   assert.ok(TSRC.includes("resetPinScroll=true"),
     "a new pin must arm a reset through the async placeholder/final-card replacement");
   assert.match(TSRC, /requestAnimationFrame\(\(\)=>\{\s*if\(routePin===f\.properties\.id\)pinBody\.scrollTop=0;/,
@@ -1720,7 +1721,7 @@ test("touch route inspection uses first-tap preview and same-cell second-tap ins
     "expanded-map action names the compact route set it restores");
 });
 
-test("input modality keeps narrow or hybrid mouse users on the desktop route-inspection model", () => {
+test("input modality only chooses preview affordances; viewport capability owns inspector layout", () => {
   const source=TSRC.slice(TSRC.indexOf("const TOUCH="),TSRC.indexOf("const REDUCE_MOTION"));
   assert.match(source,/any-pointer: coarse/);
   assert.match(source,/any-hover: hover/);
@@ -1735,6 +1736,92 @@ test("input modality keeps narrow or hybrid mouse users on the desktop route-ins
   assert.equal(desktop({originalEvent:{}}),false);
   assert.equal(classify(true)({originalEvent:{}}),true,
     "non-PointerEvent touch browsers retain the coarse/no-hover fallback");
+
+  const inspectorSource=TSRC;
+  assert.match(inspectorSource,/(?:wide-sidecar|single-card|bottom-sheet)/,
+    "the controller recognizes viewport-owned wide, single-card, and bottom-sheet capabilities");
+  assert.match(inspectorSource,/(?:innerWidth|visualViewport\.width|getBoundingClientRect\(\))/,
+    "layout capability is computed from rendered/viewport space");
+});
+
+test("responsive inspector publishes one semantic state model instead of composing body view classes", () => {
+  for(const attribute of [
+    "layout-capability", "surface", "plan-open", "presentation",
+    "sheet-content", "sheet-snap", "dragging",
+  ]) {
+    assert.match(TSRC,new RegExp(`data-${attribute}`),
+      `#pincard must expose its ${attribute} state for one inspectable controller contract`);
+  }
+  assert.doesNotMatch(TSRC,/pin-map-view|pin-plan-view/,
+    "the old Choices / Plan / Map class matrix must not remain as a second state authority");
+  assert.doesNotMatch(TSRC,/@media \(min-width:1240px\)[\s\S]{0,900}grid-template-columns:minmax\(310px,\.9fr\) minmax\(370px,1\.1fr\)/,
+    "a wide viewport must not force a permanent equal-weight two-pane workspace");
+});
+
+test("new pins start in Choices with Plan closed, while capability changes preserve requested Plan intent", () => {
+  const open=templateFn("openPin");
+  assert.match(open,/(?:planOpen\s*=\s*false|planOpen:false|planOpen\s*:\s*false)/,
+    "each new pin resets transient presentation to a closed Route Plan");
+  const controller=TSRC;
+  assert.match(controller,/planOpen/,
+    "Plan request state is explicit rather than inferred from a particular DOM placement");
+  assert.match(controller,/(?:wide-sidecar|single-card|bottom-sheet)/,
+    "the same request is rendered as sidecar, inline tray, or mobile sheet by capability");
+  assert.doesNotMatch(controller,/(?:resize|visualViewport)[\s\S]{0,220}planOpen\s*=\s*false/,
+    "resizing between sidecar and inline-tray capabilities never silently closes Plan");
+});
+
+test("map focus and Settings replace active route chrome while retaining route return state", () => {
+  const controller=TSRC;
+  assert.match(controller,/presentation[\s\S]{0,180}map-focus|map-focus[\s\S]{0,180}presentation/,
+    "map focus is a presentation state, not an unpin operation");
+  assert.match(controller,/settingsReturn/,
+    "opening Settings records a return snapshot rather than destroying the inspector state");
+  assert.match(controller,/surface[\s\S]{0,80}(?:routes|settings)|(?:routes|settings)[\s\S]{0,80}surface/,
+    "exactly one primary surface is selected at a time");
+  assert.doesNotMatch(controller,/(?:routePin\s*=\s*null|closePin\(\))[\s\S]{0,120}(?:map-focus|settingsReturn)/,
+    "neither Map focus nor Settings may clear the selected pin");
+});
+
+test("compact inspector is one bottom-sheet controller with Choices, Plan, and Settings content", () => {
+  const controller=TSRC;
+  assert.match(controller,/sheetSnap[\s\S]{0,180}(?:peek|browse|expanded)|(?:peek|browse|expanded)[\s\S]{0,180}sheetSnap/,
+    "compact routes have Peek, Browse, and Expanded snap states");
+  assert.match(controller,/sheetContent[\s\S]{0,180}(?:choices|plan|settings)|(?:choices|plan|settings)[\s\S]{0,180}sheetContent/,
+    "Choices, Plan, and Settings are content in the same sheet rather than peer pages");
+  assert.match(TSRC,/(?:View choices|Show map|Expand)/,
+    "every drag-only snap has a visible keyboard-operable alternative");
+  assert.doesNotMatch(TSRC,/data-inspector-view="map"|data-view="map"/,
+    "Show map collapses the sheet; it does not select an obsolete Map content screen");
+});
+
+test("sheet drag uses the handle only and handles threshold, velocity, cancellation, scroll boundaries, and reduced motion", () => {
+  const controller=TSRC;
+  assert.match(controller,/setPointerCapture\(/,
+    "a handle drag owns its pointer until release");
+  assert.match(controller,/pointercancel/,
+    "a cancelled gesture restores a settled sheet state");
+  assert.match(controller,/(?:dragThreshold|DRAG_THRESHOLD|clickSuppress|suppress(?:NextHandle)?Click)/,
+    "a real drag suppresses the synthetic click that would otherwise toggle the sheet again");
+  assert.match(controller,/(?:velocity|VELOCITY)/,
+    "release snapping considers flick velocity as well as drag distance");
+  assert.match(controller,/(?:clamp|Math\.min\(.*Math\.max)/,
+    "live drag translation remains within valid Peek/Expanded bounds");
+  assert.match(controller,/(?:scrollTop|closest\([^)]*(?:route-choices|route-plan|sheet))/,
+    "ordinary Choices and Plan scrolling is not promoted into a sheet drag");
+  assert.match(controller,/REDUCE_MOTION/,
+    "reduced motion settles sheet transitions without continued animation");
+  assert.match(controller,/(?:Enter|Space|key === " "|key===" ")/,
+    "the handle has a keyboard path between Peek and Browse");
+});
+
+test("Route Plan and sheet controls retain accessible expanded/controlled relationships", () => {
+  assert.match(TSRC,/aria-controls="route-plan-panel"/,
+    "the Route Plan toggle names its controlled plan region");
+  assert.match(TSRC,/aria-expanded="\$\{[^}]*planOpen[^}]*\}"/,
+    "the Plan toggle exposes open/closed state to assistive technology");
+  assert.match(TSRC,/(?:aria-hidden|inert)[\s\S]{0,180}(?:sheetSnap|peek)|(?:sheetSnap|peek)[\s\S]{0,180}(?:aria-hidden|inert)/,
+    "Peek cannot leave off-screen route rows in the keyboard focus order");
 });
 
 test("last pointerdown modality keeps hybrid pointer interactions faithful", () => {
@@ -2222,16 +2309,17 @@ test("keep-pin parameter recompute cancels old enrichment and owns the only fina
     "the generation-guarded parameter refresh remains the sole final pin=1 owner");
 });
 
-test("mobile Map view reserves the bottom sheet and refits the loaded route into view", () => {
+test("settled bottom-sheet geometry is measured for map occlusion without fitting during live drag", () => {
   const insets=templateFn("viewInsets");
-  assert.match(insets,/classList\.contains\('pin-map-view'\)[\s\S]*bottom=Math\.max\(bottom,sz\.y-qc\.t\)/,
-    "compact mobile Map mode treats the inspector as a bottom occluder");
-  const switcher=templateFn("setInspectorView");
-  assert.match(switcher,/const showPlan=view==="plan",showMap=view==="map"/);
-  assert.match(switcher,/if\(showMap\)fitToCompare\(\)/,
-    "revealing the map must refit route geometry after the sheet changes size");
-  assert.match(TSRC,/body\.pin-map-view #pincard \.pin-map-summary\{[^}]*safe-area-inset-bottom/,
-    "the compact Map summary clears the device home-indicator safe area");
+  assert.match(insets,/data-layout-capability[\s\S]{0,500}bottom=Math\.max\(bottom,sz\.y-qc\.t\)/,
+    "a settled bottom sheet contributes its measured rectangle as a bottom occluder");
+  const controller=TSRC;
+  assert.match(controller,/data-dragging|dragging/,
+    "the controller can distinguish a live drag from a settled snap");
+  assert.doesNotMatch(controller,/dragging[\s\S]{0,180}fitToCompare\(/,
+    "the map must not refit on every drag frame");
+  assert.match(controller,/(?:transitionend|requestAnimationFrame)[\s\S]{0,260}fitToCompare\(/,
+    "occlusion fitting occurs after a presentation transition settles");
 });
 
 test("the route inspector region is stable while dedicated status nodes announce updates", () => {
@@ -2250,6 +2338,6 @@ test("reduced-motion preference disables animated route fitting", () => {
   const reduced=TSRC.match(/@media \(prefers-reduced-motion:reduce\)\{([\s\S]*?)\n  \}/)?.[1]||"";
   assert.doesNotMatch(reduced,/\*,\*:before,\*:after/,
     "reduced motion must not blanket-disable unrelated transitions");
-  assert.match(reduced,/#pincard,#panel,.leaflet-cells-pane canvas/,
+  assert.match(reduced,/#pincard[\s\S]*#panel[\s\S]*\.leaflet-cells-pane canvas/,
     "route and map state feedback remains immediate in the scoped override");
 });
