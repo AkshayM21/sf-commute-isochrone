@@ -1,179 +1,227 @@
 # SF Commute Isochrone
 
-**Live at [sfcommutemap.com](https://sfcommutemap.com).** Free, no signup: enter a workplace
-address and the map colors every SF neighborhood by door-to-door commute time. **Hover any
-square to see — and watch drawn on the map — the actual route you'd take** (walk legs, transit
-lines with labels, transfers, total time); **click to pin a card and compare alternative routes**,
-one at a time. Hosted on Oracle Always Free ($0/mo) behind Cloudflare. Self-host instructions in
-`deploy/`.
+**Find where in San Francisco you can live and still reach a workplace within a
+chosen commute time.** The interactive map estimates weekday-morning,
+door-to-door trips by walking, Muni, BART, and Caltrain. Hover or tap a grid cell
+to inspect its route, compare practical alternatives, and open step-by-step
+directions.
 
-Find **where in San Francisco you can live and still reach a workplace you
-choose within N minutes** by **walking + Muni + BART + Caltrain**, arriving on a
-weekday morning — rendered as an interactive map.
+**Live at [sfcommutemap.com](https://sfcommutemap.com).** It is free and does not
+require an account.
 
-For a 200m grid of origin points across SF, the tool routes door-to-door
-(walk → transit incl. transfers → walk) to your chosen destination using real GTFS
-schedules and the OpenStreetMap walking network. The live application uses its own
-JVM-free reverse range-RAPTOR transit router plus a hill-aware walking graph. Results
-are aggregated to the 117 SF "Find Neighborhoods" and ranked by travel time.
+The served application uses a JVM-free reverse range-RAPTOR transit engine and a
+hill-aware OpenStreetMap walking graph. It groups routes structurally by boarding
+corridor and destination approach, surfaces trade-offs such as walking and
+transfers, and provides scheduled, best-case, and bad-day views.
 
-> **Note (2026-05-25): the live server now defaults to a JVM-free stack** — a self-built reverse
-> RAPTOR transit router + a hill-aware (Tobler) walk router — so **Java/R5 is no longer required to
-> run it** (~245 MB RSS, no JVM). The map answers **depart-after** ("leave during a ~8am window —
-> how long to work?"), colored by door-to-door commute DURATION (so "arrive ~9am" is implicit). It
-> has a scheduled/best-case toggle, a "bad-day" service-delay chip, and a slow/med/fast walk-speed
-> control. The scheduled depart-after read is timed to the first vehicle, so controllable starting
-> wait is not counted. **Walking faster can never increase the commute** (true-zero monotonicity,
-> guaranteed).
-> R5 is kept only for offline oracle/validation and as a fallback. See **RAPTOR.md** for the engine
-> + the one-time bakes (`fetch_dem.sh` → `build_walk_graph.py` → `bake_walk_access.py`); the
-> prereqs/quick-start below still describe the original R5 build and are being updated.
+## What the estimate means
 
-Two numbers per location:
-- **scheduled** — timed to the first vehicle you choose to board; starting wait is not counted
-- **bad-day** — the p90 service-delay tail for that committed plan
+Every colored 200 m grid cell represents a physical door-to-door trip:
 
-## Prerequisites
+```text
+walk to a boarding stop → scheduled transit, including transfers → walk to work
+```
 
-- **macOS or Linux**
-- **Java 21** (R5 is a JVM routing engine) — e.g. `brew install openjdk@21`
-- **uv** (Python env + package manager) — `curl -LsSf https://astral.sh/uv/install.sh | sh` or `brew install uv`
-- **osmium-tool** (clips the OSM extract to SF) — `brew install osmium-tool`
-- A **free 511.org API token** for the current Muni + Caltrain feeds — get one
-  at <https://511.org/open-data/token>
+- **Scheduled** is timed to the first selected vehicle; optional early-arrival
+  allowance before boarding is shown separately rather than counted as walking.
+- **Best-case** represents a well-timed trip within the model window.
+- **Bad-day** adds the model's service-delay tail for the selected plan; it is an
+  estimate, not a prediction or live alert.
+- Walking presets are Slow (3.4 km/h), Medium (4.2 km/h), and Fast/Brisk (5.2
+  km/h). They apply consistently to access, transfer, egress, and walking-only
+  legs.
 
-`setup.sh` checks each of these and prints install hints if anything is missing.
+The map uses a scheduled-data snapshot, not real-time vehicle positions,
+disruptions, accessibility status, fares, or guaranteed arrival times. The service
+date is selected from the GTFS feeds available when the bakes are created. Refresh
+the feeds and rebuild the bakes when schedules change before relying on a local
+deployment for a new service period.
 
-## Quick start
+Historical local benchmarks and R5-comparison results are documented in
+[RAPTOR.md](RAPTOR.md). They describe a particular data snapshot and machine; they
+are not performance or accuracy guarantees.
+
+## Requirements
+
+The supported development/runtime target is **Python 3.12** on macOS or Linux.
+
+For the standard JVM-free application and its data bootstrap:
+
+- [uv](https://docs.astral.sh/uv/) to create the virtual environment and install
+  Python packages
+- `curl` and `unzip` for input downloads
+- [`osmium-tool`](https://osmcode.org/osmium-tool/) to clip the OpenStreetMap
+  extract to San Francisco
+- a free [511.org Open Data token](https://511.org/open-data/token) for the
+  current Muni and Caltrain feeds
+
+**Java is not required to run the served app after its bakes exist.** A JDK 21 and
+the optional R5 dependencies are required to reproduce the one-time raw-data
+access-table seed, run offline R5 validation, or use the legacy static isochrone
+exporter. That distinction is intentional: the normal map, route inspection, and
+API path do not import R5 or start a JVM.
+
+## Quick start: reproduce a local JVM-free server
+
+The repository deliberately does not commit transit feeds, OpenStreetMap data, or
+derived bakes. A clean clone therefore needs the raw inputs and one local bake
+cycle before it can serve the fully JVM-free path.
 
 ```bash
-git clone <this-repo> sf-commute-isochrone
+git clone --branch main --single-branch <repository-url> sf-commute-isochrone
 cd sf-commute-isochrone
 
-# 1. Configure API access (this file is gitignored)
+# Configure data access. This file is ignored by Git.
 cp .env.example .env
-#    then edit .env and set:
-#      API511_TOKEN=...         (your free 511.org token), and
-#      GEOAPIFY_KEY=...         (free key for address search + autocomplete;
-#                                omit to fall back to keyless Photon)
-#    The live page does not inject a default workplace; visitors enter their own.
+# Edit .env and set API511_TOKEN=... . GEOAPIFY_KEY is optional for search.
 
-# 2. Install the environment and download all input data
+# Create Python 3.12 environment, install requirements.txt, and fetch raw inputs.
 bash scripts/setup.sh
 ```
 
-`setup.sh` is idempotent: it creates the Python venv only if missing and
-downloads each dataset only if it isn't already present, so it's safe to re-run.
+### One-time R5 seed, then JVM-free bakes
 
-## Usage
-
-All commands use the venv created by `setup.sh` at
-`.venv`.
-
-### Live interactive server (recommended)
-
-Boots once (warm R5 network + grid), then recomputes on demand as you change the
-destination in the browser:
-
-```bash
-.venv/bin/python scripts/server.py
-# then open http://127.0.0.1:8000
-```
-
-Tunable via environment variables:
-
-| Var          | Default | Meaning                                          |
-|--------------|---------|--------------------------------------------------|
-| `GRID_M`     | `200`   | grid resolution in meters (smaller = finer/slower) |
-| `WINDOW_MIN` | `30`    | departure-time window in minutes                 |
-| `PORT`       | `8000`  | server port                                      |
-
-```bash
-GRID_M=200 PORT=8080 .venv/bin/python scripts/server.py
-```
-
-### Static explorers and rankings
-
-Generate the standalone HTML map, ranked CSV, and per-cell travel-time grids in
-`out/`:
+The current raw-data seed starts with R5 because the access table's canonical cell
+set is bridged from its offline walk matrix. This is a **bootstrap/validation
+operation**, not a request-time dependency. Install JDK 21, then run:
 
 ```bash
 PY=.venv/bin/python
 
-# full network (Muni + BART + Caltrain)
-$PY scripts/isochrone.py --tag full
+# One-time optional R5 toolchain and access seed.
+uv pip install --python "$PY" -r requirements-r5.txt
+ONLY_ACCESS=1 R5_MAX_MEMORY=4G "$PY" scripts/raptor_oracle.py
 
-# Muni only (for the "BART off" comparison)
-$PY scripts/isochrone.py --gtfs muni_current.zip --tag munionly
-
-# combine both grids into one interactive page (out/commute_explorer.html)
-$PY scripts/make_interactive.py
+# Build the hill-aware, JVM-free walking artifacts.
+bash scripts/fetch_dem.sh
+"$PY" scripts/build_walk_graph.py
+"$PY" scripts/bake_walk_access.py
 ```
 
-`isochrone.py` writes, per `--tag`:
-- `out/isochrone_map_<tag>.html` — interactive banded map
-- `out/neighborhoods_ranked_<tag>.csv` — ranked table
-- `out/grid_traveltimes_<tag>.gpkg` — per-cell travel times
-
-Optional extras:
+`raptor_oracle.py` uses a JVM only for this seed. Once `walk_graph.npz` and an
+`access_walk_*.npz` bake match the downloaded feeds, start the normal app without
+R5 or Java:
 
 ```bash
-$PY scripts/itineraries.py    # example door-to-door itineraries
-$PY scripts/route_map.py      # which transit routes dominate each area
+.venv/bin/python scripts/server.py
+# Open http://127.0.0.1:8000
 ```
 
-#### `isochrone.py` CLI flags
+The first JVM-free boot also writes `data/server_static.json`, a lightweight static
+bundle keyed to the GTFS inputs. It is regenerated automatically after relevant
+feed changes. If the raw data are refreshed, repeat the R5 seed and both walking
+bakes above so their fingerprints and service date stay aligned.
 
-| Flag      | Description                                                        |
-|-----------|-------------------------------------------------------------------|
-| `--tag`   | suffix for output filenames (e.g. `full`, `munionly`)             |
-| `--gtfs`  | extra GTFS zip(s) added to the default `muni_current.zip` + `bart_gtfs.zip` + `caltrain.zip` feeds |
-| `--limit` | randomly subsample N grid origins for a fast validation run        |
+### Dependency sets
 
-## How the destination works
+| File | Purpose |
+| --- | --- |
+| [requirements.txt](requirements.txt) | Default JVM-free runtime and raw-data/build tools |
+| [requirements-dev.txt](requirements-dev.txt) | Runtime stack plus unit and browser-test tooling |
+| [requirements-r5.txt](requirements-r5.txt) | Optional offline R5 seed and validation tooling; requires JDK 21 |
 
-The destination is configured once, in a gitignored `.env` (copy from
-`.env.example`). `scripts/destination.py` resolves it in this order:
+All dependency ranges are intentionally bounded to compatible major/minor releases
+rather than a machine-specific lockfile. Use the provided requirements files for a
+repeatable supported installation; generate a lock in your own deployment
+environment if you need artifact-level pinning.
 
-1. `DEST_LAT` + `DEST_LON` (explicit coordinates; `DEST_LABEL` optional)
-2. `DEFAULT_ADDRESS` — geocoded once via OpenStreetMap Nominatim and cached in
-   `.dest_cache.json` so later runs don't re-geocode
-3. fallback: the geographic center of San Francisco
+## Usage
 
-Change the destination by editing `.env`; delete `.dest_cache.json` if you want
-to force a fresh geocode.
+### Interactive server
 
-## Data sources & credits
+```bash
+PORT=8080 .venv/bin/python scripts/server.py
+```
 
-All inputs are downloaded by `setup.sh` into `data/` (gitignored):
+Useful runtime configuration:
 
-- **Muni GTFS** — [511 SF Bay Open Data](https://511.org/open-data) (current
-  feed, operator `SF`, via `scripts/fetch_511.sh` → `data/muni_current.zip`)
-- **Caltrain GTFS** — [511 SF Bay Open Data](https://511.org/open-data) (current
-  feed, operator `CT`, via `scripts/fetch_511.sh` → `data/caltrain.zip`)
-- **BART GTFS** — [BART developer feed](https://www.bart.gov/dev/schedules/google_transit.zip) (→ `data/bart_gtfs.zip`)
-- **OpenStreetMap** — [Geofabrik](https://download.geofabrik.de/) NorCal
-  extract, clipped to SF with `osmium` (© OpenStreetMap contributors)
-- **Neighborhoods** — [DataSF](https://data.sfgov.org/) "SF Find
-  Neighborhoods" (`gfpk-269f`)
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `PORT` | `8000` | Local listening port |
+| `GRID_M` | `200` | Grid resolution in metres; smaller is finer and more expensive |
+| `WINDOW_MIN` | `30` | Departure-time window in minutes |
+| `RAPTOR_SEMANTIC` | `departafter` | Served scheduled routing semantic; `arriveby` is legacy/opt-in |
+| `RAPTOR_WALK_RELUCTANCE` | `1.15` | Tie-break preference for less walking among near-equal trips |
 
-## Methodology
+The browser keeps a workplace locally for convenience. Do not commit `.env`,
+`.dest_cache.json`, downloaded data, generated output, or browser captures; the
+repository's `.gitignore` excludes them by default.
 
-The live route metric is a full scheduled door-to-door trip: physical walk to the
-boarding stop → transit (including transfers) → physical walk to the destination.
-It is anchored to the first scheduled vehicle, so controllable time spent arriving
-early for that first boarding is reported separately as schedule allowance rather
-than mislabeled as walking. A service-delay simulation supplies the bad-day impact.
+### Optional R5 analyses and static exporters
 
-Walking uses fixed Slow (3.4 km/h), Medium (4.2 km/h), and Fast/Brisk (5.2 km/h)
-presets. Access, transfer, egress, and pure-walk legs all use the selected pace. See
-[`WALK_SPEED_CALIBRATION_2026-08-09.md`](WALK_SPEED_CALIBRATION_2026-08-09.md) for
-the bounded San Francisco calibration corpus and [`RAPTOR.md`](RAPTOR.md) for the
-routing model. Conveyal R5 remains an offline validation oracle and fallback, not
-the normal map or itinerary path.
+These legacy offline scripts use R5. Install JDK 21 and the optional dependency
+set before running them:
 
-## Notes
+```bash
+PY=.venv/bin/python
+uv pip install --python "$PY" -r requirements-r5.txt
 
-`out/`, `REPORT.md`, `.env`, and `.dest_cache.json` are gitignored: they are
-personal/address-specific and stay on your machine. The Python venv lives in
-`.venv` (gitignored) at the repo root.
+"$PY" scripts/isochrone.py --tag full
+"$PY" scripts/isochrone.py --gtfs muni_current.zip --tag munionly
+"$PY" scripts/make_interactive.py
+```
+
+Outputs are written to the ignored `out/` directory. `scripts/itineraries.py` and
+`scripts/route_map.py` use the same optional R5 toolchain.
+
+## Data sources and refreshes
+
+`scripts/setup.sh` fetches external, untracked inputs into `data/`:
+
+- Muni and Caltrain GTFS from [511 SF Bay Open Data](https://511.org/open-data)
+  (requires `API511_TOKEN`)
+- BART GTFS from the [BART developer feed](https://www.bart.gov/dev/schedules/google_transit.zip)
+- OpenStreetMap's Northern California extract from
+  [Geofabrik](https://download.geofabrik.de/), clipped locally to San Francisco
+- San Francisco neighborhood geometry from
+  [DataSF](https://data.sfgov.org/) (including the Find Neighborhoods source)
+- a San Francisco elevation raster from USGS 3DEP for the hill-aware walking bake
+
+The downloads and bakes are cached by feed fingerprints, but they are snapshots.
+They can change, disappear, or acquire updated terms at their sources. Review the
+applicable provider terms, refresh deliberately, and rerun the seed/bake workflow
+when operating your own instance.
+
+## Tests
+
+Install contributor dependencies and the browser once:
+
+```bash
+uv pip install --python .venv/bin/python -r requirements-dev.txt
+.venv/bin/python -m playwright install chromium
+```
+
+Run the repository checks from the root:
+
+```bash
+# Python suite; excludes the browser tests that need a separately running server.
+.venv/bin/python -m pytest tests/ --ignore=tests/e2e -q
+
+# Frontend logic suite (Node.js 20+).
+node --test tests/test_viz.mjs
+
+# Browser suite: start the server in another terminal first.
+.venv/bin/python scripts/server.py
+tests/e2e/run.sh
+```
+
+See [tests/e2e/README.md](tests/e2e/README.md) for targeted and opt-in route-family
+stress tests. The test suite uses neutral public locations; avoid adding a real
+home or workplace to source, fixtures, screenshots, or benchmark artifacts.
+
+## Project documents
+
+- [License (MIT)](LICENSE)
+- [Contributing guide](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Privacy policy](PRIVACY.md)
+- [Third-party notices](THIRD_PARTY_NOTICES.md)
+- [Routing model and historical validation](RAPTOR.md)
+- [Walking-speed calibration](WALK_SPEED_CALIBRATION_2026-08-09.md)
+
+## Credits
+
+Built with public transit schedules and map data from 511, BART, OpenStreetMap
+contributors, DataSF, Geofabrik, and USGS. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for license and attribution
+details.

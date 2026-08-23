@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""Create a new user-scoped CF API token via the API, with EXACTLY the permissions needed
-for Origin CA cert minting. We do this via API (not the dashboard) because the dashboard's
-permission picker omits 'Origin Write' on some plans/accounts even though the API exposes it.
+"""Create a narrowly scoped Cloudflare API token for Origin CA and DNS operations.
 
 Uses the existing CF_USER_API_TOKEN to authenticate the token-create call.
 Required existing permission: 'API Tokens: Edit' on the calling token.
@@ -27,6 +25,8 @@ ACCOUNT_ID = None  # filled from .env
 
 def load_env():
     out = {}
+    if not ENV_FILE.exists():
+        return out
     for line in ENV_FILE.read_text().splitlines():
         s = line.strip()
         if s and not s.startswith("#") and "=" in s:
@@ -53,22 +53,22 @@ def main():
     env = load_env()
     caller = env.get("CF_USER_API_TOKEN")
     account = env.get("CF_ACCOUNT_ID")
-    if not (caller and account):
-        print("ERR: need CF_USER_API_TOKEN + CF_ACCOUNT_ID in .env", file=sys.stderr)
+    zone_id = env.get("CF_ZONE_ID", "").strip()
+    if not (caller and account and zone_id):
+        print("ERR: need CF_USER_API_TOKEN + CF_ACCOUNT_ID + CF_ZONE_ID in .env", file=sys.stderr)
         return 1
 
     # Two policies because SSL/Certs Write is account-scoped while Zone Read / DNS Write are
-    # zone-scoped — different "resources" shape. We pin to the single zone we manage.
-    zone_id = env.get("CF_ZONE_ID", "00000000000000000000000000000000")  # sfcommutemap.com
+    # zone-scoped — different "resources" shape. We pin to the explicitly configured zone.
     body = {
-        "name": "sfcommutemap-deploy",
+        "name": "commute-map-deploy",
         "policies": [
             {   # account-scope: Origin CA cert minting (POST /certificates)
                 "effect": "allow",
                 "resources": {f"com.cloudflare.api.account.{account}": "*"},
                 "permission_groups": [{"id": PG_SSL_CERTS_WRITE}],
             },
-            {   # zone-scope: Zone Read + DNS Write, pinned to sfcommutemap.com
+            {   # zone-scope: Zone Read + DNS Write, pinned to the configured zone
                 "effect": "allow",
                 "resources": {f"com.cloudflare.api.account.zone.{zone_id}": "*"},
                 "permission_groups": [{"id": PG_ZONE_READ}, {"id": PG_DNS_WRITE}],

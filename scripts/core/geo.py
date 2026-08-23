@@ -28,17 +28,23 @@ import urllib.parse
 from collections import OrderedDict
 from . import config
 
+# Load .env before reading any geocoder configuration below. load_dotenv uses setdefault, so a
+# real process environment still takes precedence and the call remains idempotent.
+config.load_dotenv()
+
 # Compliant User-Agent on every upstream request (Nominatim requires one; Photon is polite).
-_UA = "SF Commute Explorer (https://sfcommutemap.com)"
+# Deployers can supply an email address or URL without baking personal contact details into the
+# source tree.  The fallback remains descriptive for keyless development use.
+_UA = os.environ.get(
+    "GEOCODER_USER_AGENT",
+    "SF Commute Explorer (https://sfcommutemap.com)",
+)
 
 # Persistent destination cache (destination.py only). The in-memory LRU below never touches it.
 # Path is env-overridable (DEST_CACHE_FILE) so a hardened systemd deploy where the repo dir is
 # read-only (ProtectSystem=strict) can point this at a writable CacheDirectory like /var/cache/sfci.
-# DEST_CACHE_FILE is bound at import, so load .env FIRST — both consumers (destination.py,
-# server.py) import geo before calling load_dotenv(); without this a DEST_CACHE_FILE set in .env
-# was silently ignored. load_dotenv uses setdefault, so real process env (systemd Environment=)
-# still wins and the call is idempotent.
-config.load_dotenv()
+# DEST_CACHE_FILE is bound at import, so the dotenv load above must precede this assignment — both
+# consumers import geo before calling load_dotenv().
 _CACHE = pathlib.Path(os.environ.get("DEST_CACHE_FILE") or (config.ROOT / ".dest_cache.json"))
 _STORE_LOCK = threading.Lock()   # serializes the read-modify-write in geocode(cache=True)
 

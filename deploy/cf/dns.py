@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Upsert the DNS A records sfcommutemap.com + www.sfcommutemap.com -> the Oracle box IP.
+"""Upsert apex and ``www`` DNS A records for the configured Cloudflare zone.
 
 Reads:
   CF_GLOBAL_KEY + CF_EMAIL  (preferred; works for everything)
   OR CF_ORIGIN_TOKEN / CF_API_TOKEN (Bearer fallback)
-  CF_ZONE_ID  (defaults to sfcommutemap.com's id if unset)
+  CF_ZONE_ID  (required; Cloudflare zone ID)
 
 Usage:
-  python3 deploy/cf/dns.py <ip>          # apex + www both -> <ip>, proxied (orange)
-  python3 deploy/cf/dns.py 203.0.113.10
+  python3 deploy/cf/dns.py <origin-ip>   # apex + www both -> <origin-ip>, proxied
 
 Idempotent: looks up existing records and PUTs if found, POSTs if not."""
 from __future__ import annotations
+import ipaddress
 import json, pathlib, sys, urllib.request, urllib.error
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-DEFAULT_ZONE = "00000000000000000000000000000000"  # sfcommutemap.com
-
-
 def load_env():
     out = {}
-    for line in (REPO_ROOT / ".env").read_text().splitlines():
+    env_file = REPO_ROOT / ".env"
+    if not env_file.exists():
+        return out
+    for line in env_file.read_text().splitlines():
         s = line.strip()
         if s and not s.startswith("#") and "=" in s:
             k, _, v = s.partition("=")
@@ -48,11 +48,20 @@ def cf_request(method, url, headers, body=None):
 
 def main():
     if len(sys.argv) != 2:
-        print(f"usage: {sys.argv[0]} <ip>", file=sys.stderr); return 1
+        print(f"usage: {sys.argv[0]} <origin-ip>", file=sys.stderr); return 1
     new_ip = sys.argv[1]
+    try:
+        if ipaddress.ip_address(new_ip).version != 4:
+            raise ValueError("DNS A records require an IPv4 address")
+    except ValueError as error:
+        print(f"ERR: invalid origin IPv4 address {new_ip!r}: {error}", file=sys.stderr)
+        return 1
 
     env = load_env()
-    zone = env.get("CF_ZONE_ID", DEFAULT_ZONE)
+    zone = env.get("CF_ZONE_ID", "").strip()
+    if not zone:
+        print("ERR: need CF_ZONE_ID in .env (the Cloudflare zone ID to update)", file=sys.stderr)
+        return 1
     if env.get("CF_GLOBAL_KEY") and env.get("CF_EMAIL"):
         auth = {"X-Auth-Email": env["CF_EMAIL"], "X-Auth-Key": env["CF_GLOBAL_KEY"]}
         src = "CF_GLOBAL_KEY"
@@ -64,12 +73,19 @@ def main():
         print("ERR: no CF credentials in .env", file=sys.stderr); return 1
     print(f"[dns] auth={src}  zone={zone[:12]}...  target_ip={new_ip}")
 
-    base = f"https://api.cloudflare.com/client/v4/zones/{zone}/dns_records"
-    # The two records we want to upsert. proxied=True (orange-cloud) is critical for the
-    # CF -> origin lockdown; without it, traffic hits the Oracle IP directly.
+    zone_url = f"https://api.cloudflare.com/client/v4/zones/{zone}"
+    code, zone_response = cf_request("GET", zone_url, auth)
+    if not zone_response.get("success") or not zone_response.get("result", {}).get("name"):
+        print(f"ERR: could not read configured CF_ZONE_ID ({code})", file=sys.stderr)
+        print(json.dumps(zone_response.get("errors", zone_response), indent=2), file=sys.stderr)
+        return 2
+    zone_name = zone_response["result"]["name"]
+    base = f"{zone_url}/dns_records"
+    # The two records we want to upsert. proxied=True (orange-cloud) is critical for origin
+    # lockdown; without it, traffic can bypass Cloudflare and hit the host directly.
     desired = [
-        {"type": "A", "name": "sfcommutemap.com",       "content": new_ip, "ttl": 1, "proxied": True},
-        {"type": "A", "name": "www.sfcommutemap.com",   "content": new_ip, "ttl": 1, "proxied": True},
+        {"type": "A", "name": zone_name,          "content": new_ip, "ttl": 1, "proxied": True},
+        {"type": "A", "name": f"www.{zone_name}", "content": new_ip, "ttl": 1, "proxied": True},
     ]
 
     # List existing A records once

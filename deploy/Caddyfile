@@ -6,7 +6,6 @@
 #
 # If you'd rather use Let's Encrypt: delete the `tls` line below and ensure port 80 is reachable
 # from the public internet (not the CF allowlist).
-
 {
 	admin off
 }
@@ -43,6 +42,25 @@ sfcommutemap.com, www.sfcommutemap.com {
 		# Let systemd-journald retain access records. Caddy's file rotation renames the
 		# active log, which SELinux denies for the packaged service on Oracle Linux.
 		output stdout
-		format json
+		# Keep structured logs useful without retaining workplace searches, route-cell
+		# identifiers, destination coordinates, or exact client addresses. Caddy applies
+		# these filters before JSON encoding.
+		format filter {
+			request>uri query {
+				replace q REDACTED
+				replace id REDACTED
+				replace lat REDACTED
+				replace lon REDACTED
+				replace dlat REDACTED
+				replace dlon REDACTED
+				replace olat REDACTED
+				replace olon REDACTED
+			}
+			request>remote_ip ip_mask 16 32
+			request>client_ip ip_mask 16 32
+			request>headers>X-Forwarded-For delete
+			request>headers>CF-Connecting-IP delete
+			wrap json
+		}
 	}
 }

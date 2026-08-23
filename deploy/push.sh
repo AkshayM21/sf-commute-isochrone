@@ -1,62 +1,77 @@
 #!/usr/bin/env bash
-# Run on your laptop. Rsync the repo to /opt/sfci on the Oracle box, then SSH a couple of
-# next-step suggestions. Re-runnable: subsequent calls only push the diff.
+# Run from a trusted development machine. Rsync the deployable source tree to the host, then
+# print the next-step commands. Re-runnable: subsequent calls only push the diff.
 #
 # Usage:
-#   deploy/push.sh opc@<oracle-public-ip>            # Oracle Linux uses opc; Ubuntu uses ubuntu
+#   deploy/push.sh <user@host>
 #
-# Excludes the venv, the numba caches (rebuilt on the box; includes tests/.nbcache_*), the
-# personal .dest_cache, the test golden oracles, out/, and the big OSM source extracts
-# (osm_sf.pbf + the ~640 MB norcal.osm.pbf setup.sh downloads) — everything the box doesn't
-# need or shouldn't have (the box consumes the baked walk_graph.npz, not raw OSM).
+# Excludes development-only state, credentials, Git metadata, browser captures, test artifacts,
+# session notes, and source extracts that the runtime does not need. Patterns use only rsync's
+# portable include/exclude syntax and work with the macOS-bundled rsync. The remote data directory
+# is protected from deletion so a clean source checkout cannot erase host-built feeds and bakes;
+# locally present data files can still be updated deliberately.
 #
-# PRIVACY/SECRETS INVARIANT: .env, REPORT.md, Progress.md, Issues.md, REVIEW_REPORT.md AND
-# deploy/cf/ are excluded (the .md session notes are operator-personal). deploy/cf/ holds the
-# Cloudflare Origin CA PRIVATE KEY (origin-key.pem) plus operator-local helper scripts — the box
-# never needs them (mint.py/dns.py run on the laptop; the cert/key reach /etc/caddy via the
-# separate scp step in DEPLOY.md). NB: rsync --delete-after protects excluded paths, so if an
-# old push already shipped deploy/cf/, clean it once: ssh <box> 'sudo rm -rf /opt/sfci/deploy/cf'
+# PRIVACY/SECRETS INVARIANT: credentials and Cloudflare certificate tooling stay on the trusted
+# machine. ``--delete-after`` preserves excluded paths already present on the host; remove any
+# legacy sensitive files from the host deliberately after confirming they are no longer needed.
 
 set -euo pipefail
 TARGET="${1:-}"
-[[ -n "$TARGET" ]] || { echo "Usage: $0 <user@oracle-public-ip>"; exit 1; }
+[[ -n "$TARGET" ]] || { echo "Usage: $0 <user@host>"; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Runs on EVERY push (not one-time): rsync runs as $USER, so it must own the tree to overwrite
-# the sfci-owned files; ownership is restored to sfci right after the rsync below.
-echo "[push] preparing /opt/sfci on $TARGET (mkdir + chown to \$USER so rsync can write)..."
+# Runs on every push: rsync needs ownership while writing. The service ownership is restored
+# afterwards if the service user exists.
+echo "[push] preparing /opt/sfci on $TARGET (mkdir + temporary write ownership)..."
 ssh -o StrictHostKeyChecking=accept-new "$TARGET" \
   "sudo mkdir -p /opt/sfci && sudo chown -R \$USER:\$USER /opt/sfci"
 
 echo "[push] rsyncing $REPO_ROOT -> $TARGET:/opt/sfci ..."
-# Keep .git so the box can `git pull` for incremental updates later. Drop everything else
-# big or local-only.
+# Deploy the source payload, not a developer checkout. Unanchored privacy patterns apply at every
+# depth; leading slashes are reserved for intentionally root-scoped runtime paths.
 rsync -avzP --delete-after \
+  --filter 'protect /data/***' \
+  --exclude '.git/' \
+  --exclude '.impeccable/' \
+  --exclude '.agents/' \
   --exclude .venv \
   --exclude __pycache__ \
   --exclude '*.pyc' \
   --exclude '.env' \
+  --exclude '.env.*' \
   --exclude 'REPORT.md' \
   --exclude 'Progress.md' \
   --exclude 'Issues.md' \
   --exclude 'REVIEW_REPORT.md' \
+  --exclude 'HANDOFF*.md' \
+  --exclude '*_PLAN_*.md' \
+  --exclude 'REVIEW*.md' \
+  --exclude '*_DESIGN_*.md' \
+  --exclude '*_QA_*.md' \
+  --exclude '*_SCOPE.md' \
+  --exclude '.plans/' \
   --exclude '/deploy/cf/' \
   --exclude '.dest_cache.json' \
   --exclude '.nbc' \
   --exclude '.numba_cache' \
   --exclude '.nbcache*' \
   --exclude '/out/' \
+  --exclude 'artifacts/' \
+  --exclude 'screenshots/' \
+  --exclude '/tests/e2e/artifacts/' \
+  --exclude '/tests/e2e/screens/' \
+  --exclude '/tests/e2e/screenshots/' \
+  --exclude '.pytest_cache/' \
   --exclude '/tests/raptor_golden/' \
   --exclude '/tests/__pycache__/' \
   --exclude '/data/osm_sf.pbf' \
   --exclude '/data/norcal.osm.pbf' \
   ./ "$TARGET:/opt/sfci/"
 
-# Restore service-user ownership so the documented redeploy flow (push + restart, NO install.sh
-# re-run) leaves sfci able to write /opt/sfci/data (ReadWritePaths in sfci.service — e.g. the
-# RAPTOR CSR cache rebake). Guarded: the first push happens before install.sh creates the user.
+# Restore service-user ownership. Guarded because the first push can happen before install.sh
+# creates that user.
 echo "[push] restoring sfci ownership of /opt/sfci (if the service user exists)..."
 ssh "$TARGET" 'if id sfci >/dev/null 2>&1; then sudo chown -R sfci:sfci /opt/sfci; fi'
 
@@ -66,9 +81,9 @@ cat <<EOF
 
 Next steps on the box:
   1. ssh $TARGET 'sudo bash /opt/sfci/deploy/install.sh'      # system deps, venv, units
-  2. ssh $TARGET 'sudo vi /etc/sfci.env'                       # paste API tokens
+  2. ssh $TARGET 'sudo vi /etc/sfci.env'                       # set runtime configuration
   3. ssh $TARGET 'sudo systemctl restart sfci'
-  4. See deploy/DEPLOY.md sections 4-8 for Cloudflare Origin CA cert + DNS + lockdown.
+  4. See deploy/DEPLOY.md for Cloudflare HTTPS, DNS, and ingress configuration.
 
 To redeploy after code changes later:
   deploy/push.sh $TARGET

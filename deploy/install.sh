@@ -62,18 +62,13 @@ if [[ ! -d "$REPO_DIR/.venv" ]]; then
 fi
 log "installing/upgrading Python dependencies..."
 sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet --upgrade pip wheel setuptools
-if [[ -f "$REPO_DIR/requirements.txt" ]]; then
-  sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
-else
-  # The repo ships no requirements.txt (deps are documented in scripts/setup.sh), so this
-  # baseline set is the NORMAL install path, not a fallback. Keep it in sync with what the
-  # JVM-free server boot actually imports.
-  log "  (no requirements.txt -- installing baseline set)"
-  sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet \
-    flask flask-limiter numpy scipy numba esy-osm-pbf rasterio python-dotenv
-fi
-# waitress: production WSGI server. server.py prefers it over Flask's dev server when present.
-sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet waitress
+[[ -f "$REPO_DIR/requirements.txt" ]] || {
+  echo "requirements.txt is required for a supported deployment" >&2
+  exit 1
+}
+# requirements.txt includes waitress and excludes optional R5/JVM tooling. Keep the
+# production installation identical to the public JVM-free runtime manifest.
+sudo -u "$USER_NAME" "$REPO_DIR/.venv/bin/pip" install --quiet -r "$REPO_DIR/requirements.txt"
 
 # ---- 4. /etc/sfci.env (preserve any user edits on re-run) --------------------------------
 if [[ ! -f /etc/sfci.env ]]; then

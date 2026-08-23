@@ -1,0 +1,24 @@
+# Default runtime and data-build dependencies for Python 3.12.
+#
+# This set runs the served, JVM-free RAPTOR + walk-graph application and the
+# repository's JVM-free data/build scripts. It intentionally does NOT install
+# r5py or start a JVM; see requirements-r5.txt for the offline R5 seed,
+# validation, and legacy static-export tooling.
+Flask>=3.1,<4
+Flask-Limiter>=4.0,<5
+waitress>=3.0,<4
+
+numpy>=2.2,<2.5
+scipy>=1.14,<1.18
+numba>=0.61,<0.66
+
+# Required only on a first data/static-bundle build and by the offline exporters,
+# but included here so `scripts/setup.sh` is reproducible from an empty clone.
+pandas>=2.2,<3.1
+geopandas>=1.0,<1.2
+shapely>=2.0,<2.2
+folium>=0.16,<0.21
+
+# JVM-free walk-graph bake dependencies.
+esy-osm-pbf>=0.1,<0.2
+rasterio>=1.4,<1.6

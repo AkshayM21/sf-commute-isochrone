@@ -1,0 +1,6 @@
+# Contributor and test dependencies.  Includes the default runtime stack.
+-r requirements.txt
+
+pytest>=8,<10
+playwright>=1.50,<2
+pytest-playwright>=0.7,<1

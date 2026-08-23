@@ -86,20 +86,21 @@ def neigh_path() -> Path:
     return DATA / NEIGH_FILE
 
 
-def gtfs_paths(extra=None):
+def gtfs_paths(extra=None, *, replace=False):
     """The transit feeds to route on, as existing Paths in network order.
 
     Muni resolves to the current 511 feed, or the stale 2022 fallback with a warning if
     the current one hasn't been fetched. Non-existent feeds are dropped so a partial data
     download runs (degraded) rather than crashing at network build. `extra` adds caller
-    feeds (names resolve under data/, absolute paths pass through)."""
+    feeds (names resolve under data/, absolute paths pass through); `replace=True` uses
+    only those caller feeds, which is useful for explicit comparison exports."""
     muni = DATA / MUNI_CURRENT
     if not muni.exists():
         fb = DATA / MUNI_FALLBACK
         if fb.exists():
             print(f"!! WARNING: using STALE Muni feed {fb.name} (no current feed found)")
             muni = fb
-    paths = [muni, DATA / BART, DATA / CALTRAIN]
+    paths = [] if replace else [muni, DATA / BART, DATA / CALTRAIN]
     if extra:
         paths += [Path(e) if Path(e).is_absolute() else DATA / e for e in extra]
     return [p for p in paths if p.exists()]

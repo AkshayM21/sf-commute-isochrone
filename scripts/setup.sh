@@ -7,8 +7,9 @@
 #
 #   bash scripts/setup.sh
 #
-# Prerequisites (checked below): Java 21, uv, osmium-tool, and a free 511.org
-# API token. See README.md for details.
+# Prerequisites (checked below): uv, osmium-tool, and a free 511.org API token.
+# Java/R5 is deliberately optional here: it is needed only for the separate
+# one-time raw-data seed described in README.md, not for the served JVM-free app.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,23 +30,6 @@ err()  { printf '  ERROR: %s\n' "$*" >&2; }
 say "Checking prerequisites"
 
 missing=0
-
-# Java 21 (r5py needs a JDK 21 runtime)
-if command -v java >/dev/null 2>&1; then
-  # `java -version` prints to stderr; capture both streams.
-  jver="$(java -version 2>&1 | head -n1)"
-  jmajor="$(printf '%s' "$jver" | sed -nE 's/.*version "([0-9]+).*/\1/p')"
-  if [ "${jmajor:-0}" -ge 21 ] 2>/dev/null; then
-    ok "java ($jver)"
-  else
-    err "Java 21+ required, found: $jver"
-    err "  Install a JDK 21, e.g.  brew install openjdk@21"
-    missing=1
-  fi
-else
-  err "java not found. Install a JDK 21, e.g.  brew install openjdk@21"
-  missing=1
-fi
 
 # uv (Python env + package manager)
 if command -v uv >/dev/null 2>&1; then
@@ -98,12 +82,10 @@ else
 fi
 
 echo "  installing/updating Python dependencies..."
-# flask-limiter: server.py imports it unconditionally; numba: the default RAPTOR engine
-# (USE_RAPTOR=1); scipy: the hill-aware walk router (USE_WALK_GRAPH=1). All three are
-# needed by the DEFAULT server boot, not just the legacy R5 path.
-uv pip install --python "$PY" \
-  r5py geopandas folium mapclassify shapely requests pandas numpy branca contextily \
-  flask flask-limiter scipy numba
+# Keep this in sync with the public dependency manifest. r5py intentionally lives
+# in requirements-r5.txt, because the served map does not require a JVM once the
+# one-time bakes are available.
+uv pip install --python "$PY" -r "$ROOT/requirements.txt"
 ok "dependencies installed"
 
 # ---------------------------------------------------------------------------
@@ -254,12 +236,15 @@ cat <<EOF
 Everything is installed and all input data is in data/.
 
 Next steps:
-  1. Configure your destination (if you haven't already):
-       cp .env.example .env      # then edit .env
-       # set DEFAULT_ADDRESS=...  (an address to geocode)
-       #   or DEST_LAT / DEST_LON / DEST_LABEL (explicit coordinates)
+  1. On a fresh clone, make the one-time R5 access seed, then the JVM-free walk bakes.
+     This requires JDK 21 but the served app does not:
+       uv pip install --python $PY -r requirements-r5.txt
+       ONLY_ACCESS=1 R5_MAX_MEMORY=4G $PY scripts/raptor_oracle.py
+       bash scripts/fetch_dem.sh
+       $PY scripts/build_walk_graph.py
+       $PY scripts/bake_walk_access.py
 
-  2. Run the live interactive server:
+  2. Run the JVM-free interactive server:
        $PY scripts/server.py
        # then open http://127.0.0.1:8000
 
@@ -267,14 +252,6 @@ Next steps:
        $PY scripts/isochrone.py --tag full
        $PY scripts/isochrone.py --gtfs muni_current.zip --tag munionly
        $PY scripts/make_interactive.py     # builds out/commute_explorer.html
-
-  4. (Optional) Rebuild the hill-aware walk-graph bakes yourself
-     (data/walk_graph.npz + the walk access table). These steps need two extra
-     packages this script does NOT install:
-       uv pip install --python $PY esy-osm-pbf rasterio
-       bash scripts/fetch_dem.sh
-       $PY scripts/build_walk_graph.py
-       $PY scripts/bake_walk_access.py
 
 See README.md for full usage and CLI flags.
 EOF

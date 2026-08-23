@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an improvement to the commute model or user experience.
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the user need, not only a proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+      description: Explain the expected behavior and any relevant trade-offs.
+    validations:
+      required: true
+  - type: textarea
+    id: examples
+    attributes:
+      label: Public examples or mockups (optional)
+      description: Use public landmarks or synthetic examples; do not include private addresses.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I checked that this is not a security report.
+          required: true
+        - label: I did not include credentials, private addresses, or sensitive trip details.
+          required: true

@@ -43,7 +43,7 @@ ISOCHRONE_BANDS = [(0, 15, "#08589e", "≤15 min"),
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gtfs", nargs="+", default=None,
-                    help="extra GTFS zip paths added to the default Muni+BART+Caltrain feeds")
+                    help="GTFS zip paths to use instead of the default Muni+BART+Caltrain feeds")
     ap.add_argument("--limit", type=int, default=None,
                     help="randomly subsample N grid origins (fast validation)")
     ap.add_argument("--tag", default="",
@@ -51,7 +51,9 @@ def main():
     args = ap.parse_args()
     suf = f"_{args.tag}" if args.tag else ""
 
-    gtfs = config.gtfs_paths(extra=args.gtfs)
+    gtfs = config.gtfs_paths(extra=args.gtfs, replace=bool(args.gtfs))
+    if args.gtfs and not gtfs:
+        ap.error("none of the requested GTFS files exist")
     print("GTFS feeds:", [p.name for p in gtfs])
 
     service_date = feeds.pick_service_date(gtfs)

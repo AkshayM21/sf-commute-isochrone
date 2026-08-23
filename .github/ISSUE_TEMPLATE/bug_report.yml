@@ -1,0 +1,59 @@
+name: Bug report
+description: Report a reproducible problem with the map, routing, or interface.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please use public, non-sensitive locations. Do not include home/work addresses,
+        API keys, tokens, certificates, or security details. For security issues, use the
+        private process in SECURITY.md.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A concise description of the unexpected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include a public location, settings, and the smallest set of steps.
+      placeholder: |
+        1. Open ...
+        2. Set workplace to a public landmark ...
+        3. Select ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Public reproduction URL (optional)
+      description: Remove the URL fragment if it contains a sensitive workplace.
+  - type: dropdown
+    id: device
+    attributes:
+      label: Device and browser
+      options:
+        - Desktop Chrome
+        - Desktop Safari
+        - Desktop Firefox
+        - iPhone Safari
+        - Android Chrome
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or console output (optional)
+      description: Redact addresses, tokens, and other sensitive information.

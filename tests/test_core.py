@@ -86,6 +86,12 @@ class TestConfig:
         assert all(p.exists() for p in paths)
         assert not any("does_not_exist" in p.name for p in paths)
 
+    def test_gtfs_paths_can_replace_the_default_network(self):
+        # Explicit comparison exports (for example Muni-only) must not silently retain
+        # BART/Caltrain or duplicate a feed by appending it to the canonical network.
+        paths = config.gtfs_paths(extra=[config.BART], replace=True)
+        assert paths == [config.DATA / config.BART]
+
     def test_departure_is_835_on_given_date(self):
         d = dt.date(2026, 5, 20)
         dep = config.departure(d)

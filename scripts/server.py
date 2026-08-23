@@ -709,8 +709,7 @@ def _compute():
              else compute(lat, lon, max_rides))
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
     tag = "raptor" if USE_RAPTOR else "approx"
-    print(f"[compute:{tag}] ({lat:.4f},{lon:.4f}) rides={max_rides} speed={speed} "
-          f"{ms:.0f}ms gen={gen}")
+    print(f"[compute:{tag}] rides={max_rides} speed={speed} {ms:.0f}ms gen={gen}")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -731,25 +730,25 @@ def _compute_exact():
     # generation/supersede dance is irrelevant since there's nothing to cancel.
     cached = _EXACT_RESULT_CACHE.get(ckey)
     if cached is not None:
-        print(f"[exact] ({lat:.4f},{lon:.4f}) rides={max_rides} cached -> {len(cached)} cells")
+        print(f"[exact] rides={max_rides} cached -> {len(cached)} cells")
         return jsonify({"dest": [lat, lon], "cells": cached, "ms": 0})
     t0 = dt.datetime.now()
     gen = _current_generation()           # cancel token: abort if a newer workplace is set
     # Non-blocking: if a heavy job is already running, tell the client to retry rather than
     # queueing behind a ~30s burst. Release the lock in finally so a crash can't wedge it.
     if not _HEAVY_LOCK.acquire(blocking=False):
-        print(f"[exact] ({lat:.4f},{lon:.4f}) busy -> 503")
+        print("[exact] busy -> 503")
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
     try:
         cells = compute_exact(lat, lon, gen, max_rides)   # one heavy job at a time; hover stays free
     except _Superseded:
-        print(f"[exact] ({lat:.4f},{lon:.4f}) superseded -> 409")
+        print("[exact] superseded -> 409")
         return jsonify({"error": "superseded"}), 409
     finally:
         _HEAVY_LOCK.release()
     _EXACT_RESULT_CACHE.put(ckey, cells)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[exact] ({lat:.4f},{lon:.4f}) rides={max_rides} {ms:.0f}ms")
+    print(f"[exact] rides={max_rides} {ms:.0f}ms")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -991,14 +990,13 @@ def _attribution():
     # color-by-line below now serves only USE_RAPTOR=0.)
     if USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter"):
         attr = sr.raptor_attribution(dlat, dlon, max_rides, speed, walk_scalar)
-        print(f"[attr:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} speed={speed} "
-              f"-> {len(attr)} cells")
+        print(f"[attr:raptor] rides={max_rides} speed={speed} -> {len(attr)} cells")
         return jsonify(attr)
     ckey = _coarse_key(dlat, dlon, max_rides)
     # CACHE HIT (same meter-scale destination): return the attribution instantly, no R5/lock.
     cached_res = _ATTR_RESULT_CACHE.get(ckey)
     if cached_res is not None:
-        print(f"[attr] ({dlat:.4f},{dlon:.4f}) rides={max_rides} cached -> {len(cached_res)} cells")
+        print(f"[attr] rides={max_rides} cached -> {len(cached_res)} cells")
         return jsonify(cached_res)
     t0 = dt.datetime.now()
     with _ITIN_CACHE_LOCK:
@@ -1007,14 +1005,14 @@ def _attribution():
     try:
         attr = _attribution_from_cache(dlat, dlon, nonblock=True, max_rides=max_rides)
     except _Busy:
-        print(f"[attr] ({dlat:.4f},{dlon:.4f}) busy -> 503")
+        print("[attr] busy -> 503")
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
     # Only cache a real result. A superseded build (workplace changed mid-build) returns {};
     # caching that would poison this destination key and make color-by-line return {} forever.
     if attr:
         _ATTR_RESULT_CACHE.put(ckey, attr)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[attr] ({dlat:.4f},{dlon:.4f}) {ms:.0f}ms -> {len(attr)} cells"
+    print(f"[attr] {ms:.0f}ms -> {len(attr)} cells"
           f"{' (cached)' if cached else ''}")
     return jsonify(attr)
 
@@ -1050,10 +1048,10 @@ def _variance():
     try:
         out = sr.raptor_mc(dlat, dlon, max_rides, speed, walk_scalar, perf=perf)
     except _Busy:
-        print(f"[variance:raptor] ({dlat:.4f},{dlon:.4f}) busy -> 503")
+        print("[variance:raptor] busy -> 503")
         return jsonify({"busy": True}), 503, {"Retry-After": "4"}
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[variance:raptor] ({dlat:.4f},{dlon:.4f}) rides={max_rides} speed={speed} {ms:.0f}ms "
+    print(f"[variance:raptor] rides={max_rides} speed={speed} {ms:.0f}ms "
           f"-> {len(out['variance'])} cells")
     # Pick the JSON-able keys explicitly: the MC entry also carries the internal alt-route
     # plumbing (alt_bundle's numpy arrays, the lazy JourneyTree cache) that backs /itinerary's
