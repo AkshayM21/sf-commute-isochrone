@@ -791,7 +791,7 @@ service_is_required_non_web() {
 
 close_zone_web_ingress() {
   local mode="$1" zone="$2" preserve_cloudflare="${3:-1}"
-  local service port protocol rule services ports protocols source_ports rich_rules forward_ports
+  local service port protocol rule services ports protocols source_ports rich_rules forward_ports target
   [[ "$zone" == "cloudflare" && "$preserve_cloudflare" == "1" ]] && return 0
   services="$(firewall_call "$mode" --zone="$zone" --list-services)" || return 1
   for service in $services; do
@@ -827,7 +827,12 @@ close_zone_web_ingress() {
     [[ -n "$rule" ]] || continue
     firewall_call "$mode" --zone="$zone" --remove-forward-port="$rule" >/dev/null || return 1
   done <<<"$forward_ports"
-  if [[ "$zone" == "public" || "$preserve_cloudflare" == "0" ]]; then
+  target="$(firewall_zone_target "$mode" "$zone")" || return 1
+  # Oracle Linux ships unattached built-in zones such as trusted and nm-shared with an ACCEPT
+  # target. The verifier correctly treats those as latent web-ingress paths, so closure must make
+  # them non-accepting too. Preserve ordinary default/reject targets; only public, an explicitly
+  # closed cloudflare zone, or an ACCEPT target needs to become DROP.
+  if [[ "$zone" == "public" || "$preserve_cloudflare" == "0" || "$target" == "ACCEPT" ]]; then
     if [[ "$mode" == "permanent" ]]; then
       firewall_call "$mode" --zone="$zone" --set-target=DROP >/dev/null || return 1
     else

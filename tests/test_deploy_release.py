@@ -101,6 +101,37 @@ service_exposes_web() { return 1; }
     )
 
 
+def zone_firewall_flow_helper(zone: str, target: str) -> subprocess.CompletedProcess[str]:
+    install = (ROOT / "deploy" / "install.sh").read_text()
+    start = install.index("firewall_zone_target() {")
+    end = install.index("\nclose_direct_web_ingress() {", start)
+    functions = install[start:end]
+    mock = r'''
+TEST_TARGET="$1"
+firewall_call() {
+  local joined="$*"
+  case "$joined" in
+    *--get-target*) printf '%s\n' "$TEST_TARGET" ;;
+    *--list-services*|*--list-ports*|*--list-protocols*|*--list-source-ports*|*--list-rich-rules*|*--list-forward-ports*) return 0 ;;
+    *--set-target=DROP*) printf '%s\n' SET_DROP >&2 ;;
+    *) return 1 ;;
+  esac
+}
+'''
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"{functions}\n{mock}\nclose_zone_web_ingress permanent {zone}",
+            "sfci-test",
+            target,
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+
 def make_release(root: Path, name: str) -> Path:
     path = root / "releases" / name
     path.mkdir(parents=True, exist_ok=True)
@@ -582,6 +613,7 @@ def test_transaction_covers_legacy_firewall_proxy_and_first_install_rollback() -
     assert 'if [[ "$mode" == "permanent" ]]' in close_zone
     assert 'firewall_call "$mode" --zone="$zone" --set-target=DROP' in close_zone
     assert 'firewall_zone_target "$mode" "$zone"' in close_zone
+    assert '|| "$target" == "ACCEPT"' in close_zone
     assert install.count("--set-target=DROP") == 1
     target_helper = install[install.index("firewall_zone_target()") : install.index("service_is_required_non_web()")]
     assert 'firewall_call permanent --zone="$zone" --get-target' in target_helper
@@ -648,6 +680,20 @@ def test_firewall_port_classifier_covers_tcp_and_http3_udp() -> None:
         assert firewall_primitive_helper('port_token_exposes_web "$1"', token).returncode == 0
     for token in ("22/tcp", "53/udp", "443/sctp"):
         assert firewall_primitive_helper('port_token_exposes_web "$1"', token).returncode != 0
+
+
+def test_firewall_closure_drops_every_non_cloudflare_accept_target() -> None:
+    trusted = zone_firewall_flow_helper("trusted", "ACCEPT")
+    assert trusted.returncode == 0, trusted.stderr
+    assert trusted.stderr.splitlines() == ["SET_DROP"]
+
+    ordinary = zone_firewall_flow_helper("home", "default")
+    assert ordinary.returncode == 0, ordinary.stderr
+    assert ordinary.stderr == ""
+
+    cloudflare = zone_firewall_flow_helper("cloudflare", "DROP")
+    assert cloudflare.returncode == 0, cloudflare.stderr
+    assert cloudflare.stderr == ""
 
 
 def test_direct_firewall_parser_preserves_quoted_and_list_arguments() -> None:
