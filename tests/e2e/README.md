@@ -2,7 +2,7 @@
 
 Durable Playwright (Python) browser tests for the Leaflet web app, covering **desktop**
 (1280x800) and **mobile** (iPhone 390x844, touch). They drive the **already-running**
-JVM-free Flask + RAPTOR + walk-graph server; they do not boot their own application process.
+Graph-native Flask + RAPTOR + walk-graph server; they do not boot their own application process.
 
 ## Prerequisites (one-time)
 
@@ -45,8 +45,8 @@ cd tests/e2e && ../../.venv/bin/python -m pytest
 
 ## What's covered
 
-- `test_desktop.py` — specs 1-10: load/no-errors, autocomplete (+ dedup flag), set/fast
-  map, opt-in refine, hover breakdown, color-by-line, sliders, export (CSV + clipboard),
+- `test_desktop.py` — specs 1-10: load/no-errors, autocomplete (+ dedup flag), set/exact
+  map, no-refine surface, hover breakdown, color-by-line, sliders, export (CSV + clipboard),
   permalink round-trip, how-it-works modal.
 - `test_mobile.py` — specs 11-14: bottom-sheet layout + toggle, address on mobile,
   tap-to-breakdown (the key touch interaction), controls reachable + legend clear.
@@ -93,8 +93,8 @@ ROUTE_FAMILY_HOTSPOT_SCAN=1 ROUTE_FAMILY_HOTSPOT_DESTS=6 \
 
 ## Expected skips and failures
 
-There are no intentional expected failures. Under RAPTOR, the one legacy R5 refine test skips
-because `/compute` is already exact and the Refine control is absent. Autocomplete deduplication
+There are no intentional expected failures. Under the graph-native engine, `/compute` is already
+exact and the obsolete Refine control is absent. Autocomplete deduplication
 and primary-line attribution are active passing regressions; do not restore the old expected-fail
 documentation or weaken those assertions.
 

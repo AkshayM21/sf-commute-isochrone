@@ -13,24 +13,28 @@ Data model (standard "trip-pattern" RAPTOR):
     that arrives earlier at some stop) is SPLIT into FIFO sub-patterns so the per-position
     binary search used by RAPTOR stays valid.
   * routes_at_stop: which (pattern, position) pairs serve each stop (CSR).
-  * transfers: synthesized walk footpaths between stops within ``FOOTPATH_M`` great-circle
-    metres (cost = distance / walk speed), bidirectional, spanning ALL feeds (so a Muni ->
-    BART street transfer exists). GTFS transfers.txt is intentionally NOT used yet (the
-    spike hit MAE 1.0 without it); see NOTES.
+  * transfers: a legacy synthesized walk-footpath CSR between stops within ``FOOTPATH_M``
+    great-circle metres (cost = distance / walk speed), bidirectional, spanning ALL feeds.
+    The graph-native access bake replaces this runtime view with its directed, hill-aware
+    transfer CSR and parses ``transfers.txt``/``pathways.txt`` separately; this legacy view
+    remains for cache compatibility and synthetic callers that do not load an access artifact.
 
 Only trips whose service runs on the model date (calendar + calendar_dates exceptions) AND
 whose times intersect the morning band are kept. After-midnight trips (HH >= 24) fall
 outside the band and are dropped, which is correct for an arrive-by-09:00 model.
 
-The build is deterministic and cached to disk (see ``load_or_build``), keyed by the feed
-file fingerprints + service date + band + footpath radius, so the server boots warm.
+The build is deterministic and cached to disk (see ``load_or_build``), keyed by the explicit
+service date, time band, and footpath radius. The cache records direct feed source mtimes and
+rebuilds when those sources change, without content-addressed metadata.
 """
 import io
 import os
 import time
 import pickle
+import tempfile
+import threading
+import weakref
 import zipfile
-import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -49,9 +53,11 @@ def _pd():
         pd = _p
     return pd
 
-BUILD_VERSION = 4            # bump when the struct schema/invariants change (v2: + pat_feed/
+BUILD_VERSION = 6            # bump when the struct schema/invariants change (v2: + pat_feed/
                              # line/mode; v3: FIFO split enforces ARR-column sortedness too;
-                             # v4: retain GTFS stop names for journey-action copy);
+                             # v4: retain GTFS stop names for journey-action copy; v5: explicit
+                             # source freshness metadata replaces content-addressed cache identities;
+                             # v6: canonical feed/GTFS stop identity aligned to gids);
                              # a cached pkl with a different version is rebuilt in place (the
                              # filename is unchanged, so the gid-keyed access table stays valid).
 FOOTPATH_M = float(os.environ.get("RAPTOR_FOOTPATH_M", "250"))  # synthesized-transfer radius (m)
@@ -61,6 +67,13 @@ BAND_START_H = 5.0           # keep trips active from 05:00 ...
 # the window end is a safe upper bound for the morning model.
 
 CACHE_DIR = config.DATA / "raptor_cache"
+
+# A process-local lock prevents two request/boot threads from rebuilding and publishing the
+# same cache identity at once.  Cross-process readers/writers are safe because publication is a
+# single os.replace() of a fully flushed file; a second process may do duplicate work, but it
+# cannot observe a partially written pickle.
+_CACHE_LOCKS_GUARD = threading.Lock()
+_CACHE_LOCKS = weakref.WeakValueDictionary()
 
 
 def _log(*a):
@@ -104,6 +117,7 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
     [band_start_sec, band_end_sec]. Returns a dict of numpy arrays (see module docstring)."""
     _pd()
     stop_key_to_gid = {}
+    stop_feed, stop_id = [], []
     stop_lat, stop_lon, stop_name = [], [], []
 
     def get_gid(feed, sid, lat, lon, name):
@@ -112,6 +126,7 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
         if g is None:
             g = len(stop_lat)
             stop_key_to_gid[key] = g
+            stop_feed.append(str(feed)); stop_id.append(str(sid))
             stop_lat.append(lat); stop_lon.append(lon); stop_name.append(str(name or "").strip())
         return g
 
@@ -256,7 +271,9 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
          f"ras {len(ras_pat)}  footpaths {len(tr_to)}")
     return dict(
         build_version=BUILD_VERSION,
-        n_stops=n_stops, stop_lat=stop_lat, stop_lon=stop_lon, stop_name=stop_name,
+        n_stops=n_stops, stop_feed=np.asarray(stop_feed, dtype="U"),
+        stop_id=np.asarray(stop_id, dtype="U"),
+        stop_lat=stop_lat, stop_lon=stop_lon, stop_name=stop_name,
         pat_nstops=pat_nstops, pat_ntrips=pat_ntrips,
         pat_stop_off=pat_stop_off, pat_mat_off=pat_mat_off,
         pat_stops=pat_stops, pat_dep=pat_dep, pat_arr=pat_arr,
@@ -265,7 +282,7 @@ def build(gtfs_paths, date_str, band_start_sec, band_end_sec, footpath_m=FOOTPAT
         ras_off=ras_off, ras_pat=ras_pat, ras_pos=ras_pos,
         tr_off=tr_off, tr_to=tr_to, tr_time=tr_time,
         feed_trip_counts=feed_trip_counts, date=date_str,
-        band=(band_start_sec, band_end_sec), footpath_m=footpath_m,
+        band=(band_start_sec, band_end_sec), footpath_m=footpath_m, source_mtimes=(),
     )
 
 
@@ -317,47 +334,298 @@ def band_seconds():
     return start, end
 
 
-def _fingerprint(gtfs_paths, date_str, band, footpath_m):
-    h = hashlib.sha256()
-    for p in gtfs_paths:
-        st = Path(p).stat()
-        h.update(f"{Path(p).name}:{st.st_size}:{int(st.st_mtime)}".encode())
-    h.update(f"{date_str}:{band}:{footpath_m}".encode())
-    return h.hexdigest()[:16]
+def _source_mtimes(gtfs_paths):
+    """Return stable direct source freshness metadata for a cache payload.
+
+    The name/size/mtime tuple is deliberately human-readable and does not digest feed contents.
+    Missing paths are represented explicitly so a deleted feed invalidates an old
+    cache instead of silently looking fresh.
+    """
+    result = []
+    for path in gtfs_paths:
+        p = Path(path)
+        try:
+            st = p.stat()
+            result.append((p.name, int(st.st_size), int(st.st_mtime_ns)))
+        except OSError:
+            result.append((p.name, None, None))
+    return tuple(result)
+
+
+def _cache_path(gtfs_paths, date_str, band, footpath_m):
+    """Return the readable canonical cache path for explicit routing parameters.
+
+    ``gtfs_paths`` remains in the signature for compatibility with existing callers, but source
+    identity belongs in the payload's direct mtime metadata rather than in the filename.
+    """
+    del gtfs_paths
+    start, end = (int(band[0]), int(band[1]))
+    footpath = format(float(footpath_m), ".6g")
+    return CACHE_DIR / f"raptor_{date_str}_{start}-{end}_footpath{footpath}m.pkl"
+
+
+_CACHE_REQUIRED_KEYS = frozenset({
+    "build_version", "n_stops", "stop_feed", "stop_id", "stop_lat", "stop_lon", "stop_name",
+    "pat_nstops", "pat_ntrips", "pat_stop_off", "pat_mat_off", "pat_stops",
+    "pat_dep", "pat_arr", "pat_feed", "pat_line", "pat_mode", "feeds",
+    "line_table", "ras_off", "ras_pat", "ras_pos", "tr_off", "tr_to",
+    "tr_time", "feed_trip_counts", "date", "band", "footpath_m", "source_mtimes",
+})
+
+
+def _cache_lock(cache):
+    """Return the stable process-local lock for one cache path."""
+    key = str(Path(cache))
+    with _CACHE_LOCKS_GUARD:
+        lock = _CACHE_LOCKS.get(key)
+        if lock is None:
+            lock = _CACHE_LOCKS[key] = threading.RLock()
+        return lock
+
+
+def _validate_cache_data(data, expected=None):
+    """Return whether *data* is a complete, current RAPTOR cache payload.
+
+    This is intentionally structural rather than a content digest: pickle truncation,
+    unrelated pickles, and older schemas must all be treated as cache misses without risking a
+    partially usable engine.  The builder's result is the source of truth for the values.
+    """
+    if not isinstance(data, dict) or data.get("build_version") != BUILD_VERSION:
+        return False
+    if not _CACHE_REQUIRED_KEYS.issubset(data):
+        return False
+    try:
+        n_stops = int(data["n_stops"])
+        pat_nstops = np.asarray(data["pat_nstops"])
+        pat_ntrips = np.asarray(data["pat_ntrips"])
+        pat_stop_off = np.asarray(data["pat_stop_off"])
+        pat_mat_off = np.asarray(data["pat_mat_off"])
+        pat_stops = np.asarray(data["pat_stops"])
+        pat_dep = np.asarray(data["pat_dep"])
+        pat_arr = np.asarray(data["pat_arr"])
+        pat_feed = np.asarray(data["pat_feed"])
+        pat_line = np.asarray(data["pat_line"])
+        pat_mode = np.asarray(data["pat_mode"])
+        stop_feed = np.asarray(data["stop_feed"])
+        stop_id = np.asarray(data["stop_id"])
+        ras_off = np.asarray(data["ras_off"])
+        ras_pat = np.asarray(data["ras_pat"])
+        ras_pos = np.asarray(data["ras_pos"])
+        tr_off = np.asarray(data["tr_off"])
+        tr_to = np.asarray(data["tr_to"])
+        tr_time = np.asarray(data["tr_time"])
+        arrays = (pat_nstops, pat_ntrips, pat_stop_off, pat_mat_off, pat_stops,
+                  pat_dep, pat_arr, pat_feed, pat_line, pat_mode, ras_off, ras_pat,
+                  ras_pos, tr_off, tr_to, tr_time)
+        if n_stops < 0 or any(a.ndim != 1 for a in arrays):
+            return False
+        if any(a.dtype.kind not in "iu" for a in arrays):
+            return False
+        n_patterns = len(pat_nstops)
+        if len(pat_ntrips) != n_patterns:
+            return False
+        if any(len(a) != n_patterns for a in (pat_feed, pat_line, pat_mode)):
+            return False
+        if (stop_feed.ndim != 1 or stop_id.ndim != 1
+                or stop_feed.dtype.kind not in "OUS" or stop_id.dtype.kind not in "OUS"
+                or len(stop_feed) != n_stops or len(stop_id) != n_stops
+                or len(set(zip(stop_feed.astype(str), stop_id.astype(str)))) != n_stops
+                or any(not str(feed).strip() or not str(sid).strip()
+                       for feed, sid in zip(stop_feed, stop_id))):
+            return False
+        stop_lat = np.asarray(data["stop_lat"])
+        stop_lon = np.asarray(data["stop_lon"])
+        stop_name = np.asarray(data["stop_name"])
+        if (stop_lat.ndim != 1 or stop_lon.ndim != 1 or stop_name.ndim != 1
+                or stop_lat.dtype.kind not in "fiu" or stop_lon.dtype.kind not in "fiu"
+                or stop_name.dtype.kind not in "OUS"
+                or len(stop_lat) != n_stops or len(stop_lon) != n_stops
+                or len(stop_name) != n_stops):
+            return False
+        if np.any(np.isinf(stop_lat)) or np.any(np.isinf(stop_lon)):
+            return False
+        if len(ras_off) != n_stops + 1 or len(tr_off) != n_stops + 1:
+            return False
+        if len(pat_stop_off) != n_patterns + 1 or len(pat_mat_off) != n_patterns + 1:
+            return False
+        if any(off[0] != 0 or np.any(np.diff(off) < 0)
+               for off in (pat_stop_off, pat_mat_off, ras_off, tr_off)):
+            return False
+        if (n_patterns and (np.any(pat_nstops <= 0) or np.any(pat_ntrips <= 0))):
+            return False
+        if not np.array_equal(np.diff(pat_stop_off), pat_nstops):
+            return False
+        matrix_sizes = pat_nstops.astype(np.int64) * pat_ntrips.astype(np.int64)
+        if not np.array_equal(np.diff(pat_mat_off), matrix_sizes):
+            return False
+        if len(pat_stops) != int(pat_stop_off[-1]):
+            return False
+        if len(pat_dep) != len(pat_arr) or len(pat_dep) != int(pat_mat_off[-1]):
+            return False
+        if len(pat_dep) and (np.any(pat_dep < 0) or np.any(pat_arr < 0)):
+            return False
+        if len(ras_pat) != len(ras_pos) or len(ras_pat) != int(ras_off[-1]):
+            return False
+        if len(tr_to) != len(tr_time) or len(tr_to) != int(tr_off[-1]):
+            return False
+        if len(pat_stops) and (np.any(pat_stops < 0) or np.any(pat_stops >= n_stops)):
+            return False
+        if len(pat_feed) and (np.any(pat_feed < 0) or np.any(pat_feed >= len(data["feeds"]))):
+            return False
+        if len(pat_line) and (np.any(pat_line < 0) or np.any(pat_line >= len(data["line_table"]))):
+            return False
+        if len(pat_mode) and (np.any(pat_mode < 0) or np.any(pat_mode > 3)):
+            return False
+        if len(ras_pat):
+            if np.any(ras_pat < 0) or np.any(ras_pat >= n_patterns) or np.any(ras_pos < 0):
+                return False
+            if np.any(ras_pos >= pat_nstops[ras_pat]):
+                return False
+        if len(tr_to) and (np.any(tr_to < 0) or np.any(tr_to >= n_stops)):
+            return False
+        if len(tr_time) and np.any(tr_time < 0):
+            return False
+        if len(data["feed_trip_counts"]) == 0 or any(
+                int(v) <= 0 for v in data["feed_trip_counts"].values()):
+            return False
+        sources = data["source_mtimes"]
+        if not isinstance(sources, (tuple, list)):
+            return False
+        for source in sources:
+            if not isinstance(source, (tuple, list)) or len(source) != 3:
+                return False
+            if not isinstance(source[0], str):
+                return False
+            for value in source[1:]:
+                if value is not None and (not isinstance(value, (int, np.integer)) or value < 0):
+                    return False
+        if expected is not None:
+            if str(data["date"]) != str(expected["date"]):
+                return False
+            if tuple(data["band"]) != tuple(expected["band"]):
+                return False
+            if float(data["footpath_m"]) != float(expected["footpath_m"]):
+                return False
+            if tuple(tuple(x) for x in data["source_mtimes"]) != tuple(tuple(x) for x in expected["source_mtimes"]):
+                return False
+        return True
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def _read_cache(cache, verbose=True, expected=None):
+    """Read and validate one cache, returning None for every cache-miss condition."""
+    try:
+        with open(cache, "rb") as f:
+            data = pickle.load(f)
+    except (OSError, EOFError, pickle.UnpicklingError, ValueError, TypeError,
+            AttributeError, IndexError, KeyError, ImportError, UnicodeDecodeError,
+            OverflowError):
+        if verbose:
+            _log(f"[raptor] cache {cache.name} is unreadable; rebuilding")
+        return None
+    if not _validate_cache_data(data, expected=expected):
+        if verbose:
+            version = data.get("build_version") if isinstance(data, dict) else "unknown"
+            _log(f"[raptor] cache {cache.name} is invalid (build v{version}); rebuilding")
+        return None
+    return data
+
+
+def _fsync_directory(directory):
+    """Best-effort durability barrier for a completed atomic rename."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass  # some filesystems/platforms do not support directory fsync
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _publish_cache(cache, data, verbose=True, expected=None):
+    """Publish a validated payload atomically, returning False if persistence fails.
+
+    The temporary file lives beside the target so os.replace remains atomic on the same
+    filesystem.  Reopening and validating the temporary pickle catches short writes and schema
+    mistakes before the old target is touched.  Any failure leaves an existing target intact.
+    """
+    tmp_name = None
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=f".{cache.name}.", suffix=".tmp",
+                dir=str(cache.parent), delete=False) as f:
+            tmp_name = f.name
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(tmp_name, "rb") as f:
+            published = pickle.load(f)
+        if not _validate_cache_data(published, expected=expected):
+            raise ValueError("serialized RAPTOR cache failed structural validation")
+        os.replace(tmp_name, cache)
+        tmp_name = None
+        _fsync_directory(cache.parent)
+        return True
+    except (OSError, EOFError, pickle.UnpicklingError, ValueError, TypeError,
+            AttributeError, IndexError, KeyError, ImportError, UnicodeDecodeError,
+            OverflowError) as exc:
+        if verbose:
+            _log(f"[raptor] could not publish cache {cache.name}: {exc}")
+        return False
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
 
 
 def load_or_build(gtfs_paths=None, service_date=None, footpath_m=FOOTPATH_M, verbose=True):
     """Return RAPTOR structures for the canonical model, building + caching on first use.
 
-    The cache key folds in each feed's size+mtime, so a GTFS repull (or a footpath-radius
-    change) invalidates it automatically. Cheap to rebuild (~1-2s, no JVM)."""
+    The canonical filename contains only explicit routing parameters. A GTFS repull invalidates
+    the payload through its direct source size/mtime metadata. Cheap to rebuild (~1-2s, no JVM).
+    """
     gtfs_paths = gtfs_paths or config.gtfs_paths()
     service_date = service_date or feeds.pick_service_date(gtfs_paths)
     date_str = service_date.strftime("%Y%m%d")
     band = band_seconds()
-    fp = _fingerprint(gtfs_paths, date_str, band, footpath_m)
+    source_mtimes = _source_mtimes(gtfs_paths)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache = CACHE_DIR / f"raptor_{date_str}_{fp}.pkl"
-    if cache.exists():
-        with open(cache, "rb") as f:
-            data = pickle.load(f)
-        if data.get("build_version") == BUILD_VERSION:
-            if verbose:
-                _log(f"[raptor] loading cached structures {cache.name}")
-            return data
+    cache = _cache_path(gtfs_paths, date_str, band, footpath_m)
+    expected = {"date": date_str, "band": band, "footpath_m": footpath_m,
+                "source_mtimes": source_mtimes}
+    with _cache_lock(cache):
+        if cache.exists():
+            data = _read_cache(cache, verbose=verbose, expected=expected)
+            if data is not None:
+                if verbose:
+                    _log(f"[raptor] loading cached structures {cache.name}")
+                return data
         if verbose:
-            _log(f"[raptor] cache {cache.name} is build v{data.get('build_version')} "
-                 f"!= v{BUILD_VERSION}; rebuilding")
-    if verbose:
-        _log(f"[raptor] building structures for {date_str} band {band} ...")
-    t = time.time()
-    data = build(gtfs_paths, date_str, band[0], band[1], footpath_m)
-    if verbose:
-        _log(f"[raptor] built in {time.time()-t:.1f}s; trip counts {data['feed_trip_counts']}")
-    assert all(v > 0 for v in data["feed_trip_counts"].values()), "a feed has 0 trips in band!"
-    with open(cache, "wb") as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    return data
+            _log(f"[raptor] building structures for {date_str} band {band} ...")
+        t = time.time()
+        data = build(gtfs_paths, date_str, band[0], band[1], footpath_m)
+        data["source_mtimes"] = source_mtimes
+        if verbose:
+            _log(f"[raptor] built in {time.time()-t:.1f}s; trip counts {data['feed_trip_counts']}")
+        assert all(v > 0 for v in data["feed_trip_counts"].values()), "a feed has 0 trips in band!"
+        if not _validate_cache_data(data, expected=expected):
+            raise ValueError("RAPTOR build produced structurally invalid cache data")
+        if not _publish_cache(cache, data, verbose=verbose, expected=expected):
+            # Disk persistence is an optimization; a valid in-memory build remains usable and an
+            # existing cache (if any) was deliberately left untouched.
+            pass
+        return data
 
 
 if __name__ == "__main__":

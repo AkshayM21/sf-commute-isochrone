@@ -18,34 +18,20 @@ color-by-line is stable run-to-run.
 import numpy as np
 
 from .raptor import NEG, INF as _INF
+from . import route_response as _route_response
 
-_TINY_HOP_MIN = 2.0          # fold sub-2-min transit hops into adjacent walk (matches server.py)
-EGRESS_INF = np.int64(1 << 40)   # per-stop egress-walk sentinel: not egress-reachable from W
+_TINY_HOP_MIN = _route_response._TINY_HOP_MIN  # fold sub-2-min hops into adjacent walk
+EGRESS_INF = _route_response.EGRESS_INF       # per-stop egress-walk sentinel
 
 
 def reconcile_legs(legs, total_min):
-    """Final rounding reconciliation for a leg breakdown — the ONE implementation shared by
-    the RAPTOR hover path (``JourneyTree._format``) and the R5 recorded-path breakdown
-    (``server._build_itin``), so the two displays can never drift.
+    """Compatibility wrapper for the historical public helper.
 
-    ``legs`` is the already-ROUNDED integer leg list ({"mode","line","min"[,"wait"]});
-    ``total_min`` the integer map total the legs must sum to. Drops zero-minute walk legs,
-    then patches the rounding residual into the LAST walk leg (clamped >= 0; a positive
-    residual with no walk leg appends one) and re-filters, so the displayed legs + waits sum
-    EXACTLY to the map color's minutes. Returns the response dict {"total","xfers","legs"}."""
-    total_min = int(total_min)
-    legs = [l for l in legs if not (l["mode"] == "walk" and l["min"] <= 0)]
-    rides_kept = sum(1 for l in legs if l["mode"] != "walk")
-    cur = sum(l["min"] for l in legs) + sum(l.get("wait", 0) for l in legs)
-    diff = total_min - cur
-    if diff != 0:
-        walks = [l for l in legs if l["mode"] == "walk"]
-        if walks:
-            walks[-1]["min"] = max(0, walks[-1]["min"] + diff)
-        elif diff > 0:
-            legs.append({"mode": "walk", "line": None, "min": diff})
-        legs = [l for l in legs if not (l["mode"] == "walk" and l["min"] <= 0)]
-    return {"total": total_min, "xfers": max(0, rides_kept - 1), "legs": legs}
+    Resolve the delegated implementation at call time so both the old
+    ``raptor_journey.reconcile_legs`` and new ``route_response.reconcile_legs`` monkeypatch
+    seams remain effective.
+    """
+    return _route_response.reconcile_legs(legs, total_min)
 
 
 class JourneyTree:
@@ -891,47 +877,9 @@ class JourneyTree:
 
     # -- leg formatting + rounding reconciliation (hover == map) ---------------------------
     def _format(self, out, total_min):
-        # Round to minutes while keeping the displayed components close to their real seconds.
-        # Older code rounded every component independently, then dumped any residual into the last
-        # walk leg. That kept the sum invariant but could label a short egress walk as several
-        # minutes on multi-leg routes. Use largest-remainder rounding first; reconcile_legs remains
-        # as a final guard for callers whose target minute is not just ceil(total seconds).
-        # The geometry-source "segs" (when _clock collected them) ride along on each leg dict
-        # — reconcile_legs filters/patches the SAME dicts, so a dropped zero-minute walk leg
-        # drops its geometry too (geom stays 1:1 with the DISPLAYED legs).
-        legs = []
-        comps = []
-        for l in out:
-            if l["mode"] == "walk":
-                d = {"mode": "walk", "line": None, "min": 0}
-                # Planned depart-after traces split the first walk into actual street time and
-                # controllable pre-board allowance. Keep that identity on the formatted dict:
-                # a zero-rounded access walk may be dropped while a later egress survives, so
-                # ordinal matching back to ``out`` is not reliable.
-                if "schedule_allowance_sec" in l:
-                    d["physical_min"] = int(l.get("physical_sec", 0)) / 60.0
-                    d["schedule_allowance_min"] = int(l["schedule_allowance_sec"]) / 60.0
-                comps.append((d, "min", float(l["sec"]) / 60.0))
-            else:
-                d = {"mode": "transit", "line": l["line"],
-                     "min": 0, "wait": 0}
-                comps.append((d, "min", float(l["sec"]) / 60.0))
-                comps.append((d, "wait", float(l["wait_sec"]) / 60.0))
-            if "segs" in l:
-                d["segs"] = l["segs"]
-            legs.append(d)
-        base_sum = 0
-        ranked = []
-        for idx, (d, field, exact) in enumerate(comps):
-            base = int(np.floor(exact))
-            d[field] = base
-            base_sum += base
-            if exact > 1e-9:
-                ranked.append((-(exact - base), idx, d, field))
-        remaining = max(0, int(total_min) - base_sum)
-        for _frac, _idx, d, field in sorted(ranked)[:min(remaining, len(ranked))]:
-            d[field] += 1
-        return reconcile_legs(legs, total_min)
+        # ``reconcile_legs`` is passed explicitly to preserve the historical module-level
+        # monkeypatch seam while the pure formatting implementation lives in route_response.
+        return _route_response.format_legs(out, total_min, reconcile_fn=reconcile_legs)
 
     def _dominant(self, legs_raw):
         rides = [l for l in legs_raw if l[0] == "ride" and (l[3] - l[2]) >= _TINY_HOP_MIN * 60]
@@ -959,45 +907,13 @@ from .raptor_journey_da import DepartAfterJourneyTree  # noqa: E402  (cyclic-saf
 
 
 def _push_walk(out, sec, seg=None):
-    if sec <= 0:
-        return
-    if out and out[-1]["mode"] == "walk":
-        out[-1]["sec"] += sec
-        if seg is not None:
-            out[-1].setdefault("segs", []).append(seg)
-    else:
-        d = {"mode": "walk", "line": None, "sec": sec}
-        if seg is not None:
-            d["segs"] = [seg]
-        out.append(d)
+    return _route_response._push_walk(out, sec, seg)
 
 
 def _footpath_sec(tr_off, tr_to, tr_time, s, j):
-    for k in range(int(tr_off[s]), int(tr_off[s + 1])):
-        if int(tr_to[k]) == j:
-            return int(tr_time[k])
-    return 0                                             # same-stop transfer (no footpath edge)
+    return _route_response._footpath_sec(tr_off, tr_to, tr_time, s, j)
 
 
 def _min_overshoot_alight(pat_arr, pat_stops, eg_sec, trow, sbase, bpos, ns, apos, nd_egress):
-    """The no-overshoot FINAL-ride alight: the forward, egress-reachable position p >= bpos+1 on
-    this trip minimizing the W-arrival arr[p] + egress_walk(stop@p). Seeded with the tree's own
-    alight ``apos`` (egress-reachable by construction); ``nd_egress`` is the egress node's stored
-    walk seconds, used as a fallback when the per-stop egress table is absent (legacy caller).
-    Shared by ``_trace_from`` and ``_build_node_stats`` so the traced journey and the jtime/depth
-    stats agree byte-for-byte. Returns ``(alight_position, egress_walk_sec)`` — both call sites use
-    the SAME resolved egress (incl. the legacy fallback), so there is ONE place the egress is
-    derived and no chance of byte-drift between the trace and the stats."""
-    best_p = int(apos)
-    best_w = int(eg_sec[int(pat_stops[sbase + best_p])])
-    if best_w >= EGRESS_INF:
-        best_w = int(nd_egress) if nd_egress >= 0 else 0
-    best_arrW = int(pat_arr[trow + best_p]) + best_w
-    for p in range(int(bpos) + 1, int(ns)):
-        w = int(eg_sec[int(pat_stops[sbase + p])])
-        if w >= EGRESS_INF:
-            continue
-        cand = int(pat_arr[trow + p]) + w
-        if cand < best_arrW or (cand == best_arrW and (w < best_w or (w == best_w and p > best_p))):
-            best_arrW = cand; best_p = p; best_w = w
-    return best_p, best_w
+    return _route_response._min_overshoot_alight(
+        pat_arr, pat_stops, eg_sec, trow, sbase, bpos, ns, apos, nd_egress)

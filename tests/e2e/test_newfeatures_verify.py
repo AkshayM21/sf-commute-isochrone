@@ -9,7 +9,7 @@ Ad-hoc verification specs for the new work items (run against PORT=8765, RAPTOR 
 Drives the running server at $E2E_BASE_URL. Screenshots land in tests/e2e/screens/.
 NOT part of the committed suite (pytest.ini testpaths excludes it); run explicitly:
   E2E_BASE_URL=http://127.0.0.1:8765 ../../.venv/bin/python -m pytest test_newfeatures_verify.py
-The conftest set_address/wait_for_fast_map helpers assume the legacy R5 server (#dest shows
+The conftest set_address/wait_for_fast_map helpers assume the graph-native server (#dest shows
 'fast ~Nms'); under RAPTOR #dest has no 'fast', so we set the address + wait locally here.
 """
 import pytest
@@ -85,10 +85,10 @@ ALT_CELL_LL = (37.80075, -122.46369)
 
 def _cp_of(page, lat, lon):
     """Viewport pixel of a lat/lon (recenters the map there so it's on-screen + left of the card)."""
-    page.evaluate("([lat,lon]) => { map.setView([lat,lon], 13); return null; }", [lat, lon])
+    page.evaluate("([lat,lon]) => { window.__SFCI_E2E__.map.setView([lat,lon], 13); return null; }", [lat, lon])
     page.wait_for_timeout(500)
     return page.evaluate(
-        "([lat,lon]) => { const p = map.latLngToContainerPoint(L.latLng(lat,lon));"
+        "([lat,lon]) => { const p = window.__SFCI_E2E__.map.latLngToContainerPoint(L.latLng(lat,lon));"
         " const r = document.getElementById('map').getBoundingClientRect();"
         " return {x: r.x+p.x, y: r.y+p.y}; }", [lat, lon])
 
@@ -112,10 +112,10 @@ def test_compare_family_focus(page):
     page.wait_for_selector("#pincard.open #route-choices-panel .route-choice", timeout=COMPUTE_TIMEOUT)
     page.wait_for_timeout(500)
     choices = page.locator("#route-choices-panel .route-choice:visible")
-    options = page.evaluate("() => compareList.length")
+    options = page.evaluate("() => window.__SFCI_E2E__.compareList.length")
     assert options >= 2, f"expected >=2 route options, got {options}"
     assert choices.count() >= 2, "route inspector omitted its exact route-choice controls"
-    drawn0 = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
+    drawn0 = page.evaluate("() => { const d=window.__SFCI_E2E__.drawn; return d&&d.multi?{f:d.famKey,b:d.branchKey}:null; }")
     assert drawn0, "pin should draw the selected route with its alternative context"
     shot(page, "nf_03_pinned_compare_list")
 
@@ -125,7 +125,7 @@ def test_compare_family_focus(page):
     expected_branch = target.get_attribute("data-branch")
     target.hover()
     page.wait_for_timeout(400)
-    drawn1 = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
+    drawn1 = page.evaluate("() => { const d=window.__SFCI_E2E__.drawn; return d&&d.multi?{f:d.famKey,b:d.branchKey}:null; }")
     assert drawn1 == {"f": expected_family, "b": expected_branch}, drawn1
     assert target.get_attribute("aria-pressed") == "false", "hover previews without locking selection"
     shot(page, "nf_04_row_hover_swap")
@@ -138,7 +138,7 @@ def test_compare_family_focus(page):
     box = page.eval_on_selector("#map", "el => { const r = el.getBoundingClientRect(); return {x:r.x,y:r.y,w:r.width,h:r.height}; }")
     page.mouse.move(int(box["x"] + 160), int(box["y"] + box["h"] - 160))
     page.wait_for_timeout(400)
-    locked = page.evaluate("() => DRAWN&&DRAWN.multi?{f:DRAWN.famKey,b:DRAWN.branchKey}:null")
+    locked = page.evaluate("() => { const d=window.__SFCI_E2E__.drawn; return d&&d.multi?{f:d.famKey,b:d.branchKey}:null; }")
     assert locked == drawn1, f"locked family lens should persist after mouse-away ({drawn1!r} -> {locked!r})"
 
 
@@ -153,7 +153,7 @@ def test_no_hover_while_pinned(page):
     page.mouse.click(*hit)
     page.wait_for_selector("#pincard.open", timeout=COMPUTE_TIMEOUT)
     page.wait_for_timeout(400)
-    before = page.evaluate("() => (typeof DRAWN!=='undefined'&&DRAWN)?JSON.stringify({c:DRAWN.id,col:DRAWN.identityColor}):null")
+    before = page.evaluate("() => { const d=window.__SFCI_E2E__.drawn; return d?JSON.stringify({c:d.id,col:d.identityColor}):null; }")
     # hover lower-left map cells, clear of the top-right pin card
     box = page.eval_on_selector("#map", "el => { const r = el.getBoundingClientRect(); return {x:r.x,y:r.y,w:r.width,h:r.height}; }")
     ox, oy = int(box["x"] + 160), int(box["y"] + box["h"] - 160)
@@ -163,7 +163,7 @@ def test_no_hover_while_pinned(page):
     page.wait_for_timeout(200)
     tt = page.query_selector(".leaflet-tooltip.tt")
     assert not (tt and tt.is_visible()), "a sticky tooltip opened while pinned"
-    after = page.evaluate("() => (typeof DRAWN!=='undefined'&&DRAWN)?JSON.stringify({c:DRAWN.id,col:DRAWN.identityColor}):null")
+    after = page.evaluate("() => { const d=window.__SFCI_E2E__.drawn; return d?JSON.stringify({c:d.id,col:d.identityColor}):null; }")
     assert before == after, f"DRAWN changed by hovering another cell while pinned ({before} -> {after})"
 
 

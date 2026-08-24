@@ -59,7 +59,7 @@ fetch_op () {
     && mv "$DATA/$out.part" "$DATA/$out"
   # 511 sometimes wraps zip with BOM; validate
   if valid_gtfs_zip "$DATA/$out"; then
-    echo "OK $out ($(ls -lh "$DATA/$out" | awk '{print $5}'))"
+    echo "OK $out ($(du -h "$DATA/$out" | awk '{print $1}'))"
     unzip -p "$DATA/$out" calendar.txt 2>/dev/null | head -3 || true
   else
     echo "FAILED to get valid zip for $op. First bytes:"; head -c 300 "$DATA/$out" 2>/dev/null; echo; exit 1

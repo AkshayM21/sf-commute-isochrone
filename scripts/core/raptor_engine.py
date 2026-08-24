@@ -1,12 +1,13 @@
-"""RaptorEngine — the JVM-free, server-facing grid travel-time engine.
+"""RaptorEngine — the server-facing grid travel-time engine.
 
-Loads the RAPTOR structures (raptor_build) + the baked cell->stop walk-access table
-(raptor_oracle), and turns a workplace's egress/pure-walk (computed by the caller, e.g. one
-R5 walk matrix, or any walk router) into per-cell door-to-door times. No r5py here.
+Loads the RAPTOR structures (raptor_build) plus the graph-native baked cell-to-stop access
+table.  Its reverse transfer CSR is consumed by the backward RAPTOR kernels while the paired
+forward CSR/path arrays remain available to geometry consumers.  A workplace's egress/pure-walk
+can still be supplied by any caller-side walk router.
 
 Three semantics from the SAME reverse range-RAPTOR inputs:
   * planned scheduled depart-after — the served, first-boarding-anchored product metric.
-  * legacy depart-after p5/p50 over [DEP, DEP+WINDOW] — R5-comparable validation output.
+  * legacy depart-after p5/p50 over [DEP, DEP+WINDOW] — retained validation output.
   * legacy arrive-by over an arrival window ending at the target (default [TARGET-WINDOW, TARGET]);
     single-deadline arrive-by is the WINDOW=0 case.
 
@@ -14,9 +15,10 @@ The hot reverse sweep runs in the numba kernel automatically when available; ass
 """
 import os
 import time
+from pathlib import Path
 import numpy as np
 
-from . import config, raptor_build, raptor as R, raptor_journey
+from . import config, graph_transfers, raptor_build, raptor as R, raptor_journey
 
 
 def _perf_add(perf, name, started):
@@ -30,8 +32,30 @@ MC_DEADLINE_STEP = int(os.environ.get("RAPTOR_MC_DEADLINE_STEP", "60"))  # MC ta
 PLANNED_DEADLINE_STEP = int(os.environ.get("RAPTOR_PLANNED_DEADLINE_STEP", "60"))
 DEP_STEP = 60
 BOARD_SLACK = int(os.environ.get("RAPTOR_BOARD_SLACK", "60"))
-MAX_ROUNDS = 8                                    # rides = transfers + 1 (R5 default cap)
+MAX_ROUNDS = 8                                    # rides = transfers + 1
 ARRIVE_BY_HM = (9, 0)                             # product target: arrive by 09:00
+
+# Runtime transfer timing/path arrays emitted by the canonical graph-native access bake.  The
+# metadata arrays are retained on the engine separately; RAPTOR itself consumes only tr_off,
+# tr_to, and the effective tr_time view.
+_ACCESS_TRANSFER_KEYS = (
+    # Reverse target -> source runtime view for RAPTOR.
+    "tr_off", "tr_to", "tr_walk_time", "tr_min_time", "tr_time", "tr_path_fallback",
+    # Forward source -> target geometry view.
+    "tr_forward_off", "tr_forward_to", "tr_forward_walk_time", "tr_forward_min_time",
+    "tr_forward_time", "tr_forward_path_off", "tr_forward_path_points",
+    "tr_forward_path_fallback", "tr_forward_pathway_off", "tr_forward_pathway_id",
+    "tr_forward_pathway_time", "tr_forward_pathway_mode", "tr_forward_pathway_length_m",
+    "tr_forward_pathway_reversed", "transfer_scoped_source", "transfer_scoped_target",
+    "transfer_scoped_from_route", "transfer_scoped_to_route", "transfer_scoped_from_trip",
+    "transfer_scoped_to_trip", "transfer_scoped_min_time", "transfer_scoped_prohibited",
+    "transfer_scoped_type",
+    "transfer_scoped_physical_time", "transfer_scoped_path_fallback",
+    "transfer_scoped_path_off", "transfer_scoped_path_points",
+    "transfer_pathway_source", "transfer_pathway_target", "transfer_pathway_id",
+    "transfer_pathway_time", "transfer_pathway_mode", "transfer_pathway_length_m",
+    "transfer_pathway_reversed",
+)
 
 # --- service-noise Monte-Carlo (realistic + fragility + alt-lines) --------------------
 MC_DRAWS = int(os.environ.get("RAPTOR_MC_DRAWS", "24"))       # draws for realistic/fragility
@@ -60,7 +84,7 @@ _MU = dict(bus=float(os.environ.get("RAPTOR_MC_MU_BUS", "70")),
            bart=float(os.environ.get("RAPTOR_MC_MU_BART", "25")),
            caltrain=float(os.environ.get("RAPTOR_MC_MU_CALTRAIN", "40")))
 # fractional DRIFT (delay grows with time on the vehicle); the most uncertain knob, kept modest
-# so a long peripheral bus ride doesn't over-inflate the median (validated vs R5 p50 bias).
+# so a long peripheral bus ride does not over-inflate the median in the validation corpus.
 _SLOPE = dict(bus=0.035, metro=0.025, cable=0.03, bart=0.012, caltrain=0.02)
 
 
@@ -242,30 +266,46 @@ class RaptorEngine:
     def _load_access(self, access_path, verbose):
         expect_grid_m = None                      # set only when WE pick the table (default path);
         if access_path is None:                   # explicit callers choose their own grid
-            fp = raptor_build._fingerprint(
-                config.gtfs_paths(), self.service_date.strftime("%Y%m%d"),
-                raptor_build.band_seconds(), raptor_build.FOOTPATH_M)
-            # exact name, NOT a glob: a glob would also match access_walk*/access_walkflat*
-            # (and any leftover bake at another resolution would shadow the intended grid)
-            access_path = raptor_build.CACHE_DIR / f"access_{config.GRID_M}m_{fp}.npz"
+            # Exact canonical name, not a glob: the bake is selected by explicit grid and
+            # service date, while its direct source mtimes are validated below.
+            access_path = (raptor_build.CACHE_DIR /
+                           f"access_walk_{config.GRID_M}m_{self.service_date:%Y%m%d}.npz")
             if not access_path.exists():
                 raise FileNotFoundError(
                     f"no baked access table {access_path.name} in {raptor_build.CACHE_DIR}; "
-                    f"run scripts/raptor_oracle.py")
+                    f"run scripts/bake_walk_access.py")
             expect_grid_m = config.GRID_M
-        z = np.load(access_path, allow_pickle=True)
-        if int(z["n_stops"]) != self.data["n_stops"]:
-            raise ValueError("access table / raptor structures stop-count mismatch (stale cache)")
-        if (expect_grid_m is not None and "grid_m" in z.files
-                and int(z["grid_m"]) != expect_grid_m):
-            raise ValueError(f"access table {access_path.name} is a {int(z['grid_m'])}m bake "
-                             f"but the configured grid is {expect_grid_m}m")
-        self.cell_ids = list(z["cell_ids"].astype(str))
-        self.cell_index = {c: i for i, c in enumerate(self.cell_ids)}
-        # filter to the access cap and re-pack CSR (seconds)
-        off = z["access_off"]; to = z["access_to"]; w = z["access_w"]
+        with np.load(access_path, allow_pickle=False) as z:
+            self._validate_access_artifact(z, access_path, expect_grid_m)
+            self.cell_ids = list(z["cell_ids"].astype(str))
+            self.cell_index = {c: i for i, c in enumerate(self.cell_ids)}
+            # The graph bake is the runtime source of truth for directed transfers.  Keep
+            # timing/path metadata on the engine for geometry consumers, while RAPTOR sees the
+            # effective reference-time CSR in the same keys it has always consumed.
+            self.data = dict(self.data)
+            for key in _ACCESS_TRANSFER_KEYS:
+                self.data[key] = np.array(z[key], copy=True)
+            self.transfer_path_off = np.array(z["tr_forward_path_off"], copy=True)
+            self.transfer_path_points = np.array(z["tr_forward_path_points"], copy=True)
+            self.transfer_path_fallback = np.array(z["tr_forward_path_fallback"], copy=True)
+            self.transfer_pathway_off = np.array(z["tr_forward_pathway_off"], copy=True)
+            self.transfer_scoped_physical_time = np.array(
+                z["transfer_scoped_physical_time"], copy=True)
+            self.transfer_scoped_path_off = np.array(
+                z["transfer_scoped_path_off"], copy=True)
+            self.transfer_scoped_path_points = np.array(
+                z["transfer_scoped_path_points"], copy=True)
+            self.transfer_scoped_path_fallback = np.array(
+                z["transfer_scoped_path_fallback"], copy=True)
+            self.transfer_scoped_source = np.array(z["transfer_scoped_source"], copy=True)
+            self.transfer_scoped_target = np.array(z["transfer_scoped_target"], copy=True)
+            self.transfer_pathway_source = np.array(z["transfer_pathway_source"], copy=True)
+            self.transfer_pathway_target = np.array(z["transfer_pathway_target"], copy=True)
+            # filter to the access cap and re-pack CSR (seconds)
+            off = np.asarray(z["access_off"]); to = np.asarray(z["access_to"]); w = np.asarray(z["access_w"])
+            # Keep only arrays needed after the archive is closed.
+            n = len(self.cell_ids)
         cap = self.access_cap_min * 60
-        n = len(self.cell_ids)
         new_off = np.zeros(n + 1, dtype=np.int64)
         keep_to, keep_w = [], []
         for ci in range(n):
@@ -282,6 +322,294 @@ class RaptorEngine:
         if verbose:
             print(f"[engine] access table {access_path.name}: {n} cells, "
                   f"{len(self.access_to)} pairs <= {self.access_cap_min}min walk")
+
+    def _validate_access_artifact(self, z, access_path, expect_grid_m=None):
+        """Validate the graph-native access archive and its direct source metadata."""
+        required = {"cell_ids", "access_off", "access_to", "access_w", "grid_m", "n_stops",
+                    "service_date", "walk_ref_kmh", "slope_aware", "raptor_source_names",
+                    "raptor_source_sizes", "raptor_source_mtimes_ns", "walk_graph_size",
+                    "walk_graph_mtime_ns", "footpath_m", "raptor_build_version",
+                    "grid_source_names", "grid_source_sizes", "grid_source_mtimes_ns",
+                    *_ACCESS_TRANSFER_KEYS,
+                    "transfer_scoped_source", "transfer_scoped_target", "transfer_scoped_from_route",
+                    "transfer_scoped_to_route", "transfer_scoped_from_trip", "transfer_scoped_to_trip",
+                    "transfer_scoped_min_time", "transfer_scoped_prohibited",
+                    "transfer_pathway_source", "transfer_pathway_target", "transfer_pathway_id",
+                    "transfer_pathway_time", "transfer_pathway_mode", "transfer_pathway_length_m",
+                    "transfer_pathway_reversed"}
+        if not required.issubset(z.files):
+            raise ValueError(f"access table {access_path.name} is missing required metadata")
+        for scalar_key in (
+                "grid_m", "n_stops", "service_date", "walk_ref_kmh", "slope_aware",
+                "walk_graph_size", "walk_graph_mtime_ns", "footpath_m",
+                "raptor_build_version"):
+            if np.asarray(z[scalar_key]).ndim != 0:
+                raise ValueError(f"access table {access_path.name} has invalid scalar metadata")
+        cell_ids = np.asarray(z["cell_ids"])
+        off = np.asarray(z["access_off"]); to = np.asarray(z["access_to"]); w = np.asarray(z["access_w"])
+        if cell_ids.ndim != 1 or cell_ids.dtype.kind not in "OUS":
+            raise ValueError(f"access table {access_path.name} has invalid cell ids")
+        n_cells = len(cell_ids)
+        if len(set(cell_ids.astype(str))) != n_cells:
+            raise ValueError(f"access table {access_path.name} has duplicate cells")
+        if off.ndim != 1 or off.dtype.kind not in "iu" or len(off) != n_cells + 1:
+            raise ValueError(f"access table {access_path.name} has invalid CSR offsets")
+        if off[0] != 0 or np.any(np.diff(off) < 0) or int(off[-1]) != len(to) or len(to) != len(w):
+            raise ValueError(f"access table {access_path.name} has inconsistent CSR arrays")
+        if to.ndim != 1 or to.dtype.kind not in "iu" or w.ndim != 1 or w.dtype.kind not in "iu":
+            raise ValueError(f"access table {access_path.name} has invalid CSR dtypes")
+        n_stops = int(np.asarray(z["n_stops"]))
+        if n_stops != int(self.data["n_stops"]) or np.any(to < 0) or np.any(to >= n_stops) or np.any(w < 0):
+            raise ValueError("access table / raptor structures stop-count mismatch (stale cache)")
+        grid_m_value = np.asarray(z["grid_m"])
+        if grid_m_value.ndim != 0 or int(grid_m_value) <= 0:
+            raise ValueError(f"access table {access_path.name} has invalid grid size metadata")
+        grid_m = int(grid_m_value)
+        if expect_grid_m is not None and grid_m != expect_grid_m:
+            raise ValueError(f"access table {access_path.name} is a {grid_m}m bake but the configured grid is {expect_grid_m}m")
+        if str(np.asarray(z["service_date"]).item()) != self.service_date.strftime("%Y%m%d"):
+            raise ValueError(f"access table {access_path.name} has a different service date")
+        if abs(float(np.asarray(z["walk_ref_kmh"])) - float(config.WALK_KMH)) > 1e-6:
+            raise ValueError(f"access table {access_path.name} uses a different walk reference speed")
+        if int(np.asarray(z["slope_aware"])) != 1:
+            raise ValueError(f"access table {access_path.name} is not the hill-aware bake")
+        if (abs(float(np.asarray(z["footpath_m"])) - float(self.data["footpath_m"])) > 1e-9
+                or int(np.asarray(z["raptor_build_version"]))
+                != int(self.data["build_version"])):
+            raise ValueError(f"access table {access_path.name} has incompatible transfer bake parameters")
+        if (int(np.asarray(z["walk_graph_size"])) < -1
+                or int(np.asarray(z["walk_graph_mtime_ns"])) < -1):
+            raise ValueError(f"access table {access_path.name} has invalid walking graph metadata")
+        grid_names = np.asarray(z["grid_source_names"]).astype(str)
+        grid_sizes = np.asarray(z["grid_source_sizes"])
+        grid_mtimes = np.asarray(z["grid_source_mtimes_ns"])
+        if (grid_names.ndim != 1 or grid_sizes.ndim != 1 or grid_mtimes.ndim != 1
+                or not (len(grid_names) == len(grid_sizes) == len(grid_mtimes))
+                or len(grid_names) == 0 or any(not str(name).strip() for name in grid_names)
+                or grid_sizes.dtype.kind not in "iu" or grid_mtimes.dtype.kind not in "iu"
+                or np.any(grid_sizes < -1) or np.any(grid_mtimes < -1)):
+            raise ValueError(f"access table {access_path.name} has invalid grid source metadata")
+        grid_source = config.neigh_path()
+        try:
+            grid_st = grid_source.stat()
+            actual_grid = (grid_source.name, int(grid_st.st_size), int(grid_st.st_mtime_ns))
+        except OSError:
+            actual_grid = (Path(grid_source).name, -1, -1)
+        stored_grid = tuple((str(name), int(size), int(mtime))
+                            for name, size, mtime in zip(grid_names, grid_sizes, grid_mtimes))
+        if stored_grid != (actual_grid,):
+            raise ValueError(f"access table {access_path.name} is stale relative to the neighborhood/grid source")
+
+        def _check_view(prefix, *, with_paths=False):
+            off = np.asarray(z[f"{prefix}off"]); to = np.asarray(z[f"{prefix}to"])
+            walk = np.asarray(z[f"{prefix}walk_time"]); minimum = np.asarray(z[f"{prefix}min_time"])
+            effective = np.asarray(z[f"{prefix}time"]); fallback = np.asarray(z[f"{prefix}path_fallback"])
+            if (off.ndim != 1 or off.dtype.kind not in "iu" or len(off) != n_stops + 1
+                    or off[0] != 0 or np.any(np.diff(off) < 0) or int(off[-1]) != len(to)
+                    or to.ndim != 1 or to.dtype.kind not in "iu"
+                    or np.any(to < 0) or np.any(to >= n_stops)):
+                return False
+            edge_count = len(to)
+            if any(a.ndim != 1 or len(a) != edge_count for a in (walk, minimum, effective, fallback)):
+                return False
+            if (walk.dtype.kind not in "fiu" or minimum.dtype.kind not in "fiu"
+                    or effective.dtype.kind not in "iu" or fallback.dtype.kind not in "biu"
+                    or not np.isfinite(walk).all() or not np.isfinite(minimum).all()
+                    or np.any(walk < 0) or np.any(minimum < 0) or np.any(effective < 0)
+                    or not np.array_equal(effective, np.floor(np.maximum(walk, minimum) + 0.5).astype(effective.dtype))
+                    or np.any((fallback != 0) & (fallback != 1))):
+                return False
+            for row in range(n_stops):
+                a, b = int(off[row]), int(off[row + 1])
+                if b - a > 1 and np.any(np.diff(to[a:b]) <= 0):
+                    return False
+            if with_paths:
+                path_off = np.asarray(z["tr_forward_path_off"]); points = np.asarray(z["tr_forward_path_points"])
+                if (path_off.ndim != 1 or path_off.dtype.kind not in "iu"
+                        or len(path_off) != edge_count + 1 or path_off[0] != 0
+                        or np.any(np.diff(path_off) < 2) or int(path_off[-1]) != len(points)
+                        or points.ndim != 2 or points.shape[1:] != (2,)
+                        or points.dtype.kind not in "f" or not np.isfinite(points).all()
+                        or np.any(points[:, 0] < -90.0) or np.any(points[:, 0] > 90.0)
+                        or np.any(points[:, 1] < -180.0) or np.any(points[:, 1] > 180.0)):
+                    return False
+                # Every stored path is a reusable route result, not merely a polyline blob:
+                # its endpoints must remain attached to the forward CSR edge's canonical stops.
+                try:
+                    stop_lat = np.asarray(self.data["stop_lat"], dtype=np.float64)
+                    stop_lon = np.asarray(self.data["stop_lon"], dtype=np.float64)
+                    sources = np.repeat(np.arange(n_stops, dtype=np.int64), np.diff(off))
+                    if (stop_lat.ndim != 1 or stop_lon.ndim != 1
+                            or len(stop_lat) != n_stops or len(stop_lon) != n_stops
+                            or len(sources) != edge_count
+                            or (edge_count and (
+                                not np.isfinite(stop_lat[sources]).all()
+                                or not np.isfinite(stop_lon[sources]).all()
+                                or not np.isfinite(stop_lat[to]).all()
+                                or not np.isfinite(stop_lon[to]).all()))):
+                        return False
+                    if (not np.allclose(
+                            points[path_off[:-1]],
+                            np.column_stack((stop_lat[sources], stop_lon[sources])),
+                            atol=1e-5, rtol=0.0)
+                            or not np.allclose(
+                                points[path_off[1:] - 1],
+                                np.column_stack((stop_lat[to], stop_lon[to])),
+                                atol=1e-5, rtol=0.0)):
+                        return False
+                except (KeyError, IndexError, TypeError, ValueError):
+                    return False
+                edge_path_off = np.asarray(z["tr_forward_pathway_off"])
+                if (edge_path_off.ndim != 1 or edge_path_off.dtype.kind not in "iu"
+                        or len(edge_path_off) != edge_count + 1 or edge_path_off[0] != 0
+                        or np.any(np.diff(edge_path_off) < 0)):
+                    return False
+                edge_meta_len = int(edge_path_off[-1])
+                for key in ("tr_forward_pathway_id", "tr_forward_pathway_time",
+                            "tr_forward_pathway_mode", "tr_forward_pathway_length_m",
+                            "tr_forward_pathway_reversed"):
+                    if np.asarray(z[key]).ndim != 1 or len(np.asarray(z[key])) != edge_meta_len:
+                        return False
+                if (np.asarray(z["tr_forward_pathway_id"]).dtype.kind not in "OUS"
+                        or np.asarray(z["tr_forward_pathway_mode"]).dtype.kind not in "OUS"):
+                    return False
+                pt = np.asarray(z["tr_forward_pathway_time"]); pr = np.asarray(z["tr_forward_pathway_reversed"])
+                pl = np.asarray(z["tr_forward_pathway_length_m"])
+                if (pt.dtype.kind not in "iu" or pr.dtype.kind not in "biu"
+                        or pl.dtype.kind not in "f" or np.any(pt < -1)
+                        or np.any((pr != 0) & (pr != 1))
+                        or np.any(~np.isnan(pl) & (pl < 0))):
+                    return False
+            return True
+
+        if not _check_view("tr_") or not _check_view("tr_forward_", with_paths=True):
+            raise ValueError(f"access table {access_path.name} has invalid transfer CSR/timing/path arrays")
+        if not graph_transfers.validate_transfer_views(
+                n_stops,
+                forward_off=z["tr_forward_off"], forward_to=z["tr_forward_to"],
+                forward_walk=z["tr_forward_walk_time"], forward_min=z["tr_forward_min_time"],
+                forward_time=z["tr_forward_time"], forward_fallback=z["tr_forward_path_fallback"],
+                reverse_off=z["tr_off"], reverse_to=z["tr_to"],
+                reverse_walk=z["tr_walk_time"], reverse_min=z["tr_min_time"],
+                reverse_time=z["tr_time"], reverse_fallback=z["tr_path_fallback"],
+                forward_pathway_off=z["tr_forward_pathway_off"],
+                forward_pathway_time=z["tr_forward_pathway_time"]):
+            raise ValueError(f"access table {access_path.name} has mismatched forward/reverse transfer views")
+        pathway_names = [key for key in z.files if key.startswith("transfer_pathway_")]
+        if (not pathway_names
+                or len({len(np.asarray(z[key])) for key in pathway_names}) != 1):
+            raise ValueError(f"access table {access_path.name} has invalid preserved pathway metadata")
+        scoped_n = len(np.asarray(z["transfer_scoped_source"]))
+        pathway_n = len(np.asarray(z["transfer_pathway_source"]))
+        for source_key, target_key, count in (
+                ("transfer_scoped_source", "transfer_scoped_target", scoped_n),
+                ("transfer_pathway_source", "transfer_pathway_target", pathway_n)):
+            source = np.asarray(z[source_key]); target = np.asarray(z[target_key])
+            if (source.dtype.kind not in "iu" or target.dtype.kind not in "iu"
+                    or np.any(source < 0) or np.any(source >= n_stops)
+                or np.any(target < 0) or np.any(target >= n_stops)
+                or len(source) != count or len(target) != count):
+                raise ValueError(f"access table {access_path.name} has invalid preserved rule indexes")
+        scoped_scalar_keys = (
+            "transfer_scoped_target", "transfer_scoped_from_route",
+            "transfer_scoped_to_route", "transfer_scoped_from_trip",
+            "transfer_scoped_to_trip", "transfer_scoped_min_time",
+            "transfer_scoped_prohibited", "transfer_scoped_type",
+            "transfer_scoped_physical_time",
+            "transfer_scoped_path_fallback")
+        if any(len(np.asarray(z[key])) != scoped_n for key in scoped_scalar_keys):
+            raise ValueError(f"access table {access_path.name} has invalid scoped metadata lengths")
+        scoped_path_off = np.asarray(z["transfer_scoped_path_off"])
+        scoped_path_points = np.asarray(z["transfer_scoped_path_points"])
+        if (scoped_path_off.ndim != 1 or scoped_path_off.dtype.kind not in "iu"
+                or len(scoped_path_off) != scoped_n + 1 or scoped_path_off[0] != 0
+                or np.any(np.diff(scoped_path_off) < 0)
+                or int(scoped_path_off[-1]) != len(scoped_path_points)
+                or scoped_path_points.ndim != 2 or scoped_path_points.shape[1:] != (2,)
+                or scoped_path_points.dtype.kind not in "f"
+                or not np.isfinite(scoped_path_points).all()
+                or np.any(scoped_path_points[:, 0] < -90.0)
+                or np.any(scoped_path_points[:, 0] > 90.0)
+                or np.any(scoped_path_points[:, 1] < -180.0)
+                or np.any(scoped_path_points[:, 1] > 180.0)):
+            raise ValueError(f"access table {access_path.name} has invalid scoped paths")
+        scoped_physical = np.asarray(z["transfer_scoped_physical_time"])
+        scoped_fallback = np.asarray(z["transfer_scoped_path_fallback"])
+        if (scoped_physical.ndim != 1 or scoped_physical.dtype.kind not in "f"
+                or not np.all((scoped_physical == -1)
+                               | (np.isfinite(scoped_physical) & (scoped_physical >= 0)))
+                or scoped_fallback.ndim != 1 or scoped_fallback.dtype.kind not in "biu"
+                or np.any((scoped_fallback != 0) & (scoped_fallback != 1))):
+            raise ValueError(f"access table {access_path.name} has invalid scoped path values")
+        scoped_source = np.asarray(z["transfer_scoped_source"])
+        scoped_target = np.asarray(z["transfer_scoped_target"])
+        stop_lat = np.asarray(self.data.get("stop_lat", ()), dtype=np.float64)
+        stop_lon = np.asarray(self.data.get("stop_lon", ()), dtype=np.float64)
+        if stop_lat.ndim != 1 or stop_lon.ndim != 1 or len(stop_lat) != n_stops or len(stop_lon) != n_stops:
+            raise ValueError(f"access table {access_path.name} has no canonical stop coordinates")
+        for index, (start, end, physical) in enumerate(
+                zip(scoped_path_off[:-1], scoped_path_off[1:], scoped_physical)):
+            if int(end) > int(start) and (int(end) - int(start) < 2 or float(physical) < 0.0):
+                raise ValueError(f"access table {access_path.name} has disconnected scoped paths")
+            if int(end) == int(start) and float(physical) >= 0.0:
+                raise ValueError(f"access table {access_path.name} has a scoped time without a path")
+            if int(end) > int(start):
+                source = int(scoped_source[index]); target = int(scoped_target[index])
+                if (not np.isfinite(stop_lat[source]) or not np.isfinite(stop_lon[source])
+                        or not np.isfinite(stop_lat[target]) or not np.isfinite(stop_lon[target])
+                        or not np.allclose(
+                            scoped_path_points[int(start)],
+                            (stop_lat[source], stop_lon[source]), atol=1e-5, rtol=0.0)
+                        or not np.allclose(
+                            scoped_path_points[int(end) - 1],
+                            (stop_lat[target], stop_lon[target]), atol=1e-5, rtol=0.0)):
+                    raise ValueError(f"access table {access_path.name} has disconnected scoped paths")
+        scoped_min = np.asarray(z["transfer_scoped_min_time"])
+        scoped_prohibited = np.asarray(z["transfer_scoped_prohibited"])
+        if (scoped_min.dtype.kind not in "iu" or scoped_prohibited.dtype.kind not in "biu"
+                or np.any(scoped_min < -1)
+                or np.any((scoped_prohibited != 0) & (scoped_prohibited != 1))):
+            raise ValueError(f"access table {access_path.name} has invalid scoped rule values")
+        if any(np.asarray(z[key]).dtype.kind not in "OUS" for key in (
+                "transfer_scoped_from_route", "transfer_scoped_to_route",
+                "transfer_scoped_from_trip", "transfer_scoped_to_trip",
+                "transfer_scoped_type")):
+            raise ValueError(f"access table {access_path.name} has invalid scoped rule strings")
+        pathway_time = np.asarray(z["transfer_pathway_time"])
+        pathway_rev = np.asarray(z["transfer_pathway_reversed"])
+        pathway_len = np.asarray(z["transfer_pathway_length_m"])
+        if (pathway_time.dtype.kind not in "iu" or pathway_rev.dtype.kind not in "biu"
+                or pathway_len.dtype.kind not in "f" or np.any(pathway_time < -1)
+                or np.any((pathway_rev != 0) & (pathway_rev != 1))
+                or np.any(~np.isnan(pathway_len) & (pathway_len < 0))):
+            raise ValueError(f"access table {access_path.name} has invalid preserved pathway values")
+        if any(np.asarray(z[key]).dtype.kind not in "OUS" for key in (
+                "transfer_pathway_id", "transfer_pathway_mode")):
+            raise ValueError(f"access table {access_path.name} has invalid pathway strings")
+        names = np.asarray(z["raptor_source_names"]).astype(str)
+        sizes = np.asarray(z["raptor_source_sizes"])
+        mtimes = np.asarray(z["raptor_source_mtimes_ns"])
+        expected_sources = tuple(self.data.get("source_mtimes", ()))
+        if (names.ndim != 1 or sizes.ndim != 1 or mtimes.ndim != 1
+                or not (len(names) == len(sizes) == len(mtimes))
+                or any(not str(name).strip() for name in names)
+                or sizes.dtype.kind not in "iu" or mtimes.dtype.kind not in "iu"
+                or np.any(sizes < -1) or np.any(mtimes < -1)):
+            raise ValueError(f"access table {access_path.name} has invalid RAPTOR source metadata")
+        actual_sources = tuple((str(name), None if int(size) < 0 else int(size),
+                                None if int(mtime) < 0 else int(mtime))
+                               for name, size, mtime in zip(names, sizes, mtimes))
+        if expected_sources and actual_sources != expected_sources:
+            raise ValueError(f"access table {access_path.name} is stale relative to the RAPTOR feeds")
+        graph_path = config.DATA / "walk_graph.npz"
+        try:
+            st = graph_path.stat()
+            graph_source = (int(st.st_size), int(st.st_mtime_ns))
+        except OSError:
+            graph_source = (None, None)
+        stored_graph = (int(np.asarray(z["walk_graph_size"])), int(np.asarray(z["walk_graph_mtime_ns"])))
+        if graph_source != (None, None) and stored_graph != graph_source:
+            raise ValueError(f"access table {access_path.name} is stale relative to the walking graph")
 
     def _make_grids(self):
         dep = config.DEP_HM[0] * 3600 + config.DEP_HM[1] * 60
@@ -343,10 +671,32 @@ class RaptorEngine:
         if cached is not None:
             return cached
         data = dict(self.data)
-        base = np.asarray(self.data["tr_time"])
-        scaled64 = np.rint(base.astype(np.float64) * scalar).astype(np.int64)
-        scaled64 = np.where((base > 0) & (scaled64 < 1), 1, scaled64)
-        data["tr_time"] = scaled64.astype(base.dtype, copy=False)
+        # Graph-baked timing keeps physical walk, fixed GTFS minimum, and effective time
+        # separate.  Only ordinary physical walking scales; minimum dwell and authoritative
+        # pathway traversal remain reference-authoritative.  The legacy fallback preserves
+        # synthetic callers and old in-memory fixtures that have only tr_time.
+        if {"tr_walk_time", "tr_min_time", "tr_path_fallback"}.issubset(self.data):
+            def _scale_view(prefix):
+                walk = np.asarray(self.data[f"{prefix}walk_time"], dtype=np.float64)
+                minimum = np.asarray(self.data[f"{prefix}min_time"], dtype=np.float64)
+                pathway = np.asarray(self.data[f"{prefix}path_fallback"], dtype=bool)
+                # Artifact timing is already integer-rounded at scalar 1.  For non-unit pace,
+                # apply the same half-up rounding once to physical walking only.
+                scaled_walk = np.where(pathway, walk, np.floor(walk * scalar + 0.5))
+                scaled_effective = np.floor(np.maximum(scaled_walk, minimum) + 0.5).astype(np.int64)
+                return scaled_walk, scaled_effective
+            scaled_walk, scaled = _scale_view("tr_")
+            data["tr_walk_time"] = scaled_walk
+            data["tr_time"] = scaled
+            if {"tr_forward_walk_time", "tr_forward_min_time", "tr_forward_path_fallback"}.issubset(self.data):
+                forward_walk, forward_time = _scale_view("tr_forward_")
+                data["tr_forward_walk_time"] = forward_walk
+                data["tr_forward_time"] = forward_time
+        else:
+            base = np.asarray(self.data["tr_time"])
+            scaled64 = np.rint(base.astype(np.float64) * scalar).astype(np.int64)
+            scaled64 = np.where((base > 0) & (scaled64 < 1), 1, scaled64)
+            data["tr_time"] = scaled64.astype(base.dtype, copy=False)
         self._walk_scaled_data[key] = data
         return data
 
@@ -409,7 +759,7 @@ class RaptorEngine:
                      column count and ``walk_reluctance``/``walk_prior_eps`` are inert (the
                      planned selection takes no walk prior).
                      'departafter' — p-percentiles over the [DEP, DEP+WINDOW] departure window:
-                     the LEGACY R5-VALIDATED comparison model (MAE 0.75 vs the oracles), NOT
+                     the LEGACY comparison model retained for offline validation, NOT
                      what the map serves on this branch;
                      'arriveby'    — perfect-timing arrive-by window ending at ``target_sec``
                      (default 09:00; ``window_sec`` None -> config.window(), 0 -> single deadline).
@@ -471,8 +821,8 @@ class RaptorEngine:
         """{cell_id: [p5, p50]} minutes over the depart-after window.
 
         Default (``planned=False``) = the LEGACY percentile model: p5/p50 over the
-        [DEP, DEP+WINDOW] departure window. This is the R5-VALIDATED path (MAE 0.75 vs the
-        committed oracles). At its reference ``walk_scalar=1.0`` it stays byte-identical for
+        [DEP, DEP+WINDOW] departure window. This path remains stable for offline
+        validation. At its reference ``walk_scalar=1.0`` it stays byte-identical for
         validation/existing callers; other scalars now correctly scale every walk leg. It is no
         longer what the map serves on this branch.
 

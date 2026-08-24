@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Controlled real-data stage benchmark for the committed Monte-Carlo kernel.
+"""Controlled synthetic stage benchmark for the committed Monte-Carlo kernel.
 
 This is deliberately an *offline diagnostic*, not a server benchmark and not a new routing
-path.  It prepares one normal ``RaptorEngine`` workload from an existing public oracle, warms
+path. It prepares a small deterministic synthetic workload, warms
 the exact Numba specializations, then measures four sequential per-draw stages:
 
 * schedule perturbation;
@@ -19,13 +19,13 @@ the served wall-clock time.  Use ``scripts/perf_benchmark.py`` for controlled en
 Examples (run one process at a time: Numba's cache is shared):
 
     NUMBA_NUM_THREADS=1 .venv/bin/python scripts/mc_kernel_stage_benchmark.py \\
-      --oracle tests/raptor_golden/oracle_downtown.npz --repeats 5 --output out/mc-stages.json
+      --repeats 5 --output out/mc-stages.json
     NUMBA_NUM_THREADS=2 .venv/bin/python scripts/mc_kernel_stage_benchmark.py \\
       --tree planned --walk-scalar 1.0 --repeats 5
 
-The oracle is a public, checked-in workplace fixture.  It supplies the normal egress/pure-walk
-arrays; the engine loads the ordinary GTFS build and baked access table.  A data-less checkout
-will fail with an actionable message instead of starting a server or fabricating a workload.
+The fixture exercises two joined patterns, a transfer tail, committed transit/walk rows, and
+unreachable cells. It is intentionally small enough to run in a data-less checkout and is not a
+performance claim for production geography.
 """
 
 from __future__ import annotations
@@ -70,53 +70,55 @@ def _distribution(samples):
     }
 
 
-def _purewalk_aligned(engine, oracle):
-    purewalk = np.full(len(engine.cell_ids), -1, dtype=np.int64)
-    oracle_pos = {cell: i for i, cell in enumerate(oracle["cell_ids"].astype(str))}
-    for i, cell in enumerate(engine.cell_ids):
-        j = oracle_pos.get(cell)
-        if j is not None:
-            purewalk[i] = int(oracle["purewalk"][j])
-    return purewalk
+class _SyntheticEngine:
+    max_min = 99
+    service_date = "synthetic"
+
+    def _mc_draw_arrays(self, draws, seed):
+        rng = np.random.default_rng(seed)
+        return (rng.gamma(2.0, 15.0, size=(draws, 6)).astype(np.float64),
+                rng.gamma(2.0, 0.02, size=(draws, 6)).astype(np.float64))
 
 
-def _default_oracle():
-    preferred = REPO / "tests" / "raptor_golden" / "oracle_downtown.npz"
-    if preferred.exists():
-        return preferred
-    choices = sorted((REPO / "tests" / "raptor_golden").glob("oracle_*.npz"))
-    if not choices:
-        raise FileNotFoundError(
-            "no public oracle fixture found; pass --oracle tests/raptor_golden/oracle_*.npz")
-    return choices[0]
-
-
-def _load_workload(oracle_path, tree_kind, walk_scalar, draws, seed, max_rounds):
+def _load_workload(tree_kind, walk_scalar, draws, seed, max_rounds):
+    """Build a tiny workload with two joined patterns and a transfer tail."""
     from core import raptor as R
-    from core import raptor_engine as RE
-
-    oracle = np.load(oracle_path, allow_pickle=True)
-    engine = RE.RaptorEngine(verbose=False)
-    egress_g = np.asarray(oracle["egress_g"], dtype=np.int32)
-    egress_w = np.asarray(oracle["egress_w"], dtype=np.int64)
-    purewalk = _purewalk_aligned(engine, oracle)
-    if tree_kind == "planned":
-        tree = engine.journey_tree_departafter(
-            egress_g, egress_w, purewalk, percentile=50.0, walk_scalar=walk_scalar,
-            max_rounds=max_rounds, planned=True)
-    else:
-        tree = engine.journey_tree(
-            egress_g, egress_w, purewalk, walk_scalar=walk_scalar, max_rounds=max_rounds)
-    perfect, _ = tree.commute_and_dominant()
-    legs = tree.committed_first_legs()
-    egress_w_scaled, _, _ = engine._scale_walk(egress_w, purewalk, walk_scalar)
-    deadlines = RE._committed_deadline_prefix(engine.Tgrid_mc, legs, engine.max_min)
-    data = getattr(tree, "d", engine.data)
+    engine = _SyntheticEngine()
+    data = {
+        "n_stops": 3,
+        "pat_nstops": np.array([2, 2], np.int32),
+        "pat_ntrips": np.array([3, 3], np.int32),
+        "pat_stop_off": np.array([0, 2], np.int32),
+        "pat_mat_off": np.array([0, 6], np.int32),
+        "pat_stops": np.array([0, 1, 1, 2], np.int32),
+        "pat_dep": np.array([100, 150, 220, 270, 340, 390,
+                             240, 300, 360, 420, 480, 540], np.int32),
+        "pat_arr": np.array([100, 160, 220, 280, 340, 400,
+                             240, 300, 360, 420, 480, 540], np.int32),
+        "ras_off": np.array([0, 1, 3, 4], np.int32),
+        "ras_pat": np.array([0, 0, 1, 1], np.int32),
+        "ras_pos": np.array([0, 1, 0, 1], np.int32),
+        "tr_off": np.array([0, 0, 0, 0], np.int32),
+        "tr_to": np.empty(0, np.int32),
+        "tr_time": np.empty(0, np.int32),
+    }
+    legs = {
+        "commit_home": np.array([100, 220, 0, 0], np.int64),
+        "commit_kind": np.array([2, 2, 1, 0], np.int64),
+        "commit_walk0": np.array([0, 0, 0, 0], np.int64),
+        "commit_pi": np.array([0, 0, 0, 0], np.int64),
+        "commit_bpos": np.array([0, 0, 0, 0], np.int64),
+        "commit_apos": np.array([1, 1, 0, 0], np.int64),
+        "commit_as": np.array([1, 1, 0, 0], np.int64),
+    }
+    deadlines = np.arange(300, 661, 60, dtype=np.int64)
+    egress_g = np.array([2], dtype=np.int32)
+    egress_w_scaled = np.array([0], dtype=np.int64)
+    perfect = np.array([5, 5, 17, -1], np.int64)
     delta0_all, slope_all = engine._mc_draw_arrays(draws, seed)
     return {
         "R": R,
         "engine": engine,
-        "oracle": oracle,
         "data": data,
         "egress_g": egress_g,
         "egress_w": egress_w_scaled,
@@ -126,6 +128,8 @@ def _load_workload(oracle_path, tree_kind, walk_scalar, draws, seed, max_rounds)
         "delta0_all": np.ascontiguousarray(delta0_all, dtype=np.float64),
         "slope_all": np.ascontiguousarray(slope_all, dtype=np.float64),
         "max_rounds": int(max_rounds),
+        "tree": tree_kind,
+        "walk_scalar": float(walk_scalar),
     }
 
 
@@ -180,7 +184,7 @@ def _stage_once(workload):
 
 
 def _production_once(workload):
-    """Call the unmodified production kernel, retained as the equality oracle."""
+    """Call the unmodified production kernel as the stage-equivalence reference."""
     from core import raptor_numba as RN
 
     R = workload["R"]
@@ -195,17 +199,13 @@ def _production_once(workload):
         True)
 
 
-def _workload_identity(workload, oracle_path, tree_kind, walk_scalar):
+def _workload_identity(workload, tree_kind, walk_scalar):
     data = workload["data"]
     legs = workload["legs"]
-    oracle = workload["oracle"]
-    oracle_name = str(oracle["name"]) if "name" in oracle.files else Path(oracle_path).stem
     return {
-        "oracle_path": str(oracle_path),
-        "oracle_name": oracle_name,
+        "source": "synthetic",
         "service_date": str(workload["engine"].service_date),
         "build_version": int(data.get("build_version", -1)),
-        "gtfs_fingerprint": str(data.get("gtfs_fp", "unknown")),
         "tree": tree_kind,
         "walk_scalar": float(walk_scalar),
         "draws": int(workload["delta0_all"].shape[0]),
@@ -221,8 +221,6 @@ def _workload_identity(workload, oracle_path, tree_kind, walk_scalar):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--oracle", type=Path, default=None,
-                        help="public oracle .npz (default: oracle_downtown when present)")
     parser.add_argument("--tree", choices=("planned", "arriveby"), default="planned",
                         help="normal server-like planned tree, or an arrive-by diagnostic tree")
     parser.add_argument("--walk-scalar", type=float, default=1.0)
@@ -236,16 +234,10 @@ def main(argv=None):
         parser.error("--draws, --repeats, and --max-rounds must all be positive")
     if args.walk_scalar <= 0:
         parser.error("--walk-scalar must be positive")
-    oracle_path = (args.oracle or _default_oracle()).resolve()
-    if not oracle_path.exists():
-        parser.error(f"oracle does not exist: {oracle_path}")
-    try:
-        workload = _load_workload(
-            oracle_path, args.tree, args.walk_scalar, args.draws, args.seed, args.max_rounds)
-    except FileNotFoundError as error:
-        parser.error(str(error))
+    workload = _load_workload(
+        args.tree, args.walk_scalar, args.draws, args.seed, args.max_rounds)
 
-    # Compile every exact stage specialization and the independent production oracle before
+    # Compile every exact stage specialization and the independent production implementation before
     # timing.  This intentionally does not time engine/data setup or any HTTP/server work.
     staged_warm = _stage_once(workload)
     production_warm = _production_once(workload)
@@ -283,7 +275,7 @@ def main(argv=None):
             "production_kernel is the same process's parallel committed kernel and remains the served comparison",
             "no server, HTTP, data-build, tree-build, statistics, or planned-overlay time is included",
         ],
-        "workload": _workload_identity(workload, oracle_path, args.tree, args.walk_scalar),
+        "workload": _workload_identity(workload, args.tree, args.walk_scalar),
         "execution": {
             "repeats": int(args.repeats),
             "numba_threads": numba_threads,

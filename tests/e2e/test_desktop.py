@@ -3,8 +3,7 @@ Desktop end-to-end specs (viewport 1280x800) for the SF Commute Explorer.
 
 Specs 1-10 from the brief. Run against the live server at $E2E_BASE_URL (default
 http://127.0.0.1:8000). Each test is isolated via fresh_load() (localStorage + hash
-cleared). Tests assert current user-visible behavior for both the featured RAPTOR app and the
-remaining legacy R5-only refine surface.
+cleared). Tests assert current user-visible behavior for the graph-native RAPTOR app.
 """
 import time
 import pytest
@@ -28,7 +27,7 @@ def page(new_context):
 
 
 # ---- Spec 1: Load ----------------------------------------------------------------------
-def test_01_load_no_errors_prompt_refine_disabled(page):
+def test_01_load_no_errors_prompt(page):
     errors = []
     page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
     page.on("pageerror", lambda e: errors.append(str(e)))
@@ -39,8 +38,9 @@ def test_01_load_no_errors_prompt_refine_disabled(page):
     assert page.is_visible("#prompt"), "intro prompt should be visible before an address is set"
     expect(page.locator("#prompt")).to_contain_text("workplace")
 
-    # Refine is disabled until a fast map has been computed.
-    assert page.get_attribute("#refine", "disabled") is not None, "Refine must be disabled pre-address"
+    # The retired approximate/exact split has no Refine surface anywhere in the app.
+    assert page.locator("#refinebox").count() == 0
+    assert page.locator("#refine").count() == 0
 
     # Map + legend present, no JS errors.
     assert page.is_visible("#map")
@@ -195,14 +195,8 @@ def test_03_set_fast_map(page):
     assert dest, "#dest should retain the selected workplace label after the map renders"
     assert ADDR_MARKET in dest, "#dest should echo the typed workplace label"
 
-    # Legacy R5 exposes an approximate-map refine pass. RAPTOR is already exact and deliberately
-    # hides/disables that control, so both served configurations get an honest assertion.
-    if page.is_visible("#refinebox"):
-        assert page.get_attribute("#refine", "disabled") is None, (
-            "legacy Refine must enable after the first map")
-    else:
-        assert page.get_attribute("#refine", "disabled") is not None, (
-            "RAPTOR's hidden no-op Refine control must stay disabled")
+    assert page.locator("#refinebox").count() == 0
+    assert page.locator("#refine").count() == 0
 
     # Neighborhood list populated, prompt dismissed.
     assert page.eval_on_selector_all("#list .nb", "els => els.length") > 0
@@ -211,52 +205,14 @@ def test_03_set_fast_map(page):
     shot(page, "desktop_03_fastmap")
 
 
-# ---- Spec 4: Opt-in Refine -------------------------------------------------------------
-def test_04_refine_is_opt_in_then_exact(page):
+# ---- Spec 4: Retired approximate-map surface -----------------------------------------
+def test_04_no_refine_surface(page):
     fresh_load(page)
+    assert page.locator("#refinebox").count() == 0
+    assert page.locator("#refine").count() == 0
     set_address(page, ADDR_MARKET, via="go")
-
-    if not page.is_visible("#refinebox"):
-        pytest.skip("RAPTOR /compute is already exact; the legacy approximate-map refiner is absent")
-
-    # It must NOT auto-run: immediately after fast map, #dest still says 'fast', not 'exact'.
-    assert "exact" not in page.inner_text("#dest"), "exact refine must NOT run automatically"
-
-    # Record the busy-chip text the instant Refine is clicked, via a MutationObserver, so the
-    # assertion is not flaky when /compute_exact is cached and returns near-instantly (the
-    # busy chip can flash faster than a polled is-visible check).
-    page.evaluate(
-        """() => {
-            window.__busySeen = [];
-            const b = document.getElementById('busy');
-            const rec = () => { if (b.style.display !== 'none' && b.textContent) window.__busySeen.push(b.textContent); };
-            new MutationObserver(rec).observe(b, {attributes:true, childList:true, subtree:true, characterData:true});
-            rec();
-        }"""
-    )
-    page.click("#refine")
-
-    # Exact result must land: #dest shows 'exact ...s'. Generous timeout — the exact pass is
-    # 14-34s when cold, instant when the result cache is warm.
-    page.wait_for_function(
-        "() => document.querySelector('#dest').textContent.includes('exact')",
-        timeout=HEAVY_TIMEOUT,
-    )
-    dest = page.inner_text("#dest")
-    assert "exact" in dest and dest.rstrip().endswith("s"), f"expected 'exact ...s', got {dest!r}"
-
-    # The busy ("refining (exact)…") indicator should appear during the pass. On a warm
-    # result-cache the exact pass can complete within a single microtask, faster than a
-    # MutationObserver batch — so a miss here is not a regression; we record it as info but
-    # only hard-fail if the chip never carried the refining text on a SLOW (cold) pass.
-    busy_seen = page.evaluate("() => window.__busySeen || []")
-    cold = "exact 0.0s" not in dest  # cold pass takes seconds; warm cache reports ~0.0s
-    if cold:
-        assert any("refining" in t for t in busy_seen), \
-            f"a 'refining (exact)…' busy indicator should appear during a cold refine; saw {busy_seen}"
-    # The chip must be cleared once done regardless.
-    expect(page.locator("#busy")).to_be_hidden()
-    shot(page, "desktop_04_refine_exact")
+    assert page.locator("#refinebox").count() == 0
+    assert page.locator("#refine").count() == 0
 
 
 # ---- Spec 5: Hover breakdown -----------------------------------------------------------
@@ -287,35 +243,28 @@ def test_06_color_by_line(page):
     fresh_load(page)
     set_address(page, ADDR_MARKET, via="go")
 
-    page.click("#cmode button[data-v='line']")
-    # Legend title flips immediately (this part works).
+    with page.expect_response(
+        lambda response: "/attribution?" in response.url,
+        timeout=HEAVY_TIMEOUT,
+    ) as response_info:
+        page.click("#cmode button[data-v='line']")
+    response = response_info.value
+    assert response.ok, f"/attribution failed with HTTP {response.status}"
+    attribution = response.json()
+    assert attribution, "/attribution should map at least one reachable cell to a transit line"
+
     page.wait_for_function(
         "() => document.getElementById('legtitle').textContent.includes('line')",
         timeout=COMPUTE_TIMEOUT,
     )
-    # Wait for the heavy /attribution build to COMPLETE rather than for ATTR to become
-    # non-empty (which never happens given the bug). loadAttribution() shows the busy chip
-    # ('mapping lines…') for the duration and hides it on completion; once it's hidden the
-    # request has returned and ATTR holds whatever the server sent. This makes the test fail
-    # fast + precisely instead of burning the full timeout.
     page.wait_for_function(
-        "() => document.getElementById('busy').textContent.includes('mapping lines')",
+        "() => document.querySelectorAll('#legend .sc > span > span').length > 0",
         timeout=COMPUTE_TIMEOUT,
     )
-    page.wait_for_function(
-        "() => document.getElementById('busy').style.display === 'none'",
-        timeout=HEAVY_TIMEOUT,
-    )
-    attr_n = page.evaluate("() => Object.keys(ATTR).length")
-    line_n = page.evaluate("() => Object.keys(LINECOLOR).length")
     shot(page, "desktop_06_color_by_line")
-    assert attr_n > 0, (
-        "BUG: color-by-line broken — /attribution returned 0 cells, so NO cells recolor by "
-        "line. The legend title flips to 'Primary transit line per area' but the map and "
-        "legend never update (verified directly: /attribution yields {} for multiple "
-        "destinations after a 36-169s build)."
+    assert page.locator("#legend .sc > span").count() > 0, (
+        "color-by-line legend should list at least one returned line"
     )
-    assert line_n > 0, "color-by-line legend should list at least one line"
 
 
 # ---- Spec 7: Sliders -------------------------------------------------------------------

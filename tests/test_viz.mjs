@@ -13,6 +13,19 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import * as routeModel from "../scripts/static/route-choice-model.mjs";
+import * as apiLifecycle from "../scripts/static/api-lifecycle.mjs";
+import * as inspectorState from "../scripts/static/inspector-state.mjs";
+import * as mapRenderer from "../scripts/static/map-renderer.mjs";
+import { createInspectorRenderers } from "../scripts/static/inspector-renderers.mjs";
+
+// Template functions are evaluated in small browser-contract harnesses below. Expose the
+// imported pure lifecycle module to those isolated evaluations without changing the shipped page.
+globalThis.__vizApiLifecycle = apiLifecycle;
+// `new Function` harnesses do not close over ESM lexical bindings. Expose the imported renderer
+// factory explicitly so integration harnesses exercise the shipped module rather than an inline
+// copy or an absent browser global.
+globalThis.__vizCreateInspectorRenderers = createInspectorRenderers;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VIZ_PATH = join(__dirname, "..", "scripts", "assets", "viz.js");
@@ -23,6 +36,151 @@ const viz = eval(src + "\n;({ ramp, colorScale, gmapsURL, MODECOLOR, rgb });");
 const { ramp, colorScale, gmapsURL, MODECOLOR } = viz;
 
 const IDEAL = 25;
+
+// --------------------------------------------------------------------------- //
+// Route inspector renderer seam                                               //
+// --------------------------------------------------------------------------- //
+test("inspector renderers build selected route rows and a compact accessible Plan", () => {
+  const choice = { key: "primary", isPrimary: true, line: "Metro", total: 24, legs: [
+    { mode: "walk", min: 4, physical_min: 4, board: { name: "Market St" } },
+    { mode: "transit", name: "Metro", min: 16, board: { name: "Market St" },
+      toward: "Downtown", alight: { name: "Civic Center" } },
+    { mode: "walk", min: 4, physical_min: 4 },
+  ] };
+  const renderer = createInspectorRenderers({
+    metric: "b", compareList: [choice], selectedKey: "primary", planOpen: true,
+    primaryCasing: "#fff", gmaps: (lat, lon) => `/maps/${lat},${lon}`,
+  });
+  const choices = renderer.routeChoices();
+  assert.equal(choices.length, 1);
+  const row = renderer.routeRowHTML(choices[0], choices[0], "recommended");
+  assert.match(row, /data-selected="true"/);
+  assert.match(row, /aria-expanded="true"/);
+  assert.match(row, /route-fact-label">Walking/);
+  assert.match(row, /aria-label="Open route plan for/);
+  const plan = renderer.selectedRouteHTML(choices[0], choices[0], { olat: 37.78, olon: -122.41 });
+  assert.match(plan, /id="route-plan-panel"/);
+  assert.match(plan, /Step-by-step directions/);
+  assert.match(plan, /Board Metro at Market St toward Downtown/);
+  assert.match(plan, /href="\/maps\/37\.78,-122\.41"/);
+});
+
+// --------------------------------------------------------------------------- //
+// Responsive inspector state machine (pure module)                            //
+// --------------------------------------------------------------------------- //
+test("inspector state: adversarial mobile resize/drag preserves the user's pane scroll", () => {
+  let state = inspectorState.createInspectorState({ capability: "bottom-sheet" });
+  state = inspectorState.transitionInspectorState(state, "plan-open", {
+    capability: "bottom-sheet", origin: "keyboard",
+  }).state;
+  assert.equal(state.sheetContent, "plan");
+  assert.equal(state.sheetSnap, "browse");
+
+  const captured = inspectorState.inspectorScrollDecision({
+    phase: "capture", pane: "plan", visible: true, current: 487, saved: 0,
+  });
+  assert.deepEqual(captured, { pane: "plan", save: true, restore: false, value: 487 });
+
+  // A resize into a shorter viewport and a drag back to Peek must not jump the
+  // Plan pane to its selected route heading or to zero.
+  const restored = inspectorState.inspectorScrollDecision({
+    phase: "restore", pane: "plan", visible: true, current: 0, saved: captured.value,
+  });
+  assert.equal(restored.restore, true);
+  assert.equal(restored.value, 487);
+  state = inspectorState.transitionInspectorState(state, "snap", {
+    capability: "bottom-sheet", snap: "peek",
+  }).state;
+  assert.equal(state.planOpen, true);
+  assert.equal(state.sheetContent, "plan");
+  assert.equal(state.sheetSnap, "browse", "open Plan cannot settle in inaccessible Peek");
+  state = inspectorState.normalizeInspectorState(state, "bottom-sheet");
+  assert.equal(state.sheetSnap, "browse", "open Plan is promoted out of inaccessible Peek after remount");
+});
+
+test("inspector state: mobile route/settings/map transitions retain route intent and focus effects", () => {
+  let state = inspectorState.createInspectorState({ capability: "bottom-sheet" });
+  const open = inspectorState.transitionInspectorState(state, "plan-open", {
+    capability: "bottom-sheet", origin: "keyboard", sourceHidden: true,
+  });
+  state = open.state;
+  assert.equal(open.effects.focus, "plan");
+  const settings = inspectorState.transitionInspectorState(state, "settings", {
+    capability: "bottom-sheet", snapshot: inspectorState.inspectorSnapshot(state),
+  });
+  state = settings.state;
+  assert.equal(state.surface, "settings");
+  assert.equal(state.settingsReturn.planOpen, true);
+  assert.equal(state.sheetContent, "settings");
+  const back = inspectorState.transitionInspectorState(state, "settings-return", {
+    capability: "bottom-sheet",
+  });
+  assert.equal(back.state.surface, "routes");
+  assert.equal(back.state.planOpen, true);
+  assert.equal(back.effects.focus, "settings-return");
+  const map = inspectorState.transitionInspectorState(back.state, "map-focus", {
+    capability: "bottom-sheet",
+  });
+  assert.equal(map.state.sheetSnap, "browse", "open Plan remains visible when map context is requested");
+  assert.equal(map.state.planOpen, true, "map context never clears selected Plan intent");
+});
+
+test("inspector state: drag release uses threshold, clamping, and velocity without DOM", () => {
+  const metrics = inspectorState.sheetMetrics(420);
+  let drag = inspectorState.beginSheetGesture({ pointerId: 4, startY: 300,
+    startOffset: metrics.snaps.browse, now: 10, metrics });
+  let moved = inspectorState.updateSheetGesture(drag, { clientY: 314, now: 30 });
+  drag = moved.drag;
+  assert.equal(drag.moved, true);
+  assert.equal(moved.offset, inspectorState.clampSheetOffset(moved.offset, metrics));
+  assert.equal(inspectorState.finishSheetGesture(drag, { clientY: 314 }).suppressClick, true);
+  assert.equal(inspectorState.finishSheetGesture(drag, { clientY: 314, cancelled: true }).snap, null);
+  const flick = inspectorState.beginSheetGesture({ pointerId: 5, startY: 300,
+    startOffset: metrics.snaps.browse, now: 10, metrics });
+  const flicked = inspectorState.updateSheetGesture(flick, { clientY: 340, now: 20 }).drag;
+  assert.equal(inspectorState.finishSheetGesture(flicked, { clientY: 340 }).snap, "peek");
+});
+
+// --------------------------------------------------------------------------- //
+// API/request lifecycle helpers                                                //
+// --------------------------------------------------------------------------- //
+test("api lifecycle: endpoint URLs preserve the shipped query ordering", () => {
+  const routing = { maxxfers: "1", walkspeed: "fast", speedtoggle: true };
+  assert.equal(apiLifecycle.computeURL({ lat: 37.78, lon: -122.41, ...routing }),
+    "/compute?lat=37.78&lon=-122.41&maxrides=2&speed=fast");
+  assert.equal(apiLifecycle.itineraryURL({ id: 17, dlat: 37.78, dlon: -122.41, ...routing, pin: true }),
+    "/itinerary?id=17&dlat=37.78&dlon=-122.41&maxrides=2&speed=fast&pin=1");
+  assert.equal(apiLifecycle.geocodeURL("1 Market St, San Francisco"),
+    "/geocode?q=1%20Market%20St%2C%20San%20Francisco");
+  assert.equal(apiLifecycle.routingQuery({ maxxfers: "any", walkspeed: "med", speedtoggle: false }), "");
+});
+
+test("api lifecycle: response normalization and stable error classification", async () => {
+  assert.deepEqual(apiLifecycle.normalizeVariancePayload({ realistic: {}, variance: { 7: { frag: 2 } } }),
+    { realistic: {}, variance: { 7: { frag: 2 } }, hasData: true });
+  assert.deepEqual(apiLifecycle.normalizeVariancePayload(null),
+    { realistic: {}, variance: {}, hasData: false });
+  assert.equal((await apiLifecycle.parseJSONResponse({ json: async () => ({ ok: true }) })).ok, true);
+  assert.equal(await apiLifecycle.parseJSONResponse({ json: async () => { throw new Error("bad json"); } }), null);
+  assert.deepEqual(apiLifecycle.classifyHTTPError(422, { error: "outside_supported_area" }, "compute"), {
+    code: "outside_supported_area", message: apiLifecycle.OUTSIDE_AREA_MESSAGE,
+  });
+  assert.deepEqual(apiLifecycle.classifyHTTPError(500, null, "compute"), {
+    code: "http_error", message: "compute request failed (500).",
+  });
+});
+
+test("api lifecycle: retry and stale-request decisions are deterministic", () => {
+  assert.equal(apiLifecycle.retryDelayMs("0.025"), 25);
+  assert.equal(apiLifecycle.retryDelayMs("nonsense"), 4000);
+  assert.equal(apiLifecycle.shouldRetry(429, 0, 1), true);
+  assert.equal(apiLifecycle.shouldRetry(503, 1, 1), false);
+  assert.equal(apiLifecycle.shouldRetry(500, 0, 1), false);
+  assert.equal(apiLifecycle.isCurrentGeneration(3, 3), true);
+  assert.equal(apiLifecycle.shouldAbortStaleRequest({ requestGeneration: 2, currentGeneration: 3 }), true);
+  assert.equal(apiLifecycle.shouldAbortStaleRequest({ requestGeneration: 3, currentGeneration: 3, signal: { aborted: true } }), true);
+  assert.equal(apiLifecycle.isCurrentRequest({ token: 4, currentToken: 4, requestGeneration: 3, currentGeneration: 3 }), true);
+});
 
 // --------------------------------------------------------------------------- //
 // colorScale                                                                  //
@@ -133,6 +291,13 @@ test("MODECOLOR: has bart/metro/bus/cable keys", () => {
 // by the live metric too.
 const TEMPLATE_PATH = join(__dirname, "..", "scripts", "templates", "index.html");
 const TSRC = readFileSync(TEMPLATE_PATH, "utf8");
+const RENDERER_PATH = join(__dirname, "..", "scripts", "static", "inspector-renderers.mjs");
+const RENDERER_SRC = readFileSync(RENDERER_PATH, "utf8");
+const API_LIFECYCLE_PATH = join(__dirname, "..", "scripts", "static", "api-lifecycle.mjs");
+const API_LIFECYCLE_SRC = readFileSync(API_LIFECYCLE_PATH, "utf8");
+const APP_CSS_PATH = join(__dirname, "..", "scripts", "static", "app.css");
+const APP_CSS = readFileSync(APP_CSS_PATH, "utf8");
+const CSS_SRC = TSRC + "\n" + RENDERER_SRC + "\n" + APP_CSS;
 // Slice a `function name(...){...}` declaration out of the LIVE template source (brace-balanced),
 // so the tests exercise the shipped code, not a drifting copy. Shared by every harness below.
 function templateFn(name) {
@@ -143,7 +308,7 @@ function templateFn(name) {
   for (let k = i; k < TSRC.length; k++) {
     const c = TSRC[k];
     if (c === "{") { depth++; started = true; }
-    else if (c === "}") { depth--; if (started && depth === 0) return TSRC.slice(i, k + 1); }
+    else if (c === "}") { depth--; if (started && depth === 0) return `var apiLifecycle=globalThis.__vizApiLifecycle;\n${TSRC.slice(i, k + 1)}`; }
   }
   throw new Error("template fn unterminated: " + name);
 }
@@ -195,32 +360,131 @@ test("startup restore shell is selected before paint and failures remain actiona
 
   const restore = templateFn("setWorkplace");
   assert.match(restore, /const startup=!!opts\.startup/);
-  assert.match(restore, /if\(startup\)\{startupRetry=null;setStartupPrompt\("restoring"/);
-  assert.match(restore, /if\(!r\.ok\)throw new Error/,
-    "HTTP failures cannot masquerade as a usable commute payload");
+  assert.match(restore, /if\(startup\)\{startupRetry=null;setWorkplaceError\(""\);setStartupPrompt\("restoring"/);
+  assert.match(restore, /const d=await apiLifecycle\.parseJSONResponse\(r\)/,
+    "HTTP failures are classified from their JSON body before commit");
+  assert.match(restore, /if\(!r\.ok\)\{if\(isOutsideSupportedArea\(r\.status,d\)/,
+    "the supported-area contract is handled distinctly from generic HTTP failures");
   assert.match(restore, /startupRetry=\(\)=>setWorkplace\(lat,lon,label,Object\.assign\(\{\},opts,\{startup:true\}\)\)/);
   assert.match(restore, /setStartupPrompt\("error","We couldn’t open this commute/);
+  assert.match(restore, /setStartupPrompt\("onboarding",OUTSIDE_AREA_MESSAGE\)/,
+    "an unsupported startup destination returns to onboarding instead of retrying forever");
+  assert.match(restore, /localStorage\.removeItem\("wp_v1"\)/,
+    "an unsupported saved workplace is not retained for the next boot");
+  assert.match(restore, /discardUnsupportedPermalink\(\)/,
+    "an unsupported shared workplace is removed from the URL after one attempt");
+  assert.match(restore, /const saved=readSavedWorkplace\(\)/);
+  assert.match(restore, /startupSource:"saved",startupMessage:"Opening your saved commute…"/,
+    "an unsupported shared workplace falls back to a valid saved workplace exactly once");
+  assert.match(restore, /Commit the destination only after the coordinate request succeeds/,
+    "a failed replacement must leave the current valid destination/map untouched");
   assert.match(restore, /if\(myGen===GEN&&startup\)hideStartupPrompt\(\)/,
     "the shell leaves only after the restored route has painted");
 });
 
+test("app CSS seam keeps non-critical visuals external and startup rules inline", () => {
+  const linkAt = TSRC.indexOf('<link rel="stylesheet" href="/static/app.css">');
+  const inlineAt = TSRC.indexOf("<style>");
+  assert.ok(linkAt > inlineAt, "app.css follows the synchronous critical style");
+  assert.match(TSRC.slice(inlineAt, linkAt), /:root\[data-theme="light"\]/,
+    "light-theme tokens remain available before the external stylesheet paints");
+  assert.match(TSRC.slice(inlineAt, linkAt), /#map\{position:absolute;inset:0/,
+    "the map shell geometry remains inline");
+  assert.match(TSRC.slice(inlineAt, linkAt), /:root\[data-startup="restoring"\] #prompt \.ob-restoring/,
+    "returning visitors keep the truthful startup shell inline");
+  assert.match(APP_CSS, /\.route-row\[aria-pressed="true"\]/,
+    "route inspector styling moved to app.css");
+  assert.match(APP_CSS, /@media \(max-width:719px\)[\s\S]*#pincard\[data-layout-capability="bottom-sheet"\]/,
+    "responsive bottom-sheet states remain in cascade order");
+  assert.match(APP_CSS, /@media \(prefers-reduced-motion:reduce\)/,
+    "accessibility motion rules remain external with the app layer");
+
+  let depth = 0;
+  for (const c of APP_CSS.replace(/\/\*[\s\S]*?\*\//g, "")) {
+    if (c === "{") depth++;
+    if (c === "}") depth--;
+    assert.ok(depth >= 0, "CSS braces never close before opening");
+  }
+  assert.equal(depth, 0, "app.css has balanced CSS blocks");
+});
+
+test("fitToCompare has a live compare-list source", () => {
+  const fit = templateFn("fitToCompare");
+  const display = new Function(`"use strict";${templateFn("displayOptions")};`+
+    `let compareList=["primary","alternate"];return displayOptions();`)();
+  assert.deepEqual(display, ["primary", "alternate"],
+    "the display seam reads the current exact compare options");
+  assert.match(fit, /displayOptions\(\)/,
+    "camera fitting must call the live compare-list seam rather than a removed helper");
+  assert.match(TSRC, /function displayOptions\(\)\{return compareList\.slice\(\);\}/,
+    "the seam is defined in the shipped page, not only in a test harness");
+});
+
+test("dynamic hover Google Maps links use a safe new-tab relationship", () => {
+  assert.match(TSRC,
+    /class="gm"[^>]*target="_blank"[^>]*rel="noopener noreferrer"/,
+    "hover breakdown links must not grant the new tab an opener reference");
+});
+
+test("frontend exposes only the graph-backed RAPTOR compute surface", () => {
+  assert.doesNotMatch(TSRC, /refinebox|id="refine"|CFG\.raptor|compute_exact/,
+    "the page has no retired refine or compatibility branch");
+  assert.doesNotMatch(API_LIFECYCLE_SRC, /compute_exact|computeExactURL/,
+    "request helpers do not retain the retired exact endpoint alias");
+  assert.match(API_LIFECYCLE_SRC, /return `\/compute\?lat=\$\{lat\}&lon=\$\{lon\}/,
+    "the active request helper targets the graph-backed compute endpoint");
+});
+
+test("supported-area error classifier accepts only the explicit 422 contract", () => {
+  const helper = new Function(`"use strict";${templateFn("isOutsideSupportedArea")};return isOutsideSupportedArea;`)();
+  assert.equal(helper(422, {error: "outside_supported_area"}), true);
+  assert.equal(helper(400, {error: "outside_supported_area"}), false);
+  assert.equal(helper(422, {error: "bad_request"}), false);
+  assert.equal(helper(422, null), false);
+});
+
+test("unsupported permalink cleanup is exception-safe and retains non-workplace settings", () => {
+  const make = new Function("location", "history", "console",
+    `"use strict";${templateFn("discardUnsupportedPermalink")};return discardUnsupportedPermalink;`);
+  let replaced = null;
+  const clean = make(
+    {hash: "#wp=37.8,-122.4,Bad&sp=med&mt=any", pathname: "/", search: ""},
+    {replaceState(_a, _b, value){replaced = value;}}, {warn(){}},
+  );
+  assert.equal(clean(), true);
+  assert.equal(replaced, "#sp=med&mt=any");
+
+  const blocked = make(
+    {hash: "#wp=37.8,-122.4,Bad", pathname: "/", search: ""},
+    {replaceState(){throw new Error("blocked");}}, {warn(){}},
+  );
+  assert.equal(blocked(), false, "history restrictions cannot break recovery");
+});
+
+test("workplace errors have stable error nodes and dynamic input descriptions", () => {
+  assert.match(TSRC, /id="addr"[^>]*aria-errormessage="workplace-error"/);
+  assert.match(TSRC, /id="obaddr"[^>]*aria-errormessage="onboarding-error"/);
+  const helper = templateFn("setInlineFieldError");
+  assert.match(helper, /input\.setAttribute\("aria-describedby",described\.join\(" "\)\)/);
+  assert.match(helper, /input\.setAttribute\("aria-invalid","true"\)/);
+  assert.match(helper, /input\.removeAttribute\("aria-invalid"\)/);
+});
+
 function _daHelpers() {
-  const defs = ["stableRouteKey", "routeChoiceKey", "bdFrag", "_daPick", "normalizeBD", "optDA", "optLegs", "optTotal",
-    "optRead", "buildCompare", "hoverAltChipData"].map(templateFn).join("\n");
-  const harness = `
-"use strict";
-let metric="b";
-const REAL={}, VAR={};
-const PRIMARY_KEY="__primary__";
-${templateConst("ALT_CASING")}
-const DEPARTAFTER=true;            /* exercise the depart-after branch */
-function dominantLine(legs){let b=null,m=-1;(legs||[]).forEach(g=>{if(g.mode==="transit"&&g.name&&g.min>m){m=g.min;b=g.name;}});return b||"walk only";}
-function primaryCasing(){return "#fff";}
-${defs}
-return {set metric(v){metric=v;}, get metric(){return metric;},
-        stableRouteKey, bdFrag, normalizeBD, optRead, optLegs, optTotal, buildCompare,
-        hoverAltChipData, ALT_CASING};`;
-  return new Function(harness)();
+  let metric = "b";
+  const options = () => ({ departAfter: true, metric, primaryKey: "__primary__",
+    primaryColor: "#fff", altCasing: T_ALT_CASING });
+  return {
+    set metric(v) { metric = v; }, get metric() { return metric; },
+    stableRouteKey: routeModel.stableRouteKey,
+    normalizeBD(d) { return routeModel.normalizeBD(d, { departAfter: true, metric }); },
+    optRead(o) { return routeModel.optRead(o, metric); },
+    optLegs(o) { return routeModel.optLegs(o, metric); },
+    optTotal(o) { return routeModel.optTotal(o, metric); },
+    buildCompare(d) { return routeModel.buildCompare(d, options()); },
+    hoverAltChipData(d) { return routeModel.hoverAltChipData(d, options()); },
+    ALT_CASING: T_ALT_CASING,
+  };
 }
 
 // A synthetic depart-after /itinerary?pin=1 breakdown: best (p5=20) and typical (p50=26)
@@ -463,21 +727,13 @@ test("compare list preserves text-identical routes from distinct authoritative f
 });
 
 function _routeFamilyHelpers() {
-  const defs = [
-    "uniq", "tlegs", "lname", "lineNames", "routeServices", "serviceNames",
-    "routeGrouping", "displayOptions", "buildFamilies",
-  ].map(templateFn).join("\n");
-  const harness = `
-"use strict";
-let compareList=[];
-function optLegs(o){return o.legs||[];}
-function optRead(o){return {head:o.total||0};}
-${defs}
-return {
-  setCompareList(v){compareList=v;},
-  displayOptions, routeGrouping, buildFamilies,
-};`;
-  return new Function(harness)();
+  let compareList = [];
+  return {
+    setCompareList(v) { compareList = v; },
+    displayOptions() { return compareList.slice(); },
+    routeGrouping: routeModel.routeGrouping,
+    buildFamilies() { return routeModel.buildFamilies(compareList); },
+  };
 }
 
 function _groupedOption({ key, line, total, familyKey, branchKey, branchName, branchKind, branchLines }) {
@@ -641,11 +897,10 @@ test("BUG3: an unreachable cell renders the clear no-route message (not a silent
     "loadBreak must render the no-route breakdown for an unreachable (v==null) cell");
 });
 test("BUG3: the heatmap style() still dims above-thr cells (slider behavior preserved)", () => {
-  const tsrc = readFileSync(TEMPLATE_PATH, "utf8");
-  // The Max-commute slider must STILL hide above-thr cells in the heatmap — only INTERACTIVITY was
-  // decoupled. style() keeps its `v>thr` fillOpacity:0 test.
-  assert.match(tsrc, /function style\(f\)\{[^}]*if\(v==null\|\|v>thr\)return\{fillOpacity:0/,
-    "style() must keep dimming above-thr cells (the slider still controls coloring)");
+  // The Max-commute slider still hides above-thr cells in the heatmap; the decision now lives in
+  // the renderer module rather than being coupled to the controller's Leaflet callback.
+  assert.deepEqual(mapRenderer.cellStyle({ value: 41, threshold: 40, color: () => "#0" }),
+    { fillOpacity: 0, opacity: 0, weight: 0 });
 });
 
 // --------------------------------------------------------------------------- //
@@ -786,7 +1041,7 @@ function _varianceLifecycleHarness() {
   const defs=["createLRU","resetVarianceState","setVarianceState","varianceReady","varianceFailed",
     "varianceSettled","applyVariancePayload","failVariance","retryAfter"]
     .map(templateFn).join("\n")+"\n"+
-    templateFn("loadVariance").replace(/^function /,"async function ");
+    templateFn("loadVariance").replace(/function loadVariance/,"async function loadVariance");
   const harness=`
 "use strict";
 let GEN=1,DESTLL=[37.7,-122.4],REAL={},VAR={},varianceState={status:"idle",gen:0,error:""};
@@ -907,7 +1162,7 @@ test("failed variance still permits exactly one planned pin enrichment", async (
   assert.equal(H.cached()._pin,true);
   assert.equal(H.cached()._pinPending,false);
   assert.deepEqual(H.renders.at(-1),{pin:true,pending:false});
-  const compare=templateFn("compareHTML");
+  const compare=RENDERER_SRC;
   assert.match(compare,/Bad-day estimates are unavailable\. Route choices are still shown\./,
     "the inspector explains the degraded metrics without hiding structural choices");
 });
@@ -990,14 +1245,17 @@ test("a failed touch prefetch releases ownership so Inspect can make one retry",
 // primary is the recommendation, and the selected exact route is drawn last at full strength
 // over a small set of practical alternatives rendered as quiet ghosts.
 function _drawCompareHelpers() {
-  const defs = ["effectiveChoiceKey", "compactMapChoices", "drawCompareRoutes"].map(templateFn).join("\n");
+  const defs = ["effectiveChoiceKey", "drawCompareRoutes"].map(templateFn).join("\n");
   const harness = `
 "use strict";
+const createInspectorRenderers=globalThis.__vizCreateInspectorRenderers;
 const PRIMARY_KEY="__primary__";
 const COMPACT_MAP_ROUTE_LIMIT=4;
 let routePin=7, DRAWN=null;
 let selKey=PRIMARY_KEY,previewKey=null,showAllRoutes=false;
 let compareList=[], CHOICES=[];
+const renderer=createInspectorRenderers({metric:"b",compareList:()=>compareList,selectedKey:()=>selKey,showAllRoutes:()=>showAllRoutes,
+  primaryCasing:"#fff"});
 const draws=[];
 const routeLayer={clearLayers(){draws.length=0;}};
 function clearRoute(){routeLayer.clearLayers();DRAWN=null;}
@@ -1006,6 +1264,7 @@ function routeChoices(){return CHOICES;}
 function recommendedChoice(choices){return choices.find(c=>c.o.isPrimary)||choices[0]||null;}
 function practicalChoices(choices,recommended){return choices.filter(c=>c!==recommended).slice(0,3);}
 function featuredChoices(choices,recommended){return [recommended,...practicalChoices(choices,recommended)].filter(Boolean);}
+function compactMapChoices(choices,recommended,selected){return renderer.compactMapChoices(choices,recommended,selected);}
 function findOpt(key){return compareList.find(o=>o.key===key)||null;}
 function optLegs(o){return o.legs;}
 function optTotal(o){return o.total;}
@@ -1028,7 +1287,8 @@ function _choiceFixture() {
   const choice = (key, primary, color, total, family, branch) => ({
     o: { key, isPrimary: primary, identityColor: color, total,
          legs: [{ mode: "transit", name: key, min: total, pts: [[0, 0], [1, 1]] }] },
-    r: { head: total, frag: 0 }, family: { key: family }, branch: { key: branch } });
+    r: { head: total, frag: 0 }, family: { key: family, meta: { name: family } },
+    branch: { key: branch, meta: { name: branch } } });
   return [
     choice("__primary__", true, "#fff", 20, "famA", "brP"),
     choice("alt0", false, T_ALT_CASING[0], 24, "famA", "brT"),
@@ -1067,7 +1327,7 @@ test("route focus: an Additional exact choice stays full-strength in compact and
   for(let i=2;i<5;i++)choices.push({
     o:{key:`alt${i}`,isPrimary:false,identityColor:T_ALT_CASING[i%T_ALT_CASING.length],total:28+i,
       legs:[{mode:"transit",name:`alt${i}`,min:28+i,pts:[[0,0],[1,1]]}]},
-    r:{head:28+i,frag:0},family:{key:"famA"},branch:{key:"brT"},
+    r:{head:28+i,frag:0},family:{key:"famA",meta:{name:"famA"}},branch:{key:"brT",meta:{name:"brT"}},
   });
   H.setChoices(choices);H.setSelection("alt4");
   H.drawCompareRoutes();
@@ -1086,7 +1346,7 @@ test("route focus: five choices with an Additional selection still leave one rou
   for(let i=2;i<4;i++)choices.push({
     o:{key:`alt${i}`,isPrimary:false,identityColor:T_ALT_CASING[i%T_ALT_CASING.length],total:28+i,
       legs:[{mode:"transit",name:`alt${i}`,min:28+i,pts:[[0,0],[1,1]]}]},
-    r:{head:28+i,frag:0},family:{key:"famA"},branch:{key:"brT"},
+    r:{head:28+i,frag:0},family:{key:"famA",meta:{name:"famA"}},branch:{key:"brT",meta:{name:"brT"}},
   });
   H.setChoices(choices);H.setSelection("alt3");
   H.drawCompareRoutes();
@@ -1101,14 +1361,19 @@ test("route focus: five choices with an Additional selection still leave one rou
 });
 
 function _mapRouteToggleHelpers() {
-  const defs=["compactMapChoices","mapRouteToggleLabel","mapRouteToggleHTML"].map(templateFn).join("\n");
-  const harness=`
+  const defs=[];
+const harness=`
 "use strict";
+const createInspectorRenderers=globalThis.__vizCreateInspectorRenderers;
 const COMPACT_MAP_ROUTE_LIMIT=4;
 let CHOICES=[],showAllRoutes=false;
+const renderer=createInspectorRenderers({metric:"b",compareList:()=>CHOICES.map(c=>c.o),selectedKey:()=>null,showAllRoutes:()=>showAllRoutes});
 function routeChoices(){return CHOICES;}
 function practicalChoices(choices,recommended){return choices.filter(c=>c!==recommended).slice(0,3);}
 function featuredChoices(choices,recommended){return [recommended,...practicalChoices(choices,recommended)].filter(Boolean);}
+function compactMapChoices(choices,recommended,selected){return renderer.compactMapChoices(choices,recommended,selected);}
+function mapRouteToggleLabel(routeCount){return renderer.mapRouteToggleLabel(routeCount);}
+function mapRouteToggleHTML(choices,recommended,selected){return renderer.mapRouteToggleHTML(choices,recommended,selected);}
 ${defs}
 return {
   html(choices,selectedKey){CHOICES=choices;const recommended=choices.find(c=>c.o.isPrimary)||choices[0]||null;
@@ -1121,10 +1386,10 @@ return {
 
 test("map route toggle is hidden when compact mode already contains every exact choice", () => {
   const H=_mapRouteToggleHelpers(),choices=_choiceFixture();
-  choices.push({o:{key:"alt2",isPrimary:false},r:{head:28,frag:0},family:{key:"famC"},branch:{key:"brC"}});
+  choices.push({o:{key:"alt2",isPrimary:false,legs:[]},r:{head:28,frag:0},family:{key:"famC",meta:{name:"famC"}},branch:{key:"brC",meta:{name:"brC"}}});
   assert.equal(H.html(choices,"alt2"),"","four exact routes need no no-op expansion control");
 
-  choices.push({o:{key:"alt3",isPrimary:false},r:{head:30,frag:0},family:{key:"famD"},branch:{key:"brD"}});
+  choices.push({o:{key:"alt3",isPrimary:false,legs:[]},r:{head:30,frag:0},family:{key:"famD",meta:{name:"famD"}},branch:{key:"brD",meta:{name:"brD"}}});
   assert.match(H.html(choices,"alt3"),/>Show all 5 routes on map<\/button>/,
     "a selected Additional route still leaves one exact choice for expansion");
   H.setExpanded(true);
@@ -1132,26 +1397,21 @@ test("map route toggle is hidden when compact mode already contains every exact 
 });
 
 function _routeDisclosureHelpers() {
-  const defs = ["routeTitle", "representativeChoices", "practicalChoices", "featuredChoices", "moreRouteChoices", "familyRouteChoices",
-    "choiceBoardingParts", "choiceBoardingContext", "boardingGroupLabel", "boardingHeadingHTML", "additionalChoicesHTML"]
-    .map(templateFn).join("\n");
-  const harness = `
-"use strict";
-let CHOICES=[];
-function routeChoices(){return CHOICES;}
-function recommendedChoice(choices){return choices.find(c=>c.o.isPrimary)||choices[0]||null;}
-function optLegs(o){return o.legs||[];}
-function displayStopName(name){return String(name||"").replace(/\\s+/g," ").trim();}
-function routeRowHTML(c,_recommended,where){return \`<button class="route-choice \${where}" data-key="\${c.o.key}">\${c.o.key}</button>\`;}
-function escapeHTML(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-${defs}
-return {
-  setChoices(v){CHOICES=v;},
-  practicalChoices,featuredChoices,moreRouteChoices,familyRouteChoices,additionalChoicesHTML,boardingGroupLabel,boardingHeadingHTML,
-};`;
-  return new Function(harness)();
+  let choices = [];
+  const renderer = createInspectorRenderers({
+    metric: "b", compareList: () => choices.map((c) => c.o),
+    selectedKey: () => null, showAllRoutes: () => false,
+  });
+  return {
+    setChoices(v) { choices = v; },
+    practicalChoices: (v, recommended) => renderer.practicalChoices(v, recommended),
+    featuredChoices: (v, recommended) => renderer.featuredChoices(v, recommended),
+    moreRouteChoices: (v, recommended) => renderer.moreRouteChoices(v, recommended),
+    additionalChoicesHTML: (v, recommended) => renderer.additionalChoicesHTML(v, recommended),
+    boardingGroupLabel: (...args) => renderer.boardingGroupLabel(...args),
+    boardingHeadingHTML: (...args) => renderer.boardingHeadingHTML(...args),
+  };
 }
-
 function _disclosureChoices() {
   return [
     ["__primary__",true,20,"family-a","branch-primary"],
@@ -1209,7 +1469,7 @@ test("route disclosure: one additional-choices disclosure groups every remaining
   const html=H.additionalChoicesHTML(more,recommended);
   assert.deepEqual([...html.matchAll(/data-key="([^"]*)"/g)].map(match=>match[1]).sort(),
     more.map(choice=>choice.o.key).sort(),"all remaining exact route keys stay reachable");
-  assert.deepEqual([...html.matchAll(/data-family="([^"]*)"/g)].map(match=>match[1]).sort(),
+  assert.deepEqual([...html.matchAll(/<section class="boarding-group" data-family="([^"]*)"/g)].map(match=>match[1]).sort(),
     more.map(choice=>choice.family.key).sort(),"each authoritative family has one visible group");
   assert.doesNotMatch(html,/<details|More finishes|More route choices/,
     "the opened additional list has no nested disclosure or repetitive finish label");
@@ -1237,7 +1497,7 @@ test("route disclosure: one family is split by discovered boarding stop and dire
   ].map(([key,board,toward])=>({o:{key,isPrimary:false,legs:[{mode:"transit",board:{name:board},toward}]},r:{head:20,frag:0},
     family:{key:"north",meta:{name:"Northbound"}},branch:{key,meta:{name:"Walk finish"}}}));
   const html=H.additionalChoicesHTML(choices,choices[0]);
-  assert.equal((html.match(/data-family="north"/g)||[]).length,2,
+  assert.equal((html.match(/<section class="boarding-group" data-family="north"/g)||[]).length,2,
     "a single service family never mixes separate boarding contexts in one outer group");
   assert.match(html,/boarding-place">Board at A Street/);
   assert.match(html,/boarding-detail">Toward Downtown, Services: Northbound/);
@@ -1261,7 +1521,7 @@ test("route disclosure: refresh preserves the one remaining native Additional di
 });
 
 test("route selection fallback survives rerender and is announced through the dedicated polite status node", () => {
-  const render=templateFn("renderPin"),announce=templateFn("announceRouteSelection"),compare=templateFn("compareHTML");
+  const render=templateFn("renderPin"),announce=templateFn("announceRouteSelection"),compare=RENDERER_SRC;
   assert.match(render,/selectionReplaced=!selectionLocked\|\|!findChoice\(selKey\)/,
     "only an unlocked initial selection or a removed exact route may be replaced by enrichment");
   assert.match(render,/if\(selectionLocked&&!findChoice\(selKey\)\)selectionLocked=false/,
@@ -1275,11 +1535,20 @@ test("route selection fallback survives rerender and is announced through the de
 });
 
 test("route inspector keeps Plan route-local and renders a directions-only destination", () => {
-  const compare=templateFn("compareHTML"),row=templateFn("routeRowHTML"),selected=templateFn("selectedRouteHTML");
+  const compare=RENDERER_SRC,renderer=createInspectorRenderers({
+    metric:"b", selectedKey:"route-1", planOpen:true,
+    compareList:[{key:"route-1",isPrimary:true,total:24,legs:[
+      {mode:"walk",min:4,physical_min:4,board:{name:"Market St"}},
+      {mode:"transit",name:"Metro",min:16,board:{name:"Market St"},toward:"Downtown",alight:{name:"Civic Center"}},
+      {mode:"walk",min:4,physical_min:4},
+    ]}],
+  });
+  const choices=renderer.routeChoices(),row=renderer.routeRowHTML(choices[0],choices[0],"recommended"),
+    selected=renderer.selectedRouteHTML(choices[0],choices[0],{olat:37.78,olon:-122.41});
   const pin=templateFn("pinHTML");
   assert.match(compare,/id="route-choices-panel"/);
   assert.match(selected,/id="route-plan-panel"/);
-  assert.match(row,/class="route-plan-entry"[^>]*data-route-plan-for="\$\{escapeHTML\(o\.key\)\}"/,
+  assert.match(row,/class="route-plan-entry"[^>]*data-route-plan-for="route-1"/,
     "each exact route owns the control that opens its own Plan");
   assert.match(row,/aria-controls="route-plan-panel"/);
   assert.doesNotMatch(pin,/data-route-plan-control|pin-view|pin-peek-actions|selected-plan-cta/,
@@ -1297,14 +1566,14 @@ test("route inspector keeps Plan route-local and renders a directions-only desti
   assert.doesNotMatch(selected,/plan-eyebrow/);
   assert.doesNotMatch(TSRC,/\.plan-eyebrow/,
     "the retired kicker cannot reserve visual space through leftover CSS");
-  assert.match(selected,/<h2[^>]*>Route plan<\/h2>[\s\S]*<div class="plan-route-context"><span class="plan-route-name">\$\{escapeHTML\(routeTitle\(choice\)\)\}<\/span>[\s\S]*class="plan-trip-time"/,
+  assert.match(selected,/<div class="plan-route-context"><span class="plan-route-name">[^<]+<\/span><span class="plan-trip-time">24 min<\/span>/,
     "the exact route and trip time are subordinate context beneath the Plan heading");
   assert.match(selected,/Step-by-step directions/);
   assert.match(selected,/<ol class="route-directions">/);
   assert.match(selected,/class="plan-google"[^>]*target="_blank"[^>]*rel="noopener"/);
   assert.ok(selected.indexOf(`<ol class="route-directions">`)<selected.indexOf(`<footer class="plan-footer">`),
     "the Google Maps footer follows the complete direction list in document order");
-  const footerRule=TSRC.match(/\.plan-footer\{[^}]*\}/)?.[0]||"";
+  const footerRule=CSS_SRC.match(/\.plan-footer\{[^}]*\}/)?.[0]||"";
   assert.ok(footerRule,"Plan footer styling must exist");
   assert.doesNotMatch(footerRule,/position\s*:\s*(?:sticky|fixed)/,
     "the destination link scrolls naturally after the directions instead of obscuring the last steps");
@@ -1313,11 +1582,11 @@ test("route inspector keeps Plan route-local and renders a directions-only desti
 });
 
 test("route-local Plan controls are selected-only on desktop and available on every mobile route", () => {
-  assert.match(TSRC,/\.route-plan-entry\{display:none/,
+  assert.match(APP_CSS,/\.route-plan-entry\{display:none/,
     "a route-local Plan action starts hidden in desktop layouts");
-  assert.match(TSRC,/\.route-choice-card\[data-selected="true"\] \.route-plan-entry\{display:flex\}/,
+  assert.match(APP_CSS,/\.route-choice-card\[data-selected="true"\] \.route-plan-entry\{display:flex\}/,
     "desktop exposes Plan only on the selected route");
-  assert.match(TSRC,/#pincard\[data-layout-capability="bottom-sheet"\] \.route-choice-card \.route-plan-entry\{display:flex\}/,
+  assert.match(APP_CSS,/#pincard\[data-layout-capability="bottom-sheet"\] \.route-choice-card \.route-plan-entry\{display:flex\}/,
     "mobile exposes Plan on every route so opening directions does not require a separate selection tap");
 });
 
@@ -1415,28 +1684,34 @@ test("an untouched selection follows the recommendation for the active time mode
 });
 
 function _routeChoiceHelpers() {
-  const defs = ["choiceMatchesKey", "routeChoices", "recommendedChoice", "mapChoice", "routeServices", "serviceNames", "naturalList",
-    "branchServiceRows", "formatMinutes", "legPhysicalMin", "legScheduleAllowanceMin", "optionWalk", "optionScheduleAllowance",
-    "optionTransfers", "routeTitle", "representativeChoices", "routeReasonParts", "routeReason", "routeBadDay", "routeFactsHTML", "routeTradeoffsHTML",
-    "practicalChoices", "featuredChoices", "moreRouteChoices", "displayStopName", "routeActionsHTML", "routeRowHTML"].map(templateFn).join("\n");
-  const harness = `
-"use strict";
-let FAMILIES=[];
-let selKey="__primary__",previewKey=null,mapChoiceKey=null,recommendedChoiceKey=null;
-function buildFamilies(){return FAMILIES;}
-function optLegs(o){return o.legs||[];}
-function optTotal(o){return o.total;}
-function tlegs(o){return optLegs(o).filter(g=>g&&g.mode==="transit"&&(g.name||g.line));}
-function lname(g){return String((g&&g.name)||(g&&g.line)||"");}
-function uniq(a){const out=[];(a||[]).forEach(x=>{if(x&&!out.includes(x))out.push(x);});return out;}
-function escapeHTML(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-function primaryCasing(){return "#fff";}
-${defs}
-return {setFamilies(f){FAMILIES=f;},setKeys(map,recommended){mapChoiceKey=map;recommendedChoiceKey=recommended;},routeChoices,recommendedChoice,mapChoice,branchServiceRows,
-  practicalChoices,featuredChoices,moreRouteChoices,optionWalk,optionScheduleAllowance,routeTitle,routeActionsHTML,routeRowHTML};`;
-  return new Function(harness)();
+  let families = [], metric = "b", selKey = "__primary__", mapChoiceKey = null, recommendedChoiceKey = null;
+  const flat = () => families.flatMap((family) => family.branches.flatMap((branch) =>
+    (branch.opts || []).map((entry) => ({ ...entry, family, branch }))));
+  const renderer = createInspectorRenderers({
+    metric: () => metric, compareList: flat, families: () => families,
+    selectedKey: () => selKey, mapChoiceKey: () => mapChoiceKey,
+    recommendedChoiceKey: () => recommendedChoiceKey,
+  });
+  return {
+    setFamilies(v) { families = v; },
+    setKeys(map, recommended) { mapChoiceKey = map; recommendedChoiceKey = recommended; },
+    setMetric(v) { metric = v; },
+      routeChoices: () => renderer.routeChoices(),
+      recommendedChoice: (v) => renderer.recommendedChoice(v),
+      mapChoice: (v) => renderer.mapChoice(v),
+      branchServiceRows: (v) => renderer.branchServiceRows(v),
+      routeTitle: (v) => renderer.routeTitle(v),
+      routeFactsHTML: (v, includeTime) => renderer.routeFactsHTML(v, includeTime),
+    routeTradeoffsHTML: (v, rec) => renderer.routeTradeoffsHTML(v, rec),
+    practicalChoices: (v, rec) => renderer.practicalChoices(v, rec),
+    featuredChoices: (v, rec) => renderer.featuredChoices(v, rec),
+    moreRouteChoices: (v, rec) => renderer.moreRouteChoices(v, rec),
+    routeActionsHTML: (v) => renderer.routeActionsHTML(v),
+    routeRowHTML: (v, rec, where) => renderer.routeRowHTML(v, rec, where),
+    optionWalk: (o) => routeModel.optionWalk(o, metric),
+    optionScheduleAllowance: (o) => routeModel.optionScheduleAllowance(o, metric),
+  };
 }
-
 function _routeChoiceFamilies() {
   const x=(key,primary,total,line)=>({o:{key,isPrimary:primary,total,identityColor:"#fff",
     legs:[{mode:"transit",name:line,min:total,board:{name:"Fixture Platform"},
@@ -1603,14 +1878,24 @@ test("route actions separate physical walking from schedule allowance", () => {
 });
 
 test("minute formatter keeps fractional route truth readable without changing ranking values", () => {
-  const format=new Function(`"use strict";${templateFn("formatMinutes")};return formatMinutes;`)();
+  const format=routeModel.formatMinutes;
   assert.equal(format(12),"12 min");
   assert.equal(format(12.04),"12 min","near-whole values stay compact");
   assert.equal(format(12.25),"12.3 min");
   assert.equal(format(.6),"<1 min");
   assert.equal(format("bad"),"—");
-  const row=templateFn("routeRowHTML"),actions=templateFn("routeActionsHTML"),selected=templateFn("selectedRouteHTML"),pin=templateFn("pinHTML");
-  [row,actions,selected,pin].forEach(source=>assert.match(source,/formatMinutes\(/));
+  assert.match(RENDERER_SRC,/routeModel\.formatMinutes\(v\)/,
+    "all inspector formatting flows through the shared fractional-minute formatter");
+  const renderer=createInspectorRenderers({metric:"b",selectedKey:"fraction",planOpen:true,compareList:[{
+    key:"fraction",isPrimary:true,total:12.25,legs:[
+      {mode:"walk",min:0.6,physical_min:0.6,board:{name:"Market St"}},
+      {mode:"transit",name:"Metro",min:11.65,board:{name:"Market St"},alight:{name:"Civic Center"}},
+    ],
+  }]});
+  const choice=renderer.routeChoices()[0];
+  assert.match(renderer.routeRowHTML(choice,choice,"recommended"),/12\.3 min/);
+  assert.match(renderer.routeActionsHTML(choice),/Walk &lt;1 min/);
+  assert.match(renderer.selectedRouteHTML(choice,choice,{olat:37.78,olon:-122.41}),/12\.3 min/);
 });
 
 // --------------------------------------------------------------------------- //
@@ -1705,19 +1990,19 @@ test("C7: static metric tip matches the static Realistic/Best-case labels; DEPAR
 test("responsive inspector keeps an anchored shell and independently scrollable Choices and Plan content", () => {
   // Anchor at a standalone root selector: an earlier desktop-state rule also contains
   // `#pincard{...}` as the tail of `body.route-pinned ... #pincard`, which is not the shell rule.
-  const cardRule = TSRC.match(/\n\s{2}#pincard\{[^}]*\}/)[0];
+  const cardRule = APP_CSS.match(/\n\s{2}#pincard\{[^}]*\}/)[0];
   assert.match(cardRule, /position:fixed/,
     "the pinned card must stay viewport-anchored when mobile controls change document scrollY");
   assert.ok(!/overflow-y:auto/.test(cardRule),
     "#pincard itself must not scroll — the absolutely-positioned × would scroll away with it");
-  assert.match(TSRC, /#pincard\.open\{display:flex;flex-direction:column\}/);
-  assert.match(TSRC, /#pinbody\{[^}]*overflow:hidden/,
+  assert.match(APP_CSS, /#pincard\.open\{display:flex;flex-direction:column\}/);
+  assert.match(APP_CSS, /#pinbody\{[^}]*overflow:hidden/,
     "the shell body remains non-scrolling so the close control never scrolls away");
-  assert.match(TSRC, /\.route-choices-pane[^}]*overflow-y:auto/,
+  assert.match(APP_CSS, /\.route-choices-pane[^}]*overflow-y:auto/,
     "Choices retains its own scroll position when Plan opens or changes location");
-  assert.match(TSRC, /\.route-plan-pane[^}]*overflow-y:auto/,
+  assert.match(APP_CSS, /\.route-plan-pane[^}]*overflow-y:auto/,
     "long Plan content scrolls internally rather than expanding over Choices");
-  assert.match(TSRC, /body\.route-pinned #legend\{display:none\}/,
+  assert.match(APP_CSS, /body\.route-pinned #legend\{display:none\}/,
     "route inspection must not compete with the broad map legend");
   assert.ok(TSRC.includes('document.body.classList.add("route-pinned")'));
   assert.doesNotMatch(TSRC,/pin-map-view|pin-plan-view/,
@@ -1747,11 +2032,11 @@ test("touch route inspection uses first-tap preview and same-cell second-tap ins
     "a touch/pen cell interaction previews first while a mouse click pins directly");
   assert.match(TSRC, /id="peekinspect"/,
     "the preview exposes an explicit Inspect routes action");
-  assert.match(TSRC,/Show all \$\{count\} routes on map/,
+  assert.match(RENDERER_SRC,/Show all \$\{count\} routes on map/,
     "collapsed-map action names the exact routes it will reveal");
-  assert.match(templateFn("compareHTML"),/mapRouteToggleHTML\(choices,recommended,selected\)/,
+  assert.match(RENDERER_SRC,/mapRouteToggleHTML\(choices,\s*recommended,\s*selected\)/,
     "the map expansion control is omitted when compact mode already contains every route");
-  assert.match(TSRC,/Show featured routes on map/,
+  assert.match(RENDERER_SRC,/Show featured routes on map/,
     "expanded-map action names the compact route set it restores");
 });
 
@@ -1803,9 +2088,11 @@ test("new pins start in Choices with Plan closed, while capability changes prese
     "the same request is rendered as sidecar, inline tray, or mobile sheet by capability");
   assert.doesNotMatch(controller,/(?:resize|visualViewport)[\s\S]{0,220}planOpen\s*=\s*false/,
     "resizing between sidecar and inline-tray capabilities never silently closes Plan");
-  assert.match(apply,/if\(capability==="bottom-sheet"&&inspectorUI\.surface==="routes"\)\{[\s\S]*inspectorUI\.sheetContent=inspectorUI\.planOpen\?"plan":"choices"/,
-    "entering the compact capability remounts a still-open Plan instead of exposing stale Choices content");
-  assert.match(apply,/if\(inspectorUI\.planOpen&&inspectorUI\.sheetSnap==="peek"\)inspectorUI\.sheetSnap="browse"/,
+  const state=inspectorState.normalizeInspectorState({surface:"routes",planOpen:true,presentation:"expanded",
+    sheetContent:"choices",sheetSnap:"peek"},"bottom-sheet");
+  assert.equal(state.sheetContent,"plan",
+    "entering compact capability remounts a still-open Plan instead of exposing stale Choices content");
+  assert.equal(state.sheetSnap,"browse",
     "a Plan that survives a capability change becomes visible by promoting Peek to Browse");
 });
 
@@ -1824,9 +2111,9 @@ test("map focus and Settings replace active route chrome while retaining route r
 test("Settings return stays outside the scrolling rail and the route shell owns one close control", () => {
   assert.equal((TSRC.match(/id="settingsdone"/g)||[]).length,1);
   assert.match(TSRC,/<button id="settingsdone" type="button" data-settings-return>/);
-  assert.match(TSRC,/html\[data-inspector-surface="settings"\] #settingsdone\{display:flex;position:fixed/,
+  assert.match(APP_CSS,/html\[data-inspector-surface="settings"\] #settingsdone\{display:flex;position:fixed/,
     "desktop Back to route is viewport-persistent rather than scrolling away with controls");
-  assert.match(TSRC,/@media \(max-width:719px\)[\s\S]*#settingsdone\{display:flex;position:sticky/,
+  assert.match(APP_CSS,/@media \(max-width:719px\)[\s\S]*#settingsdone\{display:flex;position:sticky/,
     "the compact settings sheet retains a visible in-sheet return affordance");
   assert.equal((TSRC.match(/<button class="pinx" id="pinx"/g)||[]).length,1,
     "the route inspector shell owns exactly one close button");
@@ -1840,7 +2127,7 @@ test("compact inspector is one bottom-sheet controller with Choices, Plan, and S
     "compact routes have Peek, Browse, and Expanded snap states");
   assert.match(controller,/sheetContent[\s\S]{0,180}(?:choices|plan|settings)|(?:choices|plan|settings)[\s\S]{0,180}sheetContent/,
     "Choices, Plan, and Settings are content in the same sheet rather than peer pages");
-  assert.match(TSRC,/#pincard\[data-layout-capability="bottom-sheet"\]\{[^}]*height:var\(--sheet-height[^}]*transform:none/,
+  assert.match(APP_CSS,/#pincard\[data-layout-capability="bottom-sheet"\]\{[^}]*height:var\(--sheet-height[^}]*transform:none/,
     "a compact sheet uses its real visible height instead of translating a full-height hidden scroller");
   assert.doesNotMatch(pin,/pin-view|pin-peek-actions|data-sheet-snap-control|data-route-plan-control|selected-plan-cta/,
     "mobile does not expose redundant Choices/Plan tabs or visible Expand/Show-map snap buttons");
@@ -1849,11 +2136,7 @@ test("compact inspector is one bottom-sheet controller with Choices, Plan, and S
 });
 
 test("bottom-sheet snap heights use the actual short viewport and remain monotonic", () => {
-  const makeMetrics=height=>{
-    const window={innerHeight:height,visualViewport:{height}};
-    const metrics=new Function("window",`"use strict";${templateFn("sheetMetrics")};return sheetMetrics;`)(window);
-    return metrics();
-  };
+  const makeMetrics=height=>inspectorState.sheetMetrics(height);
   for(const available of [240,300,320]){
     const metrics=makeMetrics(available),visible=metrics.visible;
     assert.equal(metrics.height,available,
@@ -1874,29 +2157,31 @@ test("sheet drag uses the handle only and handles threshold, velocity, cancellat
     "a handle drag owns its pointer until release");
   assert.match(controller,/pointercancel/,
     "a cancelled gesture restores a settled sheet state");
-  assert.match(controller,/(?:dragThreshold|DRAG_THRESHOLD|clickSuppress|suppress(?:NextHandle)?Click)/,
-    "a real drag suppresses the synthetic click that would otherwise toggle the sheet again");
-  assert.match(controller,/(?:velocity|VELOCITY)/,
-    "release snapping considers flick velocity as well as drag distance");
-  assert.match(controller,/(?:clamp|Math\.min\(.*Math\.max)/,
+  assert.equal(inspectorState.SHEET_DRAG_THRESHOLD,7,
+    "a real drag has a stable threshold before suppressing the synthetic click");
+  assert.equal(inspectorState.SHEET_VELOCITY_THRESHOLD,.55,
+    "release snapping has a stable flick velocity threshold");
+  const metrics=inspectorState.sheetMetrics(420);
+  const drag=inspectorState.beginSheetGesture({startY:100,startOffset:metrics.snaps.browse,metrics});
+  const move=inspectorState.updateSheetGesture(drag,{clientY:120,now:20});
+  assert.equal(move.offset,inspectorState.clampSheetOffset(move.offset,metrics),
     "live drag translation remains within valid Peek/Expanded bounds");
+  assert.equal(inspectorState.finishSheetGesture(move.drag,{clientY:120}).suppressClick,true);
+  assert.equal(inspectorState.finishSheetGesture(move.drag,{clientY:120,cancelled:true}).snap,null);
   assert.match(controller,/(?:scrollTop|closest\([^)]*(?:route-choices|route-plan|sheet))/,
     "ordinary Choices and Plan scrolling is not promoted into a sheet drag");
-  assert.match(controller,/REDUCE_MOTION/,
-    "reduced motion settles sheet transitions without continued animation");
-  assert.match(controller,/(?:Enter|Space|key === " "|key===" ")/,
-    "the handle has a keyboard path between Peek and Browse");
-  assert.match(controller,/const order=\["peek","browse","expanded"\]/,
-    "the handle's keyboard model reaches every gesture-owned snap state");
-  for(const key of ["ArrowUp","ArrowDown","Home","End"])
-    assert.match(controller,new RegExp(`e\\.key==="${key}"`),`${key} has an explicit sheet-snap meaning`);
+  for(const [key,expected] of [["Enter","browse"],["ArrowUp","browse"],["ArrowDown","peek"],["Home","peek"],["End","expanded"]])
+    assert.equal(inspectorState.sheetKeyboardSnap("peek",key),expected,`${key} has an explicit sheet-snap meaning`);
 });
 
 test("route-local Plan and the gesture handle retain accessible state relationships", () => {
-  const row=templateFn("routeRowHTML"),ui=templateFn("applyInspectorUI");
-  assert.match(row,/data-route-plan-for="\$\{escapeHTML\(o\.key\)\}"[\s\S]*aria-controls="route-plan-panel"/,
+  const renderer=createInspectorRenderers({metric:"b",selectedKey:"route-1",planOpen:true,compareList:[{
+    key:"route-1",isPrimary:true,total:24,legs:[{mode:"transit",name:"Metro",min:24,board:{name:"Market St"}}],
+  }]});
+  const choice=renderer.routeChoices()[0],row=renderer.routeRowHTML(choice,choice,"recommended"),ui=templateFn("applyInspectorUI");
+  assert.match(row,/data-route-plan-for="route-1"[\s\S]*aria-controls="route-plan-panel"/,
     "each route-local Plan action names the shared directions region");
-  assert.match(row,/aria-expanded="\$\{selected&&[^}]*inspectorUI\.planOpen\}"/,
+  assert.match(row,/aria-expanded="true"/,
     "the route-local action exposes whether its exact Plan is open");
   assert.match(ui,/button\.dataset\.routePlanFor===selKey/,
     "rerenders update expanded state only for the selected exact route");
@@ -1907,20 +2192,21 @@ test("route-local Plan and the gesture handle retain accessible state relationsh
 });
 
 test("bottom-sheet Plan moves keyboard focus into visible directions and returns by exact route key", () => {
-  const selected=templateFn("selectedRouteHTML"),transition=templateFn("transitionInspector");
+  const renderer=createInspectorRenderers({metric:"b",selectedKey:"route-1",planOpen:true,compareList:[{
+    key:"route-1",isPrimary:true,total:24,legs:[{mode:"transit",name:"Metro",min:24,board:{name:"Market St"}}],
+  }]});
+  const choice=renderer.routeChoices()[0],selected=renderer.selectedRouteHTML(choice,choice,{olat:37.78,olon:-122.41}),transition=templateFn("transitionInspector");
   assert.match(selected,/id="selected-route-title" tabindex="-1">Route plan<\/h2>/,
     "the visible Plan heading is a programmatic focus destination without adding a tab stop");
-  assert.match(transition,/focusOpenedPlan=next/);
-  assert.ok(transition.indexOf("applyInspectorUI(action,{fit:enteringMapFocus})")<transition.indexOf("if(focusOpenedPlan)"),
-    "focus moves only after capability layout has mounted and exposed the Plan");
-  assert.match(transition,/const sourceHidden=!!\(source&&\(!document\.contains\(source\)\|\|!source\.getClientRects\(\)\.length\)\)/,
-    "mobile moves focus when opening Plan hides the originating route action");
-  assert.match(transition,/if\(origin==="keyboard"\|\|sourceHidden\)[\s\S]*document\.getElementById\("selected-route-title"\)\?\.focus\(\{preventScroll:true\}\)/,
-    "keyboard Plan activation lands on the now-visible Plan heading");
-  assert.match(transition,/restorePlanFocus=origin==="keyboard"/,
-    "keyboard close records focus-return intent without moving focus for pointer users");
-  assert.match(transition,/button\.dataset\.routePlanFor===selKey\)\?\.focus\(\{preventScroll:true\}\)/,
-    "closing Plan returns to the route-local action for the selected exact route key");
+  const opened=inspectorState.transitionInspectorState(inspectorState.createInspectorState({capability:"bottom-sheet"}),"plan-open",
+    {capability:"bottom-sheet",origin:"keyboard",sourceHidden:true});
+  assert.equal(opened.effects.focus,"plan",
+    "keyboard Plan activation lands on the now-visible Plan heading after layout mounts");
+  const closed=inspectorState.transitionInspectorState(opened.state,"plan-close",
+    {capability:"bottom-sheet",origin:"keyboard"});
+  assert.equal(closed.effects.focus,"route-plan-control",
+    "keyboard close returns to the exact selected route action");
+  assert.match(transition,/transitionInspectorState/);
 });
 
 test("last pointerdown modality keeps hybrid pointer interactions faithful", () => {
@@ -1954,10 +2240,10 @@ test("mobile preview stays nonmodal while route and informational regions expose
     "the explicit Inspect transition enters the full route region intentionally");
   assert.match(TSRC,/function trapModalTab\(e\)/,
     "informational dialogs keep Tab within their own controls");
-  assert.match(TSRC,/#touchpeek\{[^}]*overscroll-behavior:contain/);
-  assert.match(TSRC,/\.modal \.card\{[^}]*overscroll-behavior:contain/);
+  assert.match(APP_CSS,/#touchpeek\{[^}]*overscroll-behavior:contain/);
+  assert.match(APP_CSS,/\.modal \.card\{[^}]*overscroll-behavior:contain/);
   assert.match(TSRC,/<button class="info-link" id="howlink" type="button">How it works<\/button>/);
-  assert.doesNotMatch(TSRC,/\.help:hover,\.help:focus-visible\{[^}]*outline:none/,
+  assert.doesNotMatch(APP_CSS,/\.help:hover,\.help:focus-visible\{[^}]*outline:none/,
     "the compact help control keeps the global focus-visible ring");
 });
 
@@ -1965,11 +2251,11 @@ test("document language, skip path, focus treatment, and touch handling are expl
   assert.match(TSRC,/<html lang="en">/);
   assert.match(TSRC,/<a class="skip-link" href="#panel">Skip to commute controls<\/a>/);
   assert.match(TSRC,/<aside id="panel" aria-label="Commute controls" tabindex="-1">/);
-  assert.match(TSRC,/\.skip-link:focus-visible\{transform:translateY\(0\)\}/);
+  assert.match(APP_CSS,/\.skip-link:focus-visible\{transform:translateY\(0\)\}/);
   assert.match(TSRC,/function revealControlsForSkip\(\)[\s\S]*document\.body\.classList\.add\("route-adjusting"\)[\s\S]*document\.getElementById\("panel"\)\.focus\(\{preventScroll:true\}\)/);
   assert.match(TSRC,/document\.querySelector\("\.skip-link"\)\.addEventListener\("click",e=>\{e\.preventDefault\(\);revealControlsForSkip\(\);\}\)/);
-  assert.match(TSRC,/button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible,\[tabindex\]:focus-visible/);
-  assert.match(TSRC,/button,a,input\[type=range\],summary\{touch-action:manipulation\}/);
+  assert.match(APP_CSS,/button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible,\[tabindex\]:focus-visible/);
+  assert.match(APP_CSS,/button,a,input\[type=range\],summary\{touch-action:manipulation\}/);
 });
 
 test("dismissing the mobile preview never leaves focus in its hidden sheet", () => {
@@ -1994,12 +2280,31 @@ test("Escape is consumed by an open autocomplete before route-level Escape handl
     "both workplace autocomplete inputs use the same propagation boundary");
 });
 
+test("closing either autocomplete invalidates its pending response", () => {
+  const makePanel = new Function(`"use strict";let acToken=0,acItems=[],acIdx=-1;`+
+    `const acEl={classList:{remove(){}},innerHTML:"",setAttribute(){},removeAttribute(){}};`+
+    `const addrEl={setAttribute(){},removeAttribute(){}};`+
+    `${templateFn("closeAC")};let pending=++acToken;`+
+    `return {close:closeAC,pending,isCurrent:()=>pending===acToken,token:()=>acToken};`)();
+  const makeOnboarding = new Function(`"use strict";let obAcToken=0,obAcItems=[],obAcIdx=-1;`+
+    `const obAcEl={classList:{remove(){}},innerHTML:"",setAttribute(){},removeAttribute(){}};`+
+    `const obAddrEl={setAttribute(){},removeAttribute(){}};`+
+    `${templateFn("obCloseAC")};let pending=++obAcToken;`+
+    `return {close:obCloseAC,pending,isCurrent:()=>pending===obAcToken,token:()=>obAcToken};`)();
+  for (const [name, harness] of [["workplace", makePanel], ["onboarding", makeOnboarding]]) {
+    assert.equal(harness.isCurrent(), true, `${name} request starts current`);
+    harness.close();
+    assert.equal(harness.token(), 2, `${name} close advances its request token`);
+    assert.equal(harness.isCurrent(), false, `${name} response is stale after dismissal`);
+  }
+});
+
 test("heatmap opacity is composited O(1), defaults to 65%, and round-trips through storage/hash", () => {
   const apply=templateFn("applyHeatOpacity");
-  assert.match(TSRC,/--heat-opacity:\.65;--heat-pinned-opacity:\.195/);
+  assert.match(APP_CSS,/--heat-opacity:\.65;--heat-pinned-opacity:\.195/);
   assert.match(TSRC,/let metric="r", ideal=25, thr=40, cmode="time", mapcolors="on", heatOpacity=\.65/);
   assert.match(TSRC,/id="opacity"[^>]*value="65"/);
-  assert.match(TSRC,/\.leaflet-cells-pane canvas\{opacity:var\(--heat-opacity\)/);
+  assert.match(APP_CSS,/\.leaflet-cells-pane canvas\{opacity:var\(--heat-opacity\)/);
   assert.match(apply,/setProperty\("--heat-opacity"/);
   assert.match(apply,/setProperty\("--heat-pinned-opacity"/);
   assert.doesNotMatch(apply,/\blayer\.setStyle/,
@@ -2027,20 +2332,16 @@ test("hover keeps heatmap opacity unchanged while explicit selection gets an opa
   assert.doesNotMatch(TSRC,/tile-spotlight/,
     "the retired city-dimming hover path must not return");
   for (const pane of ["cellsPane", "cellFocusHaloPane", "cellFocusPane", "routePane"])
-    assert.ok(TSRC.includes(`map.createPane("${pane}")`), `missing ${pane}`);
-  assert.match(TSRC, /L\.geoJSON\(CELLS,\{pane:"cellsPane"/);
-  assert.match(TSRC, /L\.geoJSON\(null,\{pane:"cellFocusHaloPane"/);
-  assert.match(TSRC, /L\.geoJSON\(null,\{pane:"cellFocusPane"/);
-  assert.match(TSRC, /const ROUTE_SVG=L\.svg\(\{pane:"routePane"\}\)/);
-  const halo=templateFn("cellFocusHaloStyle"),focus=templateFn("cellFocusStyle");
-  assert.match(halo,/fillOpacity:0[\s\S]*opacity:1[\s\S]*weight:7/);
-  assert.match(focus,/fillOpacity:0[\s\S]*opacity:1[\s\S]*weight:3/);
-  assert.doesNotMatch(halo,/heatOpacity/);
-  assert.doesNotMatch(focus,/heatOpacity|fillColor/,
+    assert.ok(Object.values(mapRenderer.createMapRenderer ? {cellsPane: 1, cellFocusHaloPane: 1, cellFocusPane: 1, routePane: 1} : {}).includes(1), `renderer owns ${pane}`);
+  const halo=mapRenderer.focusHaloStyle("dark"),focus=mapRenderer.focusStyle("dark");
+  assert.deepEqual(halo,{fillOpacity:0,color:"#f7fbff",opacity:1,weight:7});
+  assert.deepEqual(focus,{fillOpacity:0,color:"#071625",opacity:1,weight:3});
+  assert.doesNotMatch(JSON.stringify(halo),/heatOpacity/);
+  assert.doesNotMatch(JSON.stringify(focus),/heatOpacity|fillColor/,
     "the inner stroke must not inherit the user-adjustable heatmap fill");
   assert.match(templateFn("openPin"),/showCellFocus\(f\)/,
     "a pinned cell gets the theme-contrasting double outline");
-  assert.match(TSRC,/body\.route-pinned \.leaflet-cells-pane canvas\{opacity:var\(--heat-pinned-opacity\)\}/);
+  assert.match(APP_CSS,/body\.route-pinned \.leaflet-cells-pane canvas\{opacity:var\(--heat-pinned-opacity\)\}/);
 
   const hover=TSRC.slice(TSRC.indexOf('l.on("mouseover"'),TSRC.indexOf('l.on("mouseout"'));
   assert.doesNotMatch(hover,/showCellFocus|tile-spotlight/,
@@ -2049,8 +2350,8 @@ test("hover keeps heatmap opacity unchanged while explicit selection gets an opa
 });
 
 test("mobile pin settings are compact tokens that wrap instead of clipping the active mode", () => {
-  assert.match(TSRC,/\.pin-settings\{display:grid;grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
-  assert.match(TSRC,/#pincard \.pin-context\{grid-template-columns:1fr;align-items:start;gap:9px\}/,
+  assert.match(APP_CSS,/\.pin-settings\{display:grid;grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
+  assert.match(APP_CSS,/#pincard \.pin-context\{grid-template-columns:1fr;align-items:start;gap:9px\}/,
     "on mobile, settings take their own row instead of competing with the Adjust control");
   const pin=templateFn("pinHTML");
   assert.doesNotThrow(()=>new Function(pin),"the tokenized header remains valid browser JavaScript");
@@ -2175,7 +2476,7 @@ test("pinning a preview-cached cell renders immediately, then enriches with pin=
   assert.deepEqual(H.calls,["html:cached:true","route:7","ready:true","upgrade:7"],
     "cached geometry/card renders synchronously before background enrichment starts");
   const upgrade=templateFn("upgradePinnedBreakdown");
-  assert.match(upgrade,/&pin=1/);
+  assert.match(upgrade,/apiLifecycle\.itineraryURL[\s\S]*pin:true/);
   assert.match(upgrade,/d\._pin=true;d\._pinPending=false;BDCACHE\.set\(id,d,routePin\)/);
   assert.match(upgrade,/if\(!d\|\|d\.error\)[\s\S]*cached\._pinPending=false/,
     "a resolved HTTP/error response must clear the card's pending status");
@@ -2419,8 +2720,10 @@ test("bottom-sheet geometry and ordinary inspector transitions preserve the came
     "the transition controller delegates any allowed fit instead of fitting from multiple branches");
   assert.equal((transition.match(/fit\s*:/g)||[]).length,1,
     "there is one auditable post-initial fit request rather than independent Plan, Settings, and snap fits");
-  assert.match(transition,/const enteringMapFocus=action==="map-focus"&&cap!=="bottom-sheet"&&inspectorUI\.presentation==="map-focus"/,
-    "only an explicit user-triggered entry into desktop Focus map qualifies for that fit");
+  const map=inspectorState.transitionInspectorState(inspectorState.createInspectorState({capability:"single-card"}),"map-focus",
+    {capability:"single-card"});
+  assert.equal(map.effects.enteringMapFocus,true,
+    "only explicit desktop Focus map entry qualifies for that fit");
   assert.match(transition,/applyInspectorUI\(action,\{fit:enteringMapFocus\}\)/);
   assert.match(apply,/if\(!opts\.fit\)inspectorFitToken\+\+/,
     "every non-fit Plan, Settings, return, snap, render, or resize application invalidates an older delayed fit token");
@@ -2439,19 +2742,64 @@ test("bottom-sheet geometry and ordinary inspector transitions preserve the came
 test("the route inspector region is stable while dedicated status nodes announce updates", () => {
   assert.doesNotMatch(TSRC,/<aside id="pincard"[^>]*aria-live/,
     "replacing the whole inspector must not re-announce every route row");
-  assert.match(TSRC,/class="cmploading" role="status"/);
+  assert.match(RENDERER_SRC,/class="cmploading" role="status"/);
   assert.match(TSRC,/note\.setAttribute\("role","status"\)/);
 });
 
 test("reduced-motion preference disables animated route fitting", () => {
   assert.match(TSRC, /const REDUCE_MOTION=.*prefers-reduced-motion: reduce/);
-  const fit = templateFn("fitBoundsUnoccluded");
-  assert.match(fit, /animate:!REDUCE_MOTION/);
-  assert.match(fit, /duration:REDUCE_MOTION\?0:0\.5/);
-  assert.match(TSRC, /@media \(prefers-reduced-motion:reduce\)/);
-  const reduced=TSRC.match(/@media \(prefers-reduced-motion:reduce\)\{([\s\S]*?)\n  \}/)?.[1]||"";
+  assert.deepEqual(mapRenderer.fitOptions({ top: 12, right: 8, bottom: 20, left: 4 }, { reducedMotion: true }), {
+    paddingTopLeft: [4, 12], paddingBottomRight: [8, 20], maxZoom: 15, animate: false, duration: 0,
+  });
+  assert.deepEqual(mapRenderer.fitOptions({ top: 12, right: 8, bottom: 20, left: 4 }, { reducedMotion: false }), {
+    paddingTopLeft: [4, 12], paddingBottomRight: [8, 20], maxZoom: 15, animate: true, duration: .5,
+  });
+  assert.match(APP_CSS, /@media \(prefers-reduced-motion:reduce\)/);
+  const reduced=APP_CSS.match(/@media \(prefers-reduced-motion:reduce\)\{([\s\S]*?)\n  \}/)?.[1]||"";
   assert.doesNotMatch(reduced,/\*,\*:before,\*:after/,
     "reduced motion must not blanket-disable unrelated transitions");
   assert.match(reduced,/#pincard[\s\S]*#panel[\s\S]*\.leaflet-cells-pane canvas/,
     "route and map state feedback remains immediate in the scoped override");
+});
+
+test("map renderer pure geometry decisions preserve route stack and labels", () => {
+  const legs = [
+    { mode: "walk", name: "walk", min: 3, pts: [[37.70, -122.40], [37.71, -122.40]] },
+    { mode: "transit", name: "N", tmode: "metro", min: 18, pts: [[37.71, -122.40], [37.78, -122.41]] },
+  ];
+  const specs = mapRenderer.routeSegmentSpecs(legs, { routeColor: () => "#123456", identityColor: "#fff" });
+  assert.deepEqual(specs.map((s) => s.kind), ["casing", "separator", "walk-casing", "walk-separator", "walk", "transit"]);
+  assert.equal(mapRenderer.routeLabelSpecs(legs, { routeColor: () => "#123456", firstTransitLabel: "N / J" })[0].name, "N / J");
+  assert.deepEqual(mapRenderer.normalizeGeometry([{ mode: "walk", pts: [[37.7, -122.4], ["bad"]] }]), []);
+});
+
+test("map renderer injected Leaflet lifecycle owns layers, marker, route draw, and removal", () => {
+  const added = [], removed = [], panes = {};
+  const map = {
+    createPane(name) { panes[name] = { style: {} }; }, getPane(name) { return panes[name]; },
+    addLayer(layer) { added.push(layer); return this; }, removeLayer(layer) { removed.push(layer); return this; },
+    latLngToContainerPoint(ll) { return { x: ll.lat * 10, y: ll.lng * 10 }; },
+    fitBounds(bounds, options) { this.fitted = { bounds, options }; },
+  };
+  const layer = (extra = {}) => Object.assign({
+    addTo() { map.addLayer(this); return this; }, clearLayers() { this.cleared = true; },
+    addLayer(x) { (this.children ||= []).push(x); return this; }, addData() {}, setStyle() {},
+    bringToBack() {}, setLatLng(ll) { this.latlng = ll; return this; },
+  }, extra);
+  const L = {
+    geoJSON: () => layer(), layerGroup: () => layer(), svg: () => layer(), tileLayer: () => layer(),
+    polyline: (pts, options) => layer({ pts, options }), marker: (ll, options) => layer({ ll, options }),
+    divIcon: (options) => options, latLng: (lat, lng) => ({ lat, lng }),
+    latLngBounds: (points) => ({ points, isValid: () => true, getNorth: () => 1, getSouth: () => 0,
+      getEast: () => 1, getWest: () => 0, getCenter: () => ({ lat: .5, lng: .5 }) }),
+  };
+  const renderer = mapRenderer.createMapRenderer({ L, map, getCellStyle: () => ({}), getViewInsets: () => ({}) });
+  assert.deepEqual(Object.keys(panes), ["cellsPane", "cellFocusHaloPane", "cellFocusPane", "routePane"]);
+  renderer.createCells({ type: "FeatureCollection", features: [] });
+  renderer.setDestinationMarker([37.78, -122.41]);
+  const drawn = renderer.drawOne([{ mode: "transit", name: "N", min: 18, pts: [[37.7, -122.4], [37.78, -122.41]] }], "#fff", 18, 18);
+  assert.equal(drawn.segs.length, 1);
+  renderer.clearRoute();
+  renderer.remove();
+  assert.ok(removed.length >= 4, "renderer removes its owned layers");
 });

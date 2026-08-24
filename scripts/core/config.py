@@ -1,16 +1,38 @@
 """Paths, the canonical commute model, and feed locations — the single definition.
 
-Every script reads its constants from here, so there is exactly ONE GTFS feed list,
-ONE departure window, ONE walk speed, etc. This is what makes the offline analyses
-(isochrone.py, route_map.py, ...) actually comparable to the live server instead of
-each re-deriving slightly different values.
+Every runtime and build helper reads its constants from here, so there is exactly ONE GTFS
+feed list, ONE departure window, and ONE walk-speed model shared by the graph-native server.
 """
 import os
 import datetime as dt
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]   # scripts/core/config.py -> repo root
-DATA = ROOT / "data"
+
+
+def _data_root() -> Path:
+    """Resolve the runtime data root.
+
+    Normal startup remains exactly ``<repo>/data``.  Refresh/build jobs can point a
+    subprocess at an inactive generation with ``SFCI_DATA_DIR``; resolving here keeps
+    every downstream path helper on the same tree and makes relative overrides explicit
+    (relative to the repository, never to the caller's working directory).
+    """
+    raw = os.environ.get("SFCI_DATA_DIR")
+    if raw is None or not raw.strip():
+        return (ROOT / "data").resolve()
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = ROOT / candidate
+    resolved = candidate.resolve(strict=False)
+    if resolved == Path(resolved.anchor):
+        raise ValueError("SFCI_DATA_DIR must not be a filesystem root")
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError(f"SFCI_DATA_DIR is not a directory: {resolved}")
+    return resolved
+
+
+DATA = _data_root()
 OUT = ROOT / "out"
 
 # Coordinate reference systems
@@ -47,9 +69,8 @@ DEFAULT_SPEED = "med"
 #     can change by at most ~1 min (the rounding minute) and a genuinely-faster farther stop (>eps)
 #     is NEVER traded away. Without this cap, a raw beta multiplier on the full (<=25 min) access
 #     walk could flip a stop up to ~3.75 min slower — over-correcting the user's "slight" preference.
-# R5 has no walk-reluctance field, so the goal is purely the tie-break: measured MAE vs R5 is ~zero
-# (~+0.001 at the shipping settings). beta=1.0 reproduces the no-prior behavior exactly. The engine
-# threads both through assemble + JourneyTree._select_arrays.
+# beta=1.0 reproduces the no-prior behavior exactly. The engine threads both through assemble +
+# JourneyTree._select_arrays.
 WALK_RELUCTANCE = float(os.environ.get("RAPTOR_WALK_RELUCTANCE", "1.15"))
 WALK_PRIOR_EPS_SEC = float(os.environ.get("RAPTOR_WALK_PRIOR_EPS", "60"))
 
@@ -70,10 +91,8 @@ SF_VALID_BBOX = (-123.1, 37.3, -122.0, 38.1)
 # --- Data files -----------------------------------------------------------------------
 OSM_FILE = "osm_sf.pbf"
 NEIGH_FILE = "sf_neighborhoods.geojson"
-# Transit feeds, in network order: Muni (current 511 feed, else a stale 2022 fallback)
-# + BART + Caltrain.
+# Transit feeds, in network order: current Muni 511 feed + BART + Caltrain.
 MUNI_CURRENT = "muni_current.zip"
-MUNI_FALLBACK = "muni_gtfs_2022_fallback.zip"
 BART = "bart_gtfs.zip"
 CALTRAIN = "caltrain.zip"
 
@@ -89,17 +108,12 @@ def neigh_path() -> Path:
 def gtfs_paths(extra=None, *, replace=False):
     """The transit feeds to route on, as existing Paths in network order.
 
-    Muni resolves to the current 511 feed, or the stale 2022 fallback with a warning if
-    the current one hasn't been fetched. Non-existent feeds are dropped so a partial data
-    download runs (degraded) rather than crashing at network build. `extra` adds caller
-    feeds (names resolve under data/, absolute paths pass through); `replace=True` uses
-    only those caller feeds, which is useful for explicit comparison exports."""
+    Current Muni is mandatory for the production readiness contract. Non-existent feeds
+    are dropped here so lightweight feed/build callers can inspect partial input; the
+    server readiness check rejects missing required archives. `extra` adds caller feeds
+    (names resolve under data/, absolute paths pass through); `replace=True` uses only
+    those caller feeds, which is useful for explicit comparison exports."""
     muni = DATA / MUNI_CURRENT
-    if not muni.exists():
-        fb = DATA / MUNI_FALLBACK
-        if fb.exists():
-            print(f"!! WARNING: using STALE Muni feed {fb.name} (no current feed found)")
-            muni = fb
     paths = [] if replace else [muni, DATA / BART, DATA / CALTRAIN]
     if extra:
         paths += [Path(e) if Path(e).is_absolute() else DATA / e for e in extra]

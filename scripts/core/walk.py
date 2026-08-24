@@ -1,17 +1,15 @@
-"""Runtime hill-aware pedestrian router (JVM-free) over the baked walk graph.
+"""Runtime hill-aware pedestrian router over the baked walk graph.
 
 Loads ``data/walk_graph.npz`` (built by ``scripts/build_walk_graph.py``), rebuilds a cKDTree for
 snapping + a scipy CSR for routing, and answers one-to-many WALK queries with C-speed Dijkstra.
-This replaces R5's last runtime job (the per-workplace walk matrix) and the offline access bake.
-
 Weights are REFERENCE seconds at ``config.WALK_KMH`` (4.8): ``w_ref`` is grade-aware (Tobler +
-stairs), ``w_flat`` is the grade-agnostic distance/speed (R5-comparable, for validation). A
+stairs), ``w_flat`` is the grade-agnostic distance/speed reference used for validation. A
 per-request walk-speed scalar is applied by the CALLER (engine), not here — this module is
 scalar-agnostic and always returns reference seconds, so the same graph serves every speed.
-
-Do NOT import r5py here — the whole point is to drop the JVM.
 """
 import math
+from typing import NamedTuple
+
 import numpy as np
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
@@ -22,7 +20,40 @@ from . import config
 _DEFAULT = config.DATA / "walk_graph.npz"
 
 
+def _wgs84_lonlat(value):
+    """Normalize one ``(lon, lat)`` pair, or return ``None`` when it is not valid WGS84."""
+    try:
+        lon, lat = value
+        lon, lat = float(lon), float(lat)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(lon) and math.isfinite(lat)):
+        return None
+    if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+        return None
+    return lon, lat
+
+
+class WalkRouteResult(NamedTuple):
+    """The duration and predecessor-chain path for one graph route choice.
+
+    ``seconds`` includes both straight-line snap connectors and the directed graph cost, in
+    the graph's reference seconds.  ``points`` includes those exact endpoint connectors around
+    the predecessor-chain graph path, in walking order.  A named tuple keeps this result cheap
+    to pass around while still allowing callers to destructure it as ``seconds, points``.
+    """
+
+    seconds: float
+    points: list
+
+
 class WalkGraph:
+    # The graph is a bounded SF pedestrian network.  A connector this long is already a
+    # substantial off-network walk and, more importantly, is where the audit found false
+    # positives from snapping points outside the baked graph (East Bay/water examples).  Keep
+    # this policy in the graph owner so every caller can validate against the same boundary.
+    MAX_CONNECTOR_M = 300.0
+
     def __init__(self, path=None):
         z = np.load(path or _DEFAULT)
         self.lon = z["node_lon"].astype(np.float64)
@@ -66,6 +97,45 @@ class WalkGraph:
     K_SNAP = 4              # connect each endpoint to its K nearest nodes (nearest-EDGE approx:
     #                        a mid-block point reaches the graph via whichever node is best by
     #                        graph distance, not just the geometrically nearest one)
+
+    def nearest_distance_m(self, lon, lat):
+        """Return the nearest graph-node distance in metres, or ``inf`` for invalid input.
+
+        This is deliberately an opt-in validation query: :meth:`snap` keeps its historical
+        permissive behavior for existing callers, while API boundaries can reject locations
+        that would otherwise be silently snapped to a distant edge of the SF-only graph.
+        Coordinates are WGS84 ``(lon, lat)`` scalars.  Non-finite, out-of-range, or otherwise
+        malformed values are not sent to cKDTree.
+        """
+        try:
+            lon = float(lon)
+            lat = float(lat)
+        except (TypeError, ValueError, OverflowError):
+            return math.inf
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            return math.inf
+        if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+            return math.inf
+        q = np.array([[lon * self.mlon, lat * self.mlat]], dtype=np.float64)
+        distance, _ = self._tree.query(q, k=1)
+        return float(distance[0])
+
+    def supports_point(self, lon, lat, max_connector_m=None):
+        """Whether a WGS84 point is close enough to this graph to be routable.
+
+        ``max_connector_m`` is an explicit override for tests or a caller with a narrower
+        product policy.  The default is the authoritative :attr:`MAX_CONNECTOR_M` policy.
+        Invalid coordinates, invalid thresholds, and negative thresholds return ``False``.
+        """
+        if max_connector_m is None:
+            max_connector_m = self.MAX_CONNECTOR_M
+        try:
+            max_connector_m = float(max_connector_m)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(max_connector_m) or max_connector_m < 0.0:
+            return False
+        return self.nearest_distance_m(lon, lat) <= max_connector_m
 
     def snap(self, lonlats, k=K_SNAP):
         """lon/lat array [m,2] -> (node_idx int32[m,k], connector REFERENCE seconds float[m,k]),
@@ -149,6 +219,10 @@ class PathTree:
         self.wg = wg
         self.reverse = bool(reverse)
         self.cap_ref_sec = float(cap_ref_sec)
+        # Retain the exact point because the Dijkstra duration includes its graph connector.
+        # Validation is intentionally local to the new route-result contract: legacy path-only
+        # callers keep their historical snapping behavior.
+        self._src_lonlat = _wgs84_lonlat(src_lonlat)
         snodes, sconn = wg.snap([src_lonlat])             # [1,k] each
         self._snodes = snodes[0]
         dist, pred = dijkstra(wg._graph(flat, reverse), directed=True,
@@ -186,18 +260,32 @@ class PathTree:
         ref[ref > cap] = np.inf
         return ref
 
-    def path_points(self, tgt_lonlat):
-        """[[lat, lon], ...] node path to/from ``tgt_lonlat`` (lon, lat — same convention
-        as ``snap``) in walking order, or None when unreachable within the cap."""
+    def _target_choice(self, tgt_lonlat, enforce_cap=False):
+        """Return the shared root/target snap argmin for a target point.
+
+        The graph distance rows retain one value per root snap node so geometry can follow the
+        same choice as timing.  Keep the argmin in one helper: callers must not independently
+        ask for a distance and a path and accidentally select different connector pairs.
+        ``path_points`` historically did not apply the final connector cap, so that behavior is
+        opt-in here for the new result API, which follows ``one_to_many``'s cap semantics.
+        """
         tn, tc = self.wg.snap([tgt_lonlat])
         tn, tc = tn[0], tc[0]
-        tot = self._dist[:, tn] + tc[None, :]             # [k_root, k_tgt]
-        if not np.isfinite(tot).any():
+        total = self._dist[:, tn] + tc[None, :]
+        valid = np.isfinite(total)
+        if enforce_cap:
+            valid &= total <= self.cap_ref_sec
+        if not valid.any():
             return None
-        i, j = np.unravel_index(int(np.argmin(tot)), tot.shape)
-        pred_row = self._pred[i]
-        chain = [int(tn[j])]
-        cur = int(tn[j])
+        choices = np.where(valid, total, np.inf)
+        i, j = np.unravel_index(int(np.argmin(choices)), choices.shape)
+        return float(total[i, j]), tn, i, j
+
+    def _path_for_choice(self, target_nodes, root_ix, target_ix):
+        """Materialize a path for a previously selected root/target snap pair."""
+        pred_row = self._pred[root_ix]
+        chain = [int(target_nodes[target_ix])]
+        cur = chain[0]
         for _ in range(len(self.wg.lat)):                 # bounded (acyclic by construction)
             p = int(pred_row[cur])
             if p < 0:                                     # reached the root snap node
@@ -208,3 +296,44 @@ class PathTree:
             chain.reverse()                               # forward tree: root -> target
         lat, lon = self.wg.lat, self.wg.lon
         return [[round(float(lat[c]), 6), round(float(lon[c]), 6)] for c in chain]
+
+    def route_result(self, tgt_lonlat):
+        """Return the selected graph duration and exact path for ``tgt_lonlat``.
+
+        The duration and path are produced from one root-snap/target-snap argmin, so they
+        cannot disagree about which of the K connector candidates was selected.  The returned
+        points include the exact requested endpoints around that graph-node chain, deduplicated
+        when an endpoint already equals its snap node.  ``None`` is returned for invalid WGS84
+        endpoints or when the target is unreachable within the tree's build cap, matching
+        :meth:`one_to_many`'s unreachable result.  Duration is reference seconds and follows
+        the tree's directed graph orientation (including ``reverse=True`` semantics).
+        """
+        target_lonlat = _wgs84_lonlat(tgt_lonlat)
+        if self._src_lonlat is None or target_lonlat is None:
+            return None
+        choice = self._target_choice(target_lonlat, enforce_cap=True)
+        if choice is None:
+            return None
+        seconds, target_nodes, root_ix, target_ix = choice
+        graph_points = self._path_for_choice(target_nodes, root_ix, target_ix)
+        # A reverse tree is rooted at the walk's destination, so walking order is target->root.
+        start, end = ((target_lonlat, self._src_lonlat) if self.reverse
+                      else (self._src_lonlat, target_lonlat))
+        endpoint_points = (
+            [round(float(start[1]), 6), round(float(start[0]), 6)],
+            [round(float(end[1]), 6), round(float(end[0]), 6)],
+        )
+        points = []
+        for point in (endpoint_points[0], *graph_points, endpoint_points[1]):
+            if not points or points[-1] != point:
+                points.append(point)
+        return WalkRouteResult(seconds, points)
+
+    def path_points(self, tgt_lonlat):
+        """[[lat, lon], ...] node path to/from ``tgt_lonlat`` (lon, lat — same convention
+        as ``snap``) in walking order, or None when unreachable within the cap."""
+        choice = self._target_choice(tgt_lonlat)
+        if choice is None:
+            return None
+        _seconds, target_nodes, root_ix, target_ix = choice
+        return self._path_for_choice(target_nodes, root_ix, target_ix)

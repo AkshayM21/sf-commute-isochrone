@@ -1,4 +1,4 @@
-"""Fast, JVM-free unit tests for the pure-logic core (scripts/core/*).
+"""Fast unit tests for the pure-logic core (scripts/core/*).
 
 These cover the *stable* modules so refactors can't silently regress the
 canonical commute model, feed/route resolution, the SF grid, and geocoding:
@@ -8,9 +8,9 @@ canonical commute model, feed/route resolution, the SF grid, and geocoding:
     grid    -- neighborhoods, build_grid, square_cells, attach_neighborhoods
     geo     -- autocomplete/geocode with the HTTP layer mocked (offline)
 
-We deliberately do NOT import core.network or scripts.server -- they boot the
-JVM (r5py). feeds/grid read the real GTFS zips and neighborhoods geojson in
-data/, which is JVM-free and fast.
+We deliberately keep the Flask/server boot out of these unit tests. feeds/grid
+read the real GTFS zips and neighborhoods geojson in
+data/, and are fast when the artifacts are present.
 
 Run:  .venv/bin/python -m pytest tests/test_core.py -q
 """
@@ -204,7 +204,7 @@ class TestFeeds:
         assert muni != bart
 
     def test_route_name_normalizes_floatish_id(self, routes):
-        # r5py hands ids back as floats; "8.0" must resolve like "8".
+        # Feed readers can expose numeric identifiers as floats; "8.0" must resolve like "8".
         assert feeds.route_name("8.0", "bart_gtfs", routes) == "Red-N"
         assert feeds.route_name(8.0, "bart_gtfs", routes) == "Red-N"
         assert feeds.route_name("8", "bart_gtfs", routes) == "Red-N"

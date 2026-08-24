@@ -1,8 +1,8 @@
 """Integration tests for the Flask commute API (scripts/server.py).
 
 These are REGRESSION GUARDS, not unit tests: they exercise the real in-process engine —
-the JVM-FREE RAPTOR stack by default, pinned by conftest.py's setdefaults to the
-production config (USE_RAPTOR=1, USE_WALK_GRAPH=1, RAPTOR_SEMANTIC=arriveby, RAPTOR_MC=1)
+the graph-backed RAPTOR stack, pinned by conftest.py's setdefaults to the
+production config (RAPTOR_SEMANTIC=arriveby, RAPTOR_MC=1)
 — booted once via the session-scoped `server`/`client` fixtures, and assert the
 cross-cutting invariants that hold the app together:
 
@@ -13,15 +13,14 @@ cross-cutting invariants that hold the app together:
   * /variance (service-noise MC overlay): realistic >= perfect floor, frag/stuck bounds,
     alt-lines exclude the dominant line, caching + the ?speed= walk-scalar knob.
   * /attribution, /geocode, /autocomplete shapes + bounds + caching.
-  * the operational guards: a held _HEAVY_LOCK turns /compute_exact into a 503{busy}, the
-    rate limiter is wired, and the per-workplace breakdown caches are reset on a new dest.
+  * the operational guards: the compatibility /compute_exact alias remains responsive, the
+    rate limiter is wired, and RAPTOR caches remain bounded.
   * the served page has no leftover template tokens and (privacy) no user address.
 
 Run with:  .venv/bin/python -m pytest tests/test_api.py -q
 
 Under the default RAPTOR boot the whole suite is fast (~1s boot, ~ms grid computes); the
-`slow` marker survives for the heaviest full-grid passes, which take ~30s+ only on the
-legacy USE_RAPTOR=0 R5 path. Never run beside a server that is still BOOTING (concurrent
+`slow` marker survives for the heaviest full-grid passes. Never run beside a server that is still BOOTING (concurrent
 numba JIT corrupts the shared .nbc cache — see CLAUDE.md); a long-running server on :8000
 is fine (we never bind a port).
 """
@@ -97,10 +96,9 @@ def test_compute_shape_and_best_le_real(client):
 # --------------------------------------------------------------------------------------
 @pytest.mark.slow
 def test_compute_exact_shape_and_determinism(client, server):
-    # Clear the coarse cache so the FIRST call actually recomputes (otherwise a cache hit
-    # from an earlier test would make "determinism" trivially true).
-    with server._RESULT_CACHE_LOCK:
-        server._EXACT_RESULT_CACHE.clear()
+    # /compute_exact is a compatibility alias to RAPTOR /compute; clear the shared tree cache
+    # so the first call exercises the same cold path as a fresh workplace.
+    server._RAPTOR_TREE_CACHE.clear()
     first = _get_exact_cells(client)
     assert _approx_cell_count(len(first)), f"got {len(first)} cells"
 
@@ -125,35 +123,37 @@ def test_compute_exact_matches_golden(client, server):
     non-skipping golden coverage in test_compute_exact_matches_golden_departafter below.
 
     If this fails after a GTFS refresh (pick_service_date shifted) or an engine change,
-    regenerate:  .venv/bin/python tests/make_golden.py arriveby"""
+    update the checked-in snapshot after an intentional feed or engine change."""
     if not os.path.exists(GOLDEN_PATH):
         pytest.skip(
-            "arrive-by golden missing — generate with "
-            "`.venv/bin/python tests/make_golden.py arriveby`"
+            "arrive-by golden snapshot is missing — restore the checked-in fixture"
         )
     with open(GOLDEN_PATH) as f:
         golden = json.load(f)
     if golden.get("service_date") != str(server._SVC_DATE):
         pytest.skip(
             f"golden service_date {golden.get('service_date')} != current "
-            f"{server._SVC_DATE}; regenerate via tests/make_golden.py"
+            f"{server._SVC_DATE}; refresh the checked-in snapshot"
         )
-    # Engine-identity guard (mirrors the service_date one): the snapshot is only comparable
-    # when the booted engine matches the one it was baked under — e.g. USE_RAPTOR=0 (legacy
-    # R5) legitimately differs from the RAPTOR golden by MAE ~0.75, and a GTFS-fingerprint
-    # shift means a repull happened even if pick_service_date landed on the same date.
-    from make_golden import engine_identity
-    booted = engine_identity(server)
-    if golden.get("engine") != booted:
+    # Compare only human-readable model settings.  Feed freshness is validated by the
+    # current source metadata and service date, not an opaque content fingerprint.
+    booted = {
+        "raptor_semantic": str(server.RAPTOR_SEMANTIC),
+        "walk_reference_kmh": float(server.config.WALK_KMH),
+        "walk_speeds": {key: float(value) for key, value in sorted(server.WALK_SPEEDS.items())},
+        "default_walk_speed": str(server.DEFAULT_SPEED),
+    }
+    golden_engine = golden.get("engine", {})
+    if any(golden_engine.get(key) != value for key, value in booted.items()):
         pytest.skip(
-            f"golden engine {golden.get('engine')} != booted {booted}; "
-            "regenerate via tests/make_golden.py (or unset the engine env overrides)"
+            f"golden engine {golden_engine} does not match booted {booted}; "
+            "refresh the checked-in snapshot after an intentional change"
         )
     current = _get_exact_cells(client)
     g_cells = golden["cells"]
     assert current == g_cells, (
         "compute_exact output drifted from the golden snapshot. If GTFS feeds were "
-        "refreshed this is expected — regenerate with tests/make_golden.py."
+        "refreshed this is expected — refresh the checked-in snapshot."
     )
 
 
@@ -168,22 +168,13 @@ import json, sys, os
 sys.path.insert(0, %(scripts)r)
 import server
 assert server.RAPTOR_SEMANTIC == "departafter", server.RAPTOR_SEMANTIC
-assert server._NEED_R5 is False, "depart-after golden boot flagged _NEED_R5 (would load the JVM)"
-jvm = sorted(m for m in sys.modules
-             if m == "r5py" or m.startswith("r5py.") or m.startswith("com.conveyal")
-             or m == "jpype")
-assert not jvm, "depart-after golden boot is NOT JVM-free: %%s" %% jvm
 c = server.app.test_client()
-with server._RESULT_CACHE_LOCK:
-    server._EXACT_RESULT_CACHE.clear()
+server._RAPTOR_TREE_CACHE.clear()
 r = c.get("/compute_exact?lat=%(flat)s&lon=%(flon)s")
 assert r.status_code == 200, r.get_data(as_text=True)
 print(json.dumps({
     "service_date": str(server._SVC_DATE),
-    "engine": {"use_raptor": bool(server.USE_RAPTOR),
-               "raptor_semantic": str(server.RAPTOR_SEMANTIC),
-               "use_walk_graph": bool(server.USE_WALK_GRAPH),
-               "gtfs_fp": server._gtfs_fp(),
+    "engine": {"raptor_semantic": str(server.RAPTOR_SEMANTIC),
                "walk_reference_kmh": float(server.config.WALK_KMH),
                "walk_speeds": {key: float(value)
                                for key, value in sorted(server.WALK_SPEEDS.items())},
@@ -199,16 +190,15 @@ def test_compute_exact_matches_golden_departafter():
     the depart-after golden (tests/golden_exact_ferry_departafter.json). This is the default
     path's golden guard: it does NOT skip just because the in-process suite pins arrive-by
     (the served default and the in-process fixture are deliberately different engines).
-    It also re-asserts the depart-after boot is JVM-free.
+    It also re-asserts the depart-after boot uses the graph-native path.
 
     If this fails after a GTFS refresh or an engine change, regenerate:
-        .venv/bin/python tests/make_golden.py departafter"""
+        update the checked-in snapshot after an intentional feed or engine change."""
     import subprocess
     import sys as _sys
     if not os.path.exists(GOLDEN_PATH_DEPARTAFTER):
         pytest.skip(
-            "depart-after golden missing — generate with "
-            "`.venv/bin/python tests/make_golden.py departafter`"
+            "depart-after golden snapshot is missing — restore the checked-in fixture"
         )
     with open(GOLDEN_PATH_DEPARTAFTER) as f:
         golden = json.load(f)
@@ -216,7 +206,7 @@ def test_compute_exact_matches_golden_departafter():
     scripts = os.path.join(_HERE, "..", "scripts")
     driver = _GOLDEN_DA_DRIVER % {"scripts": scripts, "flat": FERRY_LAT, "flon": FERRY_LON}
     env = dict(os.environ)
-    env.update(USE_RAPTOR="1", USE_WALK_GRAPH="1", RAPTOR_SEMANTIC="departafter", RAPTOR_MC="1")
+    env.update(RAPTOR_SEMANTIC="departafter", RAPTOR_MC="1")
     # Keep the child off the repo-default numba cache (the suite's .nbc gotcha) — share the
     # depart-after child cache used by test_itinerary_equals_map_departafter when present.
     env.setdefault("NUMBA_CACHE_DIR", os.path.join(_HERE, ".nbcache_departafter"))
@@ -233,14 +223,16 @@ def test_compute_exact_matches_golden_departafter():
     if golden.get("service_date") != res["service_date"]:
         pytest.skip(
             f"depart-after golden service_date {golden.get('service_date')} != current "
-            f"{res['service_date']}; regenerate via tests/make_golden.py departafter")
-    if golden.get("engine") != res["engine"]:
+            f"{res['service_date']}; refresh the checked-in snapshot")
+    comparable = ("raptor_semantic", "walk_reference_kmh", "walk_speeds", "default_walk_speed")
+    if any(golden.get("engine", {}).get(key) != res["engine"].get(key)
+           for key in comparable):
         pytest.skip(
             f"depart-after golden engine {golden.get('engine')} != booted {res['engine']}; "
-            "regenerate via tests/make_golden.py departafter")
+            "refresh the checked-in snapshot")
     assert res["cells"] == golden["cells"], (
         "depart-after compute_exact output drifted from the golden snapshot. If GTFS feeds "
-        "were refreshed this is expected — regenerate with `tests/make_golden.py departafter`."
+        "were refreshed this is expected — refresh the checked-in snapshot."
     )
 
 
@@ -348,25 +340,20 @@ def test_itinerary_works_for_uncolored_cells(client):
 # the depart-after path is exercised in a child process that imports server.py with
 # RAPTOR_SEMANTIC=departafter and runs the same hover==map + geom assertions the arrive-by test
 # above does. A subprocess (not a second in-process boot) keeps the two semantics from sharing a
-# numba JIT / module-global state in the test process, and proves the depart-after boot is JVM-free.
+# numba JIT / module-global state in the test process, and proves the depart-after graph boot.
 _DEPARTAFTER_DRIVER = r'''
 import json, sys, os
 sys.path.insert(0, %(scripts)r)
 import server
 ALT_CAP = getattr(server.sr, "RAPTOR_ALT_CHIP_CAP", 6)
 
-# JVM-free assertion: nothing from r5py / the Conveyal JVM may have been imported.
-jvm = sorted(m for m in sys.modules
-             if m == "r5py" or m.startswith("r5py.") or m.startswith("com.conveyal")
-             or m == "jpype")
 assert server.RAPTOR_SEMANTIC == "departafter", server.RAPTOR_SEMANTIC
-assert server._NEED_R5 is False, "depart-after boot still flagged _NEED_R5 (would load the JVM)"
-assert not jvm, ("depart-after boot is NOT JVM-free: %%s" %% jvm)
+assert server._WG is not None, "depart-after boot did not initialize graph walking"
 
 c = server.app.test_client()
 FLAT, FLON = %(flat)r, %(flon)r
 
-health = c.get("/healthz").get_json()
+health = c.get("/readyz").get_json()
 
 def route_sig(legs):
     return tuple((g.get("mode"), g.get("name") or g.get("line") or "",
@@ -661,7 +648,7 @@ if t_fast_it.status_code == 200:
     })
 
 print(json.dumps({
-    "health": {k: health.get(k) for k in ("engine", "semantic", "walk")},
+    "health": health,
     "n_cells": len(cells), "n_reach": len(reach), "n_sample": len(sample),
     "shape_bad": shape_bad[:5], "same_bad": same_bad[:5],
     "p50_match": p50_match, "p50_total": p50_total,
@@ -683,11 +670,11 @@ print(json.dumps({
 
 def test_itinerary_equals_map_departafter():
     """Stage 2 regression: under RAPTOR_SEMANTIC=departafter the server serves the map, hover
-    breakdown, color-by-line, and route geometry from the JVM-free DepartAfterJourneyTree — no
-    R5 fallback. Over many reachable cells the /itinerary total must equal the cell's /compute p50
+    breakdown, color-by-line, and route geometry from the DepartAfterJourneyTree. Over many
+    reachable cells the /itinerary total must equal the cell's /compute p50
     (itinerary == map by construction), its legs (min + wait) must reconcile to that total, the
     geom legs must mirror the breakdown 1:1, /attribution must return a non-empty dominant line
-    per reachable cell, and the boot must be JVM-free.
+    per reachable cell, and the boot must use the graph-native path.
 
     Stage 3 (the metric-contract fix): best-case (p5) and typical (p50) are DIFFERENT percentiles
     of the departure window -> DIFFERENT journeys, so /itinerary returns BOTH (root/.typical = the
@@ -703,7 +690,7 @@ def test_itinerary_equals_map_departafter():
     scripts = os.path.join(_HERE, "..", "scripts")
     driver = _DEPARTAFTER_DRIVER % {"scripts": scripts, "flat": FERRY_LAT, "flon": FERRY_LON}
     env = dict(os.environ)
-    env.update(USE_RAPTOR="1", USE_WALK_GRAPH="1", RAPTOR_SEMANTIC="departafter", RAPTOR_MC="1")
+    env.update(RAPTOR_SEMANTIC="departafter", RAPTOR_MC="1")
     # Keep the child off the repo-default numba cache (the suite's gotcha): inherit an explicit
     # NUMBA_CACHE_DIR if the parent has one, else give the child a scratch dir of its own.
     env.setdefault("NUMBA_CACHE_DIR", os.path.join(_HERE, ".nbcache_departafter"))
@@ -715,8 +702,8 @@ def test_itinerary_equals_map_departafter():
     out = proc.stdout.strip().splitlines()[-1]
     res = json.loads(out)
 
-    assert res["health"]["semantic"] == "departafter", res["health"]
-    assert res["health"]["engine"] == "raptor" and res["health"]["walk"] == "graph", res["health"]
+    assert res["health"]["ok"] is True, res["health"]
+    assert res["health"]["reason_code"] == "ok", res["health"]
     assert _approx_cell_count(res["n_cells"]), f"got {res['n_cells']} cells"
     assert res["n_reach"] >= 100, f"only {res['n_reach']} reachable cells (depart-after)"
     assert res["n_sample"] >= 15, f"only {res['n_sample']} sampled cells"
@@ -839,8 +826,7 @@ def test_attribution_shape_caching_and_count(client, server):
     # Use a fresh destination key (Twin Peaks) to avoid colliding with any cached Ferry result,
     # but keep the comparison against THIS dest's reachable count.
     dlat, dlon = FERRY_LAT, FERRY_LON
-    with server._RESULT_CACHE_LOCK:
-        server._ATTR_RESULT_CACHE.clear()
+    server._RAPTOR_TREE_CACHE.clear()
 
     resp1 = client.get(f"/attribution?dlat={dlat}&dlon={dlon}")
     assert resp1.status_code == 200, resp1.get_data(as_text=True)
@@ -868,7 +854,7 @@ def test_attribution_shape_caching_and_count(client, server):
 # /variance — service-noise Monte-Carlo overlay (realistic + fragility + alt-lines)
 # --------------------------------------------------------------------------------------
 def _skip_unless_mc(server):
-    if not (server.USE_RAPTOR and server.RAPTOR_SEMANTIC == "arriveby" and server.RAPTOR_MC):
+    if not (server.RAPTOR_SEMANTIC == "arriveby" and server.RAPTOR_MC):
         pytest.skip("/variance is only served under the RAPTOR arrive-by MC boot")
 
 
@@ -878,7 +864,7 @@ def test_variance_realistic_floor_bounds_alt_and_cache(client, server):
     (the asserted perfect <= committed invariant, floored server-side), frag >= 0,
     0 <= stuck <= 1, alt-lines respect the configured cap and never include the cell's own dominant
     line, and a second identical GET returns the identical payload (LRU cache + the
-    deterministic per-workplace sha256 seed)."""
+    deterministic per-workplace seed)."""
     _skip_unless_mc(server)
     alt_cap = getattr(server.sr, "RAPTOR_ALT_CHIP_CAP", 6)
     try:
@@ -1046,7 +1032,7 @@ def _haversine_m(lat1, lon1, lat2, lon2):
 
 
 def _skip_unless_geom(server):
-    if not (server.USE_RAPTOR and server.RAPTOR_SEMANTIC == "arriveby"):
+    if server.RAPTOR_SEMANTIC != "arriveby":
         pytest.skip("route geometry is served on the RAPTOR arrive-by path only")
 
 
@@ -1182,16 +1168,12 @@ def test_itinerary_geom_walk_paths_are_real_and_cached(client, server):
     assert r1.status_code == 200
     b1 = r1.get_json()
     walk_geoms = [g for g in b1["geom"] if g["mode"] == "walk" and g["min"] >= 2]
-    if server.USE_WALK_GRAPH:
-        assert walk_geoms, "multi-transfer journey has no walk legs >= 2 min"
-        for g in walk_geoms:
-            assert not g.get("approx"), f"walk leg marked approx with the graph loaded: {g}"
-            assert len(g["pts"]) >= 4, (
-                f"walk leg of {g['min']} min has only {len(g['pts'])} pts — not a street path"
-            )
-    else:
-        for g in walk_geoms:
-            assert g.get("approx") is True, "graphless walk leg must be marked approx"
+    assert walk_geoms, "multi-transfer journey has no walk legs >= 2 min"
+    for g in walk_geoms:
+        assert not g.get("approx"), f"walk leg marked approx with the graph loaded: {g}"
+        assert len(g["pts"]) >= 4, (
+            f"walk leg of {g['min']} min has only {len(g['pts'])} pts — not a street path"
+        )
     # cached: the per-cell geometry is assembled once per workplace tree (bit-identical).
     r2 = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
     assert r2.get_json() == b1
@@ -1391,7 +1373,7 @@ def test_itinerary_pin_per_route_typicals(client, server, monkeypatch):
     # lossless scenario was replaced by a newer workplace. Force this test's /variance call through
     # the capture path; a stale token is expected to fall back exactly, but is not what this test is
     # exercising.
-    mc_key = server._coarse_key(
+    mc_key = server.sr.coarse_key(
         FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
     server._RAPTOR_MC_CACHE.pop(mc_key)
     client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
@@ -1415,7 +1397,7 @@ def test_itinerary_pin_per_route_typicals(client, server, monkeypatch):
     token = mc.get("_scenario_token")
     assert token, "production /variance failed to retain its lossless pin accelerator"
     scenario = server.sr._mc_scenario_for(
-        token, server._coarse_key(FERRY_LAT, FERRY_LON,
+        token, server.sr.coarse_key(FERRY_LAT, FERRY_LON,
                                   server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED))
     assert scenario is not None and scenario.nbytes <= server.sr._MC_SCENARIO_MAX_BYTES
 
@@ -1500,7 +1482,7 @@ def test_itinerary_alts_empty_before_variance_built(client, server):
     except Exception:
         pass
     lat, lon = TWIN_PEAKS_LAT, TWIN_PEAKS_LON
-    key = server._coarse_key(lat, lon, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    key = server.sr.coarse_key(lat, lon, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
     # Guarantee a clean MC state for this workplace (other tests / ordering may have built it).
     server._RAPTOR_MC_CACHE.pop(key)
     assert server._mc_peek(lat, lon, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED) is None
@@ -1577,42 +1559,15 @@ def test_autocomplete_dedups_results(client):
 
 
 # --------------------------------------------------------------------------------------
-# Non-blocking heavy lock -> 503 {busy}
+# /compute_exact compatibility alias
 # --------------------------------------------------------------------------------------
-def test_heavy_lock_compute_exact_contract(client, server):
-    """The _HEAVY_LOCK contract on /compute_exact, which INVERTS with the engine:
-
-    * RAPTOR (the pinned default): /compute_exact is the instant engine result (map ==
-      refine, ~ms) and bypasses _HEAVY_LOCK BY DESIGN — so it must stay responsive (200,
-      non-empty cells) even while a heavy job holds the lock.
-    * Legacy R5 (USE_RAPTOR=0): a held lock must turn it into a non-blocking 503
-      {busy:true} with a Retry-After header; after release it works again."""
-    # Coordinate guaranteed not to be in the coarse cache yet (the legacy endpoint returns
-    # a cache hit BEFORE trying to acquire the lock).
-    lat, lon = 37.7611, -122.4350
-
-    acquired = server._HEAVY_LOCK.acquire(blocking=False)
-    assert acquired, "_HEAVY_LOCK was already held — another heavy job in this process?"
-    try:
-        if server.USE_RAPTOR:
-            resp = client.get(f"/compute_exact?lat={lat}&lon={lon}")
-            assert resp.status_code == 200, resp.get_data(as_text=True)
-            body = resp.get_json()
-            assert body["dest"] == [lat, lon]
-            assert body["cells"], "RAPTOR /compute_exact returned no cells under a held lock"
-        else:
-            with server._RESULT_CACHE_LOCK:
-                server._EXACT_RESULT_CACHE.pop(server._coarse_key(lat, lon), None)
-            resp = client.get(f"/compute_exact?lat={lat}&lon={lon}")
-            assert resp.status_code == 503, resp.get_data(as_text=True)
-            assert resp.get_json() == {"busy": True}
-            assert resp.headers.get("Retry-After"), "503 should carry a Retry-After header"
-    finally:
-        server._HEAVY_LOCK.release()
-
-    # Sanity: with the lock free, a (cheap, possibly-cached) exact request works again.
-    ok = client.get(f"/compute_exact?lat={FERRY_LAT}&lon={FERRY_LON}")
-    assert ok.status_code == 200, ok.get_data(as_text=True)
+def test_compute_exact_is_raptor_compatibility_alias(client):
+    lat, lon = FERRY_LAT, FERRY_LON
+    compute = client.get(f"/compute?lat={lat}&lon={lon}")
+    exact = client.get(f"/compute_exact?lat={lat}&lon={lon}")
+    assert compute.status_code == exact.status_code == 200
+    assert exact.get_json()["dest"] == [lat, lon]
+    assert exact.get_json()["cells"] == compute.get_json()["cells"]
 
 
 # --------------------------------------------------------------------------------------
@@ -1651,121 +1606,29 @@ def test_rate_limit_is_enforced_or_wired(client, server):
 
 
 # --------------------------------------------------------------------------------------
-# Cache gating: warm, hit, reset on new dest
+# RAPTOR cache gating: warm, hit, and bounded across destinations
 # --------------------------------------------------------------------------------------
 @pytest.mark.slow
-def test_cell_cache_warms_and_resets_on_new_dest(client, server):
-    """/compute warms _LAST_DEST_KEY; /itinerary for a cell warms the per-workplace
-    breakdown cache; repeating the SAME coords keeps it.
-
-    The cache LAYER differs by engine: under RAPTOR arrive-by (the pinned default)
-    breakdowns come from _RAPTOR_TREE_CACHE (a bounded LRU keyed by destination + rides
-    + speed; new-dest hygiene is LRU eviction, not _reset_caches) and the legacy
-    _CELL_CACHE must stay EMPTY on that path. Under legacy R5 (USE_RAPTOR=0), /itinerary
-    warms _CELL_CACHE and a DIFFERENT coord clears it (new _LAST_DEST_KEY)."""
-    fkey = server._dest_key(FERRY_LAT, FERRY_LON)
-
-    # Reset the limiter so a prior test (e.g. the rate-limit test) that consumed this
-    # minute's /itinerary or /compute budget doesn't bleed into this one and surface a 429.
-    try:
-        server.limiter.reset()
-    except Exception:
-        pass
-
-    if server.USE_RAPTOR and server.RAPTOR_SEMANTIC == "arriveby":
-        # 1) /compute sets the current dest AND builds the traced tree -> tree cache warm.
-        r = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
-        assert r.status_code == 200
-        assert server._LAST_DEST_KEY == fkey
-        tkey = server._coarse_key(FERRY_LAT, FERRY_LON,
-                                  server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
-        entry = server._RAPTOR_TREE_CACHE.get(tkey)
-        assert entry is not None, "/compute did not warm _RAPTOR_TREE_CACHE (arrive-by)"
-        # 2) /itinerary serves from that tree; its total must equal the cell's map value
-        #    (hover == map) and the legacy R5 _CELL_CACHE must remain untouched.
-        cells = entry["cells"]
-        cid = next(c for c, (b, rl) in cells.items() if rl is not None)
-        r = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
-        assert r.status_code == 200, r.get_data(as_text=True)
-        body = r.get_json()
-        assert "error" not in body, body
-        assert body["total"] == cells[cid][1], (
-            f"breakdown total {body['total']} != map value {cells[cid][1]} for cell {cid}"
-        )
-        assert fkey not in server._CELL_CACHE, (
-            "_CELL_CACHE was populated on the RAPTOR arrive-by path — legacy cache leak"
-        )
-        # 3) Same coords again: the tree entry survives (re-submit keeps caches).
-        client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
-        assert server._LAST_DEST_KEY == fkey
-        assert server._RAPTOR_TREE_CACHE.get(tkey) is not None, (
-            "tree cache should survive a same-dest /compute"
-        )
-        # 4) A DIFFERENT coord moves _LAST_DEST_KEY (tree entries age out via LRU, not reset).
-        tpkey = server._dest_key(TWIN_PEAKS_LAT, TWIN_PEAKS_LON)
-        assert tpkey != fkey
-        r = client.get(f"/compute?lat={TWIN_PEAKS_LAT}&lon={TWIN_PEAKS_LON}")
-        assert r.status_code == 200
-        assert server._LAST_DEST_KEY == tpkey, "new dest did not update _LAST_DEST_KEY"
-        # Restore Ferry as the current dest so other tests start from a known state.
-        client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
-        return
-
-    # 1) /compute for Ferry: establishes this as the current dest.
-    r = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
-    assert r.status_code == 200
-    assert server._LAST_DEST_KEY == fkey
-
-    # Drop any full-grid itinerary cache for this dest (an earlier /attribution test may have
-    # built it). /itinerary's FAST PATH 1 serves from _ITIN_CACHE without touching
-    # _CELL_CACHE, so to exercise (and assert) the per-cell on-demand cache we clear the
-    # full-grid map first. This keeps the test independent of run order.
-    with server._ITIN_CACHE_LOCK:
-        server._ITIN_CACHE.pop(fkey, None)
-    with server._CELL_CACHE_LOCK:
-        server._CELL_CACHE.pop(fkey, None)
-
-    # 2) /itinerary for a reachable grid cell -> warms _CELL_CACHE[fkey][cid]. Only cells
-    # with an actual route get cached (the endpoint caches only when "error" not in res), so
-    # iterate reachable cells (real minutes present) until one lands in the cell cache.
-    exact = _get_exact_cells(client)
-    reachable_ids = [c for c, (b, rl) in exact.items() if rl is not None]
-    assert reachable_ids, "no reachable cells — network/feeds may be broken"
-    cid = None
-    # Bound the probe count well under /itinerary's 120/min limit; a reachable cell with a
-    # route caches on its first hit, so a handful of tries is plenty in practice.
-    for candidate in reachable_ids[:20]:
-        r = client.get(f"/itinerary?id={candidate}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
-        assert r.status_code == 200, r.get_data(as_text=True)
-        if candidate in server._CELL_CACHE.get(fkey, {}):
-            cid = candidate
-            break
-    assert cid is not None, "no /itinerary call warmed _CELL_CACHE for any reachable cell"
-
-    # 3) Same coords again: cache survives (re-submitting the same dest keeps caches).
+def test_raptor_cache_warms_and_is_bounded(client, server):
+    server._RAPTOR_TREE_CACHE.clear()
+    first = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    assert first.status_code == 200
+    key = server.sr.coarse_key(
+        FERRY_LAT, FERRY_LON, server.DEFAULT_MAX_RIDES, server.DEFAULT_SPEED)
+    entry = server._RAPTOR_TREE_CACHE.get(key)
+    assert entry is not None, "/compute did not warm the RAPTOR tree cache"
+    cells = entry["cells"]
+    cid = next(c for c, (_, real) in cells.items() if real is not None)
+    route = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
+    assert route.status_code == 200, route.get_data(as_text=True)
+    assert route.get_json().get("total") == cells[cid][1]
+    repeat = client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
+    assert repeat.status_code == 200
+    assert server._RAPTOR_TREE_CACHE.get(key) is not None
+    other = client.get(f"/compute?lat={TWIN_PEAKS_LAT}&lon={TWIN_PEAKS_LON}")
+    assert other.status_code == 200
+    assert len(server._RAPTOR_TREE_CACHE) <= server._RAPTOR_TREE_CACHE.maxsize
     client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
-    assert server._LAST_DEST_KEY == fkey
-    # /itinerary for the same cell is served from cache (fast). Time it loosely as a hint,
-    # but the authoritative check is that the cache entry is still present.
-    t0 = time.perf_counter()
-    r = client.get(f"/itinerary?id={cid}&dlat={FERRY_LAT}&dlon={FERRY_LON}")
-    dt_cached = time.perf_counter() - t0
-    assert r.status_code == 200
-    assert cid in server._CELL_CACHE.get(fkey, {}), "cache should survive same-dest /compute"
-
-    # 4) DIFFERENT coord: /compute must reset caches and move _LAST_DEST_KEY.
-    tkey = server._dest_key(TWIN_PEAKS_LAT, TWIN_PEAKS_LON)
-    assert tkey != fkey
-    r = client.get(f"/compute?lat={TWIN_PEAKS_LAT}&lon={TWIN_PEAKS_LON}")
-    assert r.status_code == 200
-    assert server._LAST_DEST_KEY == tkey, "new dest did not update _LAST_DEST_KEY"
-    # _reset_caches() clears the per-workplace cell cache; the old dest's entry is gone.
-    assert fkey not in server._CELL_CACHE, "switching dest did not clear _CELL_CACHE"
-
-    # Restore Ferry as the current dest so other tests start from a known state.
-    client.get(f"/compute?lat={FERRY_LAT}&lon={FERRY_LON}")
-    # (dt_cached is informational; cache-hit /itinerary should be well under a second.)
-    assert dt_cached < 5.0, f"cached /itinerary unexpectedly slow: {dt_cached:.2f}s"
 
 
 # --------------------------------------------------------------------------------------

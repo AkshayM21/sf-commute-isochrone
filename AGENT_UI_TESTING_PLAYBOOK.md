@@ -6,7 +6,7 @@ general: discover difficult states deterministically through the API, replay onl
 states in a browser, and keep model correctness separate from display quality.
 
 The goal is not to make an agent wander around until it sees something suspicious. The goal is to
-produce a replayable run manifest with exact destinations, speeds, cell IDs, coordinates, service
+produce a replayable run record with exact destinations, speeds, cell IDs, coordinates, service
 date, measurements, and artifacts so a failure can be reproduced without the original agent.
 
 ## What this method tests
@@ -170,7 +170,7 @@ path.
 Run these checks on every sampled pinned response before opening a browser. A failure here is a
 model/API issue, not a design opinion.
 
-### Journey integrity
+### Journey consistency
 
 - The primary and every advertised alternative have complete family and branch metadata.
 - Every advertised alternative contains at least one transit leg; a slower, line-labeled walk is not
@@ -397,8 +397,8 @@ Run both because cache bugs often look like speed-toggle or destination contamin
 
 - Start from a clean, known server process and a fresh browser context.
 - Capture boot time and the first compute/variance/itinerary latencies separately.
-- Repeat the saved manifest after reboot and compare opaque keys, ordering, and payload truth.
-- Treat service-date or data-fingerprint changes as a new baseline, not cache nondeterminism.
+- Repeat the saved replay record after reboot and compare opaque keys, ordering, and payload truth.
+- Treat service-date or source-file changes as a new baseline, not cache nondeterminism.
 
 Do not approximate a cold server by clearing browser storage. That tests only client state.
 
@@ -588,7 +588,7 @@ Parallelism should separate roles, not duplicate traffic.
 
 ### Recommended roles
 
-1. **Coordinator:** freezes the manifest, health response, seed, service date, budgets, and artifact
+1. **Coordinator:** freezes the replay record, health response, seed, service date, budgets, and artifact
    directory; assigns disjoint ownership; merges findings.
 2. **API sampler:** performs the sequential deterministic scan, validates false-advertising gates,
    computes the Pareto frontier, and writes one immutable JSON artifact.
@@ -601,7 +601,7 @@ Parallelism should separate roles, not duplicate traffic.
 6. **Adversarial/design reviewer:** grades information hierarchy, map obstruction, density, and
    comprehensibility after objective gates have passed. This role proposes design work; it does not
    redefine routing truth.
-7. **Fix reviewer:** after implementation, reruns the exact failed manifest and searches for nearby
+7. **Fix reviewer:** after implementation, reruns the exact failed replay and searches for nearby
    regressions. It should not be the same agent that authored the fix when an independent review is
    available.
 
@@ -617,7 +617,7 @@ ID: RF-UI-007
 Severity: blocker | high | medium | low | design
 Confidence: high | medium | exploratory
 Reproduced: 3/3
-Build: <commit> + dirty-worktree fingerprint
+Build: <commit> + concise dirty-worktree status
 Server: <base URL>, engine, semantic, svc_date, cold/warm
 Input: destination label + lat/lon, speed, cell ID + origin lat/lon
 Browser: name/version, viewport, touch/mobile flags, scroll state
@@ -668,7 +668,7 @@ with generic fixtures and keep the former.
 - **Replay exact coordinates:** bypass geocoding, autocomplete, and pixel-grid hunting.
 - **Use staged escalation:** JS/static contract tests first, bounded API scan second, saved browser
   replay third, broad scan fourth, manual design review last.
-- **Separate discovery from confirmation:** a broad run finds candidates; a small saved manifest
+- **Separate discovery from confirmation:** a broad run finds candidates; a small saved replay
   confirms them on every change.
 - **Capture failures immediately:** save response and DOM snapshots at assertion time so later cache
   changes do not erase evidence.
@@ -825,7 +825,7 @@ tests/e2e/run.sh test_route_families.py -k broad
 ```
 
 If more than six destinations are needed across all three speeds, split the catalog into separate
-bounded manifests or restart after the rate-limit window. Do not remove the budget assertion.
+bounded replay sets or restart after the rate-limit window. Do not remove the budget assertion.
 
 ## Actionable run checklist
 
@@ -884,7 +884,7 @@ limitation; any other faster-walk-longer result is a new contract failure.
 - [ ] Fetch variance once per pair if needed.
 - [ ] Select deterministic alternative-rich, fragile, time-stratified, and seeded cells.
 - [ ] Fetch pinned itineraries sequentially.
-- [ ] Enforce journey integrity and false-advertising gates.
+- [ ] Enforce journey consistency and false-advertising gates.
 - [ ] Store the full metric vector, calculate the Pareto frontier, then apply a stable tie-break.
 - [ ] Save exact cell IDs, origin coordinates, API paths, payload snapshots, seed, and service date.
 
@@ -913,7 +913,7 @@ limitation; any other faster-walk-longer result is a new contract failure.
 - [ ] Classify every failure by routing, API, DOM, interaction, layout, design, harness, or environment.
 - [ ] Include exact replay inputs, measurements, expected/actual, and artifact paths.
 - [ ] Minimize routing failures into generic symbolic fixtures without production line literals.
-- [ ] Rerun each fixed failure from its saved manifest.
+- [ ] Rerun each fixed failure from its saved replay record.
 - [ ] Run an independent adversarial review after major fixes.
 - [ ] Run `node --test tests/test_viz.mjs`.
 - [ ] Stop the server, then run `.venv/bin/python -m pytest tests/ --ignore=tests/e2e -q`.

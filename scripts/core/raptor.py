@@ -1,14 +1,13 @@
-"""Reverse range-RAPTOR over the flat structures from ``raptor_build`` (numpy, JVM-free).
+"""Reverse range-RAPTOR over the flat structures from ``raptor_build``.
 
-Productionized from ``prototypes/spike_raptor/raptor.py`` (validated MAE ~1.0 vs R5). The
-single reverse search is rooted at the WORKPLACE: given a set of egress stops (each with a
+The single reverse search is rooted at the WORKPLACE: given a set of egress stops (each with a
 latest feasible alight time for a target arrival deadline), it returns the LATEST departure
 time from every stop such that you still reach the workplace by that deadline. Travel time to
 work from a stop = deadline - latest_departure[stop].
 
 Range over a sweep of deadlines (``reverse_profile``) gives a per-stop latest-departure
-profile; inverting it (``stop_arrival_profile``) recovers the depart-after arrival profile
-that R5's departure-window percentile model uses, which is what we validate against. The
+profile; inverting it (``stop_arrival_profile``) recovers the legacy depart-after percentile
+validation model. The
 SAME profile, read at arrival deadlines, gives the arrive-by-09:00 product semantic
 (``raptor_engine._assemble_arriveby_window``; single-deadline = that path with one deadline).
 
@@ -392,11 +391,11 @@ def stop_arrival_profile(latest, deadlines, dep_grid):
 # --------------------------------------------------------------- assembly (cells)
 def assemble_departafter(access_off, access_to, access_w, purewalk, arrivalW, dep_grid,
                          cell_deps, max_min, percentiles=(5, 50), beta=1.0, eps=60.0):
-    """Depart-after percentile minutes per cell (the R5-comparable map value).
+    """Depart-after percentile minutes per cell for the legacy validation model.
 
     For each cell and each CELL departure D in ``cell_deps``:
         tt(D) = min( pure_walk, min over access stops s [ arrivalW(s, D + access_walk) - D ] )
-    then ceil to minutes; take each requested percentile over the window (R5 counts
+    then ceil to minutes; take each requested percentile over the window (the model counts
     unreachable draws as the cap). ``access_*`` is the cell->stop walk table in CSR (seconds);
     ``purewalk`` is cell->W walk seconds (-1 if > cap). ``beta`` is the walk-reluctance multiplier
     (config.WALK_RELUCTANCE; 1.0 = no prior) + ``eps`` the true-time cap (sec): among access stops

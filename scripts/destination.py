@@ -27,8 +27,8 @@ def _resolve():
         except (LookupError, OSError, ValueError) as e:
             # RuntimeError, NOT SystemExit: SystemExit is a BaseException, so it sails past
             # the `except Exception` guard around server.py's best-effort default-workplace
-            # resolution and kills the service on a cold-cache/no-network boot. CLI importers
-            # (isochrone.py, route_map.py, ...) still fail loudly with a traceback.
+            # resolution and kills the service on a cold-cache/no-network boot. CLI callers
+            # still fail loudly with a traceback.
             raise RuntimeError(f"Could not geocode DEFAULT_ADDRESS={addr!r}: {e}") from e
     return _FALLBACK
 

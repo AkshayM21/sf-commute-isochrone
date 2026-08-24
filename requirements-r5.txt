@@ -1,6 +1,0 @@
-# Optional offline R5 oracle/validation and legacy static-export tooling. It is
-# deliberately separate from requirements.txt: importing r5py starts a JVM,
-# while the served app does not use a JVM once its data bakes exist.
--r requirements.txt
-
-r5py>=1.1,<2

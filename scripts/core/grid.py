@@ -1,6 +1,6 @@
 """SF grid construction: neighborhoods, the regular origin grid, and square cells.
 
-No r5py here.
+Pure geometry helpers; no optional routing runtime is needed here.
 """
 import numpy as np
 import geopandas as gpd

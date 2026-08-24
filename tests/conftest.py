@@ -1,7 +1,7 @@
 """Shared fixtures for the Flask API integration suite (tests/test_api.py).
 
-The app's scripts/server.py boots the JVM-FREE RAPTOR stack (since 2026-05-25): RAPTOR engine
-+ hill-aware walk router + lean static bundle — import takes ~1s, no R5/JVM. We import the
+The app's scripts/server.py boots the RAPTOR engine plus graph-backed hill-aware walk router
+and lean static bundle — import takes ~1s. We import the
 module exactly ONCE per test session via a session-scoped fixture and expose both the module
 (so tests can poke its locks/caches/globals directly) and a Flask `app.test_client()`. We
 never bind a port, so the suite is independent of any live server on :8000 — but do NOT run
@@ -21,10 +21,7 @@ Two tiers of env setup below (they behave differently — don't conflate them):
     RAPTOR_SEMANTIC=arriveby. The pin is load-bearing — an exported/leaked
     RAPTOR_SEMANTIC=departafter would silently skip the whole arrive-by suite.
   * DEFAULTED (setdefault; an exported env var DOES override — by design):
-    USE_RAPTOR, USE_WALK_GRAPH, RAPTOR_MC, R5_MAX_MEMORY. E.g. `export USE_RAPTOR=0`
-    deliberately exercises the legacy R5 path (~30s JVM boot). Note setdefault gives NO
-    protection against ambient leakage of these — exporting one swaps the engine under
-    test on purpose.
+    RAPTOR_MC. The production runtime has no alternate routing engine or fallback flags.
 
 PRIVACY: tests use a neutral public SF coordinate (the Ferry Building) as the workplace.
 The user's real saved address/coords are NEVER imported or hardcoded here.
@@ -48,14 +45,7 @@ if _SCRIPTS not in sys.path:
 # depart-after or skip. The depart-after default is covered by child-process tests that set
 # their own env explicitly.
 os.environ["RAPTOR_SEMANTIC"] = "arriveby"   # OPT-IN path, hard-pinned for the in-process suite
-# Overridable defaults: exporting one (e.g. USE_RAPTOR=0 for the legacy ~30s-JVM R5 path)
-# deliberately changes the engine under test.
-os.environ.setdefault("USE_RAPTOR", "1")
-os.environ.setdefault("USE_WALK_GRAPH", "1")
 os.environ.setdefault("RAPTOR_MC", "1")
-# Only read on the legacy _NEED_R5 path (USE_RAPTOR=0 / missing walk bakes): keep that
-# JVM modest so it coexists with another agent's live server / pytest JVM.
-os.environ.setdefault("R5_MAX_MEMORY", "1200M")
 
 # The Playwright browser suite (tests/e2e/) drives an ALREADY-RUNNING server on :8000 and
 # has its own conftest.py/pytest.ini — run it via tests/e2e/run.sh. Collecting it from a
@@ -66,12 +56,11 @@ collect_ignore = ["e2e"]
 
 
 def pytest_configure(config):
-    """Register the `slow` marker so it isn't an unknown-mark warning. Under the default
-    RAPTOR boot these tests are seconds, not minutes — the marker survives because they
-    are still the heaviest (full-grid exact/itinerary passes; ~30s+ only on the legacy
-    USE_RAPTOR=0 R5 path). Deselect with `-m 'not slow'` for a shape-only smoke run."""
+    """Register the `slow` marker so it isn't an unknown-mark warning. The marker survives
+    because these are still the heaviest full-grid exact/itinerary passes. Deselect with
+    `-m 'not slow'` for a shape-only smoke run."""
     config.addinivalue_line(
-        "markers", "slow: full-grid exact/itinerary pass (seconds on RAPTOR; ~30s+ on legacy R5)"
+        "markers", "slow: full-grid exact/itinerary pass"
     )
 
 
@@ -87,13 +76,11 @@ TWIN_PEAKS_LON = -122.4477
 
 @pytest.fixture(scope="session")
 def server():
-    """Import scripts/server.py ONCE (JVM-free RAPTOR boot, ~1s) and return the module.
+    """Import scripts/server.py once and return the module.
 
-    Session-scoped so the boot (and the ~30s JVM boot on the legacy USE_RAPTOR=0 path)
-    happens a single time for the whole run. Tests use this to reach into server
-    internals: `_HEAVY_LOCK`, `_CELL_CACHE`, `_LAST_DEST_KEY`, the result caches, etc.
+    Tests use this to reach into the bounded RAPTOR caches and other test-only internals.
     """
-    import server  # noqa: E402 — import here so the JVM boot is attributed to this fixture
+    import server  # noqa: E402
     return server
 
 
@@ -101,3 +88,11 @@ def server():
 def client(server):
     """A single Flask test client shared by every test (do NOT re-import per test)."""
     return server.app.test_client()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rate_limits(server):
+    """Keep one test's deliberate limiter exhaustion from leaking into the next test."""
+    server.limiter.reset()
+    yield
+    server.limiter.reset()

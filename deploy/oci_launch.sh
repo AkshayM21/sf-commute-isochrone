@@ -129,7 +129,11 @@ log "image: $IMAGE_ID"
 
 # ---- 7) ADs in this region -------------------------------------------------------------
 # bash 3.2 (macOS default) lacks `mapfile`; word-split the cleaned newline list into the array
-ADS=( $(oci iam availability-domain list --query 'data[*].name' --raw-output 2>/dev/null | tr -d ' ",[]' | grep -v '^$') )
+ADS=()
+while IFS= read -r ad; do
+  [[ -n "$ad" ]] && ADS+=("$ad")
+done < <(oci iam availability-domain list --query 'data[*].name' --raw-output 2>/dev/null |
+  tr -d ' ",[]' | grep -v '^$')
 log "availability domains: ${ADS[*]}"
 
 # ---- 8) Capacity-retry launch loop -----------------------------------------------------

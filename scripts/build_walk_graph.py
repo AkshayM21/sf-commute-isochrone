@@ -1,8 +1,7 @@
-"""Build a compact, hill-aware pedestrian graph from OSM + a DEM (offline, JVM-free).
+"""Build a compact, hill-aware pedestrian graph from OSM + a DEM (offline).
 
-Replaces R5's only remaining RUNTIME job (the per-workplace walk matrix) with a custom
-pedestrian router. SF is steep and R5 ignores grade, so a slope-aware walk router is MORE
-accurate, not just a JVM-free swap. We bake, once:
+SF is steep, so the runtime uses this slope-aware pedestrian graph for access, transfer,
+egress, and pure walking. We bake, once:
 
   data/walk_graph.npz  — a directed CSR pedestrian graph whose edge weights are REFERENCE
   WALK SECONDS at config.WALK_KMH (4.8 km/h), adjusted for grade via Tobler's hiking function
@@ -139,8 +138,8 @@ def build():
 
     # directed edges from way segments (both directions)
     t = time.time()
-    src, dst, w, wf = [], [], [], []     # wf = FLAT reference sec (distance/speed; matches R5's
-    for refs, is_steps in ways:          #      grade-agnostic model, for validating graph mechanics)
+    src, dst, w, wf = [], [], [], []     # wf = flat reference seconds (distance/speed), retained
+    for refs, is_steps in ways:          #      for validating the graph's grade-aware mechanics
         ix = [nid_to_ix.get(r) for r in refs]
         for a, b in zip(ix, ix[1:]):
             if a is None or b is None or a == b:
@@ -204,7 +203,7 @@ def build():
              node_lon=lon.astype(np.float32), node_lat=lat.astype(np.float32),
              node_elev=elev.astype(np.float32),
              indptr=indptr, indices=dst.astype(np.int32), w_ref=w.astype(np.float32),
-             w_flat=wf.astype(np.float32),       # grade-agnostic (R5-comparable) reference seconds
+             w_flat=wf.astype(np.float32),       # grade-agnostic reference seconds
              walk_ref_kmh=np.float32(config.WALK_KMH), slope_aware=np.int8(1),
              stairs_mult=np.float32(STAIRS_MULT))
     np.load(tmp).close()                         # cheap zip-integrity check before publish

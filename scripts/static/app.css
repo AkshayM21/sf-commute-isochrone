@@ -1,0 +1,526 @@
+  /* Theme tokens. All visible chrome reads through these vars so the only thing that
+     differs between light/dark is the palette block — no hardcoded hex past this point. */
+  :root{
+    --heat-opacity:.65;--heat-pinned-opacity:.195;
+    --panel:#171a21;--ink:#e8eaed;--mut:#9aa3af;--line:#272b34;--accent:#5ab0ff;
+    --ink-on-accent:#06121f;
+    --bg-map:#0b0d10;--bg-input:#0e1116;--bg-hover:#1f2530;--bg-row-line:#1c2027;
+    --bg-button:#11141a;--bg-toast:#2a2f3a;--bg-handle:#3a414d;
+    --bg-walk:#262b33;--ink-walk:#b6bdc8;
+    --bg-wait-a:#1c2030;--bg-wait-b:#161a26;--ink-wait:#8089b3;
+    --ink-arr:#4b515c;--ink-foot:#5c6470;--ink-dim:#9aa3af;
+    --shadow:0 6px 20px rgba(0,0,0,.45);--shadow-strong:0 10px 34px rgba(0,0,0,.55);
+    --shadow-pop:0 14px 40px rgba(0,0,0,.6);--shadow-busy:0 2px 10px rgba(0,0,0,.4);
+    --shadow-ac:0 10px 28px rgba(0,0,0,.5);--shadow-toast:0 6px 20px rgba(0,0,0,.5);
+    --shadow-sheet:0 -8px 30px rgba(0,0,0,.55);
+    --panel-rgb:23 26 33;                 /* used by #legend's rgba() */
+    --modal-bg:rgba(4,6,9,.6);
+    --route-casing:#fff;                  /* white casing under every drawn route leg (dark theme) */
+  }
+  :root[data-theme="light"]{
+    --panel:#ffffff;--ink:#1a1d23;--mut:#6b7280;--line:#dde1e6;--accent:#1f6bd6;
+    --ink-on-accent:#ffffff;
+    --bg-map:#e9edf2;--bg-input:#f5f7fa;--bg-hover:#eef1f6;--bg-row-line:#eaedf1;
+    --bg-button:#f5f7fa;--bg-toast:#ffffff;--bg-handle:#b5bcc6;
+    --bg-walk:#eef1f6;--ink-walk:#4a5160;
+    --bg-wait-a:#e8ebf0;--bg-wait-b:#f3f5f8;--ink-wait:#5560a3;
+    --ink-arr:#aab2bf;--ink-foot:#6b7280;--ink-dim:#6b7280;
+    --shadow:0 6px 20px rgba(30,40,60,.10);--shadow-strong:0 10px 34px rgba(30,40,60,.16);
+    --shadow-pop:0 14px 40px rgba(30,40,60,.18);--shadow-busy:0 2px 10px rgba(30,40,60,.10);
+    --shadow-ac:0 10px 28px rgba(30,40,60,.12);--shadow-toast:0 6px 20px rgba(30,40,60,.12);
+    --shadow-sheet:0 -8px 30px rgba(30,40,60,.14);
+    --panel-rgb:255 255 255;
+    --modal-bg:rgba(40,50,70,.4);
+    /* On the light basemap pure white casing vanishes; a near-white with a faint cool tint
+       still reads as a halo against light tiles while keeping the colored stroke dominant. */
+    --route-casing:#ffffff;
+  }
+  *{box-sizing:border-box} html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg-map);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  button,a,input,summary,[tabindex]{font:inherit}
+  button,a,input[type=range],summary{touch-action:manipulation}
+  button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible,[tabindex]:focus-visible{
+    outline:2px solid var(--accent);outline-offset:2px}
+  .skip-link{position:fixed;top:10px;left:10px;z-index:3000;transform:translateY(-180%);background:var(--panel);
+    color:var(--ink);border:1px solid var(--accent);border-radius:8px;box-shadow:var(--shadow);padding:9px 12px;
+    font-size:13px;font-weight:700;text-decoration:none;transition:transform .16s cubic-bezier(.25,1,.5,1)}
+  .skip-link:focus-visible{transform:translateY(0)}
+  #map{position:absolute;inset:0;background:var(--bg-map)}.leaflet-container{background:var(--bg-map)}
+  #panel{position:absolute;top:0;right:0;width:330px;height:100%;background:var(--panel);color:var(--ink);
+    z-index:1000;display:flex;flex-direction:column;overflow-y:auto;border-left:1px solid var(--line);
+    transition:opacity .18s cubic-bezier(.25,1,.5,1),visibility 0s linear 0s}
+  @media (min-width:720px){
+    body.route-pinned[data-inspector-surface="routes"] #panel{opacity:0;visibility:hidden;pointer-events:none;
+      transition:opacity .18s cubic-bezier(.25,1,.5,1),visibility 0s linear .18s}
+    body.route-pinned[data-inspector-surface="routes"] #pincard{right:18px}
+  }
+  h1{font-size:15px;margin:0;padding:14px 16px 3px}.sub{color:var(--mut);font-size:12px;padding:0 16px 10px;line-height:1.45}
+  .ctl{padding:9px 16px;border-top:1px solid var(--line)}
+  .lab{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);margin-bottom:7px;
+    display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;
+    border-radius:50%;border:1px solid var(--line);background:var(--bg-button);color:var(--mut);
+    font-size:10px;font-weight:700;line-height:1;cursor:help;padding:0;font-family:inherit;text-transform:none;letter-spacing:0}
+  .help:hover,.help:focus-visible{color:var(--ink);border-color:var(--accent)}
+  #helptip{position:fixed;z-index:2600;display:none;width:240px;max-width:calc(100vw - 16px);
+    padding:8px 9px;border-radius:8px;background:var(--bg-toast);color:var(--ink);
+    border:1px solid var(--line);box-shadow:var(--shadow-toast);font-size:11.5px;font-weight:500;
+    line-height:1.35;text-align:left;pointer-events:none}
+  #helptip.open{display:block}
+  .addr{display:flex;gap:6px}.addr input{flex:1;background:var(--bg-input);border:1px solid var(--line);color:var(--ink);
+    padding:8px;border-radius:8px;font-size:13px}.addr button{background:var(--accent);color:var(--ink-on-accent);border:0;
+    padding:0 12px;border-radius:8px;font-weight:600;cursor:pointer}
+  .seg{display:flex;gap:6px}.seg button{flex:1;background:var(--bg-button);color:var(--ink);border:1px solid var(--line);
+    padding:7px;border-radius:8px;font-size:12.5px;cursor:pointer}.seg button.on{background:var(--accent);color:var(--ink-on-accent);font-weight:600;border-color:var(--accent)}
+  input[type=range]{width:100%;accent-color:var(--accent)} .val{color:var(--accent);font-weight:600}
+  .range-meta{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .range-meta output{color:var(--accent);font-weight:700;font-variant-numeric:tabular-nums}
+  #list{border-top:1px solid var(--line)}   /* flows; the whole #panel scrolls */
+  .nb{display:flex;justify-content:space-between;padding:7px 16px;font-size:13px;cursor:pointer;border-bottom:1px solid var(--bg-row-line)}
+  .nb:hover{background:var(--bg-hover)}.nb .t{font-variant-numeric:tabular-nums;font-weight:600}.nb small{color:var(--mut)}
+  #legend{position:absolute;left:14px;bottom:16px;z-index:1000;background:rgb(var(--panel-rgb) / .92);color:var(--ink);
+    padding:11px 13px;border:1px solid var(--line);border-radius:10px;font-size:12px}
+  #legend .bar{height:11px;width:240px;border-radius:3px;margin:7px 0 4px}
+  #legend .sc{display:flex;justify-content:space-between;color:var(--mut);font-size:11px}
+  #busy{position:absolute;top:12px;left:12px;z-index:1100;background:var(--accent);color:var(--ink-on-accent);font-weight:600;
+    padding:7px 12px;border-radius:20px;font-size:12.5px;display:none;box-shadow:var(--shadow-busy)}
+  .leaflet-tooltip.tt{background:var(--bg-input);border:1px solid var(--line);color:var(--ink);white-space:normal;padding:0;box-shadow:var(--shadow)}
+  .leaflet-tooltip.tt:before{border:none!important}
+  /* open-after-ready: the hover card is bound+opened on hover (so it exists for hit-testing) but
+     held INVISIBLE until its content + route + final direction are ready, then revealed IN PLACE.
+     visibility (not display) keeps its measured rect valid while hidden, so it reveals exactly
+     where it was placed — the card appears once, parked, and never visibly repositions. */
+  .leaflet-tooltip.tt.tt-pending{visibility:hidden}
+  .leaflet-popup-content{margin:0;font-size:12.5px}
+  .leaflet-popup-content-wrapper{background:var(--bg-input);color:var(--ink);border:1px solid var(--line);border-radius:10px}
+  .leaflet-popup-tip{background:var(--bg-input)}
+  .bd{width:238px;padding:11px 13px;font:12.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
+  .bd .h{font-size:15px;margin-bottom:3px;letter-spacing:.1px}
+  /* --- pinned route card: a fixed corner panel (replaces the on-map popup) so the pinned
+         breakdown never sits on top of the drawn route. Same .bd content, panel chrome. --- */
+  /* The CARD is a non-scrolling shell (flex column, overflow clipped to the rounded corners);
+     only #pinbody scrolls. That keeps the absolutely-positioned × in the shell's corner — it can
+     never scroll away with the content (the old overflow-y:auto-on-#pincard bug). */
+  /* Viewport-anchored: opening a route after the mobile controls have scrolled must not place the
+     card (including its persistent close control) above the visible page. */
+  #pincard{position:fixed;top:18px;right:344px;z-index:1200;background:var(--panel);color:var(--ink);
+    border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow-pop);display:none;
+    width:min(470px,calc(100vw - 36px));height:calc(100dvh - 36px);max-height:calc(100dvh - 36px);overflow:hidden;
+    animation:pincard-in .18s cubic-bezier(.25,1,.5,1);transition:right .22s cubic-bezier(.25,1,.5,1)}
+  #pincard.open{display:flex;flex-direction:column}
+  body.route-pinned #legend{display:none}
+  #pinbody{display:flex;flex:1 1 auto;min-height:0;overflow:hidden;overscroll-behavior:contain}
+  @keyframes pincard-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+  #pincard .pinx{position:absolute;top:6px;right:6px;cursor:pointer;color:var(--mut);font-size:22px;
+    line-height:1;width:44px;height:44px;display:flex;align-items:center;justify-content:center;
+    border:0;background:transparent;border-radius:9px;z-index:4}
+  #pincard .pinx:hover{color:var(--ink);background:var(--bg-hover)}
+  #pincard .bd{width:100%;min-width:0;max-width:none;padding:0}
+  .bd .legs{display:flex;flex-wrap:wrap;gap:5px 5px;align-items:center}
+  .bd .leg{padding:1px 7px;border-radius:7px;white-space:nowrap;font-size:11.5px;font-weight:600}
+  .bd .walk{background:var(--bg-walk);color:var(--ink-walk);font-weight:500}
+  .bd .wait{color:var(--ink-wait);font-style:italic;font-weight:500;padding:1px 3px;background:repeating-linear-gradient(45deg,var(--bg-wait-a),var(--bg-wait-a) 3px,var(--bg-wait-b) 3px,var(--bg-wait-b) 6px);border-radius:6px}
+  .bd .arr{color:var(--ink-arr);font-size:10px}
+  .bd .gm{color:var(--accent);display:inline-block;margin-top:9px;font-weight:600;text-decoration:none}
+  .bd .gm:hover{text-decoration:underline}
+  .bd .foot{color:var(--ink-foot);margin-top:5px;font-size:10.5px}
+  .note{color:var(--mut);font-size:11px;margin-top:6px;line-height:1.4}
+  /* --- added: autocomplete dropdown --- */
+  .acwrap{position:relative;flex:1}.acwrap input{width:100%}
+  #ac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:1200;background:var(--bg-input);
+    border:1px solid var(--line);border-radius:8px;overflow:hidden;display:none;box-shadow:var(--shadow-ac)}
+  #ac.open{display:block}
+  .ac-item{padding:8px 10px;font-size:12.5px;color:var(--ink);cursor:pointer;border-bottom:1px solid var(--bg-row-line);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ac-item:last-child{border-bottom:0}.ac-item.hl,.ac-item:hover{background:var(--bg-hover)}
+  /* --- added: export controls --- */
+  .export{display:flex;gap:6px;padding:7px 16px 11px}
+  .export button{flex:1;background:var(--bg-button);color:var(--ink);border:1px solid var(--line);
+    padding:7px;border-radius:8px;font-size:11.5px;cursor:pointer}.export button:hover{background:var(--bg-hover)}
+  /* --- added: toast --- */
+  #toast{position:absolute;left:50%;bottom:22px;transform:translateX(-50%);z-index:1300;
+    background:var(--bg-toast);color:var(--ink);border:1px solid var(--line);padding:9px 15px;border-radius:20px;
+    font-size:12.5px;display:none;box-shadow:var(--shadow-toast);max-width:84%;text-align:center}
+  /* --- hover tooltip footer: surface that ALTERNATIVE routes exist (read-only "also serves"
+         chips, NON-interactive — the map never previews an alt on hover) + a short compare hint --- */
+  .bd .altfoot{margin-top:9px;padding-top:8px;border-top:1px solid var(--line);
+    font-size:11px;line-height:1.45;color:var(--mut)}
+  .bd .altfoot b{color:var(--accent)}
+  .bd .altfoot .alab{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--mut);margin-bottom:5px}
+  .bd .altfoot .alts{display:flex;flex-wrap:wrap;gap:5px 5px;margin-bottom:6px}
+  /* read-only identity chip: a color dot (the alt's compare-list casing color) + line + ~Nm.
+     Pill chrome reads on both themes; cursor:default + no hover/click handlers = non-interactive. */
+  .bd .altfoot .altchip{display:inline-flex;align-items:center;gap:5px;padding:1px 7px 1px 6px;
+    border-radius:8px;background:var(--bg-hover);border:1px solid var(--line);color:var(--ink);
+    font-size:10.5px;font-weight:600;white-space:nowrap;cursor:default}
+  .bd .altfoot .altchip .adot{flex:0 0 auto;width:8px;height:8px;border-radius:50%;
+    border:1px solid rgba(0,0,0,.35);box-shadow:0 0 0 1px rgba(255,255,255,.18)}
+  .bd .altfoot .altchip .amin{color:var(--mut);font-weight:500}
+  .bd .altfoot .ahint{display:block}
+  /* Recommendation-first route inspector. Rows are the only route controls: family headings and
+     expert disclosures are plain structure, so interactive elements never nest. */
+  .pin-shell{display:flex;flex:1 1 auto;min-width:0;min-height:0;flex-direction:column}
+  .pin-head{flex:0 0 auto;z-index:3;background:var(--panel);border-bottom:1px solid var(--line);
+    padding:16px 54px 13px 16px}
+  .pin-place{font-size:1.05rem;font-weight:750;line-height:1.25;letter-spacing:-.01em}
+  .pin-dest{margin-top:3px;color:var(--mut);font-size:.8125rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pin-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;min-width:0}
+  .pin-title-copy{min-width:0;flex:1}
+  .pin-context{display:flex;flex-direction:column;align-items:stretch;gap:10px;margin-top:12px}
+  .pin-settings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));min-width:0;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .pin-setting{min-width:0;padding:7px 8px;border-right:1px solid var(--line)}
+  .pin-setting:first-child{padding-left:0}.pin-setting:last-child{padding-right:0;border-right:0}
+  .pin-setting-label,.route-fact-label{display:block;color:var(--mut);font-size:.625rem;line-height:1.25;
+    text-transform:uppercase;letter-spacing:.055em;font-weight:650}
+  .pin-setting-value{display:block;margin-top:2px;color:var(--ink);font-size:.75rem;line-height:1.3;
+    font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .quiet-action{min-height:44px;border:1px solid var(--line);border-radius:8px;
+    padding:0 11px;background:var(--bg-button);color:var(--ink);cursor:pointer;font-size:.75rem;font-weight:650}
+  #pinadjust{border-color:color-mix(in srgb,var(--accent) 55%,var(--line));color:var(--accent)}
+  .quiet-action:hover{background:var(--bg-hover);border-color:var(--accent)}
+  .pin-workspace{display:block;flex:1 1 auto;min-height:0;overflow:hidden}
+  .route-choices-pane,.route-plan-pane{height:100%;overflow-y:auto;overscroll-behavior:contain;padding:0 16px 18px}
+  .route-plan-pane{display:none}
+  .route-section{padding-top:20px}
+  .route-section-title{margin:0 0 9px;color:var(--ink);font-size:.875rem;font-weight:750;line-height:1.3}
+  .route-section-title span{color:var(--mut);font-weight:600}
+  .choice-list{border-top:1px solid var(--line)}
+  .route-choice-card{position:relative;border-bottom:1px solid var(--line)}
+  .route-choice-card:last-child{border-bottom:0}
+  .route-row{position:relative;display:grid;grid-template-columns:12px minmax(0,1fr) auto;width:100%;
+    gap:10px;min-height:76px;padding:13px 2px;border:0;border-radius:0;
+    background:transparent;color:var(--ink);text-align:left;cursor:pointer}
+  .route-row:hover,.route-row:focus-visible{background:var(--bg-hover)}
+  .route-row[aria-pressed="true"]{background:var(--bg-hover);border-radius:8px;
+    box-shadow:inset 0 0 0 1px var(--accent);padding-left:9px;padding-right:9px}
+  .route-plan-entry{display:none;align-items:center;justify-content:space-between;width:calc(100% - 24px);
+    min-height:44px;margin:-5px 12px 10px;padding:0 11px;border:1px solid var(--line);border-radius:8px;
+    background:var(--bg-button);color:var(--ink);font-size:.75rem;font-weight:750;cursor:pointer;text-align:left}
+  .route-plan-entry:after{content:"\2192";color:var(--accent);font-size:1rem}
+  .route-choice-card[data-selected="true"] .route-plan-entry{display:flex}
+  .route-plan-entry:hover{background:var(--bg-hover);border-color:var(--accent)}
+  .route-dot{width:10px;height:10px;border-radius:50%;margin-top:5px;border:1px solid rgba(0,0,0,.35);
+    box-shadow:0 0 0 1px rgba(255,255,255,.18)}
+  .route-main{min-width:0}
+  .route-name{display:block;font-size:.875rem;font-weight:750;line-height:1.3;overflow-wrap:anywhere}
+  .route-time{text-align:right;white-space:nowrap;font-size:.9375rem;font-weight:800;font-variant-numeric:tabular-nums}
+  .route-selected-label{display:block;margin-top:3px;color:var(--accent);font-size:.6875rem;font-weight:750}
+  .route-facts{grid-column:2/-1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-top:1px;
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .route-fact{min-width:0;padding:7px 8px;border-right:1px solid var(--line)}
+  .route-fact:first-child{padding-left:0}.route-fact:last-child{padding-right:0;border-right:0}
+  .route-fact-value{display:block;margin-top:2px;font-size:.75rem;line-height:1.3;font-weight:700;
+    font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+  .route-tradeoffs{grid-column:2/-1;display:flex;flex-wrap:wrap;gap:5px 0;color:var(--mut);
+    font-size:.75rem;line-height:1.4;overflow-wrap:anywhere}
+  .route-tradeoffs>span{padding-right:8px}
+  .route-tradeoffs>span+span{padding-left:8px;border-left:1px solid var(--line)}
+  .alternatives{padding-top:22px}
+  .expert{border-top:1px solid var(--line);margin-top:18px}
+  .expert>summary{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:8px;
+    list-style:none;color:var(--ink);cursor:pointer;font-size:.8125rem;font-weight:700}
+  .expert>summary::-webkit-details-marker{display:none}
+  .expert>summary:after{content:"+";color:var(--mut);font-size:1rem}
+  .expert[open]>summary:after{content:"−"}
+  .boarding-group{padding:16px 0 0}
+  .boarding-group+.boarding-group{border-top:1px solid var(--line);margin-top:14px}
+  .boarding-heading{margin:0 0 8px;line-height:1.35}
+  .boarding-place{display:block;color:var(--ink);font-size:.8125rem;font-weight:750}
+  .boarding-detail{display:block;margin-top:2px;color:var(--mut);font-size:.6875rem;font-weight:600}
+  .selected-route{padding-top:0}
+  .plan-head{position:sticky;top:0;z-index:2;display:flex;align-items:flex-start;justify-content:space-between;
+    gap:12px;padding:2px 0 13px;background:var(--panel);border-bottom:1px solid var(--line)}
+  .plan-heading{min-width:0}
+  .plan-title{margin:0;color:var(--ink);font-size:.9375rem;line-height:1.3}
+  .plan-route-context{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 8px;margin-top:5px;
+    color:var(--mut);font-size:.75rem;line-height:1.35;font-weight:650}
+  .plan-route-name{min-width:0;overflow-wrap:anywhere}
+  .plan-trip-time{white-space:nowrap;font-variant-numeric:tabular-nums}
+  .plan-close{flex:0 0 auto;min-height:44px;border:1px solid var(--line);border-radius:8px;padding:0 10px;
+    background:var(--bg-button);color:var(--ink);font-size:.75rem;font-weight:750;cursor:pointer}
+  .plan-close-mobile{display:none}
+  .plan-directions-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding-top:15px}
+  .plan-directions-head h3{margin:0;font-size:.8125rem;line-height:1.3}
+  .plan-step-count{color:var(--mut);font-size:.6875rem;font-weight:700;white-space:nowrap}
+  .route-directions{margin:10px 0 0;padding:0;list-style:none;border-top:1px solid var(--line)}
+  .route-directions li{display:flex;gap:8px;padding:10px 0;border-bottom:1px solid var(--line);font-size:.8125rem;line-height:1.4}
+  .route-directions li:last-child{border-bottom:0}
+  .route-step{display:inline-flex;align-items:center;justify-content:center;flex:0 0 18px;height:18px;
+    border-radius:50%;background:var(--bg-button);border:1px solid var(--line);color:var(--mut);
+    font-size:.625rem;font-weight:750;margin-top:1px}
+  .route-copy{min-width:0}.route-detail{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
+  .route-allowance{display:block;margin-top:2px;color:var(--mut);font-size:.75rem;line-height:1.4}
+  .plan-footer{margin-top:8px;padding:12px 0 max(2px,env(safe-area-inset-bottom));
+    border-top:1px solid var(--line);background:var(--panel)}
+  .plan-google{display:flex;align-items:center;justify-content:space-between;min-height:44px;padding:0 12px;
+    border:1px solid var(--line);border-radius:8px;background:var(--bg-button);color:var(--accent);
+    font-size:.75rem;font-weight:750;text-decoration:none}
+  .plan-google:hover{background:var(--bg-hover);border-color:var(--accent)}
+  .pin-map-summary{display:none;padding:10px 16px;border-top:1px solid var(--line)}
+  .pin-map-summary strong{display:block;font-size:.875rem}.pin-map-summary span{color:var(--mut);font-size:.75rem}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  .cmploading{padding:10px 0;color:var(--mut);font-size:.75rem}
+  .pin-links{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px 16px;
+    border-top:1px solid var(--line);font-size:.75rem}
+  .pin-links .gm{margin:0}
+  .show-routes{min-height:44px;border:0;background:none;color:var(--accent);padding:8px 0;cursor:pointer;font-weight:650}
+  #touchpeek{display:none;position:fixed;z-index:1250;left:8px;right:8px;bottom:max(8px,env(safe-area-inset-bottom));
+    background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:15px;
+    box-shadow:var(--shadow-pop);padding:14px;max-height:calc(100dvh - 16px);overflow-y:auto;overscroll-behavior:contain}
+  #touchpeek.open{display:block}
+  #touchpeek .peek-close{position:absolute;right:4px;top:4px;width:44px;height:44px;border:0;border-radius:9px;
+    background:transparent;color:var(--mut);font-size:22px;cursor:pointer}
+  #touchpeek .peek-title{padding-right:42px;font-size:1rem;font-weight:750}
+  #touchpeek .peek-stats{margin-top:6px;color:var(--mut);font-size:.8125rem}
+  #touchpeek .peek-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+  #touchpeek button.inspect{min-height:44px;border:0;border-radius:9px;background:var(--accent);
+    color:var(--ink-on-accent);font-weight:750;cursor:pointer}
+  #touchpeek button.dismiss{min-height:44px;border:1px solid var(--line);border-radius:9px;background:var(--bg-button);
+    color:var(--ink);font-weight:650;cursor:pointer}
+  /* --- keep-pin recompute loading state on the pinned card (Max transfers / Walk speed) --- */
+  /* The "updating…" line sits at the top of the card; the compare strips dim + go inert so the
+     user sees it's recalculating while the card stays put (same position/size) and the OLD route
+     stays drawn until the new one lands. */
+  #pincard.pinloading .pin-workspace{opacity:.42;pointer-events:none;transition:opacity .12s}
+  #pincard .pinupd{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--mut);
+    margin:0 0 7px;font-variant-numeric:tabular-nums}
+  #pincard .pinupd .spin{flex:0 0 auto;width:12px;height:12px;border-radius:50%;
+    border:2px solid var(--line);border-top-color:var(--accent);animation:pinspin .7s linear infinite}
+  @keyframes pinspin{to{transform:rotate(360deg)}}
+  /* --- added: how-it-works link + modal --- */
+  .info-link{color:var(--accent);font-size:11.5px;cursor:pointer;text-decoration:none;margin-left:6px;
+    padding:0;border:0;background:transparent}
+  .info-link:hover{text-decoration:underline}
+  /* shared modal shell: How it works + About both use it (one source of overlay styling) */
+  .modal{position:fixed;inset:0;z-index:1400;background:var(--modal-bg);display:none;
+    align-items:center;justify-content:center;padding:18px}
+  .modal.open{display:flex}
+  .modal .card{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:14px;
+    width:min(720px,calc(100vw - 48px));max-width:720px;max-height:calc(100dvh - 48px);
+    overflow-y:auto;overscroll-behavior:contain;padding:20px 22px;box-shadow:var(--shadow-pop);
+    font-size:13.5px;line-height:1.55}
+  .modal .card h2{margin:0 0 10px;font-size:15px}
+  .modal .card h3{margin:16px 0 5px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+  .modal .card p{margin:0 0 9px}
+  .modal .card a{color:var(--accent)}
+  .modal .card ul{margin:0;padding-left:18px}
+  .modal .card ul li{margin-bottom:3px}
+  .modal .card .x{float:right;display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;
+    border:0;border-radius:9px;background:transparent;cursor:pointer;color:var(--mut);font-size:18px;line-height:1;margin:-10px -10px 0 0}
+  .modal .card .x:hover{color:var(--ink)}
+  /* slim footer bar pinned to the bottom of the side panel: About + How it works tabs */
+  .foot-bar{margin-top:auto;display:flex;border-top:1px solid var(--line);background:var(--panel)}
+  .foot-bar button{flex:1;background:none;border:0;border-right:1px solid var(--line);color:var(--mut);
+    padding:10px 8px;font-size:11.5px;font-family:inherit;cursor:pointer;letter-spacing:.02em}
+  .foot-bar button:last-child{border-right:0}
+  .foot-bar button:hover{background:var(--bg-hover);color:var(--ink)}
+  /* --- added: hover journey route (line labels + total badge drawn on the map) --- */
+  .rtwrap{background:none!important;border:none!important;pointer-events:none}
+  /* Line pill on each transit leg of the (single) drawn route: solid line-color fill, white
+     casing-ish border. Only one route draws at a time, so there is no alt-pill variant. */
+  .rtlab{display:inline-block;transform:translate(-50%,-50%);padding:1px 7px;border-radius:7px;
+    font-size:10.5px;font-weight:700;color:#fff;white-space:nowrap;
+    border:1.5px solid rgba(255,255,255,.9);box-shadow:0 1px 4px rgba(0,0,0,.45);
+    text-shadow:0 1px 1px rgba(0,0,0,.4)}
+  .rtbadge{display:inline-block;transform:translate(-50%,-135%);background:var(--panel);color:var(--ink);
+    border:1px solid var(--line);padding:2px 8px;border-radius:10px;font-size:11.5px;font-weight:700;
+    white-space:nowrap;box-shadow:var(--shadow)}
+  .leaflet-cells-pane canvas{opacity:var(--heat-opacity);transition:opacity .2s cubic-bezier(.25,1,.5,1)}
+  body.route-pinned .leaflet-cells-pane canvas{opacity:var(--heat-pinned-opacity)}
+  /* --- added: mobile bottom-sheet handle (hidden on desktop) --- */
+  /* it's a real <button> (keyboard-operable); strip the UA chrome so the sheet styling wins */
+  #sheetbtn{display:none;border:0;padding:0;width:100%;font-family:inherit}
+  /* ---- onboarding prompt: a welcoming first-step card over the empty map. The wrapper
+     spans the map area (right-padded so it centers in the visible map, not under the panel)
+     and is pointer-events:none so it never traps map pan/clicks. */
+  #prompt{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    z-index:1050;pointer-events:none;padding:24px;padding-right:354px}
+  #prompt .ob{max-width:420px;text-align:center;background:rgb(var(--panel-rgb) / .96);
+    color:var(--ink);padding:26px 30px 24px;border:1px solid var(--line);border-radius:16px;
+    box-shadow:var(--shadow-strong);animation:obIn .45s cubic-bezier(.2,.7,.3,1) both;
+    pointer-events:auto}  /* re-enable interaction on the card (the wrapper is pointer-events:none) */
+  /* Returning visitors and valid shared links are classified synchronously in <head>.  Keep the
+     first visible shell truthful while app JS restores their commute; `data-startup` holds only
+     this state, never an address or coordinates. */
+  #prompt .ob-restoring{display:none}
+  :root[data-startup="restoring"] #prompt .ob-onboarding,
+  :root[data-startup="error"] #prompt .ob-onboarding{display:none}
+  :root[data-startup="restoring"] #prompt .ob-restoring,
+  :root[data-startup="error"] #prompt .ob-restoring{display:block}
+  #prompt[data-state="restoring"] .ob-onboarding,
+  #prompt[data-state="error"] .ob-onboarding{display:none}
+  #prompt[data-state="restoring"] .ob-restoring,
+  #prompt[data-state="error"] .ob-restoring{display:block}
+  @keyframes obIn{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
+  #prompt .ob h2{margin:0 0 10px;font-size:19px;line-height:1.25;font-weight:700;letter-spacing:-.2px}
+  #prompt .ob p{margin:0;font-size:13.5px;line-height:1.5;color:var(--mut)}
+  #prompt .ob p b{color:var(--ink);font-weight:600}
+  .inline-error{margin:8px 0 0;color:#ff8f8f;font-size:12px;line-height:1.4}
+  .inline-error[hidden]{display:none}
+  #prompt .cta{margin-top:18px;display:inline-flex;align-items:center;gap:9px;
+    background:var(--accent);color:var(--ink-on-accent);font-size:13px;font-weight:600;
+    padding:9px 15px;border-radius:9px}
+  #prompt .cta .arr{font-size:16px;line-height:1;animation:obArr 1.3s ease-in-out infinite}
+  @keyframes obArr{0%,100%{transform:translateX(0)}50%{transform:translateX(4px)}}
+  /* onboarding address form: a real input + Go button (mirrors the panel's .addr chrome so the
+     two are visually consistent across light/dark). Left-aligned text inside the centered card. */
+  #prompt .obform{margin-top:18px;display:flex;gap:6px;text-align:left}
+  #prompt .obac{position:relative;flex:1}
+  #prompt #obaddr{width:100%;background:var(--bg-input);border:1px solid var(--line);color:var(--ink);
+    padding:10px 11px;border-radius:9px;font-size:14px;font-family:inherit}
+  #prompt #obaddr::placeholder{color:var(--mut)}
+  #prompt #obgo{flex:0 0 auto;background:var(--accent);color:var(--ink-on-accent);border:0;
+    padding:0 16px;border-radius:9px;font-weight:600;font-size:14px;cursor:pointer;font-family:inherit}
+  #prompt .startup-actions{display:none;justify-content:center;gap:8px;margin-top:18px}
+  #prompt[data-state="error"] .startup-actions{display:flex}
+  #prompt .startup-actions button{min-height:40px;padding:0 13px;border-radius:9px;cursor:pointer;
+    font-family:inherit;font-size:14px;font-weight:650}
+  #startupretry{border:0;background:var(--accent);color:var(--ink-on-accent)}
+  #startupchange{border:1px solid var(--line);background:var(--bg-button);color:var(--ink)}
+  /* onboarding autocomplete dropdown — reuses .ac-item visuals from the panel's #ac */
+  #prompt #obac{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:1200;background:var(--bg-input);
+    border:1px solid var(--line);border-radius:9px;overflow:hidden;display:none;box-shadow:var(--shadow-ac);text-align:left}
+  #prompt #obac.open{display:block}
+  /* ============ responsive layer (<=719px): focused full-screen inspector ============ */
+  @media (max-width:719px){
+    #map{inset:0}
+    /* panel becomes a collapsible bottom sheet */
+    #panel{top:auto;right:0;left:0;bottom:0;width:100%;height:auto;max-height:78vh;
+      border-left:0;border-top:1px solid var(--line);border-radius:16px 16px 0 0;
+      transform:translateY(calc(100% - 52px));transition:transform .28s ease;box-shadow:var(--shadow-sheet)}
+    #panel.open{transform:translateY(0)}
+    /* a fixed grab handle at the top of the sheet to open/close */
+    #sheetbtn{display:flex;align-items:center;justify-content:center;gap:8px;height:52px;flex:0 0 auto;
+      cursor:pointer;color:var(--ink);font-size:13px;font-weight:600;border-bottom:1px solid var(--line);
+      background:var(--panel);border-radius:16px 16px 0 0;position:relative;touch-action:manipulation}
+    #sheetbtn:before{content:"";position:absolute;top:7px;left:50%;transform:translateX(-50%);
+      width:38px;height:4px;border-radius:3px;background:var(--bg-handle)}
+    #panel h1{padding-top:8px}
+    /* #list flows; the bottom sheet (#panel) scrolls */
+    /* bigger tap targets */
+    .addr input,.acwrap input{padding:11px;font-size:15px}
+    .addr button{padding:12px}
+    .seg button{padding:11px;font-size:13.5px}
+    .ac-item{padding:12px 11px;font-size:14px}
+    input[type=range]{height:26px}
+    .export button{padding:11px;font-size:12.5px}
+    .nb{padding:11px 16px;font-size:14px}
+    /* legend: compact + above the sheet handle so it never covers panel/map controls */
+    #legend{left:8px;right:8px;bottom:60px;padding:8px 11px;font-size:11px}
+    #legend .bar{width:auto}
+    #busy{top:8px;left:8px;font-size:12px}
+    #toast{bottom:64px}
+    /* breakdown popup fills more width on small screens */
+    .bd{width:auto;max-width:78vw}
+    .leaflet-popup-content{max-width:80vw}
+    .modal{padding:12px}
+    .modal .card{width:100%;max-height:calc(100dvh - 24px);font-size:14px}
+    /* on mobile the side panel is a bottom sheet; float the pinned card to a fixed corner
+       so it isn't trapped inside the collapsed sheet */
+    #pincard{top:0;right:0;left:0;bottom:0;width:100vw;max-height:100dvh;height:100dvh;border-radius:0;
+      border-width:0;transition:transform .24s cubic-bezier(.25,1,.5,1)}
+    #pincard .pin-head{padding-top:max(16px,env(safe-area-inset-top))}
+    #pincard .route-row{min-height:64px}
+    #pincard .route-name{font-size:.9375rem}
+    #pincard .route-tradeoffs,#pincard .route-directions li{font-size:.8125rem}
+    #pincard .quiet-action{min-height:44px;font-size:.875rem}
+    #pincard .pin-context{grid-template-columns:1fr;align-items:start;gap:9px}
+    #pincard .quiet-action{justify-self:start}
+    #pincard .pin-setting{padding-top:9px;padding-bottom:9px}
+    #pincard .pin-links{padding-bottom:max(18px,env(safe-area-inset-bottom))}
+    /* Pinning is a focused route-inspection mode. The controls sheet and broad map legend add no
+       value behind a two-screen route card and otherwise compete for the same bottom pixels. */
+    body.route-pinned[data-inspector-surface="routes"] #panel{display:none}
+    /* onboarding: full-width centering (panel is a bottom sheet, not a side rail) and the
+       CTA points DOWN toward the "Controls" sheet handle. Sits above the 52px sheet. */
+    #prompt{padding:18px;padding-bottom:84px;align-items:center}
+    #prompt .ob{max-width:none}
+    #prompt .cta .arr{animation:obArrDn 1.3s ease-in-out infinite}
+    @keyframes obArrDn{0%,100%{transform:translateY(0)}50%{transform:translateY(4px)}}
+  }
+  /* Route Inspector V3: the presentation is driven by #pincard data attributes rather than a
+     growing collection of body classes.  Route data continues to render into the two established
+     panes; this layer only decides where those panes can live. */
+  #settingsdone{display:none}
+  #route-sidecar{position:fixed;right:calc(clamp(380px,32vw,460px) + 30px);bottom:18px;z-index:1190;
+    display:none;width:clamp(320px,25vw,400px);max-height:min(68dvh,620px);overflow:hidden;
+    background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:12px;
+    box-shadow:var(--shadow-pop)}
+  #route-sidecar[data-open="true"]{display:flex;flex-direction:column}
+  #route-sidecar .route-plan-pane{display:block;height:auto;max-height:min(68dvh,620px);padding:16px;
+    overflow-y:auto;overscroll-behavior:contain}
+  #pincard[data-layout-capability="single-card"],#pincard[data-layout-capability="wide-sidecar"]{
+    top:18px;right:18px;left:auto;bottom:auto;width:clamp(380px,32vw,460px);height:calc(100dvh - 36px);
+    max-height:calc(100dvh - 36px);transform:none}
+  #pincard[data-layout-capability="single-card"]{width:clamp(344px,42vw,390px)}
+  @media (min-width:960px){#pincard[data-layout-capability="single-card"]{width:clamp(380px,32vw,460px)}}
+  #pincard[data-layout-capability="wide-sidecar"] .pin-workspace,
+  #pincard[data-layout-capability="single-card"] .pin-workspace{display:flex;flex-direction:column}
+  #pincard[data-layout-capability="wide-sidecar"] .route-choices-pane,
+  #pincard[data-layout-capability="single-card"] .route-choices-pane{order:1;display:block;flex:1 1 auto;height:auto;min-height:0}
+  #pincard[data-layout-capability="wide-sidecar"] .route-plan-pane{display:none}
+  #pincard[data-layout-capability="single-card"] .route-plan-pane{order:2;display:none;flex:0 0 min(42%,380px);
+    height:auto;min-height:170px;padding:16px;overflow-y:auto;border-top:1px solid var(--line);background:var(--panel)}
+  #pincard[data-layout-capability="single-card"][data-plan-open="true"] .route-plan-pane{display:block}
+  .pin-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .pin-actions .quiet-action,.pin-map-focus{min-height:44px;min-width:44px;padding:0 9px}
+  .pin-sheet-handle{display:none}
+  #pincard[data-presentation="map-focus"]{top:auto;bottom:18px;height:auto;min-height:0;max-height:none;width:min(470px,calc(100vw - 36px))}
+  #pincard[data-presentation="map-focus"] .pin-head,#pincard[data-presentation="map-focus"] .pin-workspace{display:none}
+  #pincard[data-presentation="map-focus"] .pin-map-summary{display:flex;align-items:center;gap:10px;padding:10px 58px 10px 12px}
+  .pin-map-summary .map-focus-copy{min-width:0;flex:1;border:0;background:transparent;color:var(--ink);
+    padding:0;text-align:left;cursor:pointer}.pin-map-summary .map-focus-actions{display:flex;gap:5px}
+  .pin-map-summary button{min-height:44px;border:1px solid var(--line);border-radius:8px;background:var(--bg-button);color:var(--ink);padding:0 10px;cursor:pointer;font-weight:700;font-size:.75rem}
+  .pin-map-summary button.map-focus-copy{border:0;background:transparent;padding:0}
+  html[data-inspector-surface="settings"] #pincard,html[data-inspector-surface="settings"] #route-sidecar{visibility:hidden;pointer-events:none}
+  html[data-inspector-surface="settings"] #panel{opacity:1;visibility:visible;pointer-events:auto}
+  html[data-inspector-surface="settings"] #settingsdone{display:flex;position:fixed;top:18px;right:318px;z-index:1220;
+    align-items:center;min-height:44px;border:1px solid var(--line);border-radius:22px;background:var(--panel);
+    color:var(--accent);box-shadow:var(--shadow);text-align:left;padding:0 14px;font-weight:750;cursor:pointer}
+  @media (max-width:719px){
+    #route-sidecar{display:none!important}
+    #pincard[data-layout-capability="bottom-sheet"]{top:auto;right:0;bottom:0;left:0;width:100%;height:var(--sheet-height,132px);
+      max-height:calc(100dvh - 8px);border-radius:16px 16px 0 0;border-width:1px 0 0;transform:none;
+      animation:none;transition:height .24s cubic-bezier(.25,1,.5,1)}
+    #pincard[data-layout-capability="bottom-sheet"][data-dragging="true"]{transition:none}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-shell{min-height:0}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-sheet-handle{display:flex;align-items:center;justify-content:center;
+      width:calc(100% - 54px);margin-right:54px;min-height:44px;border:0;background:transparent;color:var(--mut);cursor:grab;touch-action:none}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-sheet-handle:before{content:"";width:36px;height:4px;border-radius:4px;background:var(--bg-handle)}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-head{padding:2px 54px 10px 16px}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-title-row{align-items:center;gap:8px}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-place{font-size:1rem}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-dest{font-size:.75rem}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-context{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-actions{flex:0 0 auto}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-actions .pin-map-focus{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-actions .quiet-action{min-height:44px;padding:0 9px;font-size:.75rem}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-workspace{display:flex;flex:1;min-height:0;overflow:hidden}
+    #pincard[data-layout-capability="bottom-sheet"] .route-choices-pane,
+    #pincard[data-layout-capability="bottom-sheet"] .route-plan-pane{display:none;flex:1;min-height:0;height:auto;
+      padding-bottom:calc(max(24px,env(safe-area-inset-bottom)) + 12px);overflow-y:auto}
+    #pincard[data-layout-capability="bottom-sheet"][data-sheet-content="choices"] .route-choices-pane,
+    #pincard[data-layout-capability="bottom-sheet"][data-sheet-content="plan"] .route-plan-pane{display:block}
+    #pincard[data-layout-capability="bottom-sheet"] .route-choice-card .route-plan-entry{display:flex}
+    #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-head,
+    #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-workspace{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-map-summary{display:none}
+    #pincard[data-layout-capability="bottom-sheet"][data-sheet-snap="peek"] .pin-map-summary{display:flex;align-items:center;gap:10px;padding:8px 54px 12px 16px;border-top:0}
+    #pincard[data-layout-capability="bottom-sheet"] .pin-map-summary .map-focus-actions{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .plan-close-desktop{display:none}
+    #pincard[data-layout-capability="bottom-sheet"] .plan-close-mobile{display:inline}
+    html[data-inspector-surface="settings"] #panel{top:auto;right:0;bottom:0;left:0;width:100%;height:var(--settings-sheet-height,58dvh);
+      max-height:calc(100dvh - 8px);border-left:0;border-radius:16px 16px 0 0;transform:none;transition:height .24s cubic-bezier(.25,1,.5,1)}
+    html[data-inspector-surface="settings"] #sheetbtn{display:none}
+    html[data-inspector-surface="settings"] #settingsdone{display:flex;position:sticky;top:0;right:auto;z-index:2;
+      border-width:0 0 1px;border-radius:0;box-shadow:none;padding:0 16px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    /* Keep state changes immediate without globally clobbering third-party/map transitions. */
+    #pincard,#panel,#route-sidecar,.leaflet-cells-pane canvas,#pincard.pinloading .pin-workspace{
+      transition-duration:.01ms!important}
+    #pincard,#prompt .ob,#prompt .cta .arr,#pincard .spin{
+      animation:none!important}
+    html{scroll-behavior:auto}
+  }

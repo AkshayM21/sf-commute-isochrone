@@ -5,7 +5,7 @@
 #   uv pip install -p .venv/bin/python playwright pytest-playwright
 #   .venv/bin/python -m playwright install chromium
 #
-# The featured Flask+R5 server must be running at http://127.0.0.1:8000:
+# The featured graph-native Flask server must be running at http://127.0.0.1:8000:
 #   .venv/bin/python scripts/server.py
 #
 # Usage:

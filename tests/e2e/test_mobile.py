@@ -90,9 +90,12 @@ def test_12_mobile_address_autocomplete_and_compute(page):
 def test_13_mobile_tap_to_breakdown(page):
     fresh_load(page)
 
-    # Confirm the JS TOUCH branch is active (this is what makes tap, not hover, drive the
-    # breakdown — see index.html onEachFeature).
-    assert page.evaluate("() => TOUCH === true"), "TOUCH must be true under iPhone emulation"
+    # Verify the emulated device presents the coarse/no-hover signals used by the app. The
+    # touch preview assertion below verifies the resulting user-visible branch directly.
+    assert page.evaluate(
+        "() => matchMedia('(any-pointer: coarse)').matches && "
+        "!matchMedia('(any-hover: hover)').matches"
+    ), "the mobile fixture must emulate a coarse pointer without hover"
 
     _open_sheet(page)
     set_address(page, ADDR_MARKET, via="go", tap=True)
@@ -136,15 +139,9 @@ def test_14_mobile_controls_reachable(page):
     _open_sheet(page)
     set_address(page, ADDR_MARKET, via="go", tap=True)
 
-    # Legacy R5 exposes Refine; RAPTOR is already exact and hides the no-op control.
-    refine = page.locator("#refine")
-    if page.is_visible("#refinebox"):
-        refine.scroll_into_view_if_needed()
-        assert refine.is_visible() and refine.is_enabled(), (
-            "legacy Refine should be reachable + enabled in the sheet")
-    else:
-        assert not refine.is_visible() and not refine.is_enabled(), (
-            "RAPTOR's hidden Refine control should remain inert")
+    # The approximate/exact split was retired; no Refine control should be reachable.
+    assert page.locator("#refinebox").count() == 0
+    assert page.locator("#refine").count() == 0
 
     # Color-by-line toggle reachable + togglable.
     line_btn = page.locator("#cmode button[data-v='line']")

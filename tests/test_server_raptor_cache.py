@@ -262,11 +262,10 @@ def _isolated_init_state(monkeypatch):
     """Fresh boot globals for lifecycle guards without perturbing the shared server fixture."""
     from core import server_raptor as sr
     for name in (
-        "_RAPTOR", "_RAPTOR_STOPS", "_RAPTOR_CELL_POS", "_WG", "_WG_STOP_NODES",
-        "_WG_STOP_CONN", "_WG_CELL_NODES", "_WG_CELL_CONN", "_WG_STOP_GIDS", "ORIGIN_LL",
-        "_NEED_R5", "_NETWORK", "_NET", "_SNAPPED_GRID", "_DEP", "_MC_SCENARIO_ACTIVE",
+        "_RAPTOR", "_WG", "_WG_STOP_NODES", "_WG_STOP_CONN", "_WG_CELL_NODES",
+        "_WG_CELL_CONN", "_WG_STOP_GIDS", "ORIGIN_LL", "_MC_SCENARIO_ACTIVE",
         "_MC_SCENARIO_SEQ", "_RAPTOR_EGRESS_CACHE", "_WALKPATH_TREE_CACHE",
-        "_CELL_WALKPATH_TREE_CACHE", "_TRANSFER_PATH_CACHE", "_RAPTOR_TREE_CACHE",
+        "_CELL_WALKPATH_TREE_CACHE", "_RAPTOR_TREE_CACHE",
         "_RAPTOR_MC_CACHE", "_WALKPATH_INFLIGHT", "_CELL_WALKPATH_INFLIGHT",
         "_RAPTOR_TREE_INFLIGHT", "_RAPTOR_MC_INFLIGHT",
     ):
@@ -276,7 +275,6 @@ def _isolated_init_state(monkeypatch):
     monkeypatch.setattr(sr, "_RAPTOR_EGRESS_CACHE", sr.BoundedLRU(4))
     monkeypatch.setattr(sr, "_WALKPATH_TREE_CACHE", sr.BoundedLRU(4))
     monkeypatch.setattr(sr, "_CELL_WALKPATH_TREE_CACHE", sr.BoundedLRU(4))
-    monkeypatch.setattr(sr, "_TRANSFER_PATH_CACHE", sr.BoundedLRU(4))
     monkeypatch.setattr(sr, "_RAPTOR_TREE_CACHE", sr.BoundedLRU(4, copy_mode="shallow"))
     monkeypatch.setattr(sr, "_RAPTOR_MC_CACHE", sr.BoundedLRU(4, copy_mode="shallow"))
     monkeypatch.setattr(sr, "_WALKPATH_INFLIGHT", {})
@@ -287,9 +285,8 @@ def _isolated_init_state(monkeypatch):
 
 
 def _init_for_test(sr):
-    sr.init(raptor=object(), raptor_stops=None, raptor_cell_pos=None, wg=None,
-            wg_stop_nodes=None, wg_stop_conn=None, wg_cell_nodes=None, wg_cell_conn=None,
-            wg_stop_gids=None, origin_ll=None, need_r5=True)
+    sr.init(raptor=object(), wg=None, wg_stop_nodes=None, wg_stop_conn=None,
+            wg_cell_nodes=None, wg_cell_conn=None, wg_stop_gids=None, origin_ll=None)
 
 
 def test_init_evicts_every_graph_derived_cache_and_retained_scenario(monkeypatch):
@@ -302,7 +299,7 @@ def test_init_evicts_every_graph_derived_cache_and_retained_scenario(monkeypatch
     nested_geom = {"old-cell": object()}
     caches = (
         sr._RAPTOR_EGRESS_CACHE, sr._WALKPATH_TREE_CACHE, sr._CELL_WALKPATH_TREE_CACHE,
-        sr._TRANSFER_PATH_CACHE, sr._RAPTOR_TREE_CACHE, sr._RAPTOR_MC_CACHE,
+        sr._RAPTOR_TREE_CACHE, sr._RAPTOR_MC_CACHE,
     )
     for number, cache in enumerate(caches):
         value = ({"geom": nested_geom, "branch_geom": {"old": object()}}

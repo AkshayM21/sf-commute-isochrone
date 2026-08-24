@@ -122,8 +122,23 @@ def test_legacy_paths_scale_transfer_footpaths_with_other_walk_legs(monkeypatch)
                                     walk_scalar=1.5, planned=False)
     assert reverse_calls[-1][0] is scaled
     assert departafter_tree_data[-1] is scaled
-
     engine.journey_tree_departafter(np.array([2]), np.array([20]), np.array([30]),
                                     walk_scalar=1.5, planned=True)
     assert reverse_calls[-1][0] is scaled
     assert departafter_tree_data[-1] is scaled
+
+
+def test_graph_transfer_scaling_preserves_minimum_and_timed_pathway():
+    engine = _synthetic_engine()
+    engine.data.update({
+        # Edge 0 is ordinary graph walking with a 60s GTFS minimum; edge 1 is an
+        # authoritative 40s pathway and must not be pace-scaled.
+        "tr_walk_time": np.asarray([20.0, 40.0, 50.0]),
+        "tr_min_time": np.asarray([60.0, 0.0, 0.0]),
+        "tr_time": np.asarray([60.0, 40.0, 50.0]),
+        "tr_path_fallback": np.asarray([0, 1, 0], dtype=np.int8),
+    })
+    scaled = engine._data_for_walk_scalar(1.5)
+    assert scaled["tr_walk_time"].tolist() == [30.0, 40.0, 75.0]
+    assert scaled["tr_min_time"].tolist() == [60.0, 0.0, 0.0]
+    assert scaled["tr_time"].tolist() == [60, 40, 75]

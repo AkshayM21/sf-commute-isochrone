@@ -13,7 +13,7 @@ from conftest import BASE_URL
 from route_family_hotspots import (
     ARTIFACT_PATH, DEFAULT_SEED, PARETO_DIMENSIONS, PUBLIC_DESTINATIONS, SAVED_HOTSPOT,
     _api_get, _rank_hotspots, _route_slots, _speed_query,
-    _stable_rank, _transit_legs, assert_api_matches_dom, assert_inspector_health, dom_family_snapshot,
+    _transit_legs, assert_api_matches_dom, assert_inspector_health, dom_family_snapshot,
     measure_family_card, open_destination, origin_container_point, route_metrics, scan_hotspots,
     validate_route_response, write_artifact,
 )
@@ -25,8 +25,7 @@ def _enabled(name):
 
 def _catalog_subset():
     count = max(1, min(int(os.environ.get("ROUTE_FAMILY_HOTSPOT_DESTS", "6")), len(PUBLIC_DESTINATIONS)))
-    return tuple(sorted(PUBLIC_DESTINATIONS,
-                        key=lambda item: _stable_rank(DEFAULT_SEED, "destination", item["slug"]))[:count])
+    return tuple(sorted(PUBLIC_DESTINATIONS, key=lambda item: item["slug"])[:count])
 
 
 def _scan_speeds():
@@ -37,19 +36,19 @@ def _scan_speeds():
 
 
 def _cell_container_point(page, cell_id):
-    found = page.evaluate("""id => { let target=null; layer.eachLayer(candidate => {
+    found = page.evaluate("""id => { const {cellLayer,map}=window.__SFCI_E2E__; let target=null; cellLayer.eachLayer(candidate => {
       if(String(candidate.feature?.properties?.id)===String(id)) target=candidate; });
       if(!target) return false; map.setView(target.getBounds().getCenter(),13,{animate:false}); return true; }""",
                           cell_id)
     assert found, f"Leaflet layer did not contain saved cell {cell_id}"
-    page.wait_for_function("""id => { let target=null; layer.eachLayer(candidate => {
+    page.wait_for_function("""id => { const {cellLayer,map}=window.__SFCI_E2E__; let target=null; cellLayer.eachLayer(candidate => {
       if(String(candidate.feature?.properties?.id)===String(id)) target=candidate; });
       if(!target || !map?._loaded) return false;
       const point=map.latLngToContainerPoint(target.getBounds().getCenter());
       const rect=document.getElementById('map').getBoundingClientRect();
       return point.x>=0 && point.y>=0 && point.x<=rect.width && point.y<=rect.height;
     }""", arg=cell_id, timeout=5_000)
-    return page.evaluate("""id => { let target=null; layer.eachLayer(candidate => {
+    return page.evaluate("""id => { const {cellLayer,map}=window.__SFCI_E2E__; let target=null; cellLayer.eachLayer(candidate => {
       if(String(candidate.feature?.properties?.id)===String(id)) target=candidate; });
       const point=map.latLngToContainerPoint(target.getBounds().getCenter());
       const rect=document.getElementById('map').getBoundingClientRect();
@@ -237,6 +236,7 @@ def _rects(page, *selectors):
 def _wait_camera_stable(page):
     """Wait until Leaflet's center and zoom have remained unchanged for 400 ms."""
     page.evaluate("""async () => {
+      const map=window.__SFCI_E2E__.map;
       const read=()=>{const c=map.getCenter();return {lat:c.lat,lng:c.lng,zoom:map.getZoom()};};
       const same=(a,b)=>Math.abs(a.lat-b.lat)<1e-9&&Math.abs(a.lng-b.lng)<1e-9&&a.zoom===b.zoom;
       let previous=read(),stableSince=performance.now();const deadline=stableSince+3500;
@@ -253,7 +253,7 @@ def _wait_camera_stable(page):
 
 def _camera(page):
     _wait_camera_stable(page)
-    return page.evaluate("""() => { const c=map.getCenter();
+    return page.evaluate("""() => { const map=window.__SFCI_E2E__.map,c=map.getCenter();
       return {lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
 
 
@@ -288,7 +288,7 @@ def _wait_for_final_pin(page):
     # Peek intentionally hides the choice scroller visually, so mobile only requires the final
     # route rows to be mounted. Browse/Expanded tests assert their visibility after snapping.
     page.wait_for_selector("#pincard.open #route-choices-panel .route-choice", state="attached", timeout=30_000)
-    page.wait_for_function("() => routePin!=null && BDCACHE.get(routePin)?._pin===true", timeout=30_000)
+    page.wait_for_function("() => { const e=window.__SFCI_E2E__; return e.routePin!=null && e.breakdownCache.get(e.routePin)?._pin===true; }", timeout=30_000)
     page.wait_for_function("() => !document.getElementById('pincard').classList.contains('pinloading')",
                            timeout=30_000)
 
@@ -318,7 +318,7 @@ def _select_other_route(page, *, touch=False):
     (row.tap if touch else row.click)()
     page.wait_for_function("key => document.getElementById('pincard').dataset.selectedChoiceKey===key", arg=key,
                            timeout=5_000)
-    page.wait_for_function("key => DRAWN?.key===key", arg=key, timeout=5_000)
+    page.wait_for_function("key => window.__SFCI_E2E__?.drawn?.key===key", arg=key, timeout=5_000)
     return key
 
 
@@ -332,7 +332,7 @@ def test_saved_hotspot_routes_match_api_and_keep_choice_identity(new_context, co
     _open_saved_inspector(page, touch=touch)
     if touch:
         _open_mobile_browse(page)
-    cell_id, destination, speed = page.evaluate("() => routePin"), SAVED_HOTSPOT["destination"], SAVED_HOTSPOT["speed"]
+    cell_id, destination, speed = page.evaluate("() => window.__SFCI_E2E__.routePin"), SAVED_HOTSPOT["destination"], SAVED_HOTSPOT["speed"]
     body = _api_get(context.request, BASE_URL,
                     f"/itinerary?id={quote(str(cell_id))}&dlat={destination['lat']}&dlon={destination['lon']}"
                     f"{_speed_query(speed)}&pin=1")
@@ -440,7 +440,7 @@ def test_narrow_desktop_plan_toggles_inline_without_replacing_choices(new_contex
     page.keyboard.press("End")
     _wait_state(page, sheetSnap="expanded", sheetContent="plan")
     page.wait_for_function("""key => { const card=document.getElementById('pincard');
-      return Math.abs(card.getBoundingClientRect().height-sheetMetrics().visible[key])<=1; }""", arg="expanded")
+      return Math.abs(card.getBoundingClientRect().height-window.__SFCI_E2E__.sheetMetrics().visible[key])<=1; }""", arg="expanded")
     page.evaluate("""() => { const pane=document.getElementById('route-plan-panel');
       pane.scrollTop=pane.scrollHeight-pane.clientHeight; }""")
     page.wait_for_function("""() => { const pane=document.getElementById('route-plan-panel');
@@ -448,7 +448,7 @@ def test_narrow_desktop_plan_toggles_inline_without_replacing_choices(new_contex
     landscape_plan = page.evaluate("""() => { const card=document.getElementById('pincard'),
       pane=document.getElementById('route-plan-panel'),last=pane.querySelector('.route-directions > li:last-child'),
       footer=pane.querySelector('.plan-footer'),cr=card.getBoundingClientRect(),lr=last.getBoundingClientRect(),
-      fr=footer.getBoundingClientRect(),expected=sheetMetrics().visible[card.dataset.sheetSnap];
+      fr=footer.getBoundingClientRect(),expected=window.__SFCI_E2E__.sheetMetrics().visible[card.dataset.sheetSnap];
       return {actual:cr.height,expected,lastBottom:lr.bottom,footerTop:fr.top,footerBottom:fr.bottom,
         paneBottom:pane.getBoundingClientRect().bottom,overflow:pane.scrollWidth-pane.clientWidth,
         documentOverflow:document.documentElement.scrollWidth-innerWidth}; }""")
@@ -467,10 +467,10 @@ def test_narrow_desktop_plan_toggles_inline_without_replacing_choices(new_contex
             page.keyboard.press(press)
         _wait_state(page, sheetSnap=key)
         page.wait_for_function("""key => { const card=document.getElementById('pincard');
-          return Math.abs(card.getBoundingClientRect().height-sheetMetrics().visible[key])<=1; }""", arg=key)
+          return Math.abs(card.getBoundingClientRect().height-window.__SFCI_E2E__.sheetMetrics().visible[key])<=1; }""", arg=key)
         measured = page.evaluate("""key => { const card=document.getElementById('pincard'),
           pane=document.getElementById('route-choices-panel'),r=card.getBoundingClientRect();
-          return {actual:r.height,expected:sheetMetrics().visible[key],bottom:r.bottom,
+          return {actual:r.height,expected:window.__SFCI_E2E__.sheetMetrics().visible[key],bottom:r.bottom,
             overflow:pane.scrollWidth-pane.clientWidth,documentOverflow:document.documentElement.scrollWidth-innerWidth}; }""", key)
         assert abs(measured["actual"] - measured["expected"]) <= 1, measured
         assert abs(measured["bottom"] - 320) <= 1, measured
@@ -522,11 +522,11 @@ def test_desktop_map_focus_settings_and_escape_restore_then_unpin(new_context):
     rapid = page.evaluate("""() => { const started=performance.now();
       document.querySelector('[data-map-focus-toggle]').click();
       document.querySelector('[data-show-choices]').click();
-      const c=map.getCenter();return {elapsed:performance.now()-started,lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
+      const map=window.__SFCI_E2E__.map,c=map.getCenter();return {elapsed:performance.now()-started,lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
     assert rapid["elapsed"] < 260, rapid
     _wait_state(page, presentation="expanded", planOpen="true")
     delayed = page.evaluate("""async () => { await new Promise(resolve=>setTimeout(resolve,420));
-      const c=map.getCenter();return {lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
+      const map=window.__SFCI_E2E__.map,c=map.getCenter();return {lat:c.lat,lng:c.lng,zoom:map.getZoom()}; }""")
     assert delayed["zoom"] == rapid["zoom"], {"after_exit": rapid, "delayed": delayed}
     assert abs(delayed["lat"] - rapid["lat"]) < 1e-7, {"after_exit": rapid, "delayed": delayed}
     assert abs(delayed["lng"] - rapid["lng"]) < 1e-7, {"after_exit": rapid, "delayed": delayed}
@@ -628,7 +628,7 @@ def test_mobile_route_local_plan_sheet_states_camera_and_bottom_reachability(new
     else:
         plan_action.tap()
     _wait_state(page, planOpen="true", sheetContent="plan", sheetSnap="browse")
-    page.wait_for_function("key => document.getElementById('pincard').dataset.selectedChoiceKey===key && DRAWN?.key===key",
+    page.wait_for_function("key => document.getElementById('pincard').dataset.selectedChoiceKey===key && window.__SFCI_E2E__?.drawn?.key===key",
                            arg=target_key)
     assert page.locator("#route-plan-panel").get_attribute("data-selected-choice-key") == target_key
     assert page.locator("#route-plan-panel details").count() == 0
@@ -696,7 +696,7 @@ def test_mobile_sheet_handle_drag_snaps_without_synthetic_click_toggle(new_conte
     handle = page.locator("[data-sheet-handle]")
     page.wait_for_function("""() => {
       const top=document.querySelector('[data-sheet-handle]')?.getBoundingClientRect().top;
-      return Number.isFinite(top) && Math.abs(top-sheetMetrics().snaps.browse)<3;
+      return Number.isFinite(top) && Math.abs(top-window.__SFCI_E2E__.sheetMetrics().snaps.browse)<3;
     }""")
     box = handle.bounding_box()
     assert box and box["height"] >= 44
@@ -708,7 +708,7 @@ def test_mobile_sheet_handle_drag_snaps_without_synthetic_click_toggle(new_conte
     page.wait_for_timeout(300)
     state = _state(page)
     assert state["sheetSnap"] == "peek" and state["dragging"] == "false", {
-        "state": state, "metrics": page.evaluate("() => sheetMetrics()"), "handle": box,
+        "state": state, "metrics": page.evaluate("() => window.__SFCI_E2E__.sheetMetrics()"), "handle": box,
     }
     handle.click()
     _wait_state(page, sheetSnap="browse")
@@ -823,11 +823,11 @@ def test_mobile_speed_change_cancels_stale_pin_enrichment(new_context):
     _click(page, "[data-settings-toggle]", touch=True)
     _wait_state(page, surface="settings")
     page.locator('#speed [data-v="fast"]').tap()
-    page.wait_for_function("""() => walkspeed==='fast' && routePin!=null && BDCACHE.get(routePin)?._pin===true &&
-      !document.getElementById('pincard').classList.contains('pinloading')""", timeout=45_000)
-    page.evaluate("() => { window.__fastPin=BDCACHE.get(routePin); window.__releaseOldPin(); }")
+    page.wait_for_function("""() => { const e=window.__SFCI_E2E__; return e.walkSpeed==='fast' && e.routePin!=null && e.breakdownCache.get(e.routePin)?._pin===true &&
+      !document.getElementById('pincard').classList.contains('pinloading'); }""", timeout=45_000)
+    page.evaluate("() => { const e=window.__SFCI_E2E__; window.__fastPin=e.breakdownCache.get(e.routePin); window.__releaseOldPin(); }")
     page.wait_for_function("() => window.__oldPinSettled", timeout=30_000)
-    assert page.evaluate("() => walkspeed==='fast' && BDCACHE.get(routePin)===window.__fastPin && window.__fastPin._pin")
+    assert page.evaluate("() => { const e=window.__SFCI_E2E__; return e.walkSpeed==='fast' && e.breakdownCache.get(e.routePin)===window.__fastPin && window.__fastPin._pin; }")
     _click(page, "[data-settings-return]", touch=True)
     _wait_state(page, surface="routes")
     page.wait_for_function("() => document.activeElement?.matches('[data-settings-toggle]')")

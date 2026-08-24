@@ -1,7 +1,7 @@
 """
 Shared fixtures + helpers for the SF Commute Explorer end-to-end browser suite.
 
-These tests drive the ALREADY-RUNNING JVM-free Flask + RAPTOR + walk-graph server at
+These tests drive the ALREADY-RUNNING graph-native Flask + RAPTOR + walk-graph server at
 http://127.0.0.1:8000. They do not boot their own application process. Run the server first:
 
     .venv/bin/python scripts/server.py
@@ -34,9 +34,9 @@ SCREENS.mkdir(exist_ok=True)
 ADDR_MARKET = "1 Market St"
 ADDR_FERRY = "ferry build"
 
-# How long a fast /compute may take end-to-end (geocode + R5 reverse tree). Generous.
+# How long a fast /compute may take end-to-end (geocode + reverse tree). Generous.
 COMPUTE_TIMEOUT = 25_000
-# /compute_exact + /attribution are heavy (14-36s observed); give them real headroom.
+# /attribution is the only intentionally heavy browser request; give it real headroom.
 HEAVY_TIMEOUT = 75_000
 
 
@@ -54,6 +54,10 @@ def fresh_load(page: Page):
     location.hash (permalink) BEFORE the boot script can act on them, by clearing
     then reloading so boot() runs against a clean slate.
     """
+    # Route-family tests need a small opt-in bridge for canvas/Leaflet state that has no DOM
+    # representation.  The application only installs that bridge when this flag is present;
+    # regular production visitors never receive the debug surface.
+    page.add_init_script("window.__SFCI_E2E_REQUESTED__ = true;")
     page.goto(BASE_URL, wait_until="domcontentloaded")
     page.evaluate("() => { try { localStorage.clear(); } catch (e) {} location.hash = ''; }")
     page.reload(wait_until="domcontentloaded")

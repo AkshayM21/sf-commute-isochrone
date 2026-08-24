@@ -27,16 +27,35 @@ trap 'rm -rf "$TMP"' EXIT
 curl -fsS --retry 3 --max-time 15 https://www.cloudflare.com/ips-v4 > "$TMP/v4"
 curl -fsS --retry 3 --max-time 15 https://www.cloudflare.com/ips-v6 > "$TMP/v6"
 
-# Sanity: refuse to touch rules unless BOTH lists are CIDR-shaped. A line count alone is not
-# enough — a transparent proxy / captive portal / CF HTML error served with a 200 would pass it,
-# and then the remove-then-add below could strand the permanent zone with zero sources.
-# Require >=10 valid CIDRs AND every non-blank line to be a CIDR.
-v4_ok=$(grep -Ec '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' "$TMP/v4" || true)
-v6_ok=$(grep -Ec '^[0-9A-Fa-f:]+/[0-9]{1,3}$' "$TMP/v6" || true)
-total_cidrs=$((v4_ok + v6_ok))
-nonblank=$(grep -cv '^[[:space:]]*$' "$TMP/v4" "$TMP/v6" | awk -F: '{s+=$2}END{print s}')
-[[ "$total_cidrs" -ge 10 && "$total_cidrs" -eq "$nonblank" ]] \
-  || { echo "[cf-fw] aborting: $total_cidrs valid CIDRs of $nonblank non-blank lines — bad list?" >&2; exit 1; }
+# Sanity: parse every source as a strict network, not just a CIDR-shaped string. Broad default
+# routes and near-default routes are never acceptable origin allowlists. Cloudflare's published
+# ranges are substantially narrower than these conservative floors.
+command -v python3 >/dev/null 2>&1 || { echo "[cf-fw] python3 is required" >&2; exit 127; }
+total_cidrs="$(python3 - "$TMP/v4" "$TMP/v6" <<'PY'
+import ipaddress
+import sys
+
+networks = set()
+for expected_version, filename in zip((4, 6), sys.argv[1:]):
+    for raw in open(filename, encoding="ascii"):
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError as exc:
+            raise SystemExit(f"invalid Cloudflare CIDR {value!r}: {exc}")
+        if network.version != expected_version:
+            raise SystemExit(f"wrong address family in Cloudflare IPv{expected_version} list: {value}")
+        minimum = 12 if network.version == 4 else 32
+        if network.prefixlen < minimum:
+            raise SystemExit(f"dangerously broad Cloudflare source rejected: {value}")
+        networks.add(network)
+if len(networks) < 10:
+    raise SystemExit(f"too few distinct Cloudflare CIDRs: {len(networks)}")
+print(len(networks))
+PY
+)" || { echo "[cf-fw] aborting: invalid or dangerously broad source list" >&2; exit 1; }
 
 # 1) Ensure the cloudflare zone exists, with http+https allowed and no interfaces bound.
 #    --permanent writes to /etc/firewalld/zones; we --reload at the end to apply atomically.

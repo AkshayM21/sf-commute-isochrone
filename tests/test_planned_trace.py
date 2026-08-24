@@ -2,7 +2,7 @@
 
 Pure-python fixtures in the style of test_route_family_selection.py: a minimal synthetic
 DepartAfterJourneyTree whose per-cell selection (``_sel``) and per-T* JourneyTree are fabricated
-directly, so NO RAPTOR kernel, NO numba, NO JVM runs — only the reconstruction/display machinery
+directly, so no RAPTOR kernel or numba runs — only the reconstruction/display machinery
 under test (planned-primary selection / ``_fold_first_visible_wait`` / ``_validated_stop_anchor`` /
 ``_fill_committed_leg`` and the real ``_clock``/``_format``/``_geometry``/``reconcile_legs``).
 

@@ -18,6 +18,24 @@ import numpy as np
 
 from .raptor import INF as _INF
 from .raptor_journey import JourneyTree, reconcile_legs, _TINY_HOP_MIN, EGRESS_INF
+from .planned_journey_primitives import (
+    alight_tail_better,
+    attach_walk_truth,
+    fold_first_visible_wait,
+    geom_route_label,
+    geom_route_sig,
+    planned_candidate_better,
+    planned_candidate_cheap_rank,
+    planned_candidate_quality,
+    planned_candidate_rank,
+    planned_raw_total_sec,
+    raw_access_sec,
+    raw_final_walk_sec,
+    raw_transit_sec,
+    raw_transfer_count,
+    raw_transfer_walk_sec,
+    reconcile_planned_target,
+)
 
 
 _RAW_TAIL_UNSET = object()
@@ -108,7 +126,7 @@ class DepartAfterJourneyTree:
          reconciliation the arrive-by path uses).
 
     Only ~15-17 distinct T* exist per workplace, so the per-T* trees are cheap and shared across
-    every cell that resolves to the same deadline. Pure numpy/numba — NO r5py.
+    every cell that resolves to the same deadline. Pure numpy/numba.
 
     Exposes the same caller contract the arrive-by ``JourneyTree`` does:
       ``commute_and_dominant()`` -> (commute int32[n_cells], dominant list) for the map + color-by-line;
@@ -278,28 +296,7 @@ class DepartAfterJourneyTree:
         those to decimal minute fields. When a zero-second access walk was dropped by
         ``_push_walk``, create an allowance-only access leg; in geometry mode it retains the
         ``("access",)`` tag so geometry and legs stay 1:1."""
-        for i, leg in enumerate(out):
-            if leg.get("mode") != "transit":
-                continue
-            wait = int(leg.get("wait_sec", 0))
-            if wait <= 0:
-                return
-            leg["wait_sec"] = 0
-            for j in range(i - 1, -1, -1):
-                if out[j].get("mode") == "walk":
-                    walk = out[j]
-                    physical = int(walk.get("physical_sec", walk.get("sec", 0)))
-                    allowance = int(walk.get("schedule_allowance_sec", 0)) + wait
-                    walk["physical_sec"] = physical
-                    walk["schedule_allowance_sec"] = allowance
-                    walk["sec"] = physical + allowance
-                    return
-            first = {"mode": "walk", "line": None, "sec": wait,
-                     "physical_sec": 0, "schedule_allowance_sec": wait}
-            if "segs" in leg:                            # geometry mode: mirror the access-walk tag
-                first["segs"] = [("access",)]
-            out.insert(0, first)
-            return
+        return fold_first_visible_wait(out)
 
     @staticmethod
     def _attach_walk_truth(res, out, geom=None):
@@ -312,24 +309,7 @@ class DepartAfterJourneyTree:
         The count-equal fallback only supports small direct callers that supply preformatted legs
         without those fields. It is deliberately disabled whenever reconciliation dropped a walk.
         """
-        display_walks = [leg for leg in (res.get("legs") or ()) if leg.get("mode") == "walk"]
-        if (display_walks
-                and not any("schedule_allowance_min" in leg for leg in display_walks)):
-            source_walks = [leg for leg in out
-                            if leg.get("mode") == "walk" and int(leg.get("sec", 0)) > 0]
-            if len(source_walks) == len(display_walks):
-                for source, leg in zip(source_walks, display_walks):
-                    if "schedule_allowance_sec" in source:
-                        leg["physical_min"] = int(source.get("physical_sec", 0)) / 60.0
-                        leg["schedule_allowance_min"] = int(source["schedule_allowance_sec"]) / 60.0
-        for leg_i, leg in enumerate(res.get("legs") or ()):
-            if leg.get("mode") != "walk":
-                continue
-            if "schedule_allowance_min" not in leg:
-                continue
-            if geom is not None and leg_i < len(geom) and geom[leg_i].get("mode") == "walk":
-                geom[leg_i]["physical_min"] = leg["physical_min"]
-                geom[leg_i]["schedule_allowance_min"] = leg["schedule_allowance_min"]
+        return attach_walk_truth(res, out, geom)
 
     @staticmethod
     def _reconcile_planned_target(out, total_sec, target_sec):
@@ -345,51 +325,7 @@ class DepartAfterJourneyTree:
         Callers must surface/drop an inconsistent anchor instead of asking ``reconcile_legs`` to
         fabricate a shorter physical walk.
         """
-        residual = int(target_sec) - int(total_sec)
-        if residual > 0:
-            # The first walk before transit is the access leg.  It may already carry folded
-            # first-board slack; preserve its physical truth and add only schedule allowance.
-            for leg in out:
-                if leg.get("mode") != "walk":
-                    if leg.get("mode") == "transit":
-                        break
-                    continue
-                physical = int(leg.get("physical_sec", leg.get("sec", 0)))
-                allowance = int(leg.get("schedule_allowance_sec", 0)) + residual
-                leg["physical_sec"] = physical
-                leg["schedule_allowance_sec"] = allowance
-                leg["sec"] = physical + allowance
-                return 0
-
-            # A zero-second/missing access raw leg is omitted by _clock.  Preserve geometry's
-            # source truth exactly as _fold_first_visible_wait does for an allowance-only leg.
-            access = {"mode": "walk", "line": None, "sec": residual,
-                      "physical_sec": 0, "schedule_allowance_sec": residual}
-            if any("segs" in leg for leg in out):
-                access["segs"] = [("access",)]
-            out.insert(0, access)
-            return 0
-
-        excess = -residual
-        if excess <= 0:
-            return 0
-        for leg in out:
-            if excess <= 0:
-                return 0
-            if leg.get("mode") != "walk":
-                continue
-            if "schedule_allowance_sec" in leg:
-                # B3 excess is re-anchor slack. The fold placed that slack in schedule
-                # allowance, so remove it without ever reducing genuine walking.
-                allowance = int(leg["schedule_allowance_sec"])
-                physical = int(leg.get("physical_sec", 0))
-                take_allowance = min(excess, allowance)
-                allowance -= take_allowance
-                excess -= take_allowance
-                leg["physical_sec"] = physical
-                leg["schedule_allowance_sec"] = allowance
-                leg["sec"] = physical + allowance
-        return excess
+        return reconcile_planned_target(out, total_sec, target_sec)
 
     # -- per-T* traced tree (lazy + cached) ----------------------------------------------
     def _tree_at(self, Tstar):
@@ -1551,20 +1487,11 @@ class DepartAfterJourneyTree:
 
     @staticmethod
     def _geom_route_label(geom):
-        names = []
-        for g in geom or ():
-            if g.get("mode") != "transit":
-                continue
-            n = g.get("name") or g.get("line")
-            if n:
-                names.append(str(n))
-        return " > ".join(names) if names else "walk only"
+        return geom_route_label(geom)
 
     @staticmethod
     def _geom_route_sig(geom):
-        return tuple((g.get("mode") or "", str(g.get("name") or g.get("line") or ""),
-                      int(g.get("min") or 0), int(g.get("wait") or 0))
-                     for g in (geom or ()))
+        return geom_route_sig(geom)
 
     def _planned_pattern_identity(self, pi):
         """Opaque service-pattern identity that never includes a public display name.
@@ -1940,60 +1867,33 @@ class DepartAfterJourneyTree:
 
     @staticmethod
     def _raw_final_walk_sec(raw):
-        if not raw:
-            return 1 << 60
-        last = raw[-1]
-        if last[0] in ("egress", "walk"):
-            return int(last[1])
-        return 0
+        return raw_final_walk_sec(raw)
 
     @staticmethod
     def _raw_access_sec(raw):
         """Physical walk seconds before the first transit board in a raw planned chain."""
-        total = 0
-        for leg in raw or ():
-            if leg[0] == "ride":
-                break
-            if leg[0] in ("access", "walk", "walk_t", "egress"):
-                total += max(0, int(leg[1]))
-        return total
+        return raw_access_sec(raw)
 
     @staticmethod
     def _raw_transfer_walk_sec(raw):
-        return sum(max(0, int(leg[1])) for leg in raw or () if leg[0] == "walk_t")
+        return raw_transfer_walk_sec(raw)
 
     @staticmethod
     def _raw_transfer_count(raw):
-        return max(0, sum(1 for leg in raw or () if leg[0] == "ride") - 1)
+        return raw_transfer_count(raw)
 
     @staticmethod
     def _raw_transit_sec(raw):
-        total = 0
-        for leg in raw or []:
-            if leg[0] == "ride":
-                total += max(0, int(leg[3]) - int(leg[2]))
-        return total
+        return raw_transit_sec(raw)
 
     @staticmethod
     def _planned_raw_total_sec(raw, latest_home):
         """Exact ``_clock`` elapsed seconds without allocating formatted display legs."""
-        t = int(latest_home)
-        for leg in raw or ():
-            if leg[0] in ("access", "walk", "walk_t", "egress"):
-                t += int(leg[1])
-            elif leg[0] == "ride":
-                # Waiting is implicit in the jump from the current clock to the scheduled
-                # departure; the arrival timestamp already includes both wait and ride.
-                t = int(leg[3])
-        return max(0, t - int(latest_home))
+        return planned_raw_total_sec(raw, latest_home)
 
     @staticmethod
     def _alight_tail_better(finish, apos, eg, best):
-        if best is None:
-            return True
-        best_finish, best_apos, _best_stop, best_eg = best
-        return (int(finish), int(eg), -int(apos)) < (
-            int(best_finish), int(best_eg), -int(best_apos))
+        return alight_tail_better(finish, apos, eg, best)
 
     @classmethod
     def _planned_candidate_quality(cls, cand):
@@ -2005,36 +1905,29 @@ class DepartAfterJourneyTree:
         wins equal journeys. Remaining terms prefer less physical access, fewer/shorter transfers,
         and less final walking before the durable structural identity settles true ties.
         """
-        raw = cand.get("raw") or ()
-        home = int(cand.get("home", 0))
-        metric_sec = int(cand.get("metric_sec", cls._planned_raw_total_sec(raw, home)))
-        board_anchor = int(cand.get("board_anchor", home + cls._raw_access_sec(raw)))
-        return (
-            metric_sec,
-            int(cand.get("total", int(np.ceil(metric_sec / 60.0)))),
-            -board_anchor,
-            cls._raw_access_sec(raw),
-            cls._raw_transfer_count(raw),
-            cls._raw_transfer_walk_sec(raw),
-            cls._raw_final_walk_sec(raw),
-            cand.get("route_key") or (),
+        # Pass class helpers explicitly so tests and callers that monkeypatch these
+        # compatibility seams retain the same behavior after extraction.
+        return planned_candidate_quality(
+            cand,
+            raw_total_sec=cls._planned_raw_total_sec,
+            access_sec=cls._raw_access_sec,
+            transfer_count=cls._raw_transfer_count,
+            transfer_walk_sec=cls._raw_transfer_walk_sec,
+            final_walk_sec=cls._raw_final_walk_sec,
         )
 
     @classmethod
     def _planned_candidate_cheap_rank(cls, cand):
         """Geometry-free prefix shared by every planned branch producer."""
-        return cls._planned_candidate_quality(cand)
+        return planned_candidate_cheap_rank(cand, quality=cls._planned_candidate_quality)
 
     @classmethod
     def _planned_candidate_rank(cls, cand):
-        return (
-            *cls._planned_candidate_quality(cand),
-            cand.get("sig", ()),
-        )
+        return planned_candidate_rank(cand, quality=cls._planned_candidate_quality)
 
     @classmethod
     def _planned_candidate_better(cls, cand, cur):
-        return cur is None or cls._planned_candidate_rank(cand) < cls._planned_candidate_rank(cur)
+        return planned_candidate_better(cand, cur, rank=cls._planned_candidate_rank)
 
     def _planned_branch_closure(self, ci, candidates, max_total, geom_provider=None):
         """Close planned branch seeds over the two supported finish shapes.

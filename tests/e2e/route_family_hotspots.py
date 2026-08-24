@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -65,18 +66,23 @@ PARETO_DIMENSIONS = (
 )
 
 
-def _stable_rank(seed, *parts):
-    """Stable seeded ordering for test sampling, not a cryptographic digest.
+def _seeded_sort(items, *, primary, identity, rng):
+    """Sort by the meaningful metric and sample only equal-metric ties.
 
-    The original result string is a collision-safe secondary ordering key.  The primary is a
-    small 32-bit polynomial mixer so this remains deterministic across Python processes without
-    carrying a production-style integrity primitive into a test-only sampler.
+    This is test sampling, not artifact identity: the seed is consumed by a local
+    ``random.Random`` instance and never serialized as a digest or used to identify
+    response data.  Sorting each tie group before shuffling keeps the result independent
+    of API/dict iteration order while preserving the sampler's metric priorities.
     """
-    raw = "\x1f".join([str(seed), *(str(part) for part in parts)])
-    state = int(seed) & 0xFFFFFFFF
-    for byte in raw.encode("utf-8"):
-        state = ((state * 1_103_515_245) + byte + 12_345) & 0xFFFFFFFF
-    return state, raw
+    groups = {}
+    for item in items:
+        groups.setdefault(primary(item), []).append(item)
+    ordered = []
+    for metric in sorted(groups):
+        group = sorted(groups[metric], key=identity)
+        rng.shuffle(group)
+        ordered.extend(group)
+    return ordered
 
 
 def _api_get(api, base_url, path, *, attempts=2, timeout=45_000):
@@ -512,16 +518,13 @@ def _dominates(left, right):
         a > b for a, b in zip(left, right))
 
 
-def _hotspot_scalar_key(row, seed, stratum):
-    """Documented scalar fallback with a stable, seed-controlled final tie-break."""
+def _hotspot_scalar_score(row):
+    """Return the scalar score used after Pareto filtering."""
     metrics = row.get("metrics") or {}
-    destination = row.get("destination") or {}
-    identity = (destination.get("slug") or "", row.get("speed") or "", row.get("cell_id") or "")
     try:
-        score = int(metrics.get("score", -1))
+        return int(metrics.get("score", -1))
     except (TypeError, ValueError):
-        score = -1
-    return (-score, _stable_rank(seed, "pareto", stratum, *identity))
+        return -1
 
 
 def _rank_hotspots(rows, *, seed, limit=None):
@@ -537,13 +540,23 @@ def _rank_hotspots(rows, *, seed, limit=None):
         if not any(other_index != index and _dominates(other_vector, vector)
                    for other_index, _other_row, other_vector in entries)
     }
-    ordered = sorted(
-        (entry for entry in entries if entry[0] in frontier),
-        key=lambda entry: _hotspot_scalar_key(entry[1], seed, "frontier"),
+    rng = random.Random(seed)
+    identity = lambda entry: (
+        str((entry[1].get("destination") or {}).get("slug") or ""),
+        str(entry[1].get("speed") or ""),
+        str(entry[1].get("cell_id") or ""),
     )
-    ordered += sorted(
+    ordered = _seeded_sort(
+        (entry for entry in entries if entry[0] in frontier),
+        primary=lambda entry: -_hotspot_scalar_score(entry[1]),
+        identity=identity,
+        rng=rng,
+    )
+    ordered += _seeded_sort(
         (entry for entry in entries if entry[0] not in frontier),
-        key=lambda entry: _hotspot_scalar_key(entry[1], seed, "fill"),
+        primary=lambda entry: -_hotspot_scalar_score(entry[1]),
+        identity=identity,
+        rng=rng,
     )
     if limit is not None:
         ordered = ordered[:max(0, int(limit))]
@@ -556,7 +569,7 @@ def _rank_hotspots(rows, *, seed, limit=None):
     return ranked
 
 
-def _candidate_ids(cells, variance, *, seed, config_key, limit):
+def _candidate_ids(cells, variance, *, seed, limit):
     reachable = [(str(cid), int(value[1])) for cid, value in cells.items()
                  if isinstance(value, list) and len(value) > 1 and value[1] is not None]
     if not reachable:
@@ -573,28 +586,44 @@ def _candidate_ids(cells, variance, *, seed, config_key, limit):
         alt = (variance.get(str(cid)) or {}).get("alt") or []
         return len(alt)
 
-    ranked_alts = sorted(reachable, key=lambda item: (
-        -alt_count(item[0]), _stable_rank(seed, config_key, "alt", item[0])))
+    rng = random.Random(seed)
+    ranked_alts = _seeded_sort(
+        reachable,
+        primary=lambda item: -alt_count(item[0]),
+        identity=lambda item: str(item[0]),
+        rng=rng,
+    )
     for cid, _minutes in ranked_alts[:2]:
         add(cid)
-    ranked_frag = sorted(reachable, key=lambda item: (
-        -int((variance.get(item[0]) or {}).get("frag") or 0),
-        _stable_rank(seed, config_key, "frag", item[0])))
+    ranked_frag = _seeded_sort(
+        reachable,
+        primary=lambda item: -int((variance.get(item[0]) or {}).get("frag") or 0),
+        identity=lambda item: str(item[0]),
+        rng=rng,
+    )
     if ranked_frag:
         add(ranked_frag[0][0])
 
     # Seeded travel-time strata find deterministic branch-rich cells that have no variance chips.
-    for band_name, predicate in (
-        ("near", lambda minutes: minutes <= 30),
-        ("mid", lambda minutes: 30 < minutes <= 50),
-        ("far", lambda minutes: minutes > 50),
+    for predicate in (
+        lambda minutes: minutes <= 30,
+        lambda minutes: 30 < minutes <= 50,
+        lambda minutes: minutes > 50,
     ):
-        pool = sorted((cid for cid, minutes in reachable if predicate(minutes)),
-                      key=lambda cid: _stable_rank(seed, config_key, band_name, cid))
+        pool = _seeded_sort(
+            [cid for cid, minutes in reachable if predicate(minutes)],
+            primary=lambda _cid: 0,
+            identity=lambda cid: str(cid),
+            rng=rng,
+        )
         if pool:
             add(pool[0])
-    for cid, _minutes in sorted(reachable,
-                                key=lambda item: _stable_rank(seed, config_key, "fill", item[0])):
+    for cid, _minutes in _seeded_sort(
+        reachable,
+        primary=lambda item: item[1],
+        identity=lambda item: str(item[0]),
+        rng=rng,
+    ):
         add(cid)
     return selected
 
@@ -612,9 +641,8 @@ def scan_hotspots(api, base_url, *, destinations, speeds, seed=DEFAULT_SEED, per
             compute = _api_get(api, base_url, f"/compute?lat={dlat}&lon={dlon}{speed_q}")
             variance_body = _api_get(api, base_url, f"/variance?dlat={dlat}&dlon={dlon}{speed_q}")
             variance = variance_body.get("variance") or {}
-            config_key = f"{destination['slug']}:{speed}"
             candidate_ids = _candidate_ids(compute.get("cells") or {}, variance, seed=seed,
-                                           config_key=config_key, limit=per_config)
+                                           limit=per_config)
             configs.append({"destination": destination["slug"], "speed": speed,
                             "candidate_ids": candidate_ids})
             for cid in candidate_ids:
@@ -659,26 +687,27 @@ def open_destination(page, base_url, destination, speed):
     # Clear persistence before the app's boot IIFE runs. Navigating to `/` first and then changing
     # only the hash is a same-document navigation; there is intentionally no hashchange listener,
     # so that pattern never re-runs applyHash and leaves the map blank.
-    page.add_init_script("() => { try { localStorage.clear(); } catch (e) {} }")
+    page.add_init_script(
+        "window.__SFCI_E2E_REQUESTED__ = true; "
+        "try { localStorage.clear(); } catch (e) {}"
+    )
     label = quote(destination["label"], safe="")
     url = (f"{base}/#wp={destination['lat']:.7f},{destination['lon']:.7f},{label}"
            f"&metric=r&cmode=time&colors=on&mt=any&sp={speed}&th=auto")
     page.goto(url, wait_until="domcontentloaded")
     page.wait_for_function("() => document.querySelectorAll('#list .nb').length > 0", timeout=30_000)
     page.wait_for_function(
-        "() => (typeof VAR !== 'undefined' && Object.keys(VAR).length > 0) "
-        "|| (typeof REAL !== 'undefined' && Object.keys(REAL).length > 0) "
-        "|| (typeof varianceSettled === 'function' && varianceSettled())",
+        "() => window.__SFCI_E2E__?.varianceSettled === true",
         timeout=45_000,
     )
 
 
 def origin_container_point(page, origin):
-    page.evaluate("([lat,lon]) => { map.setView([lat,lon], 13); }",
+    page.evaluate("([lat,lon]) => { window.__SFCI_E2E__.map.setView([lat,lon], 13); }",
                   [origin["lat"], origin["lon"]])
     page.wait_for_timeout(450)
     return page.evaluate(
-        "([lat,lon]) => { const p=map.latLngToContainerPoint(L.latLng(lat,lon));"
+        "([lat,lon]) => { const p=window.__SFCI_E2E__.map.latLngToContainerPoint(L.latLng(lat,lon));"
         " const r=document.getElementById('map').getBoundingClientRect();"
         " return {x:r.left+p.x,y:r.top+p.y}; }",
         [origin["lat"], origin["lon"]],
@@ -903,8 +932,8 @@ def dom_family_snapshot(page):
           plan_step_count:plan?.querySelectorAll('.route-directions li').length||0,
           plan_has_collapsed_directions:!!plan?.querySelector('#route-directions summary,details.route-directions'),
           plan_has_google_maps_link:!!plan?.querySelector('.plan-google[href]'),
-          drawn:(typeof DRAWN!=='undefined'&&DRAWN)?{multi:!!DRAWN.multi,key:DRAWN.key||null,family:DRAWN.famKey||null,branch:DRAWN.branchKey||null}:null,
-          route_layers:(typeof routeLayer!=='undefined')?routeLayer.getLayers().length:0,
+          drawn:window.__SFCI_E2E__?.drawn?{multi:!!window.__SFCI_E2E__.drawn.multi,key:window.__SFCI_E2E__.drawn.key||null,family:window.__SFCI_E2E__.drawn.famKey||null,branch:window.__SFCI_E2E__.drawn.branchKey||null}:null,
+          route_layers:window.__SFCI_E2E__?.routeLayer?.getLayers().length||0,
         })}"""
     )
 

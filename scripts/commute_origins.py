@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """Door-to-door morning commute (walk + Muni/BART/Caltrain, arrive ~9am weekday) from a set of
-ARBITRARY origin lat/lons to a chosen workplace, reusing the JVM-free RAPTOR engine + hill-aware
+ARBITRARY origin lat/lons to a chosen workplace, reusing the graph-native RAPTOR engine + hill-aware
 walk graph.
 
 This is the same math the live server runs for grid cells, but for off-grid origins: we build a
 tiny CSR access table (origin -> nearby stops walk seconds) for our origins via the walk graph,
 compute the workplace egress (stops -> W) the way the server does, and hand both to the engine's
 public ``commute_for_access`` — which roots the reverse range-RAPTOR at the workplace and
-assembles the served planned scheduled commute by default. The legacy depart-after percentile and
-arrive-by perfect-timing semantics remain available explicitly for validation/comparison. Output:
+assembles the served planned scheduled commute by default. The depart-after and arrive-by
+semantics remain available explicitly for callers that need them. Output:
 minutes int per origin id.
 """
 import sys, json, argparse
@@ -57,18 +57,18 @@ def _method(engine, semantic, speed_kmh):
               f"walk speed {speed_kmh:g} km/h; reference access cap {engine.access_cap_min} min "
               f"(rescaled at the selected pace).")
     if semantic == "planned":
-        return (f"served planned scheduled commute (JVM-free reverse range-RAPTOR + hill-aware "
+        return (f"served planned scheduled commute (graph-native reverse range-RAPTOR + hill-aware "
                 f"walk graph); one first-boarding-anchored scheduled value matching the live map "
                 f"(not a percentile); " + common)
     if semantic == "departafter":
         dep0 = config.DEP_HM[0] * 3600 + config.DEP_HM[1] * 60
         win = int(config.window().total_seconds())
-        return (f"legacy RAPTOR validation routing (JVM-free reverse range-RAPTOR + hill-aware "
+        return (f"depart-after scheduled routing (graph-native reverse range-RAPTOR + hill-aware "
                 f"walk graph); depart-after p50 (realistic median, typical wait included) over "
                 f"the {_hm(dep0)}-{_hm(dep0 + win)} departure window; not the live-map metric; "
                 + common)
     target = ARRIVE_BY_HM[0] * 3600 + ARRIVE_BY_HM[1] * 60
-    return (f"real RAPTOR routing (arrive-by-{_hm(target)} perfect-timing, JVM-free); "
+    return (f"arrive-by-{_hm(target)} graph-native routing (perfect timing); "
             f"optimistic; " + common)
 
 

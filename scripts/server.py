@@ -3,124 +3,85 @@
 Live commute-isochrone server: set ANY workplace address in the browser and the map
 recomputes door-to-door times from a grid of SF origins.
 
-The R5 network is loaded ONCE at startup and kept warm, so each recompute is just the
-travel-time step (no network rebuild). Run:
+Production uses one routing stack: RAPTOR transit plus the hill-aware walking graph. Run:
 
     .venv/bin/python scripts/server.py        # then open http://127.0.0.1:8000
 
-Env: GRID_M (default 200) trades detail for speed; EXACT_THREADS, WINDOW_MIN, PORT.
+Env: GRID_M (default 200) trades detail for speed; WINDOW_MIN, PORT.
 
 The workplace address lives only in the browser — this process never hardcodes or
-persists it. Two distinct computations power the map (see CLAUDE.md/Issues.md):
-  * map TIME  — /compute is a fast reverse one-to-many approximation; /compute_exact is
-                the exact forward per-cell refine. (scripts/isochrone.py is the reference.)
-  * route LEGS — /itinerary + /attribution use R5 recorded paths; hover computes one cell
-                on demand, color-by-line builds the whole grid lazily on first toggle.
+persists it. /compute and its compatibility alias /compute_exact both use the same
+RAPTOR result; /itinerary, /attribution, and /variance consume the corresponding
+RAPTOR tree and walking-graph caches.
 """
-import os, sys, json, copy, math, time, threading, datetime as dt
+import os, json, math, time, datetime as dt
+_BOOT_MONOTONIC = time.monotonic()
 # Cap numba's thread pool BEFORE numba is imported (via core.raptor_*). Bounds the parallel MC
 # kernel's worker threads — fewer idle threads (lower RSS) and no oversubscription on a small box.
 # Overridable via NUMBA_NUM_THREADS. (The MC kernel is also serialized below: numba's workqueue
 # threading layer is NOT threadsafe, so two concurrent parallel kernels would abort the process.)
 os.environ.setdefault("NUMBA_NUM_THREADS", str(min(4, os.cpu_count() or 4)))
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 from flask_limiter import Limiter
 
-from core import config, feeds, geo              # lightweight JVM-free core (no r5py/pandas/geopandas)
-from core.raptor_journey import reconcile_legs   # shared leg-rounding reconciliation (JVM-free)
+from core import config, feeds, geo, raptor_build, readiness, static_bundle
 from core import server_raptor as sr             # RAPTOR engine glue (state + builders, JVM-free)
 config.load_dotenv()             # load .env (GEOCODER / GEOAPIFY_KEY) for the geocoder
-# pandas / geopandas / shapely / Point / core.grid are imported LAZILY in the boot BUILD path only
-# (below): the lean JVM-free boot loads a precomputed static bundle and never pulls the ~70 MB
-# geo/pandas stack. They become module globals there, used by the R5 branches (unreachable lean).
+# geopandas and the grid helper are imported only on the one-time static-bundle build path.
 
-# ---- Flags (parsed EARLY: they decide whether the in-process JVM starts at all) --------
-# THE DEFAULT IS NOW THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + DEPART-AFTER scheduled + the
-# service-noise overlay. R5/the JVM is no longer loaded by default. The served depart-after value is
-# first-boarding-anchored, so controllable starting wait is not counted and walk speed is monotone.
-# Opt INTO arrive-by-09:00 with RAPTOR_SEMANTIC=arriveby. Opt back into the legacy R5 path with
-# USE_RAPTOR=0 (and/or USE_WALK_GRAPH=0 for the R5 walk matrix).
-# The flags are parsed ONCE in core.server_raptor (the single source); we mirror them here as
-# module globals for the boot logic + the tests that read server.X. Boot-time toggles below are
-# pushed back into the module via sr.set_flags so its builders + /healthz stay consistent.
-USE_RAPTOR = sr.USE_RAPTOR
+# ---- RAPTOR configuration --------------------------------------------------------------
 RAPTOR_SEMANTIC = sr.RAPTOR_SEMANTIC
 RAPTOR_MC = sr.RAPTOR_MC
-USE_WALK_GRAPH = sr.USE_WALK_GRAPH
-# Safety net: the JVM-free walk stack needs its one-time bakes (walk graph + access_walk table).
-# If they're absent (fresh checkout), fall back to the R5 walk matrix (re-enables the JVM) with a
-# clear message instead of crashing. Bake them to go fully JVM-free (see below / setup.sh).
-if USE_WALK_GRAPH and not (
-        (config.DATA / "walk_graph.npz").exists()
-        and any((config.DATA / "raptor_cache").glob("access_walk_*m_*.npz"))):
-    print("[boot] USE_WALK_GRAPH on but the walk graph / access_walk table isn't baked — falling "
-          "back to R5 walk (JVM). Bake the JVM-free stack: scripts/fetch_dem.sh && "
-          "scripts/build_walk_graph.py && scripts/bake_walk_access.py")
-    USE_WALK_GRAPH = False
-    sr.set_flags(USE_WALK_GRAPH=False)
-# The walk graph is only reachable through the RAPTOR path (_WG loads inside `if USE_RAPTOR:`,
-# and R5 serves everything under USE_RAPTOR=0) — force the flag off so /healthz can't report
-# walk=graph for a graph that never loads.
-if USE_WALK_GRAPH and not USE_RAPTOR:
-    print("[boot] USE_WALK_GRAPH requires USE_RAPTOR; walk graph disabled (R5 walk)")
-    USE_WALK_GRAPH = False
-    sr.set_flags(USE_WALK_GRAPH=False)
-# Validate the semantic LOUDLY: a typo (e.g. "arrive-by") would otherwise silently serve the
-# departafter branch — and load the JVM — while /healthz echoes the bogus string as healthy.
+# Validate the semantic loudly rather than silently serving the wrong branch.
 if RAPTOR_SEMANTIC not in ("arriveby", "departafter"):
     raise SystemExit(f"RAPTOR_SEMANTIC must be 'arriveby' or 'departafter', "
                      f"got {RAPTOR_SEMANTIC!r}")
-# FULLY JVM-free when the map, breakdown, AND walk all come from RAPTOR + the walk graph — now for
-# BOTH semantics: arrive-by traces a single 09:00 deadline tree, depart-after traces the window's
-# per-T* trees (DepartAfterJourneyTree), both pure numpy/numba. R5 is still needed only off the
-# RAPTOR path (fast approx / R5 walk matrix), i.e. USE_RAPTOR=0 or USE_WALK_GRAPH=0.
-_NEED_R5 = not (USE_RAPTOR and USE_WALK_GRAPH and RAPTOR_SEMANTIC in ("arriveby", "departafter"))
-
-network = None
-MAX_INT32 = (2 ** 31) - 1                         # R5's "unreachable" sentinel (JVM-free fallback)
-DEFAULT_MAX_RIDES = sr.DEFAULT_MAX_RIDES          # R5's ride cap (rides = transfers + 1); the
-#   single source is core.server_raptor (== 8); the R5 import below re-binds it from core.network.
-if _NEED_R5:
-    # Cap the JVM heap BEFORE r5py starts it (small hosting box; over-reserve risks OOM). r5py
-    # reads --max-memory; unset keeps its default (80% of RAM). Local rule: do NOT set it.
-    _r5_mem = os.environ.get("R5_MAX_MEMORY")
-    if _r5_mem and "--max-memory" not in sys.argv and "-m" not in sys.argv:
-        sys.argv += ["--max-memory", _r5_mem]
-    from core import network                      # imports r5py -> starts the in-process JVM
-    from core.network import MAX_INT32, DEFAULT_MAX_RIDES
-    import com.conveyal.r5
+DEFAULT_MAX_RIDES = sr.DEFAULT_MAX_RIDES
 
 HERE = Path(__file__).resolve().parent
 GRID_M = int(os.environ.get("GRID_M", str(config.GRID_M)))
 
-# ---- Boot: feeds, model date, grid, warm R5 network (all once) -------------------------
+# ---- Boot: feeds, model date, grid ------------------------------------------------------
 GTFS = config.gtfs_paths()
 
 # ---- Static page data: cells (GeoJSON), origin coords, line shapes, service date --------
 # These are workplace-INDEPENDENT (only the feeds + neighborhoods determine them). We cache them to
-# data/server_static.json so the JVM-free server boots WITHOUT geopandas/shapely/pandas (~70 MB).
-# The R5 path — and the first JVM-free boot, or after a GTFS repull (fingerprint mismatch) — builds
-# them via the geo stack and writes the bundle; subsequent JVM-free boots load it with json only.
+# data/server_static.json so normal server boots avoid geopandas/shapely/pandas.
 _STATIC = config.DATA / "server_static.json"
 
 
-def _gtfs_fp():
-    import hashlib
-    h = hashlib.sha256()
-    for p in GTFS:
-        st = Path(p).stat()
-        h.update(f"{Path(p).name}:{st.st_size}:{int(st.st_mtime)}".encode())
-    return h.hexdigest()[:16]
+_GTFS_SOURCES = raptor_build._source_mtimes(GTFS)
+_GRID_SOURCE = config.neigh_path()
 
 
-_fp = _gtfs_fp()
+def _grid_source_metadata(path):
+    """Return the readable direct source metadata stored in the static bundle."""
+    return static_bundle.source_metadata(path)
+
+
+_GRID_SOURCE_META = _grid_source_metadata(_GRID_SOURCE)
 _bundle = None
-if not _NEED_R5 and _STATIC.exists():
+if _STATIC.exists():
     try:
         _b = json.loads(_STATIC.read_text())
-        if _b.get("gtfs_fp") == _fp:
+        _bundle_shape_ok = (
+            isinstance(_b.get("cells"), dict)
+            and isinstance(_b.get("lines"), dict)
+            and isinstance(_b.get("origin_ll"), dict)
+            and all(isinstance(v, (list, tuple)) and len(v) == 2
+                    for v in _b["origin_ll"].values()))
+        _bundle_grid_meta = {
+            "name": _b.get("grid_source_name"),
+            "size": _b.get("grid_source_size"),
+            "mtime_ns": _b.get("grid_source_mtime_ns"),
+        }
+        if (tuple(tuple(v) for v in _b.get("source_mtimes", ())) == _GTFS_SOURCES
+                and _b.get("grid_m") == GRID_M
+                and _GRID_SOURCE_META is not None
+                and _bundle_grid_meta == _GRID_SOURCE_META
+                and isinstance(_b.get("svc_date"), str) and len(_b["svc_date"]) == 8
+                and _bundle_shape_ok):
             _bundle = _b
     except Exception:
         _bundle = None
@@ -130,342 +91,132 @@ if _bundle is not None:                          # LEAN boot — json only, no g
     ORIGIN_LL = {k: tuple(v) for k, v in _bundle["origin_ll"].items()}
     _SVC_DATE = dt.datetime.strptime(_bundle["svc_date"], "%Y%m%d").date()
     DEP = config.departure(_SVC_DATE)
-    NET = SNAPPED_GRID = _TRANSIT_LAYER = None
-    _EXACT_IDS, _EXACT_GEOMS = [], []
     print(f"[boot] modeling weekday {_SVC_DATE} @ {DEP:%-I:%M%p}".lower())
     print(f"[boot] ready: {len(ORIGIN_LL)} origins (JVM-free, lean static bundle — no geopandas). "
           f"Open http://127.0.0.1:8000")
 else:                                            # BUILD path — needs the geo/pandas stack (one-time)
-    import pandas as pd, geopandas as gpd, shapely      # noqa: F401 (module globals for R5 branches)
-    from shapely.geometry import Point                  # noqa: F401
-    from core import grid
-    LINES = feeds.route_shapes(GTFS)             # GTFS line geometries for the overlay
     # Auto-pick a weekday with trips in ALL feeds (a hardcoded date silently breaks after a repull).
     _SVC_DATE = feeds.pick_service_date(GTFS)
     DEP = config.departure(_SVC_DATE)
     print(f"[boot] modeling weekday {_SVC_DATE} @ {DEP:%-I:%M%p}".lower())
-    print(f"[boot] building grid @ {GRID_M}m" + (" + loading R5 network (once)..." if _NEED_R5
-          else " (one-time geo build; caching static bundle for lean reboots)..."))
-    NEIGH = grid.load_neighborhoods()
-    GRID = grid.build_grid(NEIGH, GRID_M)[["id", "geometry"]]
-    ORIGIN_LL = {r.id: (r.geometry.y, r.geometry.x) for r in GRID.itertuples()}
-    _cells = gpd.GeoDataFrame({"id": GRID["id"].values},
-                              geometry=grid.square_cells(GRID, GRID_M).values, crs=config.WGS)
-    _cells = grid.attach_neighborhoods(_cells, NEIGH)
-    CELLS_GEOJSON = json.loads(_cells.to_json())
-    for f in CELLS_GEOJSON["features"]:
-        f["properties"] = {"id": f["properties"]["id"], "n": f["properties"].get("name")}
+    print(f"[boot] building grid @ {GRID_M}m (one-time geo build; caching static bundle)...")
     try:                                         # cache the bundle so the next JVM-free boot is lean
-        _STATIC.write_text(json.dumps({
-            "gtfs_fp": _fp, "svc_date": _SVC_DATE.strftime("%Y%m%d"),
-            "origin_ll": {k: [v[0], v[1]] for k, v in ORIGIN_LL.items()},
-            "cells": CELLS_GEOJSON, "lines": LINES}))
+        _b = static_bundle.build_static_bundle(
+            _STATIC, GTFS, grid_m=GRID_M, service_date=_SVC_DATE,
+            source_mtimes=_GTFS_SOURCES)
+        CELLS_GEOJSON = _b["cells"]
+        LINES = _b["lines"]
+        ORIGIN_LL = {k: tuple(v) for k, v in _b["origin_ll"].items()}
+        print(f"[boot] ready: {len(ORIGIN_LL)} origins (static bundle cached). "
+              "Open http://127.0.0.1:8000")
     except Exception as _e:
-        print(f"[boot] (could not cache static bundle: {_e})")
-    if _NEED_R5:
-        NET = network.build_network(GTFS)
-        SNAPPED_GRID = GRID.copy()
-        SNAPPED_GRID["geometry"] = NET.snap_to_network(GRID.geometry)
-        SNAPPED_GRID = SNAPPED_GRID[SNAPPED_GRID.geometry != shapely.Point()].reset_index(drop=True)
-        _EXACT_IDS = list(SNAPPED_GRID.id)
-        _EXACT_GEOMS = list(SNAPPED_GRID.geometry)
-        _TRANSIT_LAYER = NET._transport_network.transitLayer
-        print(f"[boot] ready: {len(GRID)} origins ({len(SNAPPED_GRID)} on-network). "
-              f"Open http://127.0.0.1:8000")
-    else:
-        NET = SNAPPED_GRID = _TRANSIT_LAYER = None
-        _EXACT_IDS, _EXACT_GEOMS = [], []
-        print(f"[boot] ready: {len(GRID)} origins (JVM-free; bundle cached). "
-              f"Open http://127.0.0.1:8000")
-
-# Thread pool for the EXACT recompute. R5 routing is read-only against the shared warm
-# network and each task clones its own Java RegionalTask, so per-origin routing parallelises
-# safely in this one JVM. The Java RAPTOR releases the GIL, but Python-side result extraction
-# does not, so the real speedup tops out ~4.8x near the physical-core count. We default the
-# pool to (cores - 2) to leave the machine thermal/interactive headroom (the fan). Override
-# with EXACT_THREADS=N.
-_N_PHYS = os.cpu_count() or 8
-EXACT_THREADS = int(os.environ.get("EXACT_THREADS", str(max(2, _N_PHYS - 2))))
-_EXACT_POOL = ThreadPoolExecutor(max_workers=EXACT_THREADS, thread_name_prefix="r5-exact")
+        raise RuntimeError(f"could not build static bundle: {_e}") from _e
 
 
-# ---- Bounded LRU for the workplace-keyed caches ----------------------------------------
-# The ONE eviction implementation lives in core.server_raptor (shared by the RAPTOR caches there
-# AND the R5 result caches below); aliased here so the existing `_BoundedLRU(...)` call sites and
-# the tests reading server._BoundedLRU keep working.
+# ---- Shared cache type ------------------------------------------------------------------
 _BoundedLRU = sr.BoundedLRU
 
 
-# ---- RAPTOR engine (flag-gated grid travel-times; flags parsed up top) ----------------
-# When USE_WALK_GRAPH the walk-baked (slope-aware) access table + the JVM-free walk router serve
-# the whole map path; otherwise R5 stays in-process for the walk matrix (and, under departafter,
-# the R5 hover/color-by-line). The engine STATE + builders live in core.server_raptor; here we
-# resolve the boot context (engine + walk-graph snap tables, R5 deps) and hand it over via
-# sr.init(). The result objects are then re-exported as module globals (below) for the handlers +
-# the tests that reach into server.X.
+# ---- RAPTOR engine and graph-backed walking --------------------------------------------
+# The engine state and builders live in core.server_raptor; this module resolves the one-time
+# engine and graph snap tables and hands them over via sr.init().
 _RAPTOR = None
-_RAPTOR_STOPS = None             # GeoDataFrame of stop coords keyed by gid (egress destinations)
-_RAPTOR_CELL_POS = None
-_WG = None                       # WalkGraph (JVM-free) when USE_WALK_GRAPH
+_WG = None
 _WG_STOP_NODES = _WG_STOP_CONN = _WG_CELL_NODES = _WG_CELL_CONN = None
-_WG_STOP_GIDS = None             # gids aligned to _WG_STOP_NODES rows
-if USE_RAPTOR:
-    try:
-        from core import raptor_engine
-        import numpy as _np
-        _acc_path = None
-        if USE_WALK_GRAPH:                       # prefer the walk-baked (slope-aware) access table
-            import core.raptor_build as _rb
-            # _acc_fp, NOT _fp: the module-global _fp above is the static-bundle GTFS
-            # fingerprint (stamped into server_static.json) — reusing the name here would
-            # silently break the bundle's repull invalidation if the write ever moved later.
-            _acc_fp = _rb._fingerprint(GTFS, _SVC_DATE.strftime("%Y%m%d"),
-                                       _rb.band_seconds(), _rb.FOOTPATH_M)
-            # exact name, NOT a glob: a leftover bake at another resolution would sort first
-            # and silently swap the engine onto a different grid than the server's GRID_M
-            _acc_path = config.DATA / "raptor_cache" / f"access_walk_{GRID_M}m_{_acc_fp}.npz"
-            if not _acc_path.exists():
-                raise FileNotFoundError(
-                    f"USE_WALK_GRAPH set but {_acc_path.name} is missing "
-                    f"(run scripts/build_walk_graph.py + bake_walk_access.py"
-                    + (f" with GRID_M={GRID_M}" if GRID_M != config.GRID_M else "") + ")")
-            # Staleness guard: the bake embeds the sha256 of the walk_graph.npz it was built
-            # from. A graph rebuild without a rebake would silently mix access times from the
-            # OLD graph with live egress/pure-walk from the NEW one — fail loudly instead.
-            import hashlib as _hashlib
-            _wg_sha = _hashlib.sha256((config.DATA / "walk_graph.npz").read_bytes()).hexdigest()
-            with _np.load(_acc_path, allow_pickle=True) as _zacc:
-                _baked_sha = (str(_zacc["walk_graph_sha"]) if "walk_graph_sha" in _zacc.files
-                              else None)
-            if _baked_sha is None:                # pre-fingerprint bake: warn, don't refuse
-                print(f"[boot] ({_acc_path.name} predates the walk-graph fingerprint; rerun "
-                      f"scripts/bake_walk_access.py to enable the staleness check)")
-            elif _baked_sha != _wg_sha:
-                raise RuntimeError(
-                    f"{_acc_path.name} was baked against a DIFFERENT walk_graph.npz — "
-                    f"rerun scripts/bake_walk_access.py")
-        _RAPTOR = raptor_engine.RaptorEngine(GTFS, _SVC_DATE, access_path=_acc_path, verbose=True)
-        _gl, _go = _RAPTOR.data["stop_lat"], _RAPTOR.data["stop_lon"]
-        _gids = [g for g in range(_RAPTOR.data["n_stops"]) if not _np.isnan(_gl[g])]
-        # id="S<gid>" so stop ids stay DISJOINT from cell ids ("0".."N") and the origin "w"
-        # (R5's matrix returns 0 travel time when an origin id string == a destination id).
-        # _RAPTOR_STOPS (a GeoDataFrame) is only used by the R5 egress walk matrix; in the lean
-        # JVM-free path the walk router snaps stop coords from numpy below, so skip it (gpd/Point
-        # aren't even imported in lean mode).
-        if _NEED_R5:
-            _RAPTOR_STOPS = gpd.GeoDataFrame(
-                {"id": ["S" + str(g) for g in _gids]},
-                geometry=[Point(_go[g], _gl[g]) for g in _gids], crs=config.WGS)
-        # align purewalk to the engine's cell order (server grid == engine grid by id)
-        _RAPTOR_CELL_POS = {c: i for i, c in enumerate(_RAPTOR.cell_ids)}
-        if USE_WALK_GRAPH:
-            from core import walk as _walkmod
-            _WG = _walkmod.WalkGraph.load()
-            _WG_STOP_GIDS = _np.asarray(_gids, dtype=_np.int32)
-            _WG_STOP_NODES, _WG_STOP_CONN = _WG.snap(
-                _np.column_stack(([_go[g] for g in _gids], [_gl[g] for g in _gids])))
-            _cll = _np.array([[ORIGIN_LL[c][1], ORIGIN_LL[c][0]] for c in _RAPTOR.cell_ids])
-            _WG_CELL_NODES, _WG_CELL_CONN = _WG.snap(_cll)
-            print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); WALK GRAPH ON "
-                  f"(JVM-free walk: {_acc_path.name}) — R5 walk not used")
-        else:
-            print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); R5 kept for hover only")
-    except Exception as _e:                     # missing access table etc.
-        if not _NEED_R5:
-            # JVM-free mode: R5 was never imported, so there is NO fallback — fail loudly.
-            raise RuntimeError(f"USE_WALK_GRAPH engine init failed and R5 is not loaded: {_e}")
-        print(f"[boot] USE_RAPTOR requested but engine init failed ({_e}); using R5 path")
-        USE_RAPTOR = False
-        USE_WALK_GRAPH = False
-        sr.set_flags(USE_RAPTOR=False, USE_WALK_GRAPH=False)
+_WG_STOP_GIDS = None
 
-# Hand the boot-resolved RAPTOR engine + walk-graph snap tables (+ the R5 deps for the
-# USE_WALK_GRAPH=0 fallback) to the glue module. After this its builders read its own globals.
-sr.init(raptor=_RAPTOR, raptor_stops=_RAPTOR_STOPS, raptor_cell_pos=_RAPTOR_CELL_POS,
-        wg=_WG, wg_stop_nodes=_WG_STOP_NODES, wg_stop_conn=_WG_STOP_CONN,
-        wg_cell_nodes=_WG_CELL_NODES, wg_cell_conn=_WG_CELL_CONN, wg_stop_gids=_WG_STOP_GIDS,
-        origin_ll=ORIGIN_LL, need_r5=_NEED_R5, network=network, net=NET,
-        snapped_grid=SNAPPED_GRID, dep=DEP)
+from core import raptor_engine
+import numpy as _np
+from core import walk as _walkmod
+
+_acc_path = config.DATA / "raptor_cache" / f"access_walk_{GRID_M}m_{_SVC_DATE:%Y%m%d}.npz"
+if not _acc_path.exists():
+    raise FileNotFoundError(
+        f"required RAPTOR walking bake {_acc_path.name} is missing "
+        f"(run scripts/build_walk_graph.py and scripts/bake_walk_access.py"
+        + (f" with GRID_M={GRID_M}" if GRID_M != config.GRID_M else "") + ")")
+
+_RAPTOR = raptor_engine.RaptorEngine(GTFS, _SVC_DATE, access_path=_acc_path, verbose=True)
+_gl, _go = _RAPTOR.data["stop_lat"], _RAPTOR.data["stop_lon"]
+_gids = [g for g in range(_RAPTOR.data["n_stops"]) if not _np.isnan(_gl[g])]
+_WG = _walkmod.WalkGraph.load()
+_WG_STOP_GIDS = _np.asarray(_gids, dtype=_np.int32)
+_WG_STOP_NODES, _WG_STOP_CONN = _WG.snap(
+    _np.column_stack(([_go[g] for g in _gids], [_gl[g] for g in _gids])))
+_cll = _np.array([[ORIGIN_LL[c][1], ORIGIN_LL[c][0]] for c in _RAPTOR.cell_ids])
+_WG_CELL_NODES, _WG_CELL_CONN = _WG.snap(_cll)
+print(f"[boot] RAPTOR engine ON (semantic={RAPTOR_SEMANTIC}); graph walking ON "
+      f"({_acc_path.name})")
+
+sr.init(raptor=_RAPTOR, wg=_WG, wg_stop_nodes=_WG_STOP_NODES, wg_stop_conn=_WG_STOP_CONN,
+        wg_cell_nodes=_WG_CELL_NODES, wg_cell_conn=_WG_CELL_CONN,
+        wg_stop_gids=_WG_STOP_GIDS, origin_ll=ORIGIN_LL)
+
+
+def _required_feed_paths():
+    """Return the stable role-to-archive mapping used by readiness checks.
+
+    ``config.gtfs_paths()`` is intentionally a compact routing input and drops missing
+    archives. Readiness must distinguish a missing current Muni, BART, or Caltrain archive,
+    so keep the role mapping explicit.
+    """
+    return {
+        "muni": config.DATA / config.MUNI_CURRENT,
+        "bart": config.DATA / config.BART,
+        "caltrain": config.DATA / config.CALTRAIN,
+    }
+
+
+def _boot_readiness():
+    """Run expensive data/artifact checks once, after the live runtime is initialized."""
+    # Pass the already-loaded RAPTOR mapping, while the canonical graph and artifacts remain
+    # path-addressable for the structural validators.  check_readiness is deliberately called
+    # only here; probes below read the frozen result and never touch the archives.
+    try:
+        data_check = readiness.check_readiness(
+            _required_feed_paths(), _RAPTOR.data, config.DATA / "walk_graph.npz", _acc_path,
+            _STATIC, grid_m=GRID_M, grid_source=_GRID_SOURCE,
+        )
+    except Exception:
+        data_check = readiness.ReadinessResult(False, "runtime_load_failed")
+    try:
+        runtime_check = readiness.validate_runtime_state(
+            engine_kind="raptor", graph_backed=True, initialized=True,
+            semantic=RAPTOR_SEMANTIC, engine=_RAPTOR, walk_graph=_WG,
+            service_date=_SVC_DATE,
+        )
+    except Exception:
+        runtime_check = readiness.CheckResult(False, "runtime_load_failed")
+    if not data_check.ready:
+        return data_check
+    if not runtime_check.ready:
+        return readiness.ReadinessResult(
+            False, runtime_check.reason_code, data_check.service_date,
+            runtime_check.detail,
+        )
+    return data_check
+
+
+# Immutable, safe-to-serialize boot state.  Do not replace this from a request handler: a
+# controlled process restart is the refresh boundary for feed and artifact validation.
+_READINESS = _boot_readiness()
 
 # ---- Re-export the RAPTOR glue (state, caches, locks, key fns, builders) so the thin handlers
 # below and the tests that reach into server.X keep working. These are the SAME objects the
 # module owns (cache/lock identity preserved → tests' .clear()/.pop()/acquire() act on the live
-# state). Flags re-read AFTER any boot-time toggle/init failure so they reflect what loaded.
-USE_RAPTOR = sr.USE_RAPTOR
-USE_WALK_GRAPH = sr.USE_WALK_GRAPH
+# state).
 WALK_SPEEDS = sr.WALK_SPEEDS
 DEFAULT_SPEED = sr.DEFAULT_SPEED
 _RAPTOR = sr._RAPTOR
 _RAPTOR_EGRESS_CACHE = sr._RAPTOR_EGRESS_CACHE
 _RAPTOR_TREE_CACHE = sr._RAPTOR_TREE_CACHE
 _RAPTOR_MC_CACHE = sr._RAPTOR_MC_CACHE
-_coarse_key = sr.coarse_key
-_dest_key = sr.dest_key
 _mc_peek = sr.mc_peek
 _raptor_tree = sr.raptor_tree
 _Busy = sr.Busy
 
-# ---- Generation / cancel token --------------------------------------------------------
-# Each new workplace (/compute) bumps _GENERATION. The long all-cores jobs (compute_exact,
-# the lazy attribution prewarm) read the generation they started under and, between origin
-# waves, bail the moment it changes — so rapidly retyping the address does not stack multiple
-# ~14-32s exact bursts. A superseded /compute_exact returns HTTP 409 (the frontend keeps the
-# fast approximation); a superseded prewarm just stops.
-_GENERATION = 0
-_GEN_LOCK = threading.Lock()
-
-
-def _bump_generation():
-    global _GENERATION
-    with _GEN_LOCK:
-        _GENERATION += 1
-        return _GENERATION
-
-
-def _current_generation():
-    with _GEN_LOCK:
-        return _GENERATION
-
-
-class _Superseded(Exception):
-    """Raised inside a heavy job when a newer workplace has been set (cancel token)."""
-
-
-# Serialise heavy routing jobs (/compute_exact, the lazy /attribution build) against each
-# other so one heavy request can use all cores without two thrashing them. Light /itinerary
-# (one OD pair) and the fast /compute do NOT take this lock, so hover stays responsive while
-# a heavy refine/attribution job runs.
-_HEAVY_LOCK = threading.Lock()
-
-# ---- Per-workplace itinerary + attribution caches -------------------------------------
-# Recorded-path breakdowns, keyed by workplace. The full-grid build (color-by-line) and the
-# per-cell on-demand build (hover) are cached separately so a later full build can replace the
-# dest's dict wholesale without dropping hovered cells. Both are CLEARED on every new workplace
-# (_reset_caches), so memory stays bounded to the current workplace instead of growing forever.
-_ITIN_CACHE = {}                 # dest_key -> {cellId: itinerary dict}  (full-grid build)
-_ITIN_INFLIGHT = {}              # dest_key -> threading.Event (full-grid build in progress)
-_ITIN_CACHE_LOCK = threading.Lock()
-_CELL_CACHE = {}                 # dest_key -> {cellId: itinerary dict}  (per-cell on demand)
-_CELL_CACHE_LOCK = threading.Lock()
-_LAST_DEST_KEY = None            # workplace of the last /compute; a CHANGE clears the caches above
-# _dest_key / _coarse_key / _Busy live in core.server_raptor (re-exported at boot above): the
-# R5 breakdown caches below use the SAME keying as the RAPTOR caches.
-
-
-def _reset_caches():
-    """Drop cached breakdowns for previous workplaces (called on each new /compute). An
-    in-flight build for an old workplace is already a different generation, so it bails
-    between waves (returns {}) — and if it completes during its FINAL wave, the gen re-check
-    in _itineraries_cached keeps it from re-populating the cache we just cleared. Either way
-    it pops its own in-flight marker; we only clear the result dicts here."""
-    with _ITIN_CACHE_LOCK:
-        _ITIN_CACHE.clear()
-    with _CELL_CACHE_LOCK:
-        _CELL_CACHE.clear()
-
-
-def _itineraries_cached(dlat, dlon, *, nonblock=False, max_rides=DEFAULT_MAX_RIDES):
-    """Full per-cell itinerary map for (dlat,dlon) -> {cellId: itin dict}, built LAZILY (only
-    on demand from /attribution) and cached. If another thread is already building this
-    destination, wait for its result (in-flight de-dup). The build takes _HEAVY_LOCK so it
-    serialises against /compute_exact.
-
-    With ``nonblock=True``: if THIS call is the one that would do the build and _HEAVY_LOCK is
-    already held by another heavy job, raise _Busy (-> 503) instead of blocking. A call that
-    is merely WAITING on another thread's in-flight build still waits (it isn't the one doing
-    the work) — but if the owner finished WITHOUT caching anything (it hit _Busy or was
-    superseded), the waiter raises _Busy too, so both callers get the same retryable 503
-    instead of the waiter getting a successful-looking empty 200. A cache hit never blocks
-    regardless. ``max_rides`` is part of the cache key so a capped build can't be served for
-    an uncapped request."""
-    key = _dest_key(dlat, dlon, max_rides)
-    with _ITIN_CACHE_LOCK:
-        if key in _ITIN_CACHE:
-            return _ITIN_CACHE[key]
-        event = _ITIN_INFLIGHT.get(key)
-        if event is None:
-            event = threading.Event()
-            _ITIN_INFLIGHT[key] = event
-            owner = True
-        else:
-            owner = False
-    if not owner:                # someone else is building it; wait for their result
-        event.wait()
-        with _ITIN_CACHE_LOCK:
-            res = _ITIN_CACHE.get(key)
-        if res is None:          # owner cached nothing (busy/superseded/empty) -> retry later,
-            raise _Busy()        # mirroring the 503 the owner's own request reported
-        return res
-    gen = _current_generation()  # cancel token: bail if a newer workplace is set mid-build
-    locked = False
-    try:
-        if nonblock:
-            if not _HEAVY_LOCK.acquire(blocking=False):
-                raise _Busy()
-        else:
-            _HEAVY_LOCK.acquire()
-        locked = True
-        itins = prewarm_itineraries(dlat, dlon, gen, max_rides)
-        # Never cache an empty result (a superseded/partial build would poison this workplace
-        # until the next /compute). The gen re-check closes the last-wave race: _map_cancelable
-        # only checks the generation BETWEEN waves, so a /compute that bumped the generation and
-        # ran _reset_caches during the FINAL wave would otherwise see this stale full grid
-        # written back into the freshly-cleared _ITIN_CACHE (megabytes kept until the next
-        # workplace change).
-        if itins and _current_generation() == gen:
-            with _ITIN_CACHE_LOCK:
-                _ITIN_CACHE[key] = itins
-        return itins
-    except _Superseded:
-        return {}                # newer workplace set; abandon this stale full-grid build
-    finally:
-        if locked:
-            _HEAVY_LOCK.release()
-        with _ITIN_CACHE_LOCK:
-            _ITIN_INFLIGHT.pop(key, None)
-        event.set()
-
-
-def _dominant_line(itin):
-    """The "color by line" attribution for an itinerary: the transit leg carrying the most
-    ride time, or 'walk only' when the trip has no transit legs."""
-    rides = [l for l in itin["legs"] if l["mode"] != "walk"]
-    if not rides:
-        return "walk only"
-    return max(rides, key=lambda l: l["min"])["line"]
-
-
-def _attribution_from_cache(dlat, dlon, *, nonblock=False, max_rides=DEFAULT_MAX_RIDES):
-    """{cellId: dominantLine} derived from the shared per-cell itinerary cache (building the
-    full grid lazily if needed). ``nonblock`` propagates the non-blocking heavy-lock policy
-    (raise _Busy -> 503 instead of queueing behind a running heavy job). ``max_rides`` keys
-    the underlying itinerary cache."""
-    itins = _itineraries_cached(dlat, dlon, nonblock=nonblock, max_rides=max_rides)
-    return {cid: _dominant_line(it) for cid, it in itins.items()}
-
-
-# ---- Destination RESULT cache for the heavy endpoints (A4) -----------------------------
-# A bounded LRU caching the FINAL JSON-able results of /compute_exact and /attribution,
-# keyed at the same five-decimal precision as itinerary + MC seeds. A hit returns the same result
-# with no R5 work and without taking _HEAVY_LOCK — so a repeated workplace (e.g. localStorage
-# auto-restore, or panning back) is instant. This is SEPARATE from the per-workplace
-# itinerary caches (_ITIN_CACHE/_CELL_CACHE), which key on the finer _dest_key and back
-# /itinerary. copy_mode='deep' (put AND get) so callers can never mutate the store.
-# 150 entries x two small JSON-able dicts (~100s of KB each) — generous because hits are the
-# whole point (instant repeat workplaces) and the payloads are cheap relative to the tree/MC
-# caches. The lock is SHARED by both caches (tests clear them together under it).
-_RESULT_CACHE_MAX = 150
-_RESULT_CACHE_LOCK = threading.RLock()
-_EXACT_RESULT_CACHE = _BoundedLRU(_RESULT_CACHE_MAX, copy_mode="deep",
-                                  lock=_RESULT_CACHE_LOCK)   # coarse_key -> {id: [best, real]}
-_ATTR_RESULT_CACHE = _BoundedLRU(_RESULT_CACHE_MAX, copy_mode="deep",
-                                 lock=_RESULT_CACHE_LOCK)    # coarse_key -> {cellId: dominantLine}
-# _coarse_key is re-exported above (= sr.coarse_key); the R5 result caches here key with the
-# SAME _coarse_key as the RAPTOR caches.
-
-
 def _req_max_rides():
-    """Parse the ``maxrides`` query param into an R5 ride cap. Absent/blank/invalid ->
+    """Parse the ``maxrides`` query param into the model's ride cap. Absent/blank/invalid ->
     DEFAULT_MAX_RIDES (today's behavior). The frontend sends rides directly (transfers+1):
     0 transfers -> 1, 1 -> 2, 2 -> 3, "Any" -> 8. We clamp to [1, DEFAULT_MAX_RIDES] so a
     bogus value can't disable transit (rides must be >= 1) or exceed the model default."""
@@ -524,8 +275,9 @@ def _parse_ll(lat_raw, lon_raw):
     """Parse + validate lat/lon from query args — used by EVERY coordinate-taking endpoint.
     Rejects missing/non-numeric/NaN/inf coords with a friendly JSON 400 instead of a 500
     (NaN is a valid float() but never compares equal, so it would bypass every coord-keyed
-    cache), and rejects out-of-SF-region coords so a coordinate the engine can't sensibly
-    serve doesn't burn a full compute for a garbage result."""
+    cache), and rejects finite points outside the graph-backed supported area before a coordinate
+    can burn a full compute for a garbage result.  The loose bbox below is only a cheap prefilter;
+    ``WalkGraph.supports_point`` is the authoritative policy."""
     try:
         lat = float(lat_raw); lon = float(lon_raw)
     except (TypeError, ValueError):
@@ -533,18 +285,40 @@ def _parse_ll(lat_raw, lon_raw):
     if not (math.isfinite(lat) and math.isfinite(lon)):
         raise _BadRequest("lat/lon must be finite")
     lo_min, la_min, lo_max, la_max = config.SF_VALID_BBOX   # loose box; see core/config.py
+    # This box is deliberately only a cheap prefilter.  The walk graph is the authoritative
+    # supported-area policy: its connector threshold is what prevents water/East Bay points
+    # from being silently snapped to the nearest SF edge and sent through an expensive route.
     if not (la_min <= lat <= la_max and lo_min <= lon <= lo_max):
-        raise _BadRequest(f"lat/lon outside SF region: {lat:.4f},{lon:.4f}")
+        raise _OutsideSupportedArea()
+    if _WG is None or not _WG.supports_point(lon, lat, max_connector_m=300):
+        raise _OutsideSupportedArea()
     return lat, lon
+
+
+def _validate_geocoder_point(lat_raw, lon_raw):
+    """Validate one provider result with the same coordinate policy as API inputs."""
+    return _parse_ll(lat_raw, lon_raw)
 
 
 class _BadRequest(Exception):
     pass
 
 
+class _OutsideSupportedArea(Exception):
+    pass
+
+
 @app.errorhandler(_BadRequest)
 def _bad_request(e):
     return jsonify({"error": "bad_request", "detail": str(e)}), 400
+
+
+_OUTSIDE_SUPPORTED_DETAIL = "Location is outside the supported San Francisco walking area."
+
+
+@app.errorhandler(_OutsideSupportedArea)
+def _outside_supported_area(_e):
+    return jsonify({"error": "outside_supported_area", "detail": _OUTSIDE_SUPPORTED_DETAIL}), 422
 
 
 limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
@@ -554,7 +328,8 @@ limiter = Limiter(key_func=_client_ip, app=app, storage_uri="memory://")
 # autocomplete are pure functions of the query string -> let the browser cache them. The page
 # bundle (GET /) is workplace-agnostic and shipped once at boot -> stays cacheable + bfcache-
 # eligible so back-navigation doesn't refetch the network and rerun /compute + /variance.
-_NO_STORE_PATHS = frozenset({"/compute", "/compute_exact", "/itinerary", "/attribution", "/variance"})
+_NO_STORE_PATHS = frozenset({"/compute", "/compute_exact", "/itinerary", "/attribution", "/variance",
+                             "/livez", "/readyz", "/healthz"})
 
 
 @app.after_request
@@ -609,107 +384,22 @@ def _ratelimit_json(e):
     return jsonify({"error": "rate_limited", "detail": str(getattr(e, "description", e))}), 429
 
 
-# ---- RAPTOR grid travel-times + breakdown/variance/geometry (flag-gated) -------------
+# ---- RAPTOR grid travel-times + breakdown/variance/geometry -------------------------
 # The whole RAPTOR engine integration (state, caches, locks, the egress/tree/MC builders,
 # the journey-geometry provider, and the /itinerary assemblers for both semantics) lives in
 # core.server_raptor (re-exported above). The thin Flask handlers below call into sr.*.
 
 
-# ---- Map TIME: fast reverse approximation + exact forward refine ----------------------
-def compute(lat, lon, max_rides=DEFAULT_MAX_RIDES):
-    """Door-to-door times from every grid cell TO (lat, lon), as {id: [best, real]}.
-
-    FAST APPROXIMATION (reverse one-to-many): R5 is dramatically faster computing one routing
-    tree from a single point to many destinations than many one-origin trees. So we route a
-    single tree FROM the workplace TO every (pre-snapped) cell (~0.2s) and treat that as the
-    cell's commute time. Morning (cell->work) and reverse (work->cell) aren't perfectly
-    symmetric, so this has a small error (measured MAE ~2 min vs the exact method); the exact
-    forward pass below refines it, and scripts/isochrone.py is the offline reference."""
-    origin = gpd.GeoDataFrame({"id": ["w"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    ttm = pd.DataFrame(network.travel_time_matrix(NET, origin, SNAPPED_GRID, DEP,
-                                                  max_rides=max_rides))
-    cells = {}
-    for _, r in ttm.iterrows():
-        b, rl = r["travel_time_p5"], r["travel_time_p50"]
-        cells[str(r["to_id"])] = [None if pd.isna(b) else int(b),
-                                  None if pd.isna(rl) else int(rl)]
-    return cells
-
-
-def compute_exact(lat, lon, gen, max_rides=DEFAULT_MAX_RIDES):
-    """EXACT (forward) door-to-door: route every grid cell -> workplace (one tree per origin),
-    the slow accurate direction. r5py's TravelTimeMatrix runs these trees serially; here we
-    drive R5's TravelTimeComputer directly from the thread pool (each thread clones the Java
-    RegionalTask), which is bit-exact to the serial matrix but ~4.7x faster. ``gen`` is the
-    cancel token (see _map_cancelable). Returns {id: [best, real]}."""
-    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    template = network.routing_template(NET, dest, DEP, max_rides=max_rides)
-
-    def _one(i):
-        req = copy.copy(template)        # clones the underlying Java RegionalTask
-        req.origin = _EXACT_GEOMS[i]
-        # travelTimes.getValues() -> [percentile_index][destination_index]; 1 destination
-        vals = com.conveyal.r5.analyst.TravelTimeComputer(req, NET).computeTravelTimes().travelTimes.getValues()
-        b = int(vals[0][0]); rl = int(vals[1][0])
-        return _EXACT_IDS[i], [None if b == MAX_INT32 else b,
-                               None if rl == MAX_INT32 else rl]
-
-    return {cid: pair for cid, pair in _map_cancelable(_one, range(len(_EXACT_IDS)), gen)}
-
-
-# Wave size for the cancelable pool map: big enough to keep the pool saturated, small enough
-# that a superseded job stops within a fraction of a second.
-_CANCEL_WAVE = 64
-
-
-def _map_cancelable(fn, indices, gen):
-    """Like _EXACT_POOL.map(fn, indices) but submitted in waves; between waves, if the global
-    generation has moved past ``gen`` (a newer workplace was set), raise _Superseded so the
-    stale all-cores job stops. Yields fn(i) results in order within each wave."""
-    indices = list(indices)
-    for start in range(0, len(indices), _CANCEL_WAVE):
-        if _current_generation() != gen:
-            raise _Superseded()
-        wave = indices[start:start + _CANCEL_WAVE]
-        for res in _EXACT_POOL.map(fn, wave, chunksize=8):
-            yield res
-
-
 @app.route("/compute")
 @limiter.limit("60/minute")
 def _compute():
-    global _LAST_DEST_KEY
     lat, lon = _parse_ll(request.args.get("lat"), request.args.get("lon"))
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
-    # speed only changes the result when the RAPTOR engine consumes the walk scalar; the legacy
-    # R5 compute() ignores it, so keep it out of the key there — otherwise toggling the
-    # (ineffective) speed control would bump the generation, cancel an in-flight exact pass,
-    # and reset the breakdown caches for byte-identical results.
-    key = _dest_key(lat, lon, max_rides, speed if USE_RAPTOR else None)
-    # Compare-and-set under _GEN_LOCK: without it, two concurrent first-time /computes for
-    # different workplaces could both see _LAST_DEST_KEY = None, both bump generation, both reset
-    # caches, and a third request for the displaced workplace would re-fire the reset path.
-    with _GEN_LOCK:
-        changed = (key != _LAST_DEST_KEY)
-        if changed:
-            _LAST_DEST_KEY = key
-    if changed:
-        # Genuinely new workplace (or a changed transfer cap — or, under RAPTOR, a changed walk
-        # speed — different colored times, so treat it as new): bump the generation (cancels any
-        # in-flight exact/attribution job for the PREVIOUS key between waves) and drop its
-        # breakdown caches. Re-submitting the same address + params (e.g. the localStorage
-        # auto-restore on refresh) keeps caches.
-        gen = _bump_generation()
-        _reset_caches()
-    else:
-        gen = _current_generation()
     t0 = dt.datetime.now()
-    cells = (sr.compute_raptor(lat, lon, max_rides, speed, walk_scalar) if USE_RAPTOR
-             else compute(lat, lon, max_rides))
+    cells = sr.compute_raptor(lat, lon, max_rides, speed, walk_scalar)
     ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    tag = "raptor" if USE_RAPTOR else "approx"
-    print(f"[compute:{tag}] rides={max_rides} speed={speed} {ms:.0f}ms gen={gen}")
+    print(f"[compute:raptor] rides={max_rides} speed={speed} {ms:.0f}ms")
     return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
 
 
@@ -718,201 +408,12 @@ def _compute():
 def _compute_exact():
     lat, lon = _parse_ll(request.args.get("lat"), request.args.get("lon"))
     max_rides = _req_max_rides()
-    # With RAPTOR ON, /compute already returned the near-exact answer; the "exact refine" is
-    # the SAME engine, so return it instantly (no heavy per-cell R5 pass). map == refine, so
-    # the old fast-vs-exact contradiction disappears entirely.
-    if USE_RAPTOR:
-        speed, walk_scalar = _req_speed()
-        cells = sr.compute_raptor(lat, lon, max_rides, speed, walk_scalar)
-        return jsonify({"dest": [lat, lon], "cells": cells, "ms": 0})
-    ckey = _coarse_key(lat, lon, max_rides)
-    # CACHE HIT (same meter-scale destination): return instantly — no R5 work, no lock, and the
-    # generation/supersede dance is irrelevant since there's nothing to cancel.
-    cached = _EXACT_RESULT_CACHE.get(ckey)
-    if cached is not None:
-        print(f"[exact] rides={max_rides} cached -> {len(cached)} cells")
-        return jsonify({"dest": [lat, lon], "cells": cached, "ms": 0})
-    t0 = dt.datetime.now()
-    gen = _current_generation()           # cancel token: abort if a newer workplace is set
-    # Non-blocking: if a heavy job is already running, tell the client to retry rather than
-    # queueing behind a ~30s burst. Release the lock in finally so a crash can't wedge it.
-    if not _HEAVY_LOCK.acquire(blocking=False):
-        print("[exact] busy -> 503")
-        return jsonify({"busy": True}), 503, {"Retry-After": "4"}
-    try:
-        cells = compute_exact(lat, lon, gen, max_rides)   # one heavy job at a time; hover stays free
-    except _Superseded:
-        print("[exact] superseded -> 409")
-        return jsonify({"error": "superseded"}), 409
-    finally:
-        _HEAVY_LOCK.release()
-    _EXACT_RESULT_CACHE.put(ckey, cells)
-    ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[exact] rides={max_rides} {ms:.0f}ms")
-    return jsonify({"dest": [lat, lon], "cells": cells, "ms": round(ms)})
+    speed, walk_scalar = _req_speed()
+    cells = sr.compute_raptor(lat, lon, max_rides, speed, walk_scalar)
+    return jsonify({"dest": [lat, lon], "cells": cells, "ms": 0})
 
 
-# ---- Route LEGS: recorded-path breakdowns --------------------------------------------
-def _path_route_name(raw):
-    """R5 records a path leg's route as "NAME (route_id)" where NAME is resolved within the
-    leg's own feed (Muni '8' but BART 'Red-N (8)'). Take the part before " (", falling back to
-    the raw string if the format is unexpected."""
-    s = str(raw)
-    i = s.rfind(" (")
-    return s[:i] if i > 0 else s
-
-
-def _walk_only(p50):
-    """Breakdown for a cell reachable on foot only (no transit legs)."""
-    return {"total": int(p50), "xfers": 0,
-            "legs": [{"mode": "walk", "line": None, "min": int(p50)}]}
-
-
-_TINY_HOP_MIN = 2.0   # suppress sub-2-min transit hops (fold into adjacent walk)
-
-
-def _build_itin(p50, itin_map, route_name_fn):
-    """Turn an R5 recorded-path result for ONE cell into the /itinerary JSON breakdown.
-
-    ``p50`` is the cell's authoritative realistic travel time (minutes) — the SAME value
-    compute_exact colors the map with — and ``itin_map`` is that cell's path-result multimap.
-    We (1) pick the recorded iteration whose total best matches p50 (so the breakdown's total
-    == the cell's exact map color); (2) read EXACT per-leg components from R5 (ride time from
-    rideTimesSeconds — TransitLeg.inVehicleTime is unreliable — wait from the iteration's
-    waitTimes, plus access/egress and transfer walk); (3) lay them out as walk -> (wait+ride)
-    per leg -> walk so legs sum to round(p50); (4) FOLD any sub-2-min transit hop into the
-    surrounding walk; (5) reconcile rounding residual into a walk leg.
-    Returns {total, xfers, legs:[{mode, line, min, wait?}]}."""
-    total = float(p50)
-    walk_only = {"total": round(total), "xfers": 0,
-                 "legs": [{"mode": "walk", "line": None, "min": round(total)}]}
-    cands = []
-    for e in list(itin_map.entrySet()):
-        rseq = e.getKey()
-        for it in e.getValue():
-            cands.append((it.totalTime, rseq, it))
-    if not cands:
-        return walk_only
-    # iteration whose total best matches the authoritative p50 (tie -> faster trip). Among
-    # equally-good iterations, break the tie deterministically by route-name signature so the
-    # chosen path (and thus "color by line") is stable across server reboots -- R5's
-    # path-template iteration order is not.
-    def _score(c):
-        return (abs(round(c[0] / 60.0) - p50), c[0])
-    best = min(cands, key=_score)
-    ties = [c for c in cands if _score(c) == _score(best)]
-    if len(ties) > 1:
-        # Among equally-fast iterations, prefer FEWER transit legs (fewer transfers) — the
-        # route a human would actually take — then route-name signature for deterministic,
-        # reboot-stable tie-breaking. (Doesn't change the time/color, only which equal-time
-        # path is shown. A genuinely faster multi-transfer route still wins on _score.)
-        def _simplicity(c):
-            legs = list(c[1].transitLegs(_TRANSIT_LAYER))
-            return (len(legs), tuple(route_name_fn(l.route) for l in legs))
-        best = min(ties, key=_simplicity)
-    _, rseq, it = best
-    ss = rseq.stopSequence
-    rt = ss.rideTimesSeconds
-    rides = [rt.get(i) / 60.0 for i in range(rt.size())] if rt is not None else []
-    n = len(rides)
-    if n == 0:                                  # reachable on foot only
-        return walk_only
-    legs_meta = list(rseq.transitLegs(_TRANSIT_LAYER))
-    waits = [it.waitTimes.get(i) / 60.0 for i in range(it.waitTimes.size())]
-    acc = (ss.access.time / 60.0) if ss.access else 0.0
-    egr = (ss.egress.time / 60.0) if ss.egress else 0.0
-    xfer = ss.transferTime(it) / 60.0
-    # walk buckets around the n rides: walk[0]=access ... walk[n]=egress; the aggregate
-    # transfer-walk time is split evenly across the n-1 inter-ride gaps.
-    walk = [0.0] * (n + 1)
-    walk[0] = acc
-    walk[n] += egr
-    if n > 1:
-        per = xfer / (n - 1)
-        for i in range(1, n):
-            walk[i] += per
-    # fold tiny rides (and their wait) into the preceding walk bucket
-    kept = []
-    for i in range(n):
-        if rides[i] < _TINY_HOP_MIN:
-            walk[i] += rides[i] + waits[i]
-        else:
-            kept.append(i)
-    legs = []
-
-    def push_walk(m):
-        if m <= 0:
-            return
-        if legs and legs[-1]["mode"] == "walk":
-            legs[-1]["min"] += m
-        else:
-            legs.append({"mode": "walk", "line": None, "min": m})
-
-    cursor = 0
-    for i in kept:
-        push_walk(sum(walk[cursor:i + 1]))
-        legs.append({"mode": "transit", "line": route_name_fn(legs_meta[i].route),
-                     "min": rides[i], "wait": waits[i]})
-        cursor = i + 1
-    push_walk(sum(walk[cursor:n + 1]))
-    # round each leg; then reconcile so the shown legs sum EXACTLY to round(total) —
-    # core.raptor_journey.reconcile_legs is the ONE shared implementation (RAPTOR _format
-    # uses the same), so the two breakdowns can't drift.
-    for l in legs:
-        l["min"] = round(l["min"])
-        if "wait" in l:
-            l["wait"] = round(l["wait"])
-    return reconcile_legs(legs, round(total))
-
-
-def _recorded_itin(req):
-    """Run a path-recording RegionalTask ``req`` (origin already set) and return its
-    /itinerary breakdown dict, or None if the workplace is unreachable from this origin.
-    Shared by the full-grid prewarm and the single-cell on-demand fallback so a cold lookup
-    reads identically to a cached one and its total matches the map color."""
-    result = com.conveyal.r5.analyst.TravelTimeComputer(req, NET).computeTravelTimes()
-    p50 = result.travelTimes.getValues()[1][0]      # realistic (matches compute_exact)
-    if p50 == MAX_INT32:
-        return None
-    paths = result.paths
-    itin_map = paths.iterationsForPathTemplates[0].asMap() if paths is not None else None
-    if itin_map is None:
-        return _walk_only(p50)
-    return _build_itin(p50, itin_map, _path_route_name)
-
-
-def prewarm_itineraries(dlat, dlon, gen, max_rides=DEFAULT_MAX_RIDES):
-    """Full exact itinerary for EVERY grid cell -> workplace via R5 recorded paths. These are
-    the same forward journeys behind compute_exact, so each itinerary's total equals that
-    cell's exact map color. Built lazily on the first /attribution request; ``gen`` is the
-    cancel token. Returns {cellId: itin dict}."""
-    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs=config.WGS)
-    template = network.routing_template(NET, dest, DEP, paths=True, max_rides=max_rides)
-
-    def _one(i):
-        req = copy.copy(template)
-        req.origin = _EXACT_GEOMS[i]
-        return _EXACT_IDS[i], _recorded_itin(req)
-
-    itins = {}
-    for cid, itin in _map_cancelable(_one, range(len(_EXACT_IDS)), gen):
-        if itin is not None:
-            itins[cid] = itin
-    return itins
-
-
-def fastest_itin(olat, olon, dlat, dlon, max_rides=DEFAULT_MAX_RIDES):
-    """On-demand single-OD breakdown — the fallback for /itinerary cache misses (off-grid
-    points, or before any prewarm). Mirrors exactly what the prewarm caches."""
-    o = NET.snap_to_network(gpd.GeoSeries([Point(olon, olat)], crs=config.WGS)).iloc[0]
-    if o.is_empty:
-        return None
-    dest = gpd.GeoDataFrame({"id": ["d"]}, geometry=[Point(dlon, dlat)], crs=config.WGS)
-    req = network.routing_template(NET, dest, DEP, paths=True,    # fresh, single-use; no clone needed
-                                  max_rides=max_rides)
-    req.origin = o
-    return _recorded_itin(req)
-
+# RAPTOR itinerary assemblers in core.server_raptor are now the sole source for /itinerary.
 
 @app.route("/itinerary")
 @limiter.limit("120/minute")
@@ -923,97 +424,29 @@ def _itinerary():
     else:  # olat/olon are only required when no (valid) cell id resolves the origin
         olat, olon = _parse_ll(request.args.get("olat"), request.args.get("olon"))
     dlat, dlon = _parse_ll(request.args.get("dlat"), request.args.get("dlon"))
-    # Same transfer cap the map used, so the breakdown total matches the cell's colored time
-    # (and so it hits the SAME _dest_key-bucketed cache as the matching /compute).
+    # Use the same transfer cap and walking settings as /compute so the breakdown matches the map.
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
-    # RAPTOR path (Phase 2): trace the cell's journey from the cached tree -> breakdown total
-    # EQUALS the cell's map value by construction (no R5), for BOTH semantics — arrive-by from the
-    # single-deadline JourneyTree, depart-after from the DepartAfterJourneyTree's per-T* tracer.
-    # Off-grid points snap to nearest cell. (The R5 fallback below now serves only USE_RAPTOR=0.)
-    if USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter"):
-        # Both RAPTOR /itinerary assemblers live in core.server_raptor (trace the cell's journey
-        # from the cached tree -> breakdown total EQUALS the cell's map value by construction, no
-        # R5). ?pin=1 adds the per-route committed typicals/fragility (the gate keeps them off the
-        # plain-hover path). Off-grid points snap to the nearest cell inside the assembler.
-        _pin = request.args.get("pin") == "1"
-        # Benchmark-only request-local phase dict.  Plain hovers intentionally avoid even the
-        # timer calls; detailed pin instrumentation is enabled only with both ?pin=1 and the
-        # explicit server flag.
-        _perf = {} if (_pin and _perf_benchmark_enabled()) else None
-        assemble = (sr.itinerary_departafter if RAPTOR_SEMANTIC == "departafter"
-                    else sr.itinerary_arriveby)
-        res = assemble(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scalar, pin=_pin,
-                       perf=_perf)
-        res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
-        return _phase_response(res, _perf) if _perf is not None else jsonify(res)
-    dkey = _dest_key(dlat, dlon, max_rides)
-    res = None
-    # FAST PATH 1: the full-grid cache (present once color-by-line has been triggered).
-    if cid is not None:
-        with _ITIN_CACHE_LOCK:
-            full = _ITIN_CACHE.get(dkey)
-        if full is not None and cid in full:
-            res = full[cid]
-    # FAST PATH 2: the per-cell on-demand cache (this cell was hovered before).
-    if res is None and cid is not None:
-        with _CELL_CACHE_LOCK:
-            res = (_CELL_CACHE.get(dkey) or {}).get(cid)
-    # FALLBACK: first touch of this cell (or an off-grid point) -> compute ONE cell on demand
-    # (~100ms) and cache it. The common flow thus computes only the cells actually hovered.
-    if res is None:
-        gen = _current_generation()   # don't repopulate a cache _reset_caches cleared mid-call
-        res = fastest_itin(olat, olon, dlat, dlon, max_rides) or {"error": "no route"}
-        if cid is not None and "error" not in res and _current_generation() == gen:
-            with _CELL_CACHE_LOCK:
-                _CELL_CACHE.setdefault(dkey, {})[cid] = res
-    res = dict(res)                       # don't mutate the cached object with olat/olon
-    res.setdefault("geom", None)          # legacy R5 path: no traced geometry — frontend
-    #                                       falls back gracefully (text breakdown only)
-    res.setdefault("alts", [])            # alt routes are a RAPTOR-only feature; legacy path = none
+    # Both semantic assemblers trace the selected cell from the shared RAPTOR tree. Off-grid
+    # points snap to the nearest cell inside the assembler.
+    _pin = request.args.get("pin") == "1"
+    _perf = {} if (_pin and _perf_benchmark_enabled()) else None
+    assemble = (sr.itinerary_departafter if RAPTOR_SEMANTIC == "departafter"
+                else sr.itinerary_arriveby)
+    res = assemble(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scalar, pin=_pin,
+                   perf=_perf)
+    res = dict(res)
     res["olat"], res["olon"] = round(olat, 5), round(olon, 5)
-    return jsonify(res)
-
-
+    return _phase_response(res, _perf) if _perf is not None else jsonify(res)
 @app.route("/attribution")
 @limiter.limit("12/minute")
 def _attribution():
-    """The "color by line" map: dominant transit line per cell. The ONLY trigger for the
-    full-grid itinerary build (lazy here, on the user's first toggle). Cached + in-flight
-    de-duped, so /itinerary also benefits once it has run."""
+    """Return the dominant transit line per cell from the RAPTOR tree."""
     dlat, dlon = _parse_ll(request.args.get("dlat"), request.args.get("dlon"))
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
-    # RAPTOR path (Phase 2): dominant line per cell from the same cached tree as the map (no R5,
-    # no _HEAVY_LOCK / fan spike, deterministic), for BOTH semantics — depart-after reads the
-    # DepartAfterJourneyTree.dominant() populated into the entry by _raptor_tree. (The R5
-    # color-by-line below now serves only USE_RAPTOR=0.)
-    if USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter"):
-        attr = sr.raptor_attribution(dlat, dlon, max_rides, speed, walk_scalar)
-        print(f"[attr:raptor] rides={max_rides} speed={speed} -> {len(attr)} cells")
-        return jsonify(attr)
-    ckey = _coarse_key(dlat, dlon, max_rides)
-    # CACHE HIT (same meter-scale destination): return the attribution instantly, no R5/lock.
-    cached_res = _ATTR_RESULT_CACHE.get(ckey)
-    if cached_res is not None:
-        print(f"[attr] rides={max_rides} cached -> {len(cached_res)} cells")
-        return jsonify(cached_res)
-    t0 = dt.datetime.now()
-    with _ITIN_CACHE_LOCK:
-        cached = _dest_key(dlat, dlon, max_rides) in _ITIN_CACHE
-    # Non-blocking: a build needed while another heavy job runs -> 503 (don't queue ~48s).
-    try:
-        attr = _attribution_from_cache(dlat, dlon, nonblock=True, max_rides=max_rides)
-    except _Busy:
-        print("[attr] busy -> 503")
-        return jsonify({"busy": True}), 503, {"Retry-After": "4"}
-    # Only cache a real result. A superseded build (workplace changed mid-build) returns {};
-    # caching that would poison this destination key and make color-by-line return {} forever.
-    if attr:
-        _ATTR_RESULT_CACHE.put(ckey, attr)
-    ms = (dt.datetime.now() - t0).total_seconds() * 1000
-    print(f"[attr] {ms:.0f}ms -> {len(attr)} cells"
-          f"{' (cached)' if cached else ''}")
+    attr = sr.raptor_attribution(dlat, dlon, max_rides, speed, walk_scalar)
+    print(f"[attr:raptor] rides={max_rides} speed={speed} -> {len(attr)} cells")
     return jsonify(attr)
 
 
@@ -1021,7 +454,8 @@ def _attribution():
 @limiter.limit("20/minute")
 def _variance():
     """Service-noise overlay (RAPTOR, both semantics). Lazy + cached; fetched by the frontend AFTER
-    /compute paints the map (progressive refinement, like /compute_exact). Empty when the flag is off
+    /compute paints the map (progressive refinement, like /compute_exact). Empty when service-noise
+    mode is disabled
     so the frontend simply keeps the painted map.
 
     BOTH semantics build the SAME committed-plan MC off the workplace's cached traced tree, but serve
@@ -1036,9 +470,12 @@ def _variance():
         the committed-MC p90 and p50 the served depart-after p50 (the SAME floor _raptor_mc_build
         passes to montecarlo), so frag >= 0 by construction.
     Per-cell ``variance`` shape is identical for both: ``{frag, std, stuck[, alt:[lines]]}``."""
-    if not (USE_RAPTOR and RAPTOR_SEMANTIC in ("arriveby", "departafter") and RAPTOR_MC):
-        return jsonify({"realistic": {}, "variance": {}})
     dlat, dlon = _parse_ll(request.args.get("dlat"), request.args.get("dlon"))
+    # Validate the destination even when the optional MC overlay is disabled.  All coordinate
+    # endpoints share the supported-area contract; feature gating must not turn /variance into a
+    # silent 200 for an invalid workplace.
+    if not (RAPTOR_SEMANTIC in ("arriveby", "departafter") and RAPTOR_MC):
+        return jsonify({"realistic": {}, "variance": {}})
     max_rides = _req_max_rides()
     speed, walk_scalar = _req_speed()
     t0 = dt.datetime.now()
@@ -1081,6 +518,16 @@ def _geocode():
         return jsonify({"error": "not found"}), 404
     except (OSError, ValueError, KeyError):
         return jsonify({"error": "geocoding failed"}), 502
+    # Providers are SF-biased but not authoritative.  A valid upstream hit can still be in
+    # Oakland, Berkeley, water, or otherwise beyond the graph connector policy; reject it before
+    # the browser can submit it to /compute.  Malformed/nonfinite provider coordinates retain the
+    # API's ordinary bad-request contract rather than becoming a routing failure.
+    try:
+        lat, lon = _validate_geocoder_point(lat, lon)
+    except _OutsideSupportedArea as e:
+        return _outside_supported_area(e)
+    except _BadRequest as e:
+        return _bad_request(e)
     return jsonify({"lat": lat, "lon": lon, "label": label})
 
 
@@ -1098,25 +545,29 @@ def _autocomplete():
         results = geo.autocomplete(q, limit=6)
     except (OSError, ValueError, KeyError):
         return jsonify({"results": []})
-    return jsonify({"results": results})
+    # Keep upstream failures' existing empty-list behavior, but never present a suggestion that
+    # the coordinate-taking endpoints would reject.  Filter in response order and preserve the
+    # provider's labels/metadata for accepted entries.
+    supported = []
+    for result in results or ():
+        try:
+            _validate_geocoder_point(result["lat"], result["lon"])
+        except (_BadRequest, _OutsideSupportedArea, KeyError, TypeError):
+            continue
+        supported.append(result)
+        if len(supported) >= 6:
+            break
+    return jsonify({"results": supported})
 
 
 # ---- Page (built once at boot from the template + shared viz.js) -----------------------
 def _build_page():
     html = (HERE / "templates" / "index.html").read_text()
     viz = (HERE / "assets" / "viz.js").read_text()
-    # Tell the page which semantic it's serving so it can drop the (now meaningless) R5 "refine"
-    # affordance and frame everything as an arrive-by-09:00 estimate. arrive-by => map == the
-    # engine result, there is no separate exact pass to refine to.
-    _arriveby = USE_RAPTOR and RAPTOR_SEMANTIC == "arriveby"
-    _departafter = USE_RAPTOR and RAPTOR_SEMANTIC == "departafter"
-    # speedtoggle: the walk-speed control is fully wired under BOTH RAPTOR semantics now —
-    # arrive-by (map AND R5-free breakdown apply the scalar) and depart-after (the JVM-free
-    # forward tracer honors walk_scalar end-to-end, map + breakdown both). It stays OFF only
-    # for the legacy R5 stack (USE_RAPTOR=0 / USE_WALK_GRAPH=0), where the R5 breakdown would
-    # route at fixed 4.8 km/h while the map shifts — inconsistent numbers.
-    cfg = {"raptor": USE_RAPTOR, "arriveby": _arriveby, "departafter": _departafter,
-           "speedtoggle": USE_RAPTOR and USE_WALK_GRAPH,
+    _arriveby = RAPTOR_SEMANTIC == "arriveby"
+    _departafter = RAPTOR_SEMANTIC == "departafter"
+    cfg = {"raptor": True, "arriveby": _arriveby, "departafter": _departafter,
+           "speedtoggle": True,
            "timephrase": ("arriving by ~9:00am" if _arriveby
                           else (f"leaving ~{DEP:%-I:%M%p} — typical door-to-door".lower()
                                 if _departafter else f"leaving ~{DEP:%-I:%M%p}".lower()))}
@@ -1144,7 +595,6 @@ def _build_page():
 
 
 PAGE_HTML = _build_page()
-_BOOT_TS = time.time()
 
 
 @app.route("/")
@@ -1152,35 +602,65 @@ def _index():
     return PAGE_HTML
 
 
-@app.route("/healthz")
-def _healthz():
-    """Cheap, non-rate-limited liveness/readiness probe. Returns the engine + walk router state
-    + the modeled service date, so a monitor can alarm on (a) the engine never initializing or
-    (b) the GTFS feed having drifted past its validity window (svc_date won't update until the
-    server restarts after a feed re-pull)."""
-    body = {
-        "ok": _RAPTOR is not None or USE_RAPTOR is False,
-        "engine": "raptor" if USE_RAPTOR else "r5",
+def _safe_readiness_payload():
+    """Serialize only the immutable, API-safe readiness fields.
+
+    The direct validators already redact parser exceptions and paths.  Keep a second narrow
+    boundary here because the cached result is also an intentional test-injection seam.
+    """
+    result = _READINESS
+    reason_code = getattr(result, "reason_code", "runtime_load_failed")
+    if reason_code not in readiness.REASON_CODES:
+        reason_code = "runtime_load_failed"
+    body = {"ok": bool(getattr(result, "ready", False)), "reason_code": reason_code}
+    body.update({
+        "engine": "raptor",
         "semantic": RAPTOR_SEMANTIC,
-        "walk": "graph" if USE_WALK_GRAPH else "r5",
-        "svc_date": _SVC_DATE.isoformat() if _SVC_DATE else None,
-        "uptime_s": int(time.time() - _BOOT_TS),
-    }
-    # Benchmark-only aggregate telemetry. This is deliberately absent unless the process was
-    # explicitly booted with PERF_BENCHMARK_STATS=1: production health responses and attack
-    # surface stay unchanged, while a controlled latency run can correlate endpoint timings with
-    # current RSS and cache growth. Only aggregate counts/byte estimates/caps are exposed — never
-    # workplace keys/coordinates, route bodies, or labels. Deep byte walks are health-only and
-    # happen after cache roots have been snapshotted, so they never tax endpoint hot paths or hold
-    # an outer cache lock while traversing a large journey tree.
-    if os.environ.get("PERF_BENCHMARK_STATS", "").lower() in ("1", "true", "yes", "on"):
+        "walk": "graph",
+        "uptime_s": round(max(0.0, time.monotonic() - _BOOT_MONOTONIC), 3),
+    })
+    value = getattr(result, "service_date", None)
+    if isinstance(value, str) and len(value) == 8 and value.isdigit():
+        body["service_date"] = value
+        body["svc_date"] = dt.datetime.strptime(value, "%Y%m%d").date().isoformat()
+    detail = getattr(result, "detail", None)
+    if detail in readiness.DEFAULT_REQUIRED_FEEDS:
+        body["detail"] = detail
+    # Benchmark-only aggregate telemetry. This remains opt-in and is available only when the
+    # runtime is actually ready; it contains aggregate counts only, never paths or cache keys.
+    if body["ok"] and _perf_benchmark_enabled():
         body["benchmark"] = {
             "pid": os.getpid(),
             "rss_bytes": _benchmark_rss_bytes(),
             "cache_counts": _benchmark_cache_counts(),
             "cache_memory": _benchmark_cache_memory(),
         }
-    return jsonify(body)
+    return body
+
+
+@app.route("/livez", methods=["GET", "HEAD"], provide_automatic_options=False)
+def _livez():
+    """Cheap process liveness; never reads feeds, artifacts, or runtime caches."""
+    return jsonify({"ok": True, "reason_code": "process_alive"})
+
+
+@app.route("/readyz", methods=["GET", "HEAD"], provide_automatic_options=False)
+def _readyz():
+    body = _safe_readiness_payload()
+    return jsonify(body), (200 if body["ok"] else 503)
+
+
+@app.route("/healthz", methods=["GET", "HEAD"], provide_automatic_options=False)
+def _healthz():
+    """Compatibility alias for /readyz; both paths expose the exact same readiness payload."""
+    return _readyz()
+
+
+@app.errorhandler(405)
+def _method_not_allowed(e):
+    if request.path in {"/livez", "/readyz", "/healthz"}:
+        return jsonify({"ok": False, "reason_code": "method_not_allowed"}), 405
+    return e
 
 
 def _benchmark_lru_values(cache):
@@ -1198,12 +678,6 @@ def _benchmark_cache_counts():
     """Aggregate cache occupancy for PERF_BENCHMARK_STATS; never expose cache keys or values."""
     tree_entries = _benchmark_lru_values(sr._RAPTOR_TREE_CACHE)
     mc_entries = _benchmark_lru_values(sr._RAPTOR_MC_CACHE)
-    with _ITIN_CACHE_LOCK:
-        legacy_full_destinations = len(_ITIN_CACHE)
-        legacy_full_cells = sum(len(v) for v in _ITIN_CACHE.values())
-    with _CELL_CACHE_LOCK:
-        legacy_cell_destinations = len(_CELL_CACHE)
-        legacy_cell_entries = sum(len(v) for v in _CELL_CACHE.values())
 
     def _nested_count(entries, name):
         return sum(len((entry or {}).get(name) or {}) for entry in entries)
@@ -1213,10 +687,8 @@ def _benchmark_cache_counts():
         "raptor_tree_workplaces": len(tree_entries),
         "raptor_mc_workplaces": len(mc_entries),
         "walk_path_workplaces": len(sr._WALKPATH_TREE_CACHE),
-        "transfer_paths": len(sr._TRANSFER_PATH_CACHE),
         "egress_payload_bytes": sr._RAPTOR_EGRESS_CACHE.nbytes,
         "walk_path_payload_bytes": sr._WALKPATH_TREE_CACHE.nbytes,
-        "transfer_path_payload_bytes": sr._TRANSFER_PATH_CACHE.nbytes,
         "route_geometry_cells": _nested_count(tree_entries, "geom"),
         "best_route_geometry_cells": _nested_count(tree_entries, "geom5"),
         "planned_branch_cells": _nested_count(tree_entries, "branch_geom"),
@@ -1226,12 +698,6 @@ def _benchmark_cache_counts():
             (entry or {}).get("tree"))) for entry in tree_entries),
         "mc_alt_geometry_cells": _nested_count(mc_entries, "alt_geom"),
         "mc_typical_cells": _nested_count(mc_entries, "typ"),
-        "exact_result_workplaces": len(_EXACT_RESULT_CACHE),
-        "attribution_result_workplaces": len(_ATTR_RESULT_CACHE),
-        "legacy_full_itinerary_workplaces": legacy_full_destinations,
-        "legacy_full_itinerary_cells": legacy_full_cells,
-        "legacy_cell_itinerary_workplaces": legacy_cell_destinations,
-        "legacy_cell_itinerary_cells": legacy_cell_entries,
     }
 
 
@@ -1322,12 +788,6 @@ def _benchmark_outer_shadow(entries, nested, *, trees=False):
     return tuple(out)
 
 
-def _benchmark_mapping_values(mapping, lock):
-    """Snapshot ordinary cache values while holding their owner lock; never return keys."""
-    with lock:
-        return tuple(mapping.values())
-
-
 def _benchmark_cache_memory():
     """Opt-in shadow byte accounting for request-owned RAPTOR cache payloads.
 
@@ -1378,17 +838,10 @@ def _benchmark_cache_memory():
     egress_values = _benchmark_lru_values(sr._RAPTOR_EGRESS_CACHE)
     workplace_walk_values = _benchmark_lru_values(sr._WALKPATH_TREE_CACHE)
     cell_walk_values = _benchmark_lru_values(sr._CELL_WALKPATH_TREE_CACHE)
-    transfer_values = _benchmark_lru_values(sr._TRANSFER_PATH_CACHE)
-    exact_result_values = _benchmark_lru_values(_EXACT_RESULT_CACHE)
-    attribution_result_values = _benchmark_lru_values(_ATTR_RESULT_CACHE)
-    legacy_full_values = _benchmark_mapping_values(_ITIN_CACHE, _ITIN_CACHE_LOCK)
-    legacy_cell_values = _benchmark_mapping_values(_CELL_CACHE, _CELL_CACHE_LOCK)
 
     retained_roots = (
         tree_shadow, mc_shadow, scenario,
-        egress_values, workplace_walk_values, cell_walk_values, transfer_values,
-        exact_result_values, attribution_result_values,
-        legacy_full_values, legacy_cell_values,
+        egress_values, workplace_walk_values, cell_walk_values,
     )
     request_owned_retained_bytes = sr._owned_payload_nbytes(
         retained_roots, borrowed_root_ids=borrowed)
@@ -1399,21 +852,6 @@ def _benchmark_cache_memory():
             "max_entries": int(cache.maxsize),
             "accounted_payload_bytes": int(cache.nbytes),
             "max_bytes": cache.maxbytes,
-            "estimated_owned_bytes": sr._owned_payload_nbytes(
-                values, borrowed_root_ids=borrowed),
-        }
-
-    def retained_result(cache, values):
-        return {
-            "entries": len(values),
-            "max_entries": int(cache.maxsize),
-            "estimated_owned_bytes": sr._owned_payload_nbytes(
-                values, borrowed_root_ids=borrowed),
-        }
-
-    def retained_mapping(values):
-        return {
-            "entries": len(values),
             "estimated_owned_bytes": sr._owned_payload_nbytes(
                 values, borrowed_root_ids=borrowed),
         }
@@ -1447,15 +885,6 @@ def _benchmark_cache_memory():
             "raptor_egress": weighted(sr._RAPTOR_EGRESS_CACHE, egress_values),
             "workplace_walk_path": weighted(sr._WALKPATH_TREE_CACHE, workplace_walk_values),
             "cell_walk_path": weighted(sr._CELL_WALKPATH_TREE_CACHE, cell_walk_values),
-            "transfer_path": weighted(sr._TRANSFER_PATH_CACHE, transfer_values),
-        },
-        "result_cache": {
-            "exact": retained_result(_EXACT_RESULT_CACHE, exact_result_values),
-            "attribution": retained_result(_ATTR_RESULT_CACHE, attribution_result_values),
-        },
-        "legacy_itinerary_cache": {
-            "full": retained_mapping(legacy_full_values),
-            "cell": retained_mapping(legacy_cell_values),
         },
         # Tree/MC estimates include their nested payloads. Scenario is retained out-of-band and
         # therefore added separately. Weighted-cache totals stay separate to avoid implying that

@@ -1,13 +1,13 @@
 """GTFS feed helpers: route-name resolution, route shapes, and service-date picking.
 
-No r5py here, so importing this does not start the JVM.
+Importing this module only loads lightweight feed helpers; pandas remains lazy.
 """
 import io
 import zipfile
 import datetime as dt
 from pathlib import Path
 
-# pandas is imported LAZILY (it's ~44 MB): the JVM-free server precomputes this module's outputs
+# pandas is imported LAZILY (it's ~44 MB): the server precomputes this module's outputs
 # (line shapes + service date) into a static artifact and never calls these functions at runtime,
 # so importing `feeds` must not pull pandas. Call _pd() at the top of any function that needs it.
 pd = None
@@ -57,7 +57,7 @@ def load_routes(gtfs_paths):
 
 def route_name(route_id, feed, routes):
     """Feed-aware route name. `routes` is the map from load_routes(). Normalizes the
-    float-ish ids r5py hands back ('8.0' -> '8') and returns None for missing ids."""
+    float-ish feed ids ('8.0' -> '8') and returns None for missing ids."""
     if route_id is None or (isinstance(route_id, float) and route_id != route_id):  # None / NaN
         return None
     try:

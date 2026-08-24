@@ -8,8 +8,7 @@
 #   bash scripts/setup.sh
 #
 # Prerequisites (checked below): uv, osmium-tool, and a free 511.org API token.
-# Java/R5 is deliberately optional here: it is needed only for the separate
-# one-time raw-data seed described in README.md, not for the served JVM-free app.
+# The setup is fully graph-native and installs the complete supported runtime.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -82,9 +81,7 @@ else
 fi
 
 echo "  installing/updating Python dependencies..."
-# Keep this in sync with the public dependency manifest. r5py intentionally lives
-# in requirements-r5.txt, because the served map does not require a JVM once the
-# one-time bakes are available.
+# Keep this in sync with the public dependency manifest.
 uv pip install --python "$PY" -r "$ROOT/requirements.txt"
 ok "dependencies installed"
 
@@ -170,7 +167,7 @@ else
     err "osmium extract produced an empty osm_sf.pbf."
     exit 1
   fi
-  ok "osm_sf.pbf created ($(ls -lh "$DATA/osm_sf.pbf" | awk '{print $5}'))"
+  ok "osm_sf.pbf created ($(du -h "$DATA/osm_sf.pbf" | awk '{print $1}'))"
 fi
 
 # --- BART GTFS -----------------------------------------------------------
@@ -185,7 +182,7 @@ else
     "https://www.bart.gov/dev/schedules/google_transit.zip" \
     && mv "$DATA/bart_gtfs.zip.part" "$DATA/bart_gtfs.zip"
   if valid_gtfs_zip "$DATA/bart_gtfs.zip"; then
-    ok "bart_gtfs.zip downloaded ($(ls -lh "$DATA/bart_gtfs.zip" | awk '{print $5}'))"
+    ok "bart_gtfs.zip downloaded ($(du -h "$DATA/bart_gtfs.zip" | awk '{print $1}'))"
   else
     err "BART download is not a valid GTFS zip. First bytes:"
     head -c 200 "$DATA/bart_gtfs.zip" >&2; echo >&2
@@ -202,13 +199,13 @@ else
   echo "  fetching current Muni + Caltrain feeds from 511.org..."
   API511_TOKEN="$API511_TOKEN" bash "$ROOT/scripts/fetch_511.sh"
   if valid_gtfs_zip "$DATA/muni_current.zip"; then
-    ok "muni_current.zip ready ($(ls -lh "$DATA/muni_current.zip" | awk '{print $5}'))"
+    ok "muni_current.zip ready ($(du -h "$DATA/muni_current.zip" | awk '{print $1}'))"
   else
     err "Muni feed is not a valid GTFS zip after fetch_511.sh."
     exit 1
   fi
   if valid_gtfs_zip "$DATA/caltrain.zip"; then
-    ok "caltrain.zip ready ($(ls -lh "$DATA/caltrain.zip" | awk '{print $5}'))"
+    ok "caltrain.zip ready ($(du -h "$DATA/caltrain.zip" | awk '{print $1}'))"
   else
     err "Caltrain feed is not a valid GTFS zip after fetch_511.sh."
     exit 1
@@ -222,7 +219,7 @@ if valid_geojson "$DATA/sf_neighborhoods.geojson"; then
 else
   echo "  building from DataSF Realtor Neighborhoods + Find-Neighborhoods Chinatown/Japantown..."
   if "$PY" "$ROOT/scripts/build_neighborhoods.py" && valid_geojson "$DATA/sf_neighborhoods.geojson"; then
-    ok "sf_neighborhoods.geojson built ($(ls -lh "$DATA/sf_neighborhoods.geojson" | awk '{print $5}'))"
+    ok "sf_neighborhoods.geojson built ($(du -h "$DATA/sf_neighborhoods.geojson" | awk '{print $1}'))"
   else
     err "Neighborhoods build failed (scripts/build_neighborhoods.py)."
     exit 1
@@ -237,22 +234,14 @@ cat <<EOF
 Everything is installed and all input data is in data/.
 
 Next steps:
-  1. On a fresh clone, make the one-time R5 access seed, then the JVM-free walk bakes.
-     This requires JDK 21 but the served app does not:
-       uv pip install --python $PY -r requirements-r5.txt
-       ONLY_ACCESS=1 R5_MAX_MEMORY=4G $PY scripts/raptor_oracle.py
+  1. On a fresh clone, build the graph-native walking artifacts:
        bash scripts/fetch_dem.sh
        $PY scripts/build_walk_graph.py
        $PY scripts/bake_walk_access.py
 
-  2. Run the JVM-free interactive server:
+  2. Run the interactive server:
        $PY scripts/server.py
        # then open http://127.0.0.1:8000
 
-  3. Or generate the static outputs in out/:
-       $PY scripts/isochrone.py --tag full
-       $PY scripts/isochrone.py --gtfs muni_current.zip --tag munionly
-       $PY scripts/make_interactive.py     # builds out/commute_explorer.html
-
-See README.md for full usage and CLI flags.
+See README.md for full usage and server flags.
 EOF

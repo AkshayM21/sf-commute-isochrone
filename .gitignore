@@ -1,5 +1,5 @@
-# data + r5py network cache (downloaded inputs are large and may carry
-# address-derived scratch files; ignore the whole directory so nothing in it
+# data cache (downloaded inputs are large and may carry address-derived scratch files;
+# ignore the whole directory so nothing in it
 # can ever be accidentally committed)
 data/
 .venv/

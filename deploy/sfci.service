@@ -12,8 +12,11 @@ StartLimitBurst=5
 Type=simple
 User=sfci
 Group=sfci
-WorkingDirectory=/opt/sfci
+WorkingDirectory=/opt/sfci/current
 EnvironmentFile=/etc/sfci.env
+# Caddy and the deployment smoke contract both target 8000. The installer rejects any PORT entry
+# in /etc/sfci.env so this cannot be overridden.
+Environment=PORT=8000
 # Numba's @njit(cache=True) writes .nbc files next to the source by default. With our
 # ProtectSystem=strict, /opt/sfci is read-only -> the cache silently fails to persist and we
 # re-JIT (~10s for the parallel MC kernel) on every restart. Point it at a systemd-managed
@@ -27,11 +30,10 @@ Environment=TRUST_PROXY=1
 Environment=DEST_CACHE_FILE=/var/cache/sfci/dest_cache.json
 # Don't buffer print() output (so journalctl -f shows logs live).
 Environment=PYTHONUNBUFFERED=1
-# Precompile the real progressive request signatures on EVERY restart. This covers ordinary
-# push+restart deploys as well as first install, so changed Numba source is never compiled by the
-# first visitor. The child exits before the serving process starts and shares NUMBA_CACHE_DIR.
-ExecStartPre=/opt/sfci/.venv/bin/python scripts/warm_numba.py
-ExecStart=/opt/sfci/.venv/bin/python scripts/server.py
+# The bootstrap binds 127.0.0.1:8000 before importing the heavy runtime. /livez therefore proves
+# the serving process exists immediately, while /readyz stays 503 until data and routing are ready.
+# Candidate validation installs this same unit template with only current/port/unit-name replaced.
+ExecStart=/opt/sfci/current/.venv/bin/python scripts/bootstrap_server.py
 
 # Restart on any exit; the StartLimit{IntervalSec,Burst} pair in [Unit] above caps the loop.
 Restart=always
@@ -45,10 +47,11 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=sfci
 
-# Hardening -- Flask only needs the repo + tmp + the numba cache writable.
+# Hardening -- code and separately refreshed transit data are immutable to the serving process.
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/sfci/data /tmp
+ReadOnlyPaths=/opt/sfci/data-releases
+ReadWritePaths=/tmp
 CacheDirectory=sfci
 CacheDirectoryMode=0750
 ProtectHome=true

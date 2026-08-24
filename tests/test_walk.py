@@ -1,10 +1,9 @@
-"""Hill-aware JVM-free walk router tests (Phase B).
+"""Hill-aware graph-native walk-router tests.
 
-Validates the pedestrian graph built by scripts/build_walk_graph.py against R5's walk oracle and
-checks the load-bearing physics: walking is DIRECTIONAL (uphill is slower than downhill) and the
-grade-agnostic ('flat') weight reproduces R5's walk times (so the graph/snapping/Dijkstra are
-correct). Skips cleanly if data/walk_graph.npz (gitignored) or the R5 oracles are absent.
+The load-bearing physics are directional walking costs, graph snapping, and exact
+path-tree/geometry reuse. Small fixtures cover these contracts without external data.
 """
+import math
 import os
 import sys
 import threading
@@ -18,9 +17,7 @@ from scipy.sparse import csr_matrix
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
 sys.path.insert(0, os.path.join(_REPO, "scripts"))
-GOLDEN = os.path.join(_HERE, "raptor_golden")
 WALK_NPZ = os.path.join(_REPO, "data", "walk_graph.npz")
-CAP_REF = 30 * 60
 
 
 @pytest.fixture
@@ -51,6 +48,94 @@ def tiny_wg(tmp_path):
     return walk.WalkGraph.load(path)
 
 
+@pytest.fixture
+def disconnected_wg(tmp_path):
+    """Four-node graph with one isolated target for unreachable PathTree results."""
+    from core import walk
+
+    n = 4
+    lon = -122.5 + np.arange(n, dtype=np.float64) * 0.03
+    lat = np.full(n, 37.75, dtype=np.float64)
+    graph = csr_matrix(
+        ([70.0, 130.0], ([0, 1], [1, 0])), shape=(n, n), dtype=np.float64)
+    path = tmp_path / "disconnected_walk_graph.npz"
+    np.savez(
+        path,
+        node_lon=lon,
+        node_lat=lat,
+        node_elev=np.zeros(n, dtype=np.float32),
+        indptr=graph.indptr.astype(np.int32),
+        indices=graph.indices.astype(np.int32),
+        w_ref=graph.data.astype(np.float64),
+        w_flat=graph.data.astype(np.float64),
+        walk_ref_kmh=np.array(4.8),
+    )
+    return walk.WalkGraph.load(path)
+
+
+@pytest.fixture
+def route_wg(tmp_path):
+    """Line graph with wide node spacing so graph paths beat direct snap connectors."""
+    from core import walk
+
+    n = 10
+    lon = -122.5 + np.arange(n, dtype=np.float64) * 0.01
+    lat = np.full(n, 37.75, dtype=np.float64)
+    rows, cols, weights = [], [], []
+    for i in range(n - 1):
+        rows.extend((i, i + 1))
+        cols.extend((i + 1, i))
+        weights.extend((70.0, 130.0))
+    graph = csr_matrix((weights, (rows, cols)), shape=(n, n))
+    path = tmp_path / "route_walk_graph.npz"
+    np.savez(
+        path,
+        node_lon=lon,
+        node_lat=lat,
+        node_elev=np.zeros(n, dtype=np.float32),
+        indptr=graph.indptr.astype(np.int32),
+        indices=graph.indices.astype(np.int32),
+        w_ref=graph.data.astype(np.float64),
+        w_flat=graph.data.astype(np.float64),
+        walk_ref_kmh=np.array(4.8),
+    )
+    return walk.WalkGraph.load(path)
+
+
+def test_walk_graph_support_policy_uses_nearest_connector_boundary(tiny_wg):
+    lon = float(tiny_wg.lon[0])
+    lat = float(tiny_wg.lat[0])
+    max_m = tiny_wg.MAX_CONNECTOR_M
+
+    assert max_m == 300.0
+    assert tiny_wg.nearest_distance_m(lon, lat) == pytest.approx(0.0)
+    assert tiny_wg.supports_point(lon, lat, max_connector_m=0.0)
+
+    # Query west of the first node so no other tiny-fixture node can make the boundary nearer.
+    inside_lon = lon - (max_m - 0.1) / tiny_wg.mlon
+    outside_lon = lon - (max_m + 0.1) / tiny_wg.mlon
+    assert tiny_wg.nearest_distance_m(inside_lon, lat) == pytest.approx(max_m - 0.1, abs=1e-6)
+    assert tiny_wg.supports_point(inside_lon, lat)
+    assert not tiny_wg.supports_point(outside_lon, lat)
+
+
+@pytest.mark.parametrize(
+    "lon, lat",
+    [(None, 37.75), ("not-a-number", 37.75), (np.nan, 37.75),
+     (-122.5, np.inf), (181.0, 37.75), (-122.5, -91.0)],
+)
+def test_walk_graph_support_policy_rejects_malformed_or_nonfinite_points(tiny_wg, lon, lat):
+    assert not tiny_wg.supports_point(lon, lat)
+    assert math.isinf(tiny_wg.nearest_distance_m(lon, lat))
+
+
+def test_walk_graph_support_policy_rejects_invalid_thresholds(tiny_wg):
+    lon = float(tiny_wg.lon[0])
+    lat = float(tiny_wg.lat[0])
+    for threshold in (-1.0, np.nan, np.inf, "bad"):
+        assert not tiny_wg.supports_point(lon, lat, threshold)
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_path_tree_distances_exactly_match_one_to_many_at_caller_caps(tiny_wg, reverse):
     """One max-cap PathTree must reproduce the old separately-capped Dijkstras byte-for-byte."""
@@ -70,10 +155,100 @@ def test_path_tree_distances_exactly_match_one_to_many_at_caller_caps(tiny_wg, r
         tree.distances_to(nodes[:, 0], conn[:, 0], 300)
 
 
+def test_path_tree_route_result_uses_one_argmin_for_duration_and_geometry(route_wg):
+    root = (float(route_wg.lon[0]), float(route_wg.lat[0]))
+    target = (float(route_wg.lon[3]), float(route_wg.lat[3]))
+    nodes, conn = route_wg.snap([target])
+    expected = route_wg.one_to_many(root, nodes, conn, 1200)[0]
+    tree = route_wg.path_tree(root, 1200)
+
+    result = tree.route_result(target)
+
+    assert result is not None
+    assert result.seconds == pytest.approx(expected)
+    assert result.points == tree.path_points(target)
+    assert result.points[0] == [round(float(route_wg.lat[0]), 6), round(float(route_wg.lon[0]), 6)]
+    assert result.points[-1] == [round(float(route_wg.lat[3]), 6), round(float(route_wg.lon[3]), 6)]
+
+    # Each call owns its point list; a rendered response cannot mutate the next result.
+    again = tree.route_result(target)
+    result.points.append([0.0, 0.0])
+    assert again.points == tree.path_points(target)
+
+
+def test_path_tree_route_result_preserves_directed_forward_and_reverse_semantics(route_wg):
+    node0 = (float(route_wg.lon[0]), float(route_wg.lat[0]))
+    node2 = (float(route_wg.lon[2]), float(route_wg.lat[2]))
+
+    forward = route_wg.path_tree(node0, 1200).route_result(node2)
+    reverse = route_wg.path_tree(node0, 1200, reverse=True).route_result(node2)
+
+    assert forward is not None and reverse is not None
+    assert forward.seconds == pytest.approx(140.0)
+    assert reverse.seconds == pytest.approx(260.0)
+    assert forward.points == [
+        [round(float(route_wg.lat[i]), 6), round(float(route_wg.lon[i]), 6)]
+        for i in (0, 1, 2)
+    ]
+    assert reverse.points == [
+        [round(float(route_wg.lat[i]), 6), round(float(route_wg.lon[i]), 6)]
+        for i in (2, 1, 0)
+    ]
+
+
+def test_path_tree_route_result_includes_exact_connectors_in_walking_order(route_wg):
+    source = (float(route_wg.lon[0] - 0.00013), float(route_wg.lat[0] + 0.00011))
+    target = (float(route_wg.lon[3] + 0.00017), float(route_wg.lat[3] - 0.00009))
+    source_point = [round(source[1], 6), round(source[0], 6)]
+    target_point = [round(target[1], 6), round(target[0], 6)]
+    source_node = [round(float(route_wg.lat[0]), 6), round(float(route_wg.lon[0]), 6)]
+    target_node = [round(float(route_wg.lat[3]), 6), round(float(route_wg.lon[3]), 6)]
+
+    forward = route_wg.path_tree(source, 1200).route_result(target)
+    reverse = route_wg.path_tree(target, 1200, reverse=True).route_result(source)
+
+    assert forward is not None and reverse is not None
+    assert forward.seconds == pytest.approx(reverse.seconds)
+    assert forward.points == reverse.points
+    assert forward.points[:2] == [source_point, source_node]
+    assert forward.points[-2:] == [target_node, target_point]
+
+    # Exact endpoints are added only when they differ from the chosen graph nodes.
+    on_node = route_wg.path_tree(
+        (float(route_wg.lon[0]), float(route_wg.lat[0])), 1200
+    ).route_result((float(route_wg.lon[3]), float(route_wg.lat[3])))
+    assert on_node.points[0] == source_node
+    assert on_node.points[-1] == target_node
+    assert on_node.points.count(source_node) == 1
+    assert on_node.points.count(target_node) == 1
+
+
+@pytest.mark.parametrize(
+    "target",
+    [(np.nan, 37.75), (-122.5, np.inf), (181.0, 37.75), (-122.5, -91.0), ("bad", 0)],
+)
+def test_path_tree_route_result_rejects_invalid_wgs84_target(route_wg, target):
+    root = (float(route_wg.lon[0]), float(route_wg.lat[0]))
+    assert route_wg.path_tree(root, 1200).route_result(target) is None
+
+
+def test_path_tree_route_result_rejects_invalid_wgs84_root(route_wg):
+    invalid_root = (181.0, float(route_wg.lat[0]))
+    target = (float(route_wg.lon[2]), float(route_wg.lat[2]))
+    assert route_wg.path_tree(invalid_root, 1e9).route_result(target) is None
+
+
+def test_path_tree_route_result_returns_none_for_unreachable_target(disconnected_wg):
+    root = (float(disconnected_wg.lon[0]), float(disconnected_wg.lat[0]))
+    target = (float(disconnected_wg.lon[2]), float(disconnected_wg.lat[2]))
+    tree = disconnected_wg.path_tree(root, 1200)
+
+    assert tree.route_result(target) is None
+
+
 def _install_tiny_server_walk(monkeypatch, wg, stop_nodes, stop_conn, cell_nodes, cell_conn):
     from core import server_raptor as sr
 
-    monkeypatch.setattr(sr, "USE_WALK_GRAPH", True)
     monkeypatch.setattr(sr, "_WG", wg)
     monkeypatch.setattr(sr, "_WG_STOP_NODES", stop_nodes)
     monkeypatch.setattr(sr, "_WG_STOP_CONN", stop_conn)
@@ -128,50 +303,37 @@ def test_raptor_walk_arrays_and_geometry_reuse_one_reverse_tree(monkeypatch, tin
     assert len(calls) == 1
 
 
-def test_transfer_geometry_is_graph_scoped_cached_and_returned_isolated(monkeypatch, tiny_wg):
-    """Repeated route branches must share one short directed Dijkstra without sharing mutation."""
+def test_transfer_geometry_uses_baked_directed_path_and_returns_isolated_output(monkeypatch):
+    """Transfer timing and drawing use one directed baked edge; no graph routing is available."""
     from core import server_raptor as sr
 
     source, target = 2, 5
-    stop_lat = np.array(tiny_wg.lat, dtype=float)
-    stop_lon = np.array(tiny_wg.lon, dtype=float)
-    monkeypatch.setattr(sr, "_WG", tiny_wg)
+    engine = SimpleNamespace(
+        data={
+            # Geometry uses the forward source -> target view; RAPTOR's timing
+            # uses the reverse target -> source row for the same one-way edge.
+            "tr_forward_off": np.array([0, 0, 0, 1, 1, 1, 1], dtype=np.int64),
+            "tr_forward_to": np.array([target], dtype=np.int32),
+            "tr_off": np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.int64),
+            "tr_to": np.array([source], dtype=np.int32),
+            "tr_time": np.array([42], dtype=np.int64),
+        },
+        transfer_path_off=np.array([0, 3], dtype=np.int64),
+        transfer_path_points=np.array([[37.0, -122.0], [37.01, -122.01],
+                                       [37.02, -122.02]], dtype=np.float64),
+        transfer_path_fallback=np.array([False]),
+    )
+    monkeypatch.setattr(sr, "_WG", object())
     monkeypatch.setattr(
-        sr, "_RAPTOR",
-        SimpleNamespace(data={"stop_lat": stop_lat, "stop_lon": stop_lon}))
-    cache = sr.BoundedLRU(16, maxbytes=64 * 1024, weight_fn=sr._transfer_path_weight)
-    monkeypatch.setattr(sr, "_TRANSFER_PATH_CACHE", cache)
-    original_path_tree = tiny_wg.path_tree
-    calls = []
-
-    def counted_path_tree(*args, **kwargs):
-        calls.append((args, kwargs))
-        return original_path_tree(*args, **kwargs)
-
-    monkeypatch.setattr(tiny_wg, "path_tree", counted_path_tree)
+        sr, "_RAPTOR", engine)
     provider = sr._JourneyGeomProvider(37.77, -122.42)
     first = provider.transfer(source, target)
-    expected = first[0][:]
+    assert first == ([[37.0, -122.0], [37.01, -122.01], [37.02, -122.02]], False)
+    assert engine.data["tr_time"][sr._baked_transfer_edge(engine, source, target)] == 42
     first[0].append([0.0, 0.0])
     second = provider.transfer(source, target)
-
-    assert second[0] == expected
-    assert len(calls) == 1
-    assert len(cache) == 1
-    assert 0 < cache.nbytes <= cache.maxbytes
-
-    # Direction is part of the key and can be asymmetric on the hill-aware graph.
-    provider.transfer(target, source)
-    assert len(calls) == 2
-    assert len(cache) == 2
-
-    cache.clear(); calls.clear()
-    provider.prefetch_transfers([(source, target), (source, 8), (source, target)])
-    assert len(calls) == 1                               # one source tree, two target paths
-    assert len(cache) == 2
-    provider.transfer(source, target)
-    provider.transfer(source, 8)
-    assert len(calls) == 1                               # both reads hit sealed pair cache
+    assert second == ([[37.0, -122.0], [37.01, -122.01], [37.02, -122.02]], False)
+    assert provider.transfer(target, source) == ([], False)
 
 
 def _install_cell_access_provider(monkeypatch, tiny_wg):
@@ -343,12 +505,6 @@ def wg():
     return walk.WalkGraph.load()
 
 
-def _oracles():
-    if not os.path.isdir(GOLDEN):
-        return []
-    return sorted(f for f in os.listdir(GOLDEN) if f.startswith("oracle_") and f.endswith(".npz"))
-
-
 def test_walk_graph_sane(wg):
     assert len(wg.lon) > 100_000                      # SF pedestrian graph is large
     assert len(wg.indices) == len(wg.w_ref) == len(wg.w_flat)
@@ -373,44 +529,3 @@ def test_walk_is_directional_uphill_slower(wg):
     assert up.mean() > down.mean(), "uphill is not slower than downhill (model not directional)"
     # a directed edge and its reverse must differ on steep ground (asymmetry, not symmetric cost)
     assert ratio[slope > 0.12].mean() > ratio[(slope < -0.12) & (slope > -0.25)].mean()
-
-
-@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
-def test_walk_flat_matches_r5(wg):
-    """FLAT (grade-agnostic) W->stops reproduces R5's walk matrix within tolerance — validates the
-    OSM parse + snapping + Dijkstra (mechanics), independent of the hill model."""
-    from core import raptor_build
-    data = raptor_build.load_or_build(verbose=False)
-    slat, slon = data["stop_lat"], data["stop_lon"]
-    gids = np.where(~np.isnan(slat))[0]
-    snode, sconn = wg.snap(np.column_stack((slon[gids], slat[gids])))
-    gpos = {int(g): i for i, g in enumerate(gids)}
-    err = []
-    for f in _oracles():
-        z = np.load(os.path.join(GOLDEN, f), allow_pickle=True)
-        flat = wg.one_to_many((float(z["lon"]), float(z["lat"])), snode, sconn, CAP_REF, flat=True)
-        for g, r5 in zip(np.asarray(z["egress_g"]), np.asarray(z["egress_w"])):
-            i = gpos.get(int(g))
-            if i is not None and np.isfinite(flat[i]):
-                err.append(flat[i] - float(r5))
-    err = np.array(err)
-    print(f"\n[walk flat vs R5] MAE={np.abs(err).mean():.1f}s bias={err.mean():+.1f}s n={len(err)}")
-    assert np.abs(err).mean() <= 45, f"flat walk MAE {np.abs(err).mean():.0f}s > 45s"
-    assert abs(err.mean()) <= 25, f"flat walk bias {err.mean():+.0f}s > 25s"
-
-
-@pytest.mark.skipif(not _oracles(), reason="no R5 oracles in tests/raptor_golden/")
-def test_walk_hill_geq_flat(wg):
-    """The hill weight is never faster than flat on net-uphill trips and is >= R5 on steep ground
-    (the intended, more-accurate divergence)."""
-    from core import raptor_build
-    data = raptor_build.load_or_build(verbose=False)
-    slat, slon = data["stop_lat"], data["stop_lon"]
-    gids = np.where(~np.isnan(slat))[0]
-    snode, sconn = wg.snap(np.column_stack((slon[gids], slat[gids])))
-    z = np.load(os.path.join(GOLDEN, _oracles()[0]), allow_pickle=True)
-    flat = wg.one_to_many((float(z["lon"]), float(z["lat"])), snode, sconn, CAP_REF, flat=True)
-    hill = wg.one_to_many((float(z["lon"]), float(z["lat"])), snode, sconn, CAP_REF, flat=False)
-    m = np.isfinite(flat) & np.isfinite(hill)
-    # over many stops the hill model is, on net, >= flat (uphill penalties dominate gentle descents)
-    assert hill[m].mean() >= flat[m].mean()

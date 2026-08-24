@@ -8,31 +8,32 @@ route geometry. The thin Flask route handlers stay in scripts/server.py and call
 
 IMPORT BOUNDARY (no cycle): this module imports ONLY from ``core`` (config, geo helpers, the
 RAPTOR engine, the journey tracer) — NEVER from ``server``. ``server.py`` imports THIS module,
-parses the boot context (GTFS, grid, optional R5 network), and calls ``init(...)`` once to hand
-the resolved engine + walk-graph + R5 deps over. After ``init`` the builders read this module's
-own globals.
+parses the boot context (GTFS, grid, and graph), and calls ``init(...)`` once to hand the
+resolved engine and walk graph over. After ``init`` the builders read this module's own globals.
 
-JVM-FREE INVARIANT: this module must NOT import r5py / jpype / com.conveyal. The only R5 use
-on the RAPTOR map path (the USE_WALK_GRAPH=0 fallback in ``raptor_egress_purewalk``) goes
-through the ``network`` module reference INJECTED by ``init`` — server.py imports r5py there,
-not here.
-
-The shared flags (USE_RAPTOR / RAPTOR_SEMANTIC / USE_WALK_GRAPH / RAPTOR_MC / DEFAULT_MAX_RIDES
-/ DEFAULT_SPEED / WALK_SPEEDS) are parsed HERE at import time (pure env reads, JVM-free) so they
-have ONE source of truth; server.py re-exports them. ``USE_RAPTOR`` / ``USE_WALK_GRAPH`` can be
-toggled off by server.py's boot (missing bakes / engine-init failure) via ``set_flags`` — the
-final values flow back so /healthz and the page reflect what actually loaded.
+The production runtime has one mandatory in-process engine and no fallback state.
+RAPTOR semantic/Monte-Carlo settings are read once at import time, and the graph-backed walking
+router is mandatory at boot.
 """
 import os
-import copy
 import json
 import math
-import sys
 import threading
 import time
 from collections import OrderedDict
 
 from . import config
+from . import route_choice_primitives
+from . import route_identity
+from . import route_selection
+from . import route_hydration
+from .runtime_cache import (
+    BoundedCellCache,
+    BoundedLRU,
+    _array_tuple_weight,
+    _owned_payload_nbytes,
+    _walkpath_tree_weight,
+)
 
 
 # Request handlers pass an ordinary short-lived dict when benchmark phase telemetry is enabled.
@@ -43,19 +44,12 @@ def _perf_add(perf, name, started):
     if perf is not None and started is not None:
         perf[name] = round((time.perf_counter() - started) * 1000.0, 3)
 
-# ---- Shared flags (parsed EARLY: they decide whether the in-process JVM starts at all) ----
-# THE DEFAULT IS THE JVM-FREE STACK: USE_RAPTOR + USE_WALK_GRAPH + DEPART-AFTER scheduled + the
-# service-noise overlay. R5/the JVM is no longer loaded by default. The default SEMANTIC flipped
-# arrive-by -> depart-after on 2026-06-17. The served depart-after read is now anchored on the first
-# vehicle you choose to board, so controllable pre-board wait is not counted and walk speed is
-# monotone by construction. Opt INTO arrive-by-09:00 with RAPTOR_SEMANTIC=arriveby. Opt back into
-# the legacy R5 path with USE_RAPTOR=0 (and/or USE_WALK_GRAPH=0 for the R5 walk matrix).
-USE_RAPTOR = os.environ.get("USE_RAPTOR", "1").lower() in ("1", "true", "yes", "on")
+# ---- RAPTOR settings --------------------------------------------------------------------
+# The default semantic is depart-after. Opt into arrive-by-09:00 with RAPTOR_SEMANTIC=arriveby.
 RAPTOR_SEMANTIC = os.environ.get("RAPTOR_SEMANTIC", "departafter").lower()
 RAPTOR_MC = os.environ.get("RAPTOR_MC", "1").lower() in ("1", "true", "yes", "on")
-USE_WALK_GRAPH = os.environ.get("USE_WALK_GRAPH", "1").lower() in ("1", "true", "yes", "on")
 
-DEFAULT_MAX_RIDES = 8                             # R5's ride cap (rides = transfers + 1)
+DEFAULT_MAX_RIDES = 8                             # model ride cap (rides = transfers + 1)
 RAPTOR_ALT_CHIP_CAP = int(os.environ.get("RAPTOR_ALT_CHIP_CAP", "6"))
 RAPTOR_ALT_TRACE_CAP = int(os.environ.get("RAPTOR_ALT_TRACE_CAP",
                                           str(max(RAPTOR_ALT_CHIP_CAP, RAPTOR_ALT_CHIP_CAP * 3))))
@@ -85,219 +79,6 @@ def _resolve_walk_speed(speed=DEFAULT_SPEED, walk_scalar=None):
     return speed, float(walk_scalar)
 
 
-def set_flags(**kw):
-    """Let server.py's boot push back the FINAL flag values (e.g. USE_WALK_GRAPH forced off
-    because the bakes are missing, or USE_RAPTOR off after an engine-init failure) so this
-    module's builders + the re-exported copies stay consistent with what actually loaded."""
-    g = globals()
-    for k, v in kw.items():
-        g[k] = v
-
-
-# ---- Bounded LRU for the workplace-keyed caches ----------------------------------------
-class BoundedLRU:
-    """Thread-safe bounded LRU — the ONE eviction implementation behind every workplace-keyed
-    cache below (result/egress/tree/MC; previously four hand-rolled lock+move_to_end+popitem
-    copies). ``copy_mode`` preserves each cache's load-bearing copy policy (cache-poisoning
-    fixes from a past audit — do NOT weaken when adding a cache):
-      None      — hand out the stored object itself (caller must treat it as immutable,
-                  e.g. the egress tuple of numpy arrays);
-      'shallow' — store as-is, return ``dict(value)`` on get (callers can't reassign the
-                  cached entry's keys; the values themselves stay shared);
-      'deep'    — deepcopy on put AND get (full isolation for mutable JSON-able results).
-    The lock is REENTRANT and exposed as ``.lock`` so composite check-then-act sections
-    (the MC in-flight registry) and the tests' clear/pop-under-lock pattern can wrap several
-    operations atomically without deadlocking on the methods' own acquisition."""
-
-    def __init__(self, maxsize, copy_mode=None, lock=None, *, maxbytes=None, weight_fn=None):
-        self.maxsize = int(maxsize)
-        self._copy_mode = copy_mode
-        self.maxbytes = None if maxbytes is None else max(0, int(maxbytes))
-        self._weight_fn = weight_fn
-        self._od = OrderedDict()
-        self._weights = {}
-        self._bytes = 0
-        self.lock = lock if lock is not None else threading.RLock()
-
-    def _out(self, value):
-        if self._copy_mode == "deep":
-            return copy.deepcopy(value)
-        if self._copy_mode == "shallow":
-            return dict(value)
-        return value
-
-    def get(self, key, default=None):
-        with self.lock:
-            if key in self._od:
-                self._od.move_to_end(key)
-                return self._out(self._od[key])
-        return default
-
-    def put(self, key, value):
-        with self.lock:
-            stored = copy.deepcopy(value) if self._copy_mode == "deep" else value
-            weight = (max(0, int(self._weight_fn(stored)))
-                      if self._weight_fn is not None else 0)
-            if key in self._od:
-                self._bytes -= self._weights.pop(key, 0)
-            self._od[key] = stored
-            self._weights[key] = weight
-            self._bytes += weight
-            self._od.move_to_end(key)
-            while (len(self._od) > self.maxsize
-                   or (self.maxbytes is not None and self._bytes > self.maxbytes)):
-                old_key, _old_value = self._od.popitem(last=False)
-                self._bytes -= self._weights.pop(old_key, 0)
-
-    def pop(self, key, default=None):
-        with self.lock:
-            if key not in self._od:
-                return default
-            self._bytes -= self._weights.pop(key, 0)
-            return self._od.pop(key)
-
-    def clear(self):
-        with self.lock:
-            self._od.clear()
-            self._weights.clear()
-            self._bytes = 0
-
-    def __contains__(self, key):
-        with self.lock:
-            return key in self._od
-
-    def __len__(self):
-        with self.lock:
-            return len(self._od)
-
-    @property
-    def nbytes(self):
-        """Current caller-supplied payload weight (bookkeeping objects excluded)."""
-        with self.lock:
-            return self._bytes
-
-
-class BoundedCellCache(dict):
-    """Insertion-ordered bounded mapping for lazy per-cell response fragments.
-
-    Reads deliberately do not refresh order: Flask can read these without taking the mutation
-    locks, while every write already happens under ``_GEOM_LOCK``, ``_ALT_LOCK``, or ``_TYP_LOCK``.
-    FIFO eviction is deterministic and bounds adversarial citywide poking just as effectively as an
-    LRU; the browser separately keeps the actively selected route in its own protected LRU.
-    """
-
-    def __init__(self, maxsize):
-        super().__init__()
-        self.maxsize = max(1, int(maxsize))
-
-    def __setitem__(self, key, value):
-        if key not in self and len(self) >= self.maxsize:
-            del self[next(iter(self))]
-        super().__setitem__(key, value)
-
-
-def _owned_payload_nbytes(root, *, borrowed_root_ids=frozenset()):
-    """Conservatively estimate bytes retained below an owned cache root.
-
-    This is intentionally a *shadow telemetry* estimator, not an eviction weight.  It runs only
-    when the opt-in benchmark health payload asks for it, so normal request/cache mutation paths
-    pay no traversal cost.  Identity de-duplication keeps shared geometry aliases from being
-    charged twice within one estimate.  ``borrowed_root_ids`` is an explicit set of identities
-    owned elsewhere (the process-static engine/feed/walk graph, for example); excluded roots and
-    everything reachable only through them contribute zero.
-
-    NumPy arrays are detected without importing NumPy at module import time.  An owning array is
-    charged at least payload + a conservative header; a view is charged its own header and walks
-    its ``base`` chain.  Thus distinct views onto one allocation contribute their individual
-    headers but the backing allocation only once, while two aliases of the same array object are
-    also counted once.  This keeps the aggregate useful as a real retained-memory budget instead
-    of charging one shared ndarray buffer for every cached view.
-    JSON-like containers, strings/bytes/scalars, ordinary ``__dict__`` objects, and slotted known
-    payload objects (notably ``MonteCarloScenario``) are all handled.  Unknown opaque objects are
-    charged their interpreter-reported size only.
-    """
-    borrowed = frozenset(int(ident) for ident in borrowed_root_ids)
-    seen = set()
-
-    def visit(item):
-        ident = id(item)
-        if ident in borrowed or ident in seen:
-            return 0
-        seen.add(ident)
-        try:
-            shallow = max(0, int(sys.getsizeof(item)))
-        except (TypeError, ValueError, OverflowError):
-            shallow = 0
-
-        module = getattr(item.__class__, "__module__", "")
-        nbytes = None
-        if module.startswith("numpy"):
-            try:
-                nbytes = getattr(item, "nbytes", None)
-            except (AttributeError, TypeError, ValueError):
-                nbytes = None
-        if nbytes is not None:
-            try:
-                payload = max(0, int(nbytes))
-            except (TypeError, ValueError, OverflowError):
-                payload = 0
-            base = getattr(item, "base", None)
-            if base is not None:
-                # NumPy views often expose another ndarray view as ``base``.  Walk that chain so
-                # every distinct view keeps its small header charge, but the final allocation is
-                # reached (and identity-deduped) exactly once.  If the base is explicitly
-                # process-borrowed, ``visit`` returns zero and this owned view still contributes
-                # its header -- precisely the retained object this cache owns.
-                return shallow + visit(base)
-            return max(shallow, payload + 128)
-
-        if isinstance(item, memoryview):
-            return shallow + max(0, int(getattr(item, "nbytes", 0)))
-        if isinstance(item, dict):
-            try:
-                pairs = list(item.items())
-            except RuntimeError:
-                # A health read can overlap a lazy nested-cache insertion. The outer cache roots
-                # were snapshotted under their locks; if a nested mapping changes during this
-                # best-effort shadow walk, retain the safe container charge and try again next poll.
-                return shallow
-            return shallow + sum(visit(key) + visit(value) for key, value in pairs)
-        if isinstance(item, (list, tuple, set, frozenset)):
-            try:
-                values = list(item)
-            except RuntimeError:
-                return shallow
-            return shallow + sum(visit(value) for value in values)
-        if isinstance(item, (str, bytes, bytearray, bool, int, float, complex, type(None))):
-            return shallow
-
-        try:
-            attrs = getattr(item, "__dict__", None)
-        except (AttributeError, TypeError, ValueError):
-            attrs = None
-        if attrs is not None:
-            return shallow + visit(attrs)
-
-        # Slotted objects do not have a __dict__. Walk slots across the MRO so the retained MC
-        # scenario's arrays are visible without giving special weight semantics to its class.
-        total = shallow
-        for cls in getattr(item.__class__, "__mro__", ()):
-            slots = getattr(cls, "__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            for name in slots:
-                if name in ("__dict__", "__weakref__"):
-                    continue
-                try:
-                    value = getattr(item, name)
-                except (AttributeError, TypeError):
-                    continue
-                total += visit(value)
-        return total
-
-    return max(0, int(visit(root)))
-
-
 def _benchmark_borrowed_root_ids():
     """Identities of process-static roots excluded from cache-owned benchmark estimates.
 
@@ -307,9 +88,9 @@ def _benchmark_borrowed_root_ids():
     absent and therefore charged to their cache roots.
     """
     roots = [
-        _RAPTOR, _WG, _RAPTOR_STOPS, _RAPTOR_CELL_POS,
+        _RAPTOR, _WG,
         _WG_STOP_NODES, _WG_STOP_CONN, _WG_CELL_NODES, _WG_CELL_CONN, _WG_STOP_GIDS,
-        ORIGIN_LL, _NETWORK, _NET, _SNAPPED_GRID,
+        ORIGIN_LL,
     ]
     engine = _RAPTOR
     if engine is not None:
@@ -331,64 +112,24 @@ def _benchmark_borrowed_root_ids():
     return frozenset(id(root) for root in roots if not isinstance(root, primitive))
 
 
-def _array_tuple_weight(value):
-    """Payload bytes for tuples/lists/dicts made primarily of numpy arrays."""
-    seen = set()
-
-    def visit(item):
-        ident = id(item)
-        if ident in seen:
-            return 0
-        seen.add(ident)
-        nbytes = getattr(item, "nbytes", None)
-        if nbytes is not None and item.__class__.__module__.startswith("numpy"):
-            return int(nbytes) + 128
-        if isinstance(item, dict):
-            return 64 + sum(visit(k) + visit(v) for k, v in item.items())
-        if isinstance(item, (list, tuple)):
-            return 64 + sum(visit(v) for v in item)
-        return 64
-
-    return visit(value)
-
-
-def _walkpath_tree_weight(tree):
-    """Owned predecessor/distance payload only; the referenced WalkGraph is process-global."""
-    return 1024 + sum(int(getattr(getattr(tree, name, None), "nbytes", 0))
-                      for name in ("_snodes", "_dist", "_pred"))
-
-
 class Busy(Exception):
     """Raised when a heavy full-grid build is needed but its lock is already held; the route
     turns this into a 503 instead of blocking behind the running job."""
 
 
 # ---- RAPTOR engine state (populated by init() at boot) --------------------------------
-# When USE_WALK_GRAPH the walk-baked (slope-aware) access table + the JVM-free walk router serve
-# the whole map path; otherwise R5 stays in-process for the walk matrix (and, under departafter,
-# the R5 hover/color-by-line).
 _RAPTOR = None
-_RAPTOR_STOPS = None             # GeoDataFrame of stop coords keyed by gid (egress destinations)
-_RAPTOR_CELL_POS = None          # cell id -> engine cell index (R5 egress alignment)
-_WG = None                       # WalkGraph (JVM-free) when USE_WALK_GRAPH
+_WG = None
 _WG_STOP_NODES = _WG_STOP_CONN = _WG_CELL_NODES = _WG_CELL_CONN = None
-_WG_STOP_GIDS = None             # gids aligned to _WG_STOP_NODES rows
+_WG_STOP_GIDS = None
 
-# Boot context injected by server.py (the geo/R5 deps used only by the USE_WALK_GRAPH=0
-# fallback in raptor_egress_purewalk — server.py imports r5py, not this module).
+# Boot context injected by server.py.
 ORIGIN_LL = None                 # {cellId: (lat, lon)}
-_NEED_R5 = True                  # mirrors server's _NEED_R5 (true unless fully JVM-free)
-_NETWORK = None                  # core.network module (r5py) — only on the R5 fallback path
-_NET = None                      # the warm R5 network
-_SNAPPED_GRID = None             # snapped grid GeoDataFrame (R5 pure-walk matrix)
-_DEP = None                      # model departure datetime
 
 
-def init(*, raptor, raptor_stops, raptor_cell_pos, wg, wg_stop_nodes, wg_stop_conn,
-         wg_cell_nodes, wg_cell_conn, wg_stop_gids, origin_ll, need_r5, network=None,
-         net=None, snapped_grid=None, dep=None):
-    """Hand the boot-resolved RAPTOR engine + walk-graph snap tables (+ the R5 deps for the
-    USE_WALK_GRAPH=0 fallback) to this module.
+def init(*, raptor, wg, wg_stop_nodes, wg_stop_conn, wg_cell_nodes, wg_cell_conn,
+         wg_stop_gids, origin_ll):
+    """Hand the boot-resolved RAPTOR engine + walk-graph snap tables to this module.
 
     This is a boot/test-only, quiescent transition — it is not a live graph reload primitive.
     Refuse to replace module state while any request-owned build is in flight; clearing those
@@ -413,7 +154,6 @@ def init(*, raptor, raptor_stops, raptor_cell_pos, wg, wg_stop_nodes, wg_stop_co
     _RAPTOR_EGRESS_CACHE.clear()
     _WALKPATH_TREE_CACHE.clear()
     _CELL_WALKPATH_TREE_CACHE.clear()
-    _TRANSFER_PATH_CACHE.clear()
     _RAPTOR_TREE_CACHE.clear()
     _RAPTOR_MC_CACHE.clear()
     with _MC_SCENARIO_LOCK:
@@ -421,8 +161,6 @@ def init(*, raptor, raptor_stops, raptor_cell_pos, wg, wg_stop_nodes, wg_stop_co
 
     # Publish only after invalidating every value tied to the outgoing engine/walk graph.
     g["_RAPTOR"] = raptor
-    g["_RAPTOR_STOPS"] = raptor_stops
-    g["_RAPTOR_CELL_POS"] = raptor_cell_pos
     g["_WG"] = wg
     g["_WG_STOP_NODES"] = wg_stop_nodes
     g["_WG_STOP_CONN"] = wg_stop_conn
@@ -430,11 +168,6 @@ def init(*, raptor, raptor_stops, raptor_cell_pos, wg, wg_stop_nodes, wg_stop_co
     g["_WG_CELL_CONN"] = wg_cell_conn
     g["_WG_STOP_GIDS"] = wg_stop_gids
     g["ORIGIN_LL"] = origin_ll
-    g["_NEED_R5"] = need_r5
-    g["_NETWORK"] = network
-    g["_NET"] = net
-    g["_SNAPPED_GRID"] = snapped_grid
-    g["_DEP"] = dep
 
 
 # ~24 workplace buckets x 3 numpy arrays (~1 MB/entry) — covers a small crowd of distinct
@@ -461,24 +194,6 @@ _CELL_WALKPATH_TREE_CACHE = BoundedLRU(
     weight_fn=_walkpath_tree_weight)        # (id(walk_graph), cell index, cap sec) -> forward PathTree
 
 
-def _transfer_path_weight(value):
-    """Tight payload estimate for an immutable cached transfer polyline.
-
-    Coordinates are Python floats inside 2-tuples.  The estimate intentionally includes tuple and
-    float object storage, not just the numeric 16 bytes, so the byte cap remains conservative.
-    """
-    points, _approx = value
-    return 64 + len(points) * 112
-
-
-# Transfer footpaths are static: they depend only on the walk graph and directed stop pair, not the
-# workplace, cell, walk-speed scalar, deadline, or route. Planned branch hydration used to build a
-# fresh capped Dijkstra for every repeated pair, accounting for roughly half of a first pin. Keep
-# immutable point tuples behind both a count bound (adversarial tiny paths) and a hard payload-byte
-# bound. ``id(_WG)`` in the key prevents a test/re-init graph from reading paths from an older graph.
-_TRANSFER_PATH_CACHE = BoundedLRU(
-    1024, maxbytes=8 * 1024 * 1024, weight_fn=_transfer_path_weight)
-
 # A cold JVM-free workplace build and a simultaneous geometry request must not each run the same
 # destination-rooted Dijkstra.  The keyed flight covers BOTH the reverse PathTree and the arrays
 # projected from it.  Flights are deliberately separate from the LRU locks: no cache lock is held
@@ -499,8 +214,8 @@ def coarse_key(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=None):
 
     The old three-decimal (~110m latitude) bucket returned whichever exact workplace coordinate
     happened to populate the bucket first. Two nearby addresses could therefore receive identical
-    egress paths, route families, and minutes based on request order. Five decimals matches the
-    itinerary/MC seed precision, preserving exact-repeat reuse without cross-address contamination.
+    egress paths, route families, and minutes based on request order. Five decimals preserves
+    exact-repeat reuse without cross-address contamination.
     Transfer cap and walk speed remain part of the key; speed-independent reference walk arrays
     intentionally omit only speed.
     """
@@ -513,12 +228,11 @@ def coarse_key(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=None):
 
 
 def dest_key(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=None):
-    """Per-workplace cache key for the breakdown caches (_ITIN_CACHE/_CELL_CACHE/
-    _ITIN_INFLIGHT) and the _LAST_DEST_KEY change-detector. A capped result is a DIFFERENT
-    journey than the uncapped one, so the cap is part of the key — otherwise a maxrides=1
-    breakdown would poison the uncapped cell (and vice-versa). The walk SPEED likewise changes
-    the journey, so it's keyed too. At the R5 default + medium speed the key is the same 2-tuple
-    as before, so the baseline (and existing key callers) is unchanged."""
+    """Per-workplace cache key for journey-derived payloads.
+
+    A capped result is a different journey than the uncapped one, so the cap is part of the key;
+    walk speed likewise changes the journey and is included when non-default.
+    """
     base = (round(float(lat), 5), round(float(lon), 5))
     if max_rides != DEFAULT_MAX_RIDES:
         base = base + (int(max_rides),)
@@ -527,17 +241,12 @@ def dest_key(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=None):
     return base
 
 
-def mc_seed(dlat, dlon, max_rides, speed):
-    """Deterministic per-workplace committed-MC seed. LOAD-BEARING: the byte-identical seed across
-    the three MC entry points (/variance's _raptor_mc_build + the two /itinerary?pin=1 per-route
-    typical helpers) is what makes the primary compare strip's committed p50 byte-identical to the
-    cell's served `realistic` (REAL[id]) — route_typicals and montecarlo draw the same-shaped
-    (nR, T) delta arrays from this seed. Keep this the ONE source so the three can never drift.
-    (The expression is unchanged from the inline copies it replaced, so served numbers are
-    byte-identical to before the extraction.)"""
-    import hashlib as _hl
-    return int(_hl.sha256(f"{round(dlat,5)},{round(dlon,5)},{int(max_rides)},{speed}"
-                          .encode()).hexdigest()[:8], 16)
+MC_BASE_SEED = 20260717
+
+
+def mc_seed():
+    """Return the shared deterministic seed used by every committed-MC entry point."""
+    return MC_BASE_SEED
 
 
 def _cell_walkpath_tree(ci, cell_ll):
@@ -663,41 +372,21 @@ def _walkpath_tree_and_egress(lat, lon):
         return result
 
 
-# ---- RAPTOR grid travel-times (flag-gated) --------------------------------------------
+# ---- RAPTOR grid travel-times ----------------------------------------------------------
 def raptor_egress_purewalk(lat, lon):
     """Per-workplace inputs for the RAPTOR engine, via one destination-rooted walk search:
       egress_g/egress_w — W->stop walk seconds (gid-keyed), capped at the access cap;
       purewalk          — W->cell walk seconds (cell order), capped at MAX_MIN.
-    The only R5 use on the RAPTOR map path (one light walk tree, not the heavy per-cell pass).
     Cached per meter-scale workplace key."""
-    import numpy as _np
     ckey = coarse_key(lat, lon)
     cached = _RAPTOR_EGRESS_CACHE.get(ckey)
     if cached is not None:
         return cached
-    if USE_WALK_GRAPH:                              # JVM-free hill-aware walk router (no R5)
-        # stop->W and cell->W both root at W on the TRANSPOSED graph.  The helper builds once at
-        # the larger cap, then applies the original per-array caps and rounding/sentinel policy.
-        _tree, res = _walkpath_tree_and_egress(lat, lon)
-        return res
-    # Legacy R5 walk-matrix branch. Parsing is SHARED with raptor_oracle.egress_purewalk via
-    # core.r5_extract (min-dedup, minutes->seconds, -1 sentinel) so the goldens the engine
-    # validates against can't drift from what this live path computes.
-    import pandas as pd
-    import geopandas as gpd
-    from shapely.geometry import Point
-    from . import r5_extract
-    W = gpd.GeoDataFrame({"id": ["w"]}, geometry=[Point(lon, lat)], crs=config.WGS)
-    cap = _RAPTOR.access_cap_min
-    # egress: W -> stops (walk); our stop ids are "S<gid>" so the id bridge is just the strip
-    e = pd.DataFrame(_NETWORK.walk_time_matrix(_NET, W, _RAPTOR_STOPS, _DEP, cap))
-    egress_g, egress_w = r5_extract.egress_from_ttm(e, lambda to: int(to[1:]), dtype=_np.int64)
-    # pure walk: W -> cells, aligned to the engine's cell order
-    pw_ttm = pd.DataFrame(_NETWORK.walk_time_matrix(_NET, W, _SNAPPED_GRID, _DEP, config.MAX_MIN))
-    purewalk = r5_extract.purewalk_from_ttm(pw_ttm, _RAPTOR_CELL_POS,
-                                            len(_RAPTOR.cell_ids), dtype=_np.int64)
-    res = (egress_g, egress_w, purewalk)
-    _RAPTOR_EGRESS_CACHE.put(ckey, res)
+    if _WG is None:
+        raise RuntimeError("RAPTOR walking graph is not initialized")
+    # Stop->W and cell->W both root at W on the transposed graph. The helper builds once at the
+    # larger cap, then applies the original per-array caps and rounding/sentinel policy.
+    _tree, res = _walkpath_tree_and_egress(lat, lon)
     return res
 
 
@@ -730,17 +419,80 @@ _RAPTOR_TREE_INFLIGHT = {}                      # key -> {event, error}
 _GEOM_LOCK = threading.Lock()
 
 
+def _baked_transfer_edge(engine, source, target):
+    """Return the unique forward baked CSR edge for directed ``source -> target``.
+
+    RAPTOR's ``tr_off``/``tr_to`` is reverse target-to-source adjacency; geometry must use the
+    separate forward source-to-target CSR. A malformed table, absent pair, or duplicate
+    destination is unavailable rather than an invitation to guess a path.
+    """
+    if engine is None:
+        return None
+    try:
+        data = engine.data
+        offsets = data["tr_forward_off"]
+        destinations = data["tr_forward_to"]
+        source = int(source)
+        target = int(target)
+        if source < 0 or source + 1 >= len(offsets):
+            return None
+        start, end = int(offsets[source]), int(offsets[source + 1])
+        if start < 0 or end < start or end > len(destinations):
+            return None
+        matches = [edge for edge in range(start, end)
+                   if int(destinations[edge]) == target]
+        return matches[0] if len(matches) == 1 else None
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _baked_transfer_geometry(engine, source, target):
+    """Return ``(fresh_points, pathway_fallback)`` for one baked directed transfer edge.
+
+    Points preserve the bake's public ``[lat, lon]`` and walking order, and are copied on every
+    call. ``None`` means the directed edge or its path metadata is absent/corrupt. A true fallback
+    flag is surfaced as public ``approx``: an explicit pathway's endpoint segment is display-only,
+    not street geometry.
+    """
+    edge = _baked_transfer_edge(engine, source, target)
+    if edge is None:
+        return None
+    try:
+        path_offsets = getattr(engine, "transfer_path_off",
+                               engine.data.get("tr_forward_path_off", ()))
+        path_points = getattr(engine, "transfer_path_points",
+                              engine.data.get("tr_forward_path_points", ()))
+        if edge < 0 or edge + 1 >= len(path_offsets):
+            return None
+        start, end = int(path_offsets[edge]), int(path_offsets[edge + 1])
+        if start < 0 or end < start or end > len(path_points):
+            return None
+        points = []
+        for point in path_points[start:end]:
+            if len(point) != 2:
+                return None
+            points.append([float(point[0]), float(point[1])])
+        fallback = getattr(engine, "transfer_path_fallback", None)
+        if fallback is None:
+            fallback = engine.data.get(
+                "tr_forward_path_fallback", engine.data.get("tr_path_fallback", ()))
+        # Older test/minimal engine doubles may not carry the optional marker. Their baked path
+        # is still safe to draw as ordinary street geometry; production artifacts always carry it.
+        return points, bool(fallback[edge]) if len(fallback) > edge else False
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 class _JourneyGeomProvider:
     """Walk-leg geometry provider for ``JourneyTree.itinerary(ci, geom_provider=...)``.
     Real street paths when the walk graph is loaded (_WG): the workplace-rooted reverse
     PathTree serves egress + pure-walk legs (cached per workplace, warm = predecessor-chain
-    walking only), per-cell forward trees serve the access leg, and tiny capped trees serve
-    the <=250m synthesized transfer footpaths. Without the graph (R5-walk boot) every walk
-    leg degrades to a straight 2-point segment marked approx=True. All methods return
+    walking only), and per-cell forward trees serve the access leg. Transfer geometry is the
+    exact path baked beside the directed transfer CSR that supplies transfer timing. If a
+    non-transfer path is unavailable it degrades to a straight 2-point segment marked approx=True;
+    missing/corrupt baked transfer geometry is omitted rather than synthesized. All methods return
     ([[lat, lon], ...], approx) with the EXACT endpoint coords prepended/appended (cell
     center / stop / workplace), so the drawn legs visibly connect."""
-
-    _TRANSFER_CAP_REF = 900            # ref-sec Dijkstra cap for <=250m footpaths (street detours)
 
     def __init__(self, dlat, dlon):
         self.dlat, self.dlon = float(dlat), float(dlon)
@@ -790,8 +542,8 @@ class _JourneyGeomProvider:
     def _cell_tree(self, ci):
         t = self._cell_trees.get(ci)
         if t is None and _WG is not None:
-            # 2x the access cap: the table's times are <= cap, but an R5-baked table's path can
-            # run longer on OUR graph — generous so extraction never starves the cap.  The global
+            # 2x the access cap: the table's times are <= cap, but a street path can run longer
+            # on our graph — generous so extraction never starves the cap. The global
             # cache makes this exact tree survive the short-lived hover provider and serve the
             # first pin's alternate-route access geometry too.
             t = _cell_walkpath_tree(ci, self._cell_ll(ci))
@@ -823,51 +575,13 @@ class _JourneyGeomProvider:
         pts = t.path_points((cl[1], cl[0]))
         return self._straight(cl, W) if pts is None else self._seal(pts, cl, W)
 
-    def prefetch_transfers(self, pairs):
-        """Fill missing directed transfer paths with one capped tree per source stop.
-
-        Planned selection knows the handful of surviving branch transfer pairs before geometry is
-        hydrated. Grouping them avoids rebuilding the same 4-root graph predecessor tree for every
-        target, while each cached pair is still produced by the exact ``PathTree.path_points`` +
-        endpoint sealing path used by :meth:`transfer`.
-        """
-        if _WG is None:
-            return
-        pending = OrderedDict()
-        for s, j in pairs or ():
-            s, j = int(s), int(j)
-            key = (id(_WG), s, j)
-            if _TRANSFER_PATH_CACHE.get(key) is None:
-                pending.setdefault(s, OrderedDict()).setdefault(j, None)
-        for s, targets in pending.items():
-            sl = self._stop_ll(s)
-            if sl is None:
-                continue
-            tree = _WG.path_tree((sl[1], sl[0]), self._TRANSFER_CAP_REF)
-            for j in targets:
-                jl = self._stop_ll(j)
-                if jl is None:
-                    continue
-                pts = tree.path_points((jl[1], jl[0]))
-                result = self._straight(sl, jl) if pts is None else self._seal(pts, sl, jl)
-                frozen = (tuple(tuple(point) for point in result[0]), bool(result[1]))
-                _TRANSFER_PATH_CACHE.put((id(_WG), s, j), frozen)
-
-    def transfer(self, s, j):
-        sl = self._stop_ll(s); jl = self._stop_ll(j)
-        if _WG is None or sl is None or jl is None:
-            return self._straight(sl, jl)
-        key = (id(_WG), int(s), int(j))
-        cached = _TRANSFER_PATH_CACHE.get(key)
-        if cached is not None:
-            points, approx = cached
-            return [list(point) for point in points], approx
-        t = _WG.path_tree((sl[1], sl[0]), self._TRANSFER_CAP_REF)
-        pts = t.path_points((jl[1], jl[0]))
-        result = self._straight(sl, jl) if pts is None else self._seal(pts, sl, jl)
-        frozen = (tuple(tuple(point) for point in result[0]), bool(result[1]))
-        _TRANSFER_PATH_CACHE.put(key, frozen)
-        return [list(point) for point in frozen[0]], frozen[1]
+    def transfer(self, j, frm):
+        """Draw the forward ``j -> frm`` edge selected by reverse RAPTOR."""
+        result = _baked_transfer_geometry(_RAPTOR, j, frm)
+        # An unavailable directed edge is deliberately not replaced by a line or a live graph
+        # route. ``False`` means missing geometry, not an approximate street/pathway geometry
+        # that can be truthfully marked on the public leg.
+        return result if result is not None else ([], False)
 
 
 def raptor_tree(lat, lon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED,
@@ -1002,7 +716,7 @@ def nearest_raptor_cell(olat, olon):
 
 def raptor_attribution(dlat, dlon, max_rides=DEFAULT_MAX_RIDES, speed=DEFAULT_SPEED,
                        walk_scalar=None):
-    """{cellId: dominant line} from the cached tree (color-by-line, no R5). Arrive-by populates
+    """{cellId: dominant line} from the cached tree (color-by-line). Arrive-by populates
     ``dom`` eagerly at build time (one tree, ~0.1s). Depart-after leaves it None and traces it
     LAZILY here on the first color-by-line request (``dominant()`` traces the window's ~20 per-T*
     trees, ~0.9s — kept OFF the /compute + hover path); the result is cached ON THE TREE (not the
@@ -1035,7 +749,7 @@ _RAPTOR_MC_INFLIGHT = {}                     # key -> threading.Event (MC build 
 _RAPTOR_MC_LOCK = threading.Lock()           # guards the in-flight registry; held AROUND the
 # cache-miss check + owner registration so "miss => exactly one owner" stays atomic (the
 # cache's own RLock nests inside; nothing acquires them in the opposite order)
-# One MC build at a time, NON-blocking like /compute_exact's _HEAVY_LOCK: the parallel MC kernel
+# One MC build at a time, non-blocking like the compatibility compute endpoint: the parallel MC kernel
 # is serialized inside core/raptor.montecarlo_commute_committed (numba's workqueue threading
 # layer isn't threadsafe), so without this guard every concurrent distinct-key /variance pins a
 # waitress worker thread queued on that kernel lock — eight of them wedge the whole server
@@ -1164,8 +878,8 @@ def _raptor_mc_build(key, dlat, dlon, max_rides, speed, walk_scalar, perf=None):
     perfect = _np.array([(cells[c][1] if cells[c][1] is not None else -1) for c in ids], _np.int32)
     egress_g, egress_w, purewalk = raptor_egress_purewalk(dlat, dlon)
     _perf_add(perf, "variance.inputs_ms", t_phase)
-    # deterministic per-workplace seed -> the realistic numbers are stable across reboots/reloads
-    seed = mc_seed(dlat, dlon, max_rides, speed)
+    # Shared deterministic seed -> the realistic numbers are stable across reboots/reloads.
+    seed = mc_seed()
     mc, scenario = _RAPTOR.montecarlo(
         egress_g, egress_w, purewalk, perfect=perfect, seed=seed,
         walk_scalar=walk_scalar, max_rounds=int(max_rides), tree=entry.get("tree"),
@@ -1243,101 +957,36 @@ def mc_peek(dlat, dlon, max_rides, speed):
     return _RAPTOR_MC_CACHE.get(coarse_key(dlat, dlon, max_rides, speed))
 
 
-def _legs_have_transit(legs):
-    """True iff a traced journey's leg list contains a real TRANSIT leg. Used to drop WALK-ONLY
-    "alternatives" — an alt enumerated by ``alt_lines_window`` whose access-stop journey degenerates
-    to pure walking (e.g. the line's hop is a sub-2-min ride folded into walk by ``_TINY_HOP_MIN``,
-    or the via-stop trace is just a longer walk). Such an alt is labeled with a line name yet has no
-    ride: it offers the user nothing but a slower walking path (the reported "walk 26/27/27/30m"
-    pointless alternatives), so it must never be served as an alternative route. The PRIMARY itself
-    may legitimately be walk-only (a very close cell) — this guard applies ONLY to the alt list."""
-    return any((l or {}).get("mode") == "transit" for l in (legs or ()))
-
-
 def _route_sig(legs):
-    """Displayed-journey signature used only to suppress exact duplicate compare rows.
-
-    It intentionally ignores geometry points and keeps mode/line/min/wait, matching what the user
-    sees in the route card. Do NOT use this for family grouping: route families are based on the
-    directed boarding corridor, not exact displayed-leg equality.
-    """
-    out = []
-    for l in legs or ():
-        if not l:
-            continue
-        out.append((l.get("mode") or "",
-                    str(l.get("name") or l.get("line") or ""),
-                    int(l.get("min") or 0),
-                    int(l.get("wait") or 0)))
-    return tuple(out)
+    return route_choice_primitives.route_sig(legs)
 
 
 def _route_trace_sig(legs):
-    out = []
-    for l in legs or ():
-        if not l:
-            continue
-        out.append((l.get("mode") or "",
-                    str(l.get("name") or l.get("line") or ""),
-                    int(l.get("min") or 0),
-                    int(l.get("wait") or 0),
-                    _leg_geom_sig(l)))
-    return tuple(out)
+    return route_choice_primitives.route_trace_sig(legs, leg_geom=_leg_geom_sig)
 
 
 def _route_label(legs):
-    names = []
-    for l in legs or ():
-        if not l or l.get("mode") != "transit":
-            continue
-        n = l.get("name") or l.get("line")
-        if n:
-            names.append(str(n))
-    return " > ".join(names)
+    return route_choice_primitives.route_label(legs)
 
 
 def _alt_total(a):
-    nested = a.get("typical") or a.get("best") or {}
-    return int(nested.get("total", a.get("min", a.get("total", 10 ** 6))))
+    return route_choice_primitives.alt_total(a)
 
 
 def _alt_metric_total(a, metric="r"):
-    """Return the minute the compare UI displays for one selectable time mode.
-
-    The canonical selector continues to use ``_alt_total``.  Recommendations are different: they
-    must answer for the user's active metric.  Arrive-by realistic minutes land in ``real`` after
-    committed replay, while depart-after publishes explicit ``typical`` and ``best`` journeys.
-    """
-    if metric == "b":
-        nested = a.get("best") or a.get("typical") or {}
-        value = nested.get("total", a.get("min", a.get("total")))
-    else:
-        value = a.get("real")
-        if value is None:
-            nested = a.get("typical") or a.get("best") or {}
-            value = nested.get("total", a.get("min", a.get("total")))
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 10 ** 6
+    return route_choice_primitives.alt_metric_total(a, metric)
 
 
 def _leg_name(leg):
-    return str((leg or {}).get("name") or (leg or {}).get("line") or "")
+    return route_choice_primitives.leg_name(leg)
 
 
 def _alt_display_legs(a):
-    for key in ("typical", "best"):
-        legs = ((a.get(key) or {}).get("legs") or [])
-        if legs:
-            return legs
-    for key in ("legs", "geom"):
-        legs = a.get(key) or []
-        if legs:
-            return legs
-    b = a.get("_branch") or {}
-    it = b.get("it") or {}
-    return it.get("geom") or it.get("legs") or []
+    return route_choice_primitives.alt_display_legs(a)
+
+
+def _legs_have_transit(legs):
+    return route_choice_primitives.legs_have_transit(legs)
 
 
 def _planned_branch_proxy_option(branch):
@@ -1393,13 +1042,11 @@ def _planned_branch_proxy_option(branch):
 
 
 def _alt_transit_legs(a):
-    return [l for l in _alt_display_legs(a) if (l or {}).get("mode") == "transit"]
+    return route_choice_primitives.alt_transit_legs(a, display_legs=_alt_display_legs)
 
 
 def _leg_service_sig(leg):
-    vals = [str((leg or {}).get(k) or "") for k in ("feed", "tmode")]
-    vals = [v for v in vals if v]
-    return "|".join(vals)
+    return route_identity.leg_service_sig(leg)
 
 
 def _leg_route_id(leg):
@@ -1428,173 +1075,39 @@ def _leg_route_id(leg):
 
 
 def _leg_service_meta(leg):
-    """Readable structural service identity plus display metadata for one proven first ride.
-
-    Service keys are internal join keys for family and branch metadata.  They deliberately use
-    the feed-qualified GTFS route id when one is available: that is stable under a display-name
-    change and is meaningful when an API response is inspected.  Sparse/degraded callers do not
-    have a better durable identity, so their display-name fallback is explicitly labelled rather
-    than hidden behind a digest.
-    """
-    leg = leg or {}
-    feed = str(leg.get("feed") or "")
-    mode = str(leg.get("tmode") or "")
-    name = _leg_name(leg) or "Transit"
-    route_id = _leg_route_id(leg)
-    # Production geometry resolves to this feed-qualified route id.  A display fallback is only
-    # for symbolic/degraded callers that expose no durable route identity at all.  Keep the
-    # fallback readable so it cannot be mistaken for a stable route id.
-    if route_id:
-        key = f"service:feed={feed or 'unknown'};mode={mode or 'unknown'};route={route_id}"
-    else:
-        key = f"service:feed={feed or 'unknown'};mode={mode or 'unknown'};display={name}"
-    return {"key": key, "name": name, "feed": feed, "mode": mode}
+    return route_identity.leg_service_meta(leg, route_id=_leg_route_id)
 
 
 def _leg_geom_sig(leg):
-    pts = (leg or {}).get("pts") or []
-    if not pts:
-        return ""
-    idxs = [0, (len(pts) - 1) // 2, len(pts) - 1]
-    out = []
-    for i in dict.fromkeys(idxs):
-        try:
-            lat, lon = pts[i]
-            out.append(f"{round(float(lat) * 10000)}_{round(float(lon) * 10000)}")
-        except Exception:
-            return ""
-    return "_".join(out)
+    return route_choice_primitives.leg_geom_sig(leg)
 
 
 def _leg_dir_sig(leg):
-    pts = (leg or {}).get("pts") or []
-    parsed = []
-    for point in pts:
-        try:
-            parsed.append((float(point[0]), float(point[1])))
-        except Exception:
-            continue
-    if len(parsed) < 2:
-        return ""
-    lat0, lon0 = parsed[0]
-    nxt = next(((lat, lon) for lat, lon in parsed[1:]
-                if abs(lat - lat0) + abs(lon - lon0) > 1e-7), None)
-    if nxt is None:
-        return ""
-    lat1, lon1 = nxt
-    # A coarse station cell absorbs platform/stop-coordinate jitter. A 16-way bearing bucket
-    # identifies direction without demanding identical stop spacing from services sharing a road
-    # or rail trunk. Both values are generic structural tolerances, not network-specific knowledge.
-    board = f"{round(lat0 * 1000)}_{round(lon0 * 1000)}"
-    dy = lat1 - lat0
-    dx = (lon1 - lon0) * math.cos(math.radians((lat0 + lat1) / 2.0))
-    angle = math.atan2(dx, dy) % (2.0 * math.pi)
-    heading = int(round(angle / (2.0 * math.pi / 16.0))) % 16
-    return f"{board}_h{heading}"
+    return route_identity.leg_dir_sig(leg)
 
 
 def _leg_boarding_profile(leg):
-    pts = []
-    for point in (leg or {}).get("pts") or ():
-        try:
-            parsed = (float(point[0]), float(point[1]))
-        except Exception:
-            continue
-        if not pts or parsed != pts[-1]:
-            pts.append(parsed)
-    if len(pts) < 2:
-        return None
-    lat0, lon0 = pts[0]
-    nxt = next(((lat, lon) for lat, lon in pts[1:]
-                if abs(lat - lat0) + abs(lon - lon0) > 1e-7), None)
-    if nxt is None:
-        return None
-    lat1, lon1 = nxt
-    north = (lat1 - lat0) * 111_320.0
-    east = ((lon1 - lon0) * 111_320.0
-            * math.cos(math.radians((lat0 + lat1) / 2.0)))
-    norm = math.hypot(east, north)
-    if norm <= 0:
-        return None
-    return {"service": _leg_service_sig(leg), "board": (lat0, lon0),
-            "heading": (east / norm, north / norm), "prefix": tuple(pts[:4])}
+    return route_identity.leg_boarding_profile(leg)
 
 
 def _leg_boarding_direction_guard(leg):
-    """Coarse initial travel direction, independent of boarding-coordinate bins.
-
-    Route-choice dedupe needs to distinguish the two directions of the same named service, but a
-    full corridor signature is too strict: harmless platform jitter and bends later in the ridden
-    path must still dedupe.  An eight-way bucket of only the first non-zero segment provides that
-    conservative guard; missing geometry keeps the legacy fallback.
-    """
-    profile = _leg_boarding_profile(leg)
-    if profile is None:
-        return ""
-    east, north = profile["heading"]
-    angle = math.atan2(east, north) % (2.0 * math.pi)
-    return f"h{int(round(angle / (2.0 * math.pi / 8.0))) % 8}"
+    return route_identity.leg_boarding_direction_guard(leg)
 
 
 def _point_distance_m(a, b):
-    lat = math.radians((a[0] + b[0]) / 2.0)
-    north = (a[0] - b[0]) * 111_320.0
-    east = (a[1] - b[1]) * 111_320.0 * math.cos(lat)
-    return math.hypot(east, north)
+    return route_identity.point_distance_m(a, b)
 
 
 def _point_segment_distance_m(point, start, end):
-    lat = math.radians((point[0] + start[0] + end[0]) / 3.0)
-    scale_x = 111_320.0 * math.cos(lat)
-    px, py = point[1] * scale_x, point[0] * 111_320.0
-    ax, ay = start[1] * scale_x, start[0] * 111_320.0
-    bx, by = end[1] * scale_x, end[0] * 111_320.0
-    dx, dy = bx - ax, by - ay
-    if dx == 0 and dy == 0:
-        return math.hypot(px - ax, py - ay)
-    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
-    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+    return route_identity.point_segment_distance_m(point, start, end)
 
 
 def _prefixes_overlap(a, b, radius_m=120.0, min_overlap_m=200.0):
-    def nearest(point, path):
-        if len(path) < 2:
-            return min((_point_distance_m(point, p) for p in path), default=10 ** 9)
-        return min(_point_segment_distance_m(point, path[i], path[i + 1])
-                   for i in range(len(path) - 1))
-
-    def covered_length(path, other):
-        covered = 0.0
-        for i in range(len(path) - 1):
-            start, end = path[i], path[i + 1]
-            midpoint = ((start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0)
-            if nearest(midpoint, other) <= radius_m:
-                covered += _point_distance_m(start, end)
-        return covered
-
-    # Stop spacing may differ, so measure how much of each directed prefix lies near the other
-    # polyline. One coincident stop or tiny common launch segment is not a shared corridor.
-    return (covered_length(a, b) >= min_overlap_m
-            and covered_length(b, a) >= min_overlap_m)
+    return route_identity.prefixes_overlap(a, b, radius_m, min_overlap_m)
 
 
 def _same_boarding_profiles(pa, pb, a_name="", b_name=""):
-    if pa is None or pb is None or pa["service"] != pb["service"]:
-        return False
-    board_distance = _point_distance_m(pa["board"], pb["board"])
-    dot = pa["heading"][0] * pb["heading"][0] + pa["heading"][1] * pb["heading"][1]
-    # The same dynamically discovered service can be boarded on either side of a nearby route bend:
-    # its first displayed segment then points along different street axes even though it is one
-    # commuter corridor. Admit nearby, non-opposite bends without weakening the generic rule for
-    # differently named services. True opposite directions (the important split) remain separate.
-    same_line = bool(a_name and a_name == b_name)
-    if same_line and board_distance <= 300.0 and dot >= math.cos(math.radians(100.0)):
-        return True
-    if board_distance > 150.0:
-        return False
-    if dot < math.cos(math.radians(40.0)):
-        return False
-    return _prefixes_overlap(pa["prefix"], pb["prefix"])
+    return route_identity.same_boarding_profiles(pa, pb, a_name, b_name)
 
 
 def _same_boarding_corridor(a, b):
@@ -1606,562 +1119,207 @@ _SAME_BOARDING_CORRIDOR_IMPL = _same_boarding_corridor
 
 
 def _leg_corridor_sig(leg):
-    """Stable directed BOARDING-corridor identity for a transit leg.
-
-    Only the start and initial direction are used. Sampling the full ridden segment made the same
-    service split into different families merely because two alternatives alighted at different
-    stops. Feed/mode keeps physically coincident but operationally different services separate.
-    """
-    service = _leg_service_sig(leg)
-    direction = _leg_dir_sig(leg)
-    if not direction:
-        return ""
-    return f"{service or 'service'}|board:{direction}"
+    return route_identity.leg_corridor_sig(leg)
 
 
 def _alt_corridor_sig(a):
-    legs = _alt_transit_legs(a)
-    return _leg_corridor_sig(legs[0]) if legs else ""
+    return route_identity.alt_corridor_sig(a, transit_legs=_alt_transit_legs)
 
 
 def _discover_family_keys(options):
-    """Tolerant, deterministic COMPLETE-LINK clustering of boarding corridors.
-
-    Complete-link compatibility is load-bearing: single-link union can chain an eastbound option
-    through a perpendicular bend into a westbound option even though the endpoints are opposites.
-    """
-    options = list(options or ())
-    first_legs = [next(iter(_alt_transit_legs(option)), None) for option in options]
-    profiles = [_leg_boarding_profile(leg) for leg in first_legs]
-    services = [_leg_service_sig(leg) if leg is not None else None for leg in first_legs]
-    names = [_leg_name(leg) if leg is not None else "" for leg in first_legs]
-    descriptors = []
-    for i, leg in enumerate(first_legs):
-        pts = []
-        for point in (leg or {}).get("pts") or ():
-            try:
-                pts.append(f"{float(point[0]):.6f},{float(point[1]):.6f}")
-            except Exception:
-                continue
-        structural = "|".join(pts)
-        descriptor = (f"{services[i]}|path:{structural}" if structural
-                      else f"line:{_leg_name(leg) if leg else 'other'}")
-        descriptors.append(descriptor)
-    components = []
-    components_by_service = {}
-
-    def same_corridor(i, j):
-        # Preserve the long-standing test/extension seam: a caller may deliberately replace the
-        # public predicate. Production uses the pre-parsed profiles and avoids thousands of repeat
-        # point/service parses; an override still receives the original leg objects.
-        if _same_boarding_corridor is not _SAME_BOARDING_CORRIDOR_IMPL:
-            return _same_boarding_corridor(first_legs[i], first_legs[j])
-        return _same_boarding_profiles(profiles[i], profiles[j], names[i], names[j])
-
-    for i in sorted(range(len(options)), key=lambda idx: (descriptors[idx], idx)):
-        service = services[i]
-        service_components = components_by_service.setdefault(service, [])
-        compatible = [component for component in service_components if all(
-            profiles[i] is not None and profiles[j] is not None and same_corridor(i, j)
-            for j in component
-        )]
-        if compatible:
-            min(compatible, key=lambda component: min(descriptors[j] for j in component)).append(i)
-        else:
-            component = [i]
-            components.append(component)
-            service_components.append(component)
-    records = []
-    for indices in components:
-        # Keep the complete member multiset in the sort key.  A minimum-only identity can collide
-        # when two incompatible components happen to share one coarsely quantized descriptor.
-        members = "\x1f".join(sorted(descriptors[i] for i in indices))
-
-        def route_structure(option):
-            # This order breaker must not include user-facing line labels: a feed can rename a
-            # display label without changing the boarding corridor it represents.  It is reached
-            # only when first-leg component descriptors tie, where downstream structural detail
-            # keeps a response-local ordinal deterministic.
-            return tuple(
-                (str(leg.get("mode") or ""), _leg_service_sig(leg), _leg_route_id(leg),
-                 int(leg.get("min") or 0), int(leg.get("wait") or 0), _leg_geom_sig(leg))
-                for leg in _alt_display_legs(option) if leg)
-
-        option_sigs = tuple(sorted(
-            (_alt_total(options[i]), route_structure(options[i]))
-            for i in indices
-        ))
-        records.append({"indices": indices,
-                        "order": (members, option_sigs, min(indices))})
-
-    # Family ids are concise, readable ordinals over complete discovered corridor components.
-    # The ordering includes all observable structure, so route enumeration order and display-name
-    # changes cannot alter ids when durable geometry/service structure is unchanged.  When two
-    # sparse options have no distinguishing structure at all, their individual ownership is
-    # intentionally interchangeable while the emitted key set remains deterministic.
-    ordered_records = sorted(records, key=lambda record: record["order"])
-    keys = {}
-    for ordinal, record in enumerate(ordered_records, 1):
-        # Degenerate/missing geometry can produce incompatible singleton components with the same
-        # descriptor.  Ordinals keep them conservatively separate without an opaque digest.
-        key = f"corridor:{ordinal}"
-        for i in record["indices"]:
-            keys[id(options[i])] = key
-    return keys
+    return route_identity.discover_family_keys(
+        options,
+        transit_legs=_alt_transit_legs,
+        display_legs=_alt_display_legs,
+        same_corridor=_same_boarding_corridor,
+        same_corridor_default=_SAME_BOARDING_CORRIDOR_IMPL,
+        same_profile=_same_boarding_profiles,
+        route_id=_leg_route_id,
+        geometry_sig=_leg_geom_sig,
+        total=_alt_total,
+    )
 
 
 def _alt_family_key(a, context=None):
-    """Opaque family identity from the first boarded corridor and direction.
-
-    Geometry is authoritative when present, allowing differently named services on the same
-    directed corridor to form one family. A dynamic service-name fallback keeps sparse fixtures
-    and degraded geometry useful without embedding knowledge of any concrete route.
-    """
-    if context and id(a) in context:
-        return context[id(a)]
-    legs = _alt_transit_legs(a)
-    first = _leg_name(legs[0]) if legs else ""
-    sig = _alt_corridor_sig(a)
-    if sig:
-        return f"corridor:{sig}"
-    return first or "other"
+    return route_identity.alt_family_key(a, context, transit_legs=_alt_transit_legs)
 
 
 def _leg_arrival_sig(leg):
-    pts = []
-    for point in (leg or {}).get("pts") or ():
-        try:
-            parsed = (float(point[0]), float(point[1]))
-        except Exception:
-            continue
-        if not pts or parsed != pts[-1]:
-            pts.append(parsed)
-    if len(pts) >= 2:
-        end_lat, end_lon = pts[-1]
-        prev_lat, prev_lon = pts[-2]
-        north = (end_lat - prev_lat) * 111_320.0
-        east = ((end_lon - prev_lon) * 111_320.0
-                * math.cos(math.radians((end_lat + prev_lat) / 2.0)))
-        angle = math.atan2(east, north) % (2.0 * math.pi)
-        heading = int(round(angle / (2.0 * math.pi / 16.0))) % 16
-        endpoint = f"{round(end_lat * 10000)}_{round(end_lon * 10000)}"
-        return f"{_leg_service_sig(leg) or 'service'}|arrive:{endpoint}_h{heading}"
-    return f"{_leg_service_sig(leg) or 'service'}|line:{_leg_name(leg) or 'transit'}"
+    return route_identity.leg_arrival_sig(leg)
 
 
 def _branch_key_for_transit_legs(legs):
-    if not legs:
-        return "walk:only"
-    if len(legs) == 1:
-        return f"walk:{_leg_arrival_sig(legs[0])}"
-    return f"tail:{_leg_arrival_sig(legs[-1])}"
+    return route_identity.branch_key_for_transit_legs(legs)
 
 
 def _alt_branch_key(a, fam=None):
-    """Destination-facing branch identity inside a boarding-corridor family.
-
-    Intermediate feeders are deliberately omitted: a direct tail and a detour that converges onto
-    the same final service/alighting area are one branch and can be dominance-compared. A one-seat
-    option is the structural walk-finish branch.
-    """
-    legs = _alt_transit_legs(a)
-    return _branch_key_for_transit_legs(legs)
+    return route_identity.alt_branch_key(a, fam, transit_legs=_alt_transit_legs)
 
 
 def _alt_slot_legs(a, slot):
-    legs = ((a.get(slot) or {}).get("legs") or [])
-    return legs or _alt_display_legs(a)
+    return route_identity.alt_slot_legs(a, slot, display_legs=_alt_display_legs)
 
 
 def _journey_choice_key(legs):
-    transit = [leg for leg in legs or () if (leg or {}).get("mode") == "transit"]
-    # Prefer the feed-qualified GTFS route id exposed by _leg_service_meta. Display names are a
-    # compatibility fallback only when a sparse/degraded leg has no durable route id. This keeps a
-    # public selection stable across label changes and distinguishes two same-named routes.
-    sequence = tuple(_leg_service_meta(leg)["key"] for leg in transit)
-    direction = _leg_boarding_direction_guard(transit[0]) if transit else ""
-    return (direction, sequence), _branch_key_for_transit_legs(transit)
+    return route_identity.journey_choice_key(
+        legs, service_meta=_leg_service_meta, direction_guard=_leg_boarding_direction_guard)
 
 
 def _journey_choice_bucket(legs):
-    """Necessary (not sufficient) bucket for the continuous-heading equivalence test."""
-    transit = [leg for leg in legs or () if (leg or {}).get("mode") == "transit"]
-    sequence = tuple(_leg_service_meta(leg)["key"] for leg in transit)
-    return sequence, _branch_key_for_transit_legs(transit)
+    return route_identity.journey_choice_bucket(legs, service_meta=_leg_service_meta)
 
 
 def _alt_choice_key(a):
-    """Service-qualified structural identity for BOTH metric slots."""
-    return (_journey_choice_key(_alt_slot_legs(a, "best")),
-            _journey_choice_key(_alt_slot_legs(a, "typical")))
+    return route_identity.alt_choice_key(
+        a, slot_legs=_alt_slot_legs, service_meta=_leg_service_meta,
+        direction_guard=_leg_boarding_direction_guard)
 
 
 def _public_choice_key(a):
-    """Readable, JSON-safe public identity for one exact rendered route choice.
-
-    Family and branch describe useful *groups*, but several non-dominated choices may share both.
-    The client therefore needs the existing complete structural choice identity, rather than a
-    family/branch composite or a response-position ordinal, to keep selection stable.  This is
-    deliberately an inspectable serialization, not an opaque digest.
-    """
-    return "choice:" + json.dumps(_alt_choice_key(a), separators=(",", ":"),
-                                 ensure_ascii=True)
+    return route_identity.public_choice_key(a, choice_key=_alt_choice_key)
 
 
 def _alt_choice_bucket(a):
-    return (_journey_choice_bucket(_alt_slot_legs(a, "best")),
-            _journey_choice_bucket(_alt_slot_legs(a, "typical")))
+    return route_identity.alt_choice_bucket(a, slot_legs=_alt_slot_legs,
+                                            service_meta=_leg_service_meta)
 
 
 def _journey_choice_equivalent(left_legs, right_legs):
-    """Whether two rendered slots describe the same practical transit choice.
-
-    A quantized heading is useful as a stable key, but it has unavoidable bin edges: two trips on
-    the same service, toward the same tail, can start 18 degrees apart and land in adjacent coarse
-    buckets. Compare the actual unit headings for final dedupe instead. The generous non-opposite
-    tolerance mirrors the same-service bend rule used by corridor discovery; a true reverse ride
-    remains distinct. Complete route sequence + terminal branch still have to match exactly.
-    """
-    left = [leg for leg in left_legs or () if (leg or {}).get("mode") == "transit"]
-    right = [leg for leg in right_legs or () if (leg or {}).get("mode") == "transit"]
-    left_sequence = tuple(_leg_service_meta(leg)["key"] for leg in left)
-    right_sequence = tuple(_leg_service_meta(leg)["key"] for leg in right)
-    if left_sequence != right_sequence:
-        return False
-    if _branch_key_for_transit_legs(left) != _branch_key_for_transit_legs(right):
-        return False
-    if not left:
-        return True
-    lp = _leg_boarding_profile(left[0]); rp = _leg_boarding_profile(right[0])
-    if lp is None or rp is None:
-        return _leg_boarding_direction_guard(left[0]) == _leg_boarding_direction_guard(right[0])
-    dot = lp["heading"][0] * rp["heading"][0] + lp["heading"][1] * rp["heading"][1]
-    return dot >= math.cos(math.radians(100.0))
+    return route_identity.journey_choice_equivalent(
+        left_legs, right_legs, service_meta=_leg_service_meta,
+        direction_guard=_leg_boarding_direction_guard)
 
 
 def _alt_choice_equivalent(left, right):
-    """Pairwise choice equivalence across both best/typical display slots."""
-    return all(_journey_choice_equivalent(_alt_slot_legs(left, slot),
-                                          _alt_slot_legs(right, slot))
-               for slot in ("best", "typical"))
+    return route_identity.alt_choice_equivalent(
+        left, right, slot_legs=_alt_slot_legs, service_meta=_leg_service_meta,
+        direction_guard=_leg_boarding_direction_guard)
 
 
 def _alt_dedupe_key(a, family_keys=None):
-    """Pre-selection identity that preserves structurally distinct destination tails."""
-    return _alt_choice_key(a)
+    return route_identity.alt_dedupe_key(a, family_keys, choice_key=_alt_choice_key)
 
 
-def _is_subsequence(shorter, longer):
-    if not shorter:
-        return True
-    i = 0
-    for item in longer:
-        if item == shorter[i]:
-            i += 1
-            if i == len(shorter):
-                return True
-    return False
+
+
+
+def _selection_ops():
+    """Build a pure-selection callback bundle from the current server helpers.
+
+    This is intentionally rebuilt per call. Tests and narrow runtime adapters monkeypatch these
+    helpers, so caching the bundle would silently bypass those compatibility seams.
+    """
+    return route_selection.SelectionOps(
+        family_key=lambda option, keys=None: _alt_family_key(option, keys),
+        branch_key=lambda option, family=None: _alt_branch_key(option, family),
+        choice_bucket=_alt_choice_bucket,
+        choice_equivalent=_alt_choice_equivalent,
+        quality_rank=_alt_quality_rank,
+        total=_alt_total,
+        exact_seconds=_alt_exact_seconds,
+        access_walk_min=_alt_access_walk_min,
+        transfers=_alt_transfers,
+        final_walk_min=_alt_final_walk_min,
+        physical_walk_min=_alt_physical_walk_min,
+        fragility=_alt_fragility,
+        transit_legs=_alt_transit_legs,
+        leg_name=_leg_name,
+        service_meta=_leg_service_meta,
+        discover_family_keys=_discover_family_keys,
+    )
 
 
 def _alt_dominates(simple, detour, family_keys=None):
-    """Pareto dominance within one practical destination-facing branch.
-
-    Structural simplification is valuable presentation information, but it is not dominance when
-    it costs time or physical walking.  Exact semantic equivalents are collapsed separately;
-    this predicate preserves every remaining corridor/branch tradeoff unless one route is no
-    worse in every user-visible quality dimension and strictly better in at least one.
-    """
-    sfam = _alt_family_key(simple, family_keys); dfam = _alt_family_key(detour, family_keys)
-    sbranch = _alt_branch_key(simple, sfam); dbranch = _alt_branch_key(detour, dfam)
-    if sfam != dfam or sbranch != dbranch:
-        return False
-    sq = (_alt_total(simple), _alt_exact_seconds(simple), _alt_access_walk_min(simple),
-          _alt_transfers(simple), _alt_final_walk_min(simple),
-          _alt_physical_walk_min(simple), _alt_fragility(simple))
-    dq = (_alt_total(detour), _alt_exact_seconds(detour), _alt_access_walk_min(detour),
-          _alt_transfers(detour), _alt_final_walk_min(detour),
-          _alt_physical_walk_min(detour), _alt_fragility(detour))
-    return all(left <= right for left, right in zip(sq, dq)) and any(
-        left < right for left, right in zip(sq, dq))
+    return route_selection.alt_dominates(
+        simple, detour, family_keys, ops=_selection_ops())
 
 
 def _prune_dominated_alts(alts, context=(), family_keys=None):
-    context = list(context or ())
-    alts = list(alts)
-    comparisons = context + alts
-    family_keys = family_keys or _discover_family_keys(comparisons)
-
-    # Resolve exact route-choice duplicates before the broader dominance pass.  Pairwise `<`
-    # ranking is intentionally asymmetric and can let an equal-total alt beat the primary solely
-    # because its sampled access-walk polyline sorts first.  Grouping makes the product rule
-    # explicit: an equal/faster primary represents the choice; otherwise keep exactly one fastest,
-    # deterministic alt.  A genuinely faster alt therefore survives.
-    def equivalent_rank(option):
-        return _alt_quality_rank(option)
-
-    # Pairwise continuous-heading comparison avoids both false reverse-route collapse and false
-    # duplicates at an arbitrary heading-bin boundary. Use complete-link grouping so a chain of
-    # progressively bending paths cannot bridge genuinely incompatible endpoints.
-    by_choice = []
-    groups_by_bucket = {}
-    for alt in sorted(alts, key=equivalent_rank):
-        bucket = _alt_choice_bucket(alt)
-        bucket_groups = groups_by_bucket.setdefault(bucket, [])
-        compatible = [group for group in bucket_groups
-                      if all(_alt_choice_equivalent(alt, member) for member in group)]
-        if compatible:
-            compatible[0].append(alt)
-        else:
-            group = [alt]
-            by_choice.append(group)
-            bucket_groups.append(group)
-
-    deduped = []
-    for options in by_choice:
-        winner = min(options, key=equivalent_rank)
-        winner_bucket = _alt_choice_bucket(winner)
-        primary_matches = [option for option in context
-                           if _alt_choice_bucket(option) == winner_bucket
-                           if _alt_choice_equivalent(option, winner)]
-        if (primary_matches
-                and min(_alt_total(option) for option in primary_matches) <= _alt_total(winner)):
-            continue
-        deduped.append(winner)
-
-    comparisons = context + deduped
-    by_dominance = {}
-    by_exact_choice = {}
-    for option in comparisons:
-        transit = _alt_transit_legs(option)
-        family = _alt_family_key(option, family_keys)
-        branch = _alt_branch_key(option, family)
-        by_dominance.setdefault((family, branch), []).append(option)
-        by_exact_choice.setdefault(_alt_choice_bucket(option), []).append(option)
-
-    kept = []
-    for option in deduped:
-        transit = _alt_transit_legs(option)
-        family = _alt_family_key(option, family_keys)
-        branch = _alt_branch_key(option, family)
-        candidates = []
-        candidate_ids = set()
-        for pool in (by_dominance.get((family, branch), ()),
-                     by_exact_choice.get(_alt_choice_bucket(option), ())):
-            for candidate in pool:
-                if id(candidate) not in candidate_ids:
-                    candidate_ids.add(id(candidate))
-                    candidates.append(candidate)
-        if not any(candidate is not option
-                   and _alt_dominates(candidate, option, family_keys)
-                   for candidate in candidates):
-            kept.append(option)
-    return kept
+    return route_selection.prune_dominated_alts(
+        alts, context, family_keys, ops=_selection_ops())
 
 
 def _family_representative(fam, opts):
-    """Fastest truthful anchor; simplicity never outranks a faster branch member."""
-    return min(opts, key=_alt_quality_rank) if opts else None
+    return route_selection.family_representative(fam, opts, ops=_selection_ops())
 
 
 def _alt_raw_legs(a):
-    b = a.get("_branch") or {}
-    return b.get("raw") or []
+    return route_choice_primitives.alt_raw_legs(a)
 
 
 def _alt_access_walk_min(a):
-    # Newer itinerary payloads split a folded first-platform allowance out of the physical
-    # walk.  Prefer that explicit truth whenever it is present; older cached payloads retain
-    # their historical ``min`` field as the compatibility fallback.
-    legs = _alt_display_legs(a)
-    physical = [leg for leg in legs if (leg or {}).get("mode") == "walk"
-                and (leg or {}).get("physical_min") is not None]
-    if physical:
-        total = 0
-        for leg in legs:
-            if (leg or {}).get("mode") == "transit":
-                break
-            if (leg or {}).get("mode") == "walk":
-                total += _leg_physical_walk_min(leg)
-        return total
-    raw = _alt_raw_legs(a)
-    if raw:
-        sec = 0
-        for leg in raw:
-            if leg[0] == "ride":
-                break
-            if leg[0] in ("access", "walk", "walk_t", "egress"):
-                sec += int(leg[1])
-        return sec / 60.0
-    total = 0
-    for leg in _alt_display_legs(a):
-        if leg.get("mode") == "transit":
-            break
-        if leg.get("mode") == "walk":
-            total += int(leg.get("min") or 0)
-    return total
+    return route_choice_primitives.alt_access_walk_min(
+        a, display_legs=_alt_display_legs, raw_legs=_alt_raw_legs,
+        physical_walk_min=_leg_physical_walk_min)
 
 
 def _alt_final_walk_min(a):
-    legs = _alt_display_legs(a)
-    for leg in reversed(legs):
-        if (leg or {}).get("mode") == "walk":
-            return _leg_physical_walk_min(leg)
-        if (leg or {}).get("mode") == "transit":
-            break
-    raw = _alt_raw_legs(a)
-    if raw:
-        last = raw[-1]
-        if last[0] in ("egress", "walk"):
-            return int(last[1]) / 60.0
-        return 0.0
-    for leg in reversed(_alt_display_legs(a)):
-        if leg.get("mode") == "walk":
-            return _leg_physical_walk_min(leg)
-        if leg.get("mode") == "transit":
-            break
-    return 0.0
+    return route_choice_primitives.alt_final_walk_min(
+        a, display_legs=_alt_display_legs, raw_legs=_alt_raw_legs,
+        physical_walk_min=_leg_physical_walk_min)
 
 
 def _leg_physical_walk_min(leg):
-    """Physical walking minutes for ranking, never folded schedule allowance."""
-    leg = leg or {}
-    value = leg.get("physical_min", leg.get("min", 0))
-    try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
-        return 0.0
+    return route_choice_primitives.leg_physical_walk_min(leg)
 
 
 def _alt_physical_walk_min(a):
-    """Total physical walk across an itinerary, with legacy/raw fallbacks."""
-    legs = _alt_display_legs(a)
-    if any((leg or {}).get("physical_min") is not None for leg in legs):
-        return sum(_leg_physical_walk_min(leg) for leg in legs
-                   if (leg or {}).get("mode") == "walk")
-    raw = _alt_raw_legs(a)
-    if raw:
-        return sum(int(leg[1]) for leg in raw
-                   if leg and leg[0] in ("access", "walk", "walk_t", "egress")) / 60.0
-    return sum(_leg_physical_walk_min(leg) for leg in legs
-               if (leg or {}).get("mode") == "walk")
+    return route_choice_primitives.alt_physical_walk_min(
+        a, display_legs=_alt_display_legs, raw_legs=_alt_raw_legs,
+        physical_walk_min=_leg_physical_walk_min)
 
 
 def _alt_exact_seconds(a):
-    """Unrounded door-to-door seconds when a planned raw trace is still available."""
-    raw = _alt_raw_legs(a)
-    branch = a.get("_branch") or {}
-    try:
-        metric_sec = branch.get("metric_sec")
-        if metric_sec is not None:
-            return max(0, int(metric_sec))
-    except (TypeError, ValueError):
-        pass
-    if raw and branch.get("home") is not None:
-        try:
-            home = int(branch["home"])
-            clock = home
-            for leg in raw:
-                if leg[0] in ("access", "walk", "walk_t", "egress"):
-                    clock += int(leg[1])
-                elif leg[0] == "ride":
-                    clock = int(leg[3])
-            return max(0, clock - home)
-        except (IndexError, TypeError, ValueError):
-            pass
-    # Older/hydrated payloads expose rounded display legs only.  Their displayed total remains
-    # the stable approximation rather than inventing precision from formatted components.
-    return _alt_total(a) * 60
+    return route_choice_primitives.alt_exact_seconds(
+        a, raw_legs=_alt_raw_legs, total=_alt_total)
 
 
 def _alt_transfers(a):
-    return max(0, len(_alt_transit_legs(a)) - 1)
+    return route_choice_primitives.alt_transfers(a, transit_legs=_alt_transit_legs)
 
 
 def _alt_fragility(a):
-    try:
-        return max(0, int(a.get("frag", 0) or 0))
-    except (TypeError, ValueError):
-        return 0
+    return route_choice_primitives.alt_fragility(a)
 
 
 def _alt_latest_board_anchor(a):
-    for leg in _alt_raw_legs(a):
-        if leg and leg[0] == "ride" and len(leg) >= 3:
-            try:
-                return int(leg[2])
-            except (TypeError, ValueError):
-                break
-    return -1
+    return route_choice_primitives.alt_latest_board_anchor(a, raw_legs=_alt_raw_legs)
 
 
 def _is_token_transit_long_walk(a):
-    """A negligible ride followed by a long physical finish is presentation-poor, not invalid."""
-    transit = _alt_transit_legs(a)
-    ride_min = sum(max(0, int((leg or {}).get("min") or 0)) for leg in transit)
-    return bool(transit and ride_min <= 2 and _alt_final_walk_min(a) >= 8)
+    return route_choice_primitives.is_token_transit_long_walk(
+        a, transit_legs=_alt_transit_legs, final_walk_min=_alt_final_walk_min)
 
 
 def _alt_quality_rank(a):
-    """Shared deterministic rank for exact-choice collapse and branch representatives.
-
-    Time remains authoritative.  All walking fields deliberately use physical walk only; a
-    controllable schedule allowance may reconcile the duration but must not make a route look
-    walkier or less walkable.  Token-transit is only a final presentation demotion, so it cannot
-    erase a route that genuinely improves time or walking.
-    """
-    return (
-        _alt_total(a),
-        _alt_exact_seconds(a),
-        _alt_access_walk_min(a),
-        _alt_transfers(a),
-        _alt_final_walk_min(a),
-        _alt_fragility(a),
-        -_alt_latest_board_anchor(a),
-        1 if _is_token_transit_long_walk(a) else 0,
-        _alt_selection_tie_key(a),
-    )
+    return route_choice_primitives.alt_quality_rank(
+        a, total=_alt_total, exact_seconds=_alt_exact_seconds,
+        access_walk_min=_alt_access_walk_min, transfers=_alt_transfers,
+        final_walk_min=_alt_final_walk_min, fragility=_alt_fragility,
+        latest_board_anchor=_alt_latest_board_anchor,
+        token_transit_long_walk=_is_token_transit_long_walk,
+        selection_tie_key=_alt_selection_tie_key)
 
 
 def _alt_recommendation_rank(a, metric="r"):
-    """Server-owned practical recommendation rank for a pinned route choice.
-
-    This deliberately differs from ``_alt_quality_rank``.  The latter is a selector/internal
-    representative rank, while this is the user-facing answer to "which of these should I take?"
-    Routes first compete on the *displayed active minute*.  Once that is tied, less actual walking
-    is more useful than sub-minute schedule precision.  The physical-walk helper excludes a folded
-    first-platform/schedule allowance, so changing that presentation allowance cannot make an
-    otherwise identical route win or lose.  The final structural key keeps a fully tied answer
-    deterministic without encoding any route-name knowledge.
-    """
-    return (
-        _alt_metric_total(a, metric),
-        _alt_physical_walk_min(a),
-        _alt_transfers(a),
-        _alt_fragility(a),
-        _alt_exact_seconds(a),
-        -_alt_latest_board_anchor(a),
-        _alt_selection_tie_key(a),
-    )
+    return route_choice_primitives.alt_recommendation_rank(
+        a, metric, metric_total=_alt_metric_total,
+        physical_walk_min=_alt_physical_walk_min, transfers=_alt_transfers,
+        fragility=_alt_fragility, exact_seconds=_alt_exact_seconds,
+        latest_board_anchor=_alt_latest_board_anchor,
+        selection_tie_key=_alt_selection_tie_key)
 
 
 def _recommend_route_choice(primary, alternatives, metric="r"):
-    """Return the best practical route from an already-pruned pinned universe.
-
-    ``primary`` is the canonical map itinerary and remains in this comparison: the map route is
-    not presumed to be the best practical recommendation once the pin has discovered all
-    non-dominated structural alternatives.
-    """
-    options = ([primary] if primary is not None else []) + list(alternatives or ())
-    return min(options, key=lambda option: _alt_recommendation_rank(option, metric)) if options else None
+    return route_choice_primitives.recommend_route_choice(
+        primary, alternatives, metric, recommendation_rank=_alt_recommendation_rank)
 
 
 def _recommend_route_choices(primary, alternatives):
-    """Return complete-universe recommendations for both selectable UI metrics."""
-    return {metric: _recommend_route_choice(primary, alternatives, metric)
-            for metric in ("r", "b")}
+    return route_choice_primitives.recommend_route_choices(
+        primary, alternatives, recommendation=_recommend_route_choice)
 
 
-# Compatibility alias for internal callers/tests added during the ranking migration.
 _alt_representative_rank = _alt_quality_rank
 
 
@@ -2242,235 +1400,22 @@ def _assert_primary_minimum(primary, alternatives):
 
 
 def _build_family_service_catalog(routes, family_keys):
-    """Catalog proven first-board services before dominance/cap selection.
-
-    Every input route is already a complete hydrated O-D itinerary.  Consequently this bounded v1
-    never advertises a merely nearby or same-track service: membership is proof that the service
-    completed this exact family/branch journey in the traced route universe.
-    """
-    catalog = OrderedDict()
-    for route in routes or ():
-        transit = _alt_transit_legs(route)
-        if not transit:
-            continue
-        family = _alt_family_key(route, family_keys)
-        branch = _alt_branch_key(route, family)
-        service = _leg_service_meta(transit[0])
-        branches = catalog.setdefault(family, OrderedDict())
-        branch_meta = branches.setdefault(branch, {"services": OrderedDict(), "tails": []})
-        services = branch_meta["services"]
-        services.setdefault(service["key"], service)
-        # This is an ordered ride sequence, not a set. Re-boarding the same named service is a
-        # real transfer and must remain visible (A > A > B is not equivalent to A > B).
-        tail = tuple(name for leg in transit[1:] if (name := _leg_name(leg)))
-        if tail and tail not in branch_meta["tails"]:
-            branch_meta["tails"].append(tail)
-    return catalog
+    """Compatibility wrapper for the pure family catalog builder."""
+    return route_selection.build_family_service_catalog(
+        routes, family_keys, ops=_selection_ops())
 
 
 def _select_diverse_alts(alts, cap, primary=None, complete_selected_families=False,
                          force_include=None):
-    """Filter after tracing while preserving generic corridor and tail diversity.
-
-    Distinct boarding corridors get first claim on the bounded card. Remaining slots are assigned
-    round-robin to still-unrepresented destination-facing branches, then to the fastest leftovers.
-
-    ``complete_selected_families`` is for the pinned expert disclosure.  The normal ``cap`` still
-    decides corridor breadth exactly as before; after that choice, each already-visible family may
-    contribute one representative for every other non-dominated destination-facing branch inside
-    both the existing per-family near-tie and generic reservation ceilings.  The result may
-    therefore exceed ``cap`` without admitting another boarding corridor.  Hover chips and legacy
-    callers keep the strict cap.  ``force_include`` accepts one route or a collection selected by
-    the separate recommendation ranks from the complete deduped/dominance-pruned pin universe.
-    Missing recommendations are appended: neither time mode may advertise a route the card hid
-    merely because its display cap spent the available slots on corridor coverage.
-    """
-    alts = list(alts)
-    universe = ([primary] if primary else []) + alts
-    family_keys = _discover_family_keys(universe)
-    family_catalog = _build_family_service_catalog(universe, family_keys)
-    primary_family = _alt_family_key(primary, family_keys) if primary else None
-    if primary is not None:
-        primary["_family_seed"] = primary_family
-        primary["_family_catalog"] = family_catalog
-    alts = _prune_dominated_alts(alts, [primary] if primary else (), family_keys)
-    ordered = sorted(alts, key=_alt_quality_rank)
-    selected = []
-    selected_ids = set()
-
-    def add(a):
-        ident = id(a)
-        if ident in selected_ids or len(selected) >= cap:
-            return False
-        selected.append(a); selected_ids.add(ident)
-        return True
-
-    families = OrderedDict()
-    for a in ordered:
-        families.setdefault(_alt_family_key(a, family_keys), []).append(a)
-
-    primary_branch = _alt_branch_key(primary, primary_family) if primary else None
-
-    # Reserve at most ONE slot for useful tail optionality before family breadth exhausts a roomy
-    # card. The fastest branch-rich family wins; the primary counts as an already-visible branch.
-    # Tiny caps stay breadth-only (in particular cap=1 must show a missing corridor first).
-    family_order = [item for item in families.items() if item[0] != primary_family]
-    if primary_family in families:
-        family_order.append((primary_family, families[primary_family]))
-    reserved = None
-    if cap >= 3:
-        missing_items = [(fam, opts) for fam, opts in family_order if fam != primary_family]
-        missing_order = [fam for fam, _opts in missing_items]
-        eligible_families = set(missing_order[:max(0, cap - 1)])
-        if primary_family is not None:
-            eligible_families.add(primary_family)
-        displaced = (_family_representative(*missing_items[cap - 1])
-                     if len(missing_items) >= cap else None)
-        reservation_ceiling = (
-            _alt_total(displaced) + ROUTE_FAMILY_NEAR_TIE_MIN
-            if displaced is not None else None)
-        reserve_candidates = []
-        for fam, opts in family_order:
-            if fam not in eligible_families:
-                continue
-            if fam == primary_family:
-                visible_branches = {primary_branch} if primary_branch else set()
-                family_head = _alt_total(primary)
-            else:
-                anchor = _family_representative(fam, opts)
-                if anchor is None:
-                    continue
-                visible_branches = {_alt_branch_key(anchor, fam)}
-                family_head = _alt_total(anchor)
-            by_branch = OrderedDict()
-            for option in opts:
-                branch = _alt_branch_key(option, fam)
-                if branch not in visible_branches:
-                    by_branch.setdefault(branch, []).append(option)
-            sibling_reps = [_family_representative(fam, branch_opts)
-                            for branch_opts in by_branch.values()]
-            sibling_reps = [option for option in sibling_reps if option is not None]
-            if sibling_reps:
-                sibling = min(sibling_reps, key=_alt_quality_rank)
-                if (reservation_ceiling is not None
-                        and _alt_total(sibling) > reservation_ceiling):
-                    continue
-                # Prefer optionality wholly visible inside the alternative list. A sibling of the
-                # primary is still the fallback when no non-primary family is branch-rich.
-                reserve_candidates.append((0 if fam != primary_family else 1,
-                                           family_head, _alt_total(sibling), fam, sibling))
-        if reserve_candidates:
-            reserved = min(reserve_candidates, key=lambda item: item[:4])[4]
-
-    breadth_cap = max(0, cap - (1 if reserved is not None else 0))
-    for fam, opts in family_order:
-        if fam == primary_family:
-            continue                              # the primary already represents this corridor
-        rep = _family_representative(fam, opts)
-        if rep is not None:
-            add(rep)
-        if len(selected) >= breadth_cap:
-            break
-    if reserved is not None:
-        add(reserved)
-
-    # One sibling per family per pass prevents a single rich corridor from monopolizing the tail.
-    while len(selected) < cap:
-        progressed = False
-        for fam, opts in family_order:
-            represented = {
-                _alt_branch_key(a, fam) for a in selected
-                if _alt_family_key(a, family_keys) == fam
-            }
-            if fam == primary_family and primary_branch:
-                represented.add(primary_branch)
-            by_branch = OrderedDict()
-            for a in opts:
-                branch = _alt_branch_key(a, fam)
-                if branch not in represented:
-                    by_branch.setdefault(branch, []).append(a)
-            if not by_branch:
-                continue
-            branch_opts = next(iter(by_branch.values()))
-            rep = _family_representative(fam, branch_opts)
-            if rep is not None and add(rep):
-                progressed = True
-            if len(selected) >= cap:
-                break
-        if not progressed:
-            break
-
-    for a in ordered:
-        add(a)
-        if len(selected) >= cap:
-            break
-
-    if complete_selected_families and cap > 0:
-        # The cap above is a BREADTH budget, not a reason for an expert view to advertise a family
-        # while silently dropping one of its near-window finishes.  Complete only families which
-        # already earned visibility (plus the primary's family); never use this phase to admit a
-        # new corridor. ``ordered`` is already equivalence-deduped and dominance-pruned.
-        selected_families = {
-            _alt_family_key(option, family_keys) for option in selected
-        }
-        if primary_family is not None:
-            selected_families.add(primary_family)
-        represented = {
-            (_alt_family_key(option, family_keys),
-             _alt_branch_key(option, _alt_family_key(option, family_keys)))
-            for option in selected
-        }
-        if primary is not None and primary_family is not None and primary_branch is not None:
-            represented.add((primary_family, primary_branch))
-
-        def add_completion(option, fam, branch):
-            if (fam, branch) in represented:
-                return
-            # When breadth pressure established a quality ceiling, branch completion obeys that
-            # SAME ceiling. If every candidate family already fit, the caller's upstream branch
-            # window remains the bound and no extra arbitrary threshold is introduced here.
-            if (reservation_ceiling is not None
-                    and _alt_total(option) > reservation_ceiling):
-                return
-            selected.append(option)
-            selected_ids.add(id(option))
-            represented.add((fam, branch))
-
-        for fam, opts in family_order:
-            if fam not in selected_families:
-                continue
-            family_ceiling = (min(_alt_total(option) for option in opts)
-                              + ROUTE_FAMILY_NEAR_TIE_MIN)
-            by_branch = OrderedDict()
-            for option in opts:
-                branch = _alt_branch_key(option, fam)
-                if (fam, branch) not in represented:
-                    by_branch.setdefault(branch, []).append(option)
-            for branch, branch_opts in by_branch.items():
-                representative = _family_representative(fam, branch_opts)
-                if (representative is not None
-                        and _alt_total(representative) <= family_ceiling):
-                    add_completion(representative, fam, branch)
-
-    result = sorted(selected, key=_alt_quality_rank)
-    if not complete_selected_families:
-        result = result[:cap]
-    forced = (list(force_include)
-              if isinstance(force_include, (list, tuple, set)) else [force_include])
-    for forced_option in forced:
-        if (forced_option is not None
-                and any(forced_option is option for option in alts)
-                and not any(forced_option is option for option in result)):
-            # Do not evict a useful corridor/branch merely to make room for a recommendation. The
-            # pin card has a small explicit cap escape hatch (at most one route per time mode).
-            result.append(forced_option)
-    result.sort(key=_alt_quality_rank)
-    for option in result:
-        option["_family_seed"] = _alt_family_key(option, family_keys)
-        option["_family_catalog"] = family_catalog
-        if primary_family is not None:
-            option["_primary_family_seed"] = primary_family
-    return result
+    return route_selection.select_diverse_alts(
+        alts,
+        cap,
+        primary=primary,
+        complete_selected_families=complete_selected_families,
+        force_include=force_include,
+        near_tie_min=ROUTE_FAMILY_NEAR_TIE_MIN,
+        ops=_selection_ops(),
+    )
 
 
 def _uniq_strings(values):
@@ -2919,10 +1864,10 @@ def _itinerary_alt_typicals(ci, dlat, dlon, max_rides, speed, alts):
         stops.append(int(cell_alt_stop.get(a["line"], -1)))
         floors.append(a.get("min"))
     egress_g, egress_w, _purewalk = raptor_egress_purewalk(dlat, dlon)
-    # SAME per-workplace seed as _raptor_mc_build's /variance MC: route_typicals draws the same-shaped
+    # SAME shared seed as _raptor_mc_build's /variance MC: route_typicals draws the same-shaped
     # (nR, T) delta arrays, so the PRIMARY route's committed p50 here is byte-identical to that cell's
     # served `realistic` (REAL[id]) -> the primary compare strip matches the headline exactly.
-    seed = mc_seed(dlat, dlon, max_rides, speed)
+    seed = mc_seed()
     scenario = _mc_scenario_for(mc.get("_scenario_token"),
                                 coarse_key(dlat, dlon, max_rides, speed))
     pairs = _RAPTOR.route_typicals(tree, ci, stops, egress_g, egress_w,
@@ -3001,33 +1946,16 @@ def _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed, prov50,
     out = []
 
     def _add(line, it50, it5, source="window", via_stop=None):
-        if it50 is None and it5 is None:
+        option, sig = route_hydration.alternative_payload(
+            line, it50, it5, source=source, via_stop=via_stop,
+            route_label=_route_label, trace_signature=_route_trace_sig,
+            transit_predicate=_legs_have_transit)
+        if option is None:
             return
-        # Walk-only alt: BOTH percentiles' journeys degenerate to pure walking (no ride) -> pointless,
-        # drop it (a line-labeled slower walk path; see _legs_have_transit). Keep it only if at least
-        # one percentile traces a real transit leg (an alt where p5 rides but p50 walks still informs).
-        has5 = it5 is not None and _legs_have_transit(it5["geom"])
-        has50 = it50 is not None and _legs_have_transit(it50["geom"])
-        if not (has5 or has50):
-            return
-        sig5 = _route_trace_sig((it5 or it50)["geom"])
-        sig50 = _route_trace_sig((it50 or it5)["geom"])
-        sig = (sig5, sig50)
         if sig in seen:
             return                                      # exact primary/alt duplicate
         seen.add(sig)
-        traced_label = (_route_label((it50 or it5)["geom"]) or
-                        _route_label((it5 or it50)["geom"]) or line)
-        d = {"line": traced_label, "source": source}
-        if traced_label != line:
-            d["chip_line"] = line
-        if via_stop is not None:
-            d["via_stop"] = int(via_stop)
-        if it50 is not None:
-            d["typical"] = {"total": it50["total"], "legs": it50["geom"]}
-        if it5 is not None:
-            d["best"] = {"total": it5["total"], "legs": it5["geom"]}
-        out.append(d)
+        out.append(option)
 
     for line in chips:                                   # preserve the chip (closest-first) order
         s = cell_alt_stop.get(line)
@@ -3091,17 +2019,15 @@ def _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed, prov50,
 
     def hydrate_proxy(a):
         """Fill exact walk geometry for one proxy, returning False for an invalidated route."""
-        if not a.pop("_needs_hydration", False):
-            return True
-        b = a.get("_branch") or {}
-        it = tree50._format_planned_raw(
-            ci, b.get("stop"), b.get("raw"), b.get("home"), b.get("jt"),
-            geom_provider=prov50, planned_total=b.get("total"),
-            planned_target_sec=b.get("target_sec", b.get("metric_sec")))
-        if it is None or not _legs_have_transit(it.get("geom")):
+        hydrated = route_hydration.hydrate_planned_proxy(
+            a, formatter=getattr(tree50, "_format_planned_raw", None),
+            transit_predicate=_legs_have_transit, cell=ci, provider=prov50)
+        if hydrated is None:
             return False
-        a["typical"] = {"total": it["total"], "legs": it["geom"]}
-        a["best"] = {"total": it["total"], "legs": it["geom"]}
+        # Preserve the historical identity of the selected dict: recommendation candidates
+        # retain references to these objects while the final card pass annotates them.
+        a.clear()
+        a.update(hydrated)
         return True
 
     # Proxy legs carry exact transit polylines but intentionally empty walk geometry.  Their
@@ -3182,15 +2108,6 @@ def _itinerary_alts_departafter(ci, entry, dlat, dlon, max_rides, speed, prov50,
     t_hydrate = time.perf_counter() if perf is not None else None
     final = []
     final_seen = set()
-    transfer_pairs = []
-    for a in out:
-        if not a.get("_needs_hydration"):
-            continue
-        for leg in ((a.get("_branch") or {}).get("raw") or ()):
-            if leg[0] == "walk_t" and len(leg) >= 4:
-                transfer_pairs.append((int(leg[2]), int(leg[3])))
-    if transfer_pairs:
-        prov50.prefetch_transfers(transfer_pairs)
     for a in out:
         # Hydrate only the selected proxy branches.  Structural selection has already reduced the
         # production candidate set from hundreds to the small expert-card result, so transfer walk
@@ -3257,7 +2174,7 @@ def _itinerary_alt_typicals_departafter(ci, entry, dlat, dlon, max_rides, speed,
     cells = entry["cells"]
     # PRIMARY floor = the painted p50 (cells[ci][1]) — the SAME floor _raptor_mc_build passes to
     # montecarlo for this cell. Each alt floors at its OWN p50 journey best-case (the alt's "typical"
-    # total). Sharing the floor + the per-workplace seed makes the per-route p90-p50 here the SAME
+    # total). Sharing the floor + the MC seed makes the per-route p90-p50 here the SAME
     # tail the served /variance frag is measured from.
     prim_p50 = cells.get(_RAPTOR.cell_ids[ci], [None, None])[1]
     stops = [int(s_star) if (not is_walk and s_star >= 0) else -1]
@@ -3270,7 +2187,7 @@ def _itinerary_alt_typicals_departafter(ci, entry, dlat, dlon, max_rides, speed,
         stops.append(int(a.get("via_stop", -1)))
         floors.append((a.get("typical") or {}).get("total"))
     egress_g, egress_w, _purewalk = raptor_egress_purewalk(dlat, dlon)
-    seed = mc_seed(dlat, dlon, max_rides, speed)
+    seed = mc_seed()
     scenario = _mc_scenario_for(_mc.get("_scenario_token"),
                                 coarse_key(dlat, dlon, max_rides, speed))
     pairs = _RAPTOR.route_typicals(tree, ci, stops, egress_g, egress_w,
@@ -3433,12 +2350,13 @@ def itinerary_departafter(cid, olat, olon, dlat, dlon, max_rides, speed, walk_sc
         fr = _itinerary_alt_typicals_departafter(ci, entry, dlat, dlon, max_rides, speed,
                                                  res["alts"], perf=perf)
         if fr is not None:
-            if fr.get("prim_frag") is not None:
-                res["frag"] = fr["prim_frag"]
-                primary_route["frag"] = fr["prim_frag"]
-            for a, f in zip(res["alts"], fr.get("alt_frags", [])):
-                if f is not None:
-                    a["frag"] = f
+            primary_route, hydrated_alts = route_hydration.apply_departafter_reliability(
+                primary_route, res["alts"], fr, metric="r")[2:]
+            if primary_route.get("frag") is not None:
+                res["frag"] = primary_route["frag"]
+            for target, hydrated in zip(res["alts"], hydrated_alts):
+                if "frag" in hydrated:
+                    target["frag"] = hydrated["frag"]
     _publish_choice_recommendation(res, primary_route, pin,
                                    recommended_routes=recommended_alts)
     _perf_add(perf, "pin.assembly_ms", t_assembly)
@@ -3508,13 +2426,17 @@ def itinerary_arriveby(cid, olat, olon, dlat, dlon, max_rides, speed, walk_scala
         typ = _itinerary_alt_typicals(ci, dlat, dlon, max_rides, speed, res["alts"])
         _perf_add(perf, "pin.frag_replay_ms", t_frag)
         if typ is not None:
-            prim = typ.get("prim")
-            if prim is not None:
-                res["real"], res["frag"] = prim[0], prim[1]
-                primary_route["frag"] = prim[1]
-            for a, p in zip(res["alts"], typ.get("alts", [])):
-                if p is not None:
-                    a["real"], a["frag"] = p[0], p[1]
+            primary_route, hydrated_alts = route_hydration.apply_reliability(
+                primary_route, res["alts"],
+                {"prim": typ.get("prim"), "alts": typ.get("alts", [])}, metric="r")
+            if primary_route.get("real") is not None:
+                res["real"] = primary_route["real"]
+            if primary_route.get("frag") is not None:
+                res["frag"] = primary_route["frag"]
+            for target, hydrated in zip(res["alts"], hydrated_alts):
+                for key in ("real", "frag"):
+                    if key in hydrated:
+                        target[key] = hydrated[key]
     if "error" not in res:
         _publish_choice_recommendation(res, primary_route, pin,
                                        recommended_routes=recommended_alts)
