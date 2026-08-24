@@ -387,6 +387,10 @@ def test_candidate_uses_the_exact_bootstrap_production_unit_before_live_mutation
     assert 'systemd-analyze verify "$CANDIDATE_UNIT_FILE"' in install
     assert 'systemctl start "$CANDIDATE_UNIT"' in install
     assert 'render_candidate_unit "$template" "$RELEASE_ID" 1 "$temp"' in install
+    assert 'chown -R -h "root:$USER_NAME" "$RELEASE_DIR/.venv"' in install
+    assert install.index(
+        'chown -R -h "root:$USER_NAME" "$RELEASE_DIR/.venv"'
+    ) < install.index('chmod -R a-w "$RELEASE_DIR/.venv"')
     assert 'Environment=PORT=$CANDIDATE_PORT' in install
     assert 'systemctl stop "$CANDIDATE_UNIT"' in install
     assert 'USE_RAPTOR' not in install

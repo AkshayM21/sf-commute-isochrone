@@ -1335,7 +1335,10 @@ sudo -u "$USER_NAME" "$RELEASE_DIR/.venv/bin/pip" install --quiet --upgrade pip 
 sudo -u "$USER_NAME" "$RELEASE_DIR/.venv/bin/pip" install --quiet -r "$RELEASE_DIR/requirements.txt"
 
 # Lock the completed virtualenv before candidate execution. Runtime caches and logs are external.
-chown -R -h root:root "$RELEASE_DIR/.venv"
+# Root owns the frozen environment, while the service group retains read/execute traversal.
+# The top-level virtualenv starts as mode 750, so changing it to root:root before removing write
+# access would leave the unprivileged service unable to execute its interpreter (mode 550).
+chown -R -h "root:$USER_NAME" "$RELEASE_DIR/.venv"
 chmod -R a-w "$RELEASE_DIR/.venv"
 ln -s "../../$PINNED_DATA_TARGET" "$RELEASE_DIR/data"
 
