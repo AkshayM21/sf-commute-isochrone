@@ -1346,7 +1346,7 @@ install_candidate_unit() {
   [[ -f "$template" && ! -L "$template" && "$(stat -c '%u:%g:%a:%h' "$template")" == "0:0:444:1" ]] || {
     echo "candidate unit template is not frozen root-owned source" >&2; return 1
   }
-  grep -q '^ExecStart=.*/scripts/bootstrap_server.py$' "$template" || {
+  grep -Fqx 'ExecStart=/opt/sfci/current/.venv/bin/python scripts/bootstrap_server.py' "$template" || {
     echo "production unit must run scripts/bootstrap_server.py" >&2; return 1
   }
   grep -q '^ExecStartPre=' "$template" && {

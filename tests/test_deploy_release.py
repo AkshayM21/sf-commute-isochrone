@@ -398,6 +398,10 @@ def test_candidate_uses_the_exact_bootstrap_production_unit_before_live_mutation
     assert "--noproxy '*'" in install
     assert 'Environment=PORT=8000' in service
     assert 'ExecStart=/opt/sfci/current/.venv/bin/python scripts/bootstrap_server.py' in service
+    assert (
+        "grep -Fqx 'ExecStart=/opt/sfci/current/.venv/bin/python "
+        "scripts/bootstrap_server.py' \"$template\""
+    ) in install
     assert "ExecStartPre=" not in service
     assert "ReadOnlyPaths=/opt/sfci/data-releases" in service
     assert "PORT=8000" not in install
