@@ -563,6 +563,146 @@ text_mentions_web() {
      "$text" =~ (^|[^0-9])(80|443)([^0-9]|$) ]]
 }
 
+# firewalld versions disagree on whether direct passthroughs are rendered as ordinary shell
+# arguments or as a Python list. Parse both forms exactly. The public-web classifier ignores only
+# rules that are provably irrelevant to inbound TCP 80/443: non-web ports/protocols, denying
+# targets, OUTPUT, or loopback/link-local IPv4 and loopback/link-local/ULA IPv6 destinations.
+# RFC1918 IPv4 is deliberately not exempt because a cloud public address can NAT to it.
+direct_rule_fields() {
+  "$PY_BIN" - "$1" <<'PY'
+import ast
+import shlex
+import sys
+
+raw = sys.argv[1].strip()
+family, separator, rest = raw.partition(" ")
+try:
+    if not separator:
+        raise ValueError("missing direct-rule arguments")
+    if rest.lstrip().startswith("["):
+        parsed = ast.literal_eval(rest)
+        if not isinstance(parsed, (list, tuple)):
+            raise ValueError("invalid direct-rule argument list")
+        fields = [family, *(str(item) for item in parsed)]
+    else:
+        fields = shlex.split(raw)
+except (SyntaxError, ValueError):
+    raise SystemExit(1)
+sys.stdout.buffer.write(b"\0".join(field.encode() for field in fields))
+sys.stdout.buffer.write(b"\0__SFCI_DIRECT_FIELDS_OK__\0")
+PY
+}
+
+direct_rule_to_array() {
+  local line="$1" field marker=0
+  DIRECT_FIELDS=()
+  while IFS= read -r -d '' field; do
+    if [[ "$field" == "__SFCI_DIRECT_FIELDS_OK__" ]]; then
+      marker=1
+    else
+      DIRECT_FIELDS+=("$field")
+    fi
+  done < <(direct_rule_fields "$line")
+  [[ "$marker" == "1" ]]
+}
+
+direct_rule_is_public_web() {
+  local line="$1"
+  "$PY_BIN" - "$line" <<'PY'
+import ast
+import ipaddress
+import shlex
+import sys
+
+
+def parse_fields(raw):
+    family, separator, rest = raw.strip().partition(" ")
+    if not separator:
+        raise ValueError("missing direct-rule arguments")
+    if rest.lstrip().startswith("["):
+        parsed = ast.literal_eval(rest)
+        if not isinstance(parsed, (list, tuple)):
+            raise ValueError("invalid direct-rule argument list")
+        return [family, *(str(item) for item in parsed)]
+    return shlex.split(raw)
+
+
+def next_value(tokens, index):
+    return tokens[index + 1] if index + 1 < len(tokens) else ""
+
+
+def port_spec_exposes_web(spec):
+    for part in spec.lower().split(","):
+        if part in {"http", "https"}:
+            return True
+        bounds = part.replace(":", "-").split("-", 1)
+        if not all(value.isdigit() for value in bounds):
+            return True
+        first = int(bounds[0])
+        last = int(bounds[-1])
+        if first > last or any(first <= port <= last for port in (80, 443)):
+            return True
+    return False
+
+
+def destination_is_nonroutable(tokens):
+    for index, token in enumerate(tokens):
+        if token not in {"-d", "--dst", "--destination"}:
+            continue
+        if index > 0 and tokens[index - 1] == "!":
+            return False
+        try:
+            network = ipaddress.ip_network(next_value(tokens, index), strict=False)
+        except ValueError:
+            return False
+        if network.version == 4:
+            return network.is_loopback or network.is_link_local
+        ula = ipaddress.ip_network("fc00::/7")
+        return network.is_loopback or network.is_link_local or network.subnet_of(ula)
+    return False
+
+
+try:
+    tokens = parse_fields(sys.argv[1])
+except (SyntaxError, ValueError):
+    raise SystemExit(0)
+
+chain = ""
+if "-A" in tokens:
+    chain = next_value(tokens, tokens.index("-A"))
+elif len(tokens) >= 4 and tokens[0] in {"ipv4", "ipv6", "eb"}:
+    chain = tokens[2]
+if chain == "OUTPUT" or "-N" in tokens or destination_is_nonroutable(tokens):
+    raise SystemExit(1)
+
+protocol = ""
+for index, token in enumerate(tokens):
+    if token in {"-p", "--protocol"}:
+        protocol = next_value(tokens, index).lower()
+if protocol and protocol != "tcp":
+    raise SystemExit(1)
+
+jump = ""
+for index, token in enumerate(tokens):
+    if token in {"-j", "--jump", "-g", "--goto"}:
+        jump = next_value(tokens, index).upper()
+    elif token.startswith(("--jump=", "--goto=")):
+        jump = token.split("=", 1)[1].upper()
+if not jump or jump in {"DROP", "REJECT", "RETURN"}:
+    raise SystemExit(1)
+
+port_specs = []
+for index, token in enumerate(tokens):
+    if token in {"--dport", "--dports", "--destination-port"}:
+        port_specs.append(next_value(tokens, index))
+    elif token.startswith(("--dport=", "--dports=", "--destination-port=")):
+        port_specs.append(token.split("=", 1)[1])
+
+# An accepting/jumping TCP rule without a destination-port restriction includes web traffic.
+raise SystemExit(0 if not port_specs or any(port_spec_exposes_web(spec) for spec in port_specs) else 1)
+PY
+}
+
 firewall_call() {
   local mode="$1"; shift
   if [[ "$mode" == "permanent" ]]; then
@@ -621,17 +761,17 @@ close_zone_web_ingress() {
 
 close_direct_web_ingress() {
   local mode="$1" kind line lines
-  local -a fields
   for kind in rules passthroughs; do
     lines="$(firewall_call "$mode" --direct "--get-all-$kind" 2>/dev/null)" || return 1
     while IFS= read -r line; do
       [[ -n "$line" ]] || continue
-      text_mentions_web "$line" || continue
-      read -r -a fields <<<"$line"
+      direct_rule_is_public_web "$line" || continue
+      direct_rule_to_array "$line" || return 1
+      ((${#DIRECT_FIELDS[@]} > 0)) || return 1
       if [[ "$kind" == "rules" ]]; then
-        firewall_call "$mode" --direct --remove-rule "${fields[@]}" >/dev/null
+        firewall_call "$mode" --direct --remove-rule "${DIRECT_FIELDS[@]}" >/dev/null
       else
-        firewall_call "$mode" --direct --remove-passthrough "${fields[@]}" >/dev/null
+        firewall_call "$mode" --direct --remove-passthrough "${DIRECT_FIELDS[@]}" >/dev/null
       fi
     done <<<"$lines"
   done
@@ -685,12 +825,12 @@ verify_no_non_cloudflare_web_ingress() {
   direct_rules="$(firewall_call "$mode" --direct --get-all-rules 2>/dev/null)" || return 1
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    return 1
+    direct_rule_is_public_web "$rule" && return 1
   done <<<"$direct_rules"
   passthroughs="$(firewall_call "$mode" --direct --get-all-passthroughs 2>/dev/null)" || return 1
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    return 1
+    direct_rule_is_public_web "$rule" && return 1
   done <<<"$passthroughs"
   policies="$(firewall_call "$mode" --get-policies 2>/dev/null)" || return 1
   for policy in $policies; do

@@ -23,6 +23,19 @@ def bash_script(script: str, *, check: bool = True) -> subprocess.CompletedProce
     )
 
 
+def direct_rule_helper(script: str, rule: str) -> subprocess.CompletedProcess[str]:
+    install = (ROOT / "deploy" / "install.sh").read_text()
+    start = install.index("direct_rule_fields() {")
+    end = install.index("\nfirewall_call() {", start)
+    functions = install[start:end]
+    return subprocess.run(
+        ["bash", "-c", f"PY_BIN={sys.executable!s}\n{functions}\n{script}", "sfci-test", rule],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+
 def make_release(root: Path, name: str) -> Path:
     path = root / "releases" / name
     path.mkdir(parents=True, exist_ok=True)
@@ -508,6 +521,64 @@ def test_transaction_covers_legacy_firewall_proxy_and_first_install_rollback() -
     assert 'jq -e \'.ok == true\'' in install
     assert '$SFCI_ENV must be a root:root mode-600 single-link regular file' in install
     assert 'chmod 640 "$path"' in install
+
+
+def test_direct_firewall_classifier_ignores_only_provably_non_public_web_rules() -> None:
+    safe_rules = (
+        "ipv4 -N BareMetalInstanceServices",
+        "ipv4 -A OUTPUT -d 169.254.0.0/16 -j BareMetalInstanceServices",
+        "ipv4 -A BareMetalInstanceServices -d 169.254.0.2/32 -p tcp --dport 80 -j ACCEPT",
+        "ipv6 -A BareMetalInstanceServices -d fd00:c1::a9fe:0002/128 -p tcp --dport 80 -j ACCEPT",
+        "ipv4 -A INPUT -p tcp --dport 22 -j ACCEPT",
+        "ipv4 -A INPUT -p udp --dport 80 -j ACCEPT",
+        "ipv4 -A INPUT -p tcp --dport 80 -j DROP",
+    )
+    public_rules = (
+        "ipv4 filter INPUT 0 -p tcp --dport 80 -j ACCEPT",
+        "ipv4 -A INPUT -p tcp --dport 443 -j ACCEPT",
+        "ipv4 -A INPUT -p tcp -j ACCEPT",
+        "ipv4 -A INPUT -d 10.0.0.8/32 -p tcp --dport 80 -j ACCEPT",
+        "ipv4 -A INPUT ! -d 169.254.0.2/32 -p tcp --dport 80 -j ACCEPT",
+        "ipv4 ['-A', 'PREROUTING', '-p', 'tcp', '--dport', '80', '-j', 'DNAT']",
+    )
+
+    for rule in safe_rules:
+        result = direct_rule_helper('direct_rule_is_public_web "$1"', rule)
+        assert result.returncode != 0, (rule, result.stderr)
+    for rule in public_rules:
+        result = direct_rule_helper('direct_rule_is_public_web "$1"', rule)
+        assert result.returncode == 0, (rule, result.stderr)
+
+
+def test_direct_firewall_parser_preserves_quoted_and_list_arguments() -> None:
+    whitespace = (
+        "ipv4 -A INPUT -p tcp --dport 80 -m comment "
+        "--comment 'space preserving comment' -j ACCEPT"
+    )
+    parsed = direct_rule_helper(
+        'direct_rule_to_array "$1" && printf "<%s>\\n" "${DIRECT_FIELDS[@]}"',
+        whitespace,
+    )
+    assert parsed.returncode == 0, parsed.stderr
+    assert "<space preserving comment>" in parsed.stdout
+
+    listed = "ipv4 ['-A', 'INPUT', '-p', 'tcp', '--dport', '443', '-j', 'ACCEPT']"
+    parsed_list = direct_rule_helper(
+        'direct_rule_to_array "$1" && printf "<%s>\\n" "${DIRECT_FIELDS[@]}"',
+        listed,
+    )
+    assert parsed_list.returncode == 0, parsed_list.stderr
+    assert parsed_list.stdout.splitlines() == [
+        "<ipv4>",
+        "<-A>",
+        "<INPUT>",
+        "<-p>",
+        "<tcp>",
+        "<--dport>",
+        "<443>",
+        "<-j>",
+        "<ACCEPT>",
+    ]
 
 
 def test_transaction_metadata_env_and_rollback_paths_are_hardened() -> None:
