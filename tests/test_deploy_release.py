@@ -565,8 +565,10 @@ def test_transaction_covers_legacy_firewall_proxy_and_first_install_rollback() -
     close_zone = install[install.index("close_zone_web_ingress()") : install.index("close_direct_web_ingress()")]
     assert 'if [[ "$mode" == "permanent" ]]' in close_zone
     assert 'firewall_call "$mode" --zone="$zone" --set-target=DROP' in close_zone
-    assert 'firewall_call "$mode" --zone="$zone" --get-target' in close_zone
+    assert 'firewall_zone_target "$mode" "$zone"' in close_zone
     assert install.count("--set-target=DROP") == 1
+    target_helper = install[install.index("firewall_zone_target()") : install.index("service_exposes_web()")]
+    assert 'firewall_call permanent --zone="$zone" --get-target' in target_helper
     assert 'restore_caddy "$CADDY_HAD_FILE" "$CADDY_WAS_ACTIVE" "$CADDY_WAS_ENABLED"' in install
     assert "caddy_enabled=%s" in install
     assert 'PUBLIC_SMOKE_URL must be exactly https://$PUBLIC_HOST' in install

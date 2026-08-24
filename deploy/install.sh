@@ -764,6 +764,14 @@ firewall_call() {
   fi
 }
 
+firewall_zone_target() {
+  local mode="$1" zone="$2"
+  [[ "$mode" == "permanent" || "$mode" == "runtime" ]] || return 1
+  # firewalld 1.3.x exposes zone targets as permanent configuration only. The deployment reloads
+  # before runtime verification, so this is the authoritative target for both verification passes.
+  firewall_call permanent --zone="$zone" --get-target
+}
+
 service_exposes_web() {
   local mode="$1" service="$2" info token
   [[ "$service" == "http" || "$service" == "https" ]] && return 0
@@ -812,7 +820,7 @@ close_zone_web_ingress() {
     else
       # firewalld 1.3.x exposes zone target mutation only through --permanent. The caller reloads
       # after the permanent pass; the runtime pass proves that target was applied.
-      [[ "$(firewall_call "$mode" --zone="$zone" --get-target)" == "DROP" ]]
+      [[ "$(firewall_zone_target "$mode" "$zone")" == "DROP" ]]
     fi
   fi
 }
@@ -861,7 +869,7 @@ verify_no_non_cloudflare_web_ingress() {
   for zone in $zones; do
     [[ -n "$zone" ]] || continue
     [[ "$zone" == "cloudflare" && "$skip_cloudflare" == "1" ]] && continue
-    target="$(firewall_call "$mode" --zone="$zone" --get-target)" || return 1
+    target="$(firewall_zone_target "$mode" "$zone")" || return 1
     [[ "$target" != "ACCEPT" ]] || return 1
     services="$(firewall_call "$mode" --zone="$zone" --list-services)" || return 1
     for service in $services; do
@@ -931,7 +939,7 @@ verify_cloudflare_zone() {
   services="$(firewall_call "$mode" --zone=cloudflare --list-services)" || return 1
   sources="$(firewall_call "$mode" --zone=cloudflare --list-sources)" || return 1
   interfaces="$(firewall_call "$mode" --zone=cloudflare --list-interfaces)" || return 1
-  target="$(firewall_call "$mode" --zone=cloudflare --get-target)" || return 1
+  target="$(firewall_zone_target "$mode" cloudflare)" || return 1
   command -v python3 >/dev/null 2>&1 || return 1
   for source in $sources; do
     python3 -c 'import ipaddress, sys
