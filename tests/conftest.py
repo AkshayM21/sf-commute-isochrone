@@ -91,8 +91,17 @@ def client(server):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_rate_limits(server):
-    """Keep one test's deliberate limiter exhaustion from leaking into the next test."""
-    server.limiter.reset()
+def _isolate_rate_limits(request):
+    """Reset limits only for tests that actually depend on the Flask server.
+
+    Keeping the dependency lazy lets pure routing/helper tests run in a clean checkout without
+    ignored transit data while preserving isolation for API tests that request ``server`` or
+    ``client`` directly or transitively.
+    """
+    if not {"server", "client"}.intersection(request.fixturenames):
+        yield
+        return
+    server_module = request.getfixturevalue("server")
+    server_module.limiter.reset()
     yield
-    server.limiter.reset()
+    server_module.limiter.reset()
