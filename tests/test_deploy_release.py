@@ -302,6 +302,14 @@ def test_scripts_encode_safe_staging_data_and_secret_contracts() -> None:
 
     assert "--exclude '/data/***'" in push
     assert "--exclude '.claude/'" in push
+    for development_path in (
+        ".github/",
+        ".ruff_cache/",
+        "/prototypes/",
+        "/tests/",
+        "/requirements-dev.txt",
+    ):
+        assert f"--exclude '{development_path}'" in push
     assert "REMOTE_CONTROL=" in push
     assert "$REMOTE_CONTROL/install.sh --release-id" in push
     assert "'$REMOTE_STAGE/deploy/install.sh --release-id" not in push

@@ -39,6 +39,7 @@ echo "[push] rsyncing $REPO_ROOT -> $TARGET:$REMOTE_STAGE ..."
 # depth; leading slashes are reserved for intentionally root-scoped runtime paths.
 rsync -avzP --delete --no-owner --no-group --rsync-path='sudo rsync' \
   --exclude '.git/' \
+  --exclude '.github/' \
   --exclude '.claude/' \
   --exclude '.impeccable/' \
   --exclude '.agents/' \
@@ -77,7 +78,10 @@ rsync -avzP --delete --no-owner --no-group --rsync-path='sudo rsync' \
   --exclude '/tests/e2e/screens/' \
   --exclude '/tests/e2e/screenshots/' \
   --exclude '.pytest_cache/' \
-  --exclude '/tests/__pycache__/' \
+  --exclude '.ruff_cache/' \
+  --exclude '/prototypes/' \
+  --exclude '/tests/' \
+  --exclude '/requirements-dev.txt' \
   --exclude '/data/osm_sf.pbf' \
   --exclude '/data/norcal.osm.pbf' \
   ./ "$TARGET:$REMOTE_STAGE/"
