@@ -44,6 +44,19 @@ def direct_rule_helper(
     )
 
 
+def firewall_primitive_helper(script: str, value: str) -> subprocess.CompletedProcess[str]:
+    install = (ROOT / "deploy" / "install.sh").read_text()
+    start = install.index("port_token_exposes_web() {")
+    end = install.index("\ndirect_rule_fields() {", start)
+    functions = install[start:end]
+    return subprocess.run(
+        ["bash", "-c", f"{functions}\n{script}", "sfci-test", value],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+
 def direct_firewall_flow_helper(
     flow: str,
     rule: str,
@@ -63,7 +76,8 @@ firewall_call() {
   case "$joined" in
     *--get-zones*) printf '%s\n' public ;;
     *--get-target*) printf '%s\n' DROP ;;
-    *--list-services*|*--list-ports*|*--list-rich-rules*|*--list-forward-ports*) return 0 ;;
+    *--list-all*) printf '%s\n' '  target: DROP' ;;
+    *--list-services*|*--list-ports*|*--list-protocols*|*--list-source-ports*|*--list-rich-rules*|*--list-forward-ports*) return 0 ;;
     *--get-all-rules*) printf '%s\n' "$TEST_RULE" ;;
     *--get-all-passthroughs*|*--get-policies*) return 0 ;;
     *--remove-rule*|*--remove-passthrough*) return "$REMOVE_STATUS" ;;
@@ -551,6 +565,8 @@ def test_transaction_covers_legacy_firewall_proxy_and_first_install_rollback() -
     for exposure in (
         "--list-services",
         "--list-ports",
+        "--list-protocols",
+        "--list-source-ports",
         "--list-rich-rules",
         "--list-forward-ports",
         "--get-all-rules",
@@ -567,8 +583,9 @@ def test_transaction_covers_legacy_firewall_proxy_and_first_install_rollback() -
     assert 'firewall_call "$mode" --zone="$zone" --set-target=DROP' in close_zone
     assert 'firewall_zone_target "$mode" "$zone"' in close_zone
     assert install.count("--set-target=DROP") == 1
-    target_helper = install[install.index("firewall_zone_target()") : install.index("service_exposes_web()")]
+    target_helper = install[install.index("firewall_zone_target()") : install.index("service_is_required_non_web()")]
     assert 'firewall_call permanent --zone="$zone" --get-target' in target_helper
+    assert 'firewall_call runtime --zone="$zone" --list-all' in target_helper
     assert 'restore_caddy "$CADDY_HAD_FILE" "$CADDY_WAS_ACTIVE" "$CADDY_WAS_ENABLED"' in install
     assert "caddy_enabled=%s" in install
     assert 'PUBLIC_SMOKE_URL must be exactly https://$PUBLIC_HOST' in install
@@ -588,13 +605,17 @@ def test_direct_firewall_classifier_ignores_only_provably_non_public_web_rules()
         ("passthroughs", "ipv4 -A BareMetalInstanceServices -d 169.254.0.2/32 -p tcp --dport 80 -j ACCEPT"),
         ("passthroughs", "ipv6 -A BareMetalInstanceServices -d fd00:c1::a9fe:0002/128 -p tcp --dport 80 -j ACCEPT"),
         ("rules", "ipv4 filter INPUT 0 -p tcp --dport 22 -j ACCEPT"),
-        ("rules", "ipv4 filter INPUT 0 -p udp --dport 80 -j ACCEPT"),
         ("rules", "ipv4 filter INPUT 0 -p tcp --dport 80 -j DROP"),
         ("passthroughs", "ipv4 -A POSTROUTING -p tcp --dport 80 -j MARK"),
     )
     public_rules = (
         ("rules", "ipv4 filter INPUT 0 -p tcp --dport 80 -j ACCEPT"),
         ("rules", "ipv4 filter INPUT 0 -ptcp --dport=80 -jACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p all -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p 6 --dport 443 -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p udp --dport 443 -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p udp --dport 80 -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p tcp ! --dport 22 -j ACCEPT"),
         ("passthroughs", "ipv4 -A INPUT -p tcp --dport 443 -j ACCEPT"),
         ("passthroughs", "ipv4 -A INPUT -p tcp -j ACCEPT"),
         ("passthroughs", "ipv4 -A INPUT -d 10.0.0.8/32 -p tcp --dport 80 -j ACCEPT"),
@@ -620,6 +641,13 @@ def test_direct_firewall_classifier_ignores_only_provably_non_public_web_rules()
         python="/definitely/missing/python",
     )
     assert missing_python.returncode not in {0, 10}
+
+
+def test_firewall_port_classifier_covers_tcp_and_http3_udp() -> None:
+    for token in ("80/tcp", "443/tcp", "443/udp", "70-90/udp"):
+        assert firewall_primitive_helper('port_token_exposes_web "$1"', token).returncode == 0
+    for token in ("22/tcp", "53/udp", "443/sctp"):
+        assert firewall_primitive_helper('port_token_exposes_web "$1"', token).returncode != 0
 
 
 def test_direct_firewall_parser_preserves_quoted_and_list_arguments() -> None:

@@ -548,7 +548,7 @@ service_list_has() {
 port_token_exposes_web() {
   local token="$1" spec protocol first last web
   spec="${token%/*}"; protocol="${token##*/}"
-  [[ "$protocol" == "tcp" ]] || return 1
+  [[ "$protocol" == "tcp" || "$protocol" == "udp" ]] || return 1
   first="${spec%%-*}"; last="${spec##*-}"
   [[ "$first" =~ ^[0-9]+$ && "$last" =~ ^[0-9]+$ ]] || return 0
   for web in 80 443; do
@@ -729,8 +729,11 @@ if chain in {"OUTPUT", "POSTROUTING"} or destination_is_nonroutable(tokens):
     raise SystemExit(SAFE)
 
 protocol, _ = option_value(tokens, {"-p", "--protocol"}, attached=("-p",))
-if protocol and protocol.lower() != "tcp":
+protocol = protocol.lower()
+if protocol in {"icmp", "icmpv6", "ipv6-icmp", "1", "58", "esp", "ah"}:
     raise SystemExit(SAFE)
+if protocol not in {"", "all", "0", "tcp", "6", "udp", "17"}:
+    raise SystemExit(ERROR)
 
 jump, _ = option_value(
     tokens, {"-j", "--jump", "-g", "--goto"}, attached=("-j", "-g")
@@ -748,6 +751,8 @@ for names in (
 ):
     value, index = option_value(tokens, names)
     if index >= 0:
+        if index > 0 and tokens[index - 1] == "!":
+            raise SystemExit(PUBLIC)
         port_specs.append(value)
 
 # An accepting/jumping TCP rule without a destination-port restriction includes web traffic.
@@ -765,58 +770,66 @@ firewall_call() {
 }
 
 firewall_zone_target() {
-  local mode="$1" zone="$2"
+  local mode="$1" zone="$2" info target
   [[ "$mode" == "permanent" || "$mode" == "runtime" ]] || return 1
-  # firewalld 1.3.x exposes zone targets as permanent configuration only. The deployment reloads
-  # before runtime verification, so this is the authoritative target for both verification passes.
-  firewall_call permanent --zone="$zone" --get-target
+  if [[ "$mode" == "permanent" ]]; then
+    firewall_call permanent --zone="$zone" --get-target
+    return
+  fi
+  # firewalld 1.3.x makes --get-target permanent-only, but runtime --list-all reports the active
+  # target. Parse that field so the runtime pass verifies what reload actually applied.
+  info="$(firewall_call runtime --zone="$zone" --list-all)" || return 1
+  target="$(awk -F: '/^[[:space:]]*target:/{sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' \
+    <<<"$info")"
+  [[ -n "$target" ]] || return 1
+  printf '%s\n' "$target"
 }
 
-service_exposes_web() {
-  local mode="$1" service="$2" info token
-  [[ "$service" == "http" || "$service" == "https" ]] && return 0
-  info="$(firewall_call "$mode" --info-service="$service" 2>/dev/null)" || return 0
-  while read -r token; do
-    port_token_exposes_web "$token" && return 0
-  done < <(awk '/^[[:space:]]*ports:/{for(i=2;i<=NF;i++) print $i}' <<<"$info")
-  return 1
+service_is_required_non_web() {
+  [[ "$1" == "ssh" || "$1" == "dhcpv6-client" ]]
 }
 
 close_zone_web_ingress() {
   local mode="$1" zone="$2" preserve_cloudflare="${3:-1}"
-  local service port rule services ports rich_rules forward_ports
+  local service port protocol rule services ports protocols source_ports rich_rules forward_ports
   [[ "$zone" == "cloudflare" && "$preserve_cloudflare" == "1" ]] && return 0
   services="$(firewall_call "$mode" --zone="$zone" --list-services)" || return 1
   for service in $services; do
     [[ -n "$service" ]] || continue
-    if service_exposes_web "$mode" "$service"; then
-      firewall_call "$mode" --zone="$zone" --remove-service="$service" >/dev/null
+    if ! service_is_required_non_web "$service"; then
+      firewall_call "$mode" --zone="$zone" --remove-service="$service" >/dev/null || return 1
     fi
   done
   ports="$(firewall_call "$mode" --zone="$zone" --list-ports)" || return 1
   for port in $ports; do
     [[ -n "$port" ]] || continue
     if port_token_exposes_web "$port"; then
-      firewall_call "$mode" --zone="$zone" --remove-port="$port" >/dev/null
+      firewall_call "$mode" --zone="$zone" --remove-port="$port" >/dev/null || return 1
     fi
+  done
+  protocols="$(firewall_call "$mode" --zone="$zone" --list-protocols)" || return 1
+  for protocol in $protocols; do
+    [[ -n "$protocol" ]] || continue
+    firewall_call "$mode" --zone="$zone" --remove-protocol="$protocol" >/dev/null || return 1
+  done
+  source_ports="$(firewall_call "$mode" --zone="$zone" --list-source-ports)" || return 1
+  for port in $source_ports; do
+    [[ -n "$port" ]] || continue
+    firewall_call "$mode" --zone="$zone" --remove-source-port="$port" >/dev/null || return 1
   done
   rich_rules="$(firewall_call "$mode" --zone="$zone" --list-rich-rules)" || return 1
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    if text_mentions_web "$rule"; then
-      firewall_call "$mode" --zone="$zone" --remove-rich-rule="$rule" >/dev/null
-    fi
+    firewall_call "$mode" --zone="$zone" --remove-rich-rule="$rule" >/dev/null || return 1
   done <<<"$rich_rules"
   forward_ports="$(firewall_call "$mode" --zone="$zone" --list-forward-ports)" || return 1
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    if text_mentions_web "$rule"; then
-      firewall_call "$mode" --zone="$zone" --remove-forward-port="$rule" >/dev/null
-    fi
+    firewall_call "$mode" --zone="$zone" --remove-forward-port="$rule" >/dev/null || return 1
   done <<<"$forward_ports"
   if [[ "$zone" == "public" || "$preserve_cloudflare" == "0" ]]; then
     if [[ "$mode" == "permanent" ]]; then
-      firewall_call "$mode" --zone="$zone" --set-target=DROP >/dev/null
+      firewall_call "$mode" --zone="$zone" --set-target=DROP >/dev/null || return 1
     else
       # firewalld 1.3.x exposes zone target mutation only through --permanent. The caller reloads
       # after the permanent pass; the runtime pass proves that target was applied.
@@ -862,7 +875,7 @@ close_non_cloudflare_web_ingress() {
 
 verify_no_non_cloudflare_web_ingress() {
   local mode="$1" skip_cloudflare="${2:-1}"
-  local zone zones target service port rule services ports rich_rules forward_ports
+  local zone zones target service port rule services ports protocols source_ports rich_rules forward_ports
   local direct_rules passthroughs policies policy policy_info policy_value classification
   zones="$(firewall_call "$mode" --get-zones)" || return 1
   [[ -n "$zones" ]] || return 1
@@ -874,13 +887,17 @@ verify_no_non_cloudflare_web_ingress() {
     services="$(firewall_call "$mode" --zone="$zone" --list-services)" || return 1
     for service in $services; do
       [[ -n "$service" ]] || continue
-      service_exposes_web "$mode" "$service" && return 1
+      service_is_required_non_web "$service" || return 1
     done
     ports="$(firewall_call "$mode" --zone="$zone" --list-ports)" || return 1
     for port in $ports; do
       [[ -n "$port" ]] || continue
       port_token_exposes_web "$port" && return 1
     done
+    protocols="$(firewall_call "$mode" --zone="$zone" --list-protocols)" || return 1
+    [[ -z "$protocols" ]] || return 1
+    source_ports="$(firewall_call "$mode" --zone="$zone" --list-source-ports)" || return 1
+    [[ -z "$source_ports" ]] || return 1
     rich_rules="$(firewall_call "$mode" --zone="$zone" --list-rich-rules)" || return 1
     while IFS= read -r rule; do
       [[ -n "$rule" ]] || continue
@@ -922,11 +939,11 @@ verify_no_non_cloudflare_web_ingress() {
     [[ "$target" != "ACCEPT" ]] || return 1
     policy_value="$(awk -F: '/^[[:space:]]*services:/{sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' \
       <<<"$policy_info")"
-    for service in $policy_value; do service_exposes_web "$mode" "$service" && return 1; done
+    [[ -z "$policy_value" ]] || return 1
     policy_value="$(awk -F: '/^[[:space:]]*ports:/{sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' \
       <<<"$policy_info")"
-    for port in $policy_value; do port_token_exposes_web "$port" && return 1; done
-    policy_value="$(awk -F: '/^[[:space:]]*(rich rules|forward-ports):/{sub(/^[^:]*:[[:space:]]*/, ""); print}' \
+    [[ -z "$policy_value" ]] || return 1
+    policy_value="$(awk -F: '/^[[:space:]]*(protocols|source-ports|forward-ports):/{sub(/^[^:]*:[[:space:]]*/, ""); print}' \
       <<<"$policy_info")"
     [[ -z "$policy_value" ]] || return 1
   done
@@ -934,12 +951,18 @@ verify_no_non_cloudflare_web_ingress() {
 
 verify_cloudflare_zone() {
   local mode="$1" zones services sources interfaces target source
+  local ports protocols source_ports rich_rules forward_ports
   zones="$(firewall_call "$mode" --get-zones)" || return 1
   service_list_has "$zones" cloudflare || return 1
   services="$(firewall_call "$mode" --zone=cloudflare --list-services)" || return 1
   sources="$(firewall_call "$mode" --zone=cloudflare --list-sources)" || return 1
   interfaces="$(firewall_call "$mode" --zone=cloudflare --list-interfaces)" || return 1
   target="$(firewall_zone_target "$mode" cloudflare)" || return 1
+  ports="$(firewall_call "$mode" --zone=cloudflare --list-ports)" || return 1
+  protocols="$(firewall_call "$mode" --zone=cloudflare --list-protocols)" || return 1
+  source_ports="$(firewall_call "$mode" --zone=cloudflare --list-source-ports)" || return 1
+  rich_rules="$(firewall_call "$mode" --zone=cloudflare --list-rich-rules)" || return 1
+  forward_ports="$(firewall_call "$mode" --zone=cloudflare --list-forward-ports)" || return 1
   command -v python3 >/dev/null 2>&1 || return 1
   for source in $sources; do
     python3 -c 'import ipaddress, sys
@@ -948,7 +971,8 @@ minimum = 12 if n.version == 4 else 32
 raise SystemExit(0 if n.prefixlen >= minimum else 1)' "$source" || return 1
   done
   service_list_has "$services" http && service_list_has "$services" https &&
-    [[ -n "$sources" && -z "$interfaces" && "$target" == "DROP" ]]
+    [[ -n "$sources" && -z "$interfaces" && "$target" == "DROP" && -z "$ports" &&
+       -z "$protocols" && -z "$source_ports" && -z "$rich_rules" && -z "$forward_ports" ]]
 }
 
 stop_origin() {
