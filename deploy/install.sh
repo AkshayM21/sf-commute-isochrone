@@ -972,7 +972,7 @@ verify_cloudflare_zone() {
   for source in $sources; do
     python3 -c 'import ipaddress, sys
 n = ipaddress.ip_network(sys.argv[1], strict=True)
-minimum = 12 if n.version == 4 else 32
+minimum = 12 if n.version == 4 else 24
 raise SystemExit(0 if n.prefixlen >= minimum else 1)' "$source" || return 1
   done
   service_list_has "$services" http && service_list_has "$services" https &&

@@ -47,7 +47,10 @@ for expected_version, filename in zip((4, 6), sys.argv[1:]):
             raise SystemExit(f"invalid Cloudflare CIDR {value!r}: {exc}")
         if network.version != expected_version:
             raise SystemExit(f"wrong address family in Cloudflare IPv{expected_version} list: {value}")
-        minimum = 12 if network.version == 4 else 32
+        # Cloudflare currently publishes legitimate IPv6 aggregates as broad as /29. Keep a
+        # margin below that so official list changes do not darken the site, while still rejecting
+        # default and near-default routes that could expose the origin broadly.
+        minimum = 12 if network.version == 4 else 24
         if network.prefixlen < minimum:
             raise SystemExit(f"dangerously broad Cloudflare source rejected: {value}")
         networks.add(network)

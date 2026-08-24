@@ -816,7 +816,7 @@ def test_cloudflare_source_parser_rejects_broad_and_malformed_cidrs(tmp_path: Pa
     v4 = tmp_path / "v4"
     v6 = tmp_path / "v6"
     v4.write_text("\n".join(f"192.0.{index}.0/24" for index in range(5)) + "\n")
-    v6.write_text("\n".join(f"2001:db8:{index}::/48" for index in range(5)) + "\n")
+    v6.write_text("2a06:98c0::/29\n" + "\n".join(f"2001:db8:{index}::/48" for index in range(4)) + "\n")
     valid = subprocess.run(
         [sys.executable, "-c", parser, str(v4), str(v6)],
         text=True,
@@ -833,7 +833,7 @@ def test_cloudflare_source_parser_rejects_broad_and_malformed_cidrs(tmp_path: Pa
     assert broad.returncode != 0
 
     v4.write_text("\n".join(f"192.0.{index}.0/24" for index in range(5)) + "\n")
-    v6.write_text("::/0\n" + v6.read_text())
+    v6.write_text("2001::/16\n" + v6.read_text())
     broad_v6 = subprocess.run(
         [sys.executable, "-c", parser, str(v4), str(v6)],
         text=True,
@@ -851,4 +851,5 @@ def test_cloudflare_source_parser_rejects_broad_and_malformed_cidrs(tmp_path: Pa
     assert malformed.returncode != 0
     assert "ipaddress.ip_network" in firewall
     install = (ROOT / "deploy" / "install.sh").read_text()
-    assert "minimum = 12 if n.version == 4 else 32" in install
+    assert "minimum = 12 if network.version == 4 else 24" in firewall
+    assert "minimum = 12 if n.version == 4 else 24" in install
