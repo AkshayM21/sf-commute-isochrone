@@ -342,6 +342,11 @@ def test_scripts_encode_safe_staging_data_and_secret_contracts() -> None:
     assert 'switch_data_current "$ROOT" "data-releases/$DATA_ID"' in data_refresh
     assert 'restore_data_pointers_exact "$ROOT" "$old_data_target" "$old_data_previous"' in data_refresh
     assert '[[ -L "$ROOT/current" ]]' in data_refresh
+    assert '--bootstrap-code-id' in data_refresh
+    assert '"${CONTROL_DIR##*/}" == "$BOOTSTRAP_CODE_ID"' in data_refresh
+    assert "bootstrap data promotion is allowed only before the first immutable code cutover" in data_refresh
+    assert "bootstrap data promotion requires an adopted legacy data pointer" in data_refresh
+    assert "matching frozen code" in docs
     assert 'systemctl stop sfci' in data_refresh
     assert 'freeze_and_validate "$STAGE"' in data_refresh
     assert 'prune_data_releases "$ROOT"' in data_refresh

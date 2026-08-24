@@ -10,12 +10,20 @@ DATA_INCOMING="$ROOT/data-incoming"
 DATA_TRANSACTION="$ROOT/.data-deploy-transaction"
 
 usage() {
-  echo "Usage: data-refresh.sh (--promote-id|--adopt-legacy) YYYYMMDD[HHMMSS]" >&2
+  echo "Usage: data-refresh.sh (--promote-id|--adopt-legacy) YYYYMMDD[HHMMSS] [--bootstrap-code-id YYYYMMDDHHMMSS]" >&2
   exit 2
 }
-[[ "$#" == 2 && ( "$1" == "--promote-id" || "$1" == "--adopt-legacy" ) &&
-   "$2" =~ ^[0-9]{8}([0-9]{6})?$ ]] || usage
-MODE="$1"; DATA_ID="$2"
+BOOTSTRAP_CODE_ID=""
+if [[ "$#" == 2 && ( "$1" == "--promote-id" || "$1" == "--adopt-legacy" ) &&
+      "$2" =~ ^[0-9]{8}([0-9]{6})?$ ]]; then
+  MODE="$1"; DATA_ID="$2"
+elif [[ "$#" == 4 && "$1" == "--promote-id" &&
+        "$2" =~ ^[0-9]{8}([0-9]{6})?$ && "$3" == "--bootstrap-code-id" &&
+        "$4" =~ ^[0-9]{14}$ ]]; then
+  MODE="$1"; DATA_ID="$2"; BOOTSTRAP_CODE_ID="$4"
+else
+  usage
+fi
 
 CONTROL_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 [[ "$CONTROL_DIR" =~ ^/opt/sfci/\.deploy-control/[0-9]{14}$ && ! -L "$CONTROL_DIR" &&
@@ -169,13 +177,30 @@ freeze_and_validate() {
 
 validate_full_readiness() {
   local tree="$1" code_target code_root python
-  code_target="$(current_target "$ROOT")"
-  valid_release_target "$ROOT" "$code_target" || {
-    echo "a trusted active code release is required for full staged-data readiness" >&2; return 1
-  }
+  if [[ -n "$BOOTSTRAP_CODE_ID" ]]; then
+    [[ "${CONTROL_DIR##*/}" == "$BOOTSTRAP_CODE_ID" ]] || {
+      echo "bootstrap validation must use the control files from the same code release" >&2
+      return 1
+    }
+    code_target="releases/$BOOTSTRAP_CODE_ID"
+    valid_release_target "$ROOT" "$code_target" || {
+      echo "bootstrap code release is missing or unsafe" >&2; return 1
+    }
+  else
+    code_target="$(current_target "$ROOT")"
+    valid_release_target "$ROOT" "$code_target" || {
+      echo "a trusted active code release is required for full staged-data readiness" >&2
+      return 1
+    }
+  fi
   code_root="$ROOT/$code_target"
   python="$code_root/.venv/bin/python"
-  [[ -x "$python" ]] || { echo "active release virtualenv is incomplete" >&2; return 1; }
+  [[ -f "$code_root/scripts/core/readiness.py" &&
+     ! -L "$code_root/scripts/core/readiness.py" &&
+     "$(stat -c '%u:%g:%a:%h' "$code_root/scripts/core/readiness.py")" == "0:0:444:1" ]] || {
+    echo "readiness validator is not frozen root-owned release source" >&2; return 1
+  }
+  [[ -x "$python" ]] || { echo "readiness release virtualenv is incomplete" >&2; return 1; }
   runuser -u sfci -- env PYTHONPATH="$code_root/scripts" "$python" - "$tree" <<'PY'
 import datetime as dt
 import json
@@ -244,11 +269,23 @@ PY
 TARGET="$DATA_RELEASES/$DATA_ID"
 
 if [[ "$MODE" == "--promote-id" ]]; then
-  validate_release_pointers "$ROOT" || { echo "unsafe code release pointers" >&2; exit 1; }
   validate_data_pointers "$ROOT" || { echo "unsafe data release pointers" >&2; exit 1; }
-  [[ -L "$ROOT/current" ]] || {
-    echo "promote code into the immutable release layout before advancing data-current" >&2; exit 1
-  }
+  if [[ -n "$BOOTSTRAP_CODE_ID" ]]; then
+    [[ ! -e "$ROOT/current" && ! -L "$ROOT/current" &&
+       ! -e "$ROOT/previous" && ! -L "$ROOT/previous" ]] || {
+      echo "bootstrap data promotion is allowed only before the first immutable code cutover" >&2
+      exit 1
+    }
+    [[ -L "$ROOT/data" && "$(readlink "$ROOT/data")" == "data-current" ]] || {
+      echo "bootstrap data promotion requires an adopted legacy data pointer" >&2; exit 1
+    }
+  else
+    validate_release_pointers "$ROOT" || { echo "unsafe code release pointers" >&2; exit 1; }
+    [[ -L "$ROOT/current" ]] || {
+      echo "promote code into the immutable release layout before advancing data-current" >&2
+      exit 1
+    }
+  fi
   if [[ -e "$TARGET" || -L "$TARGET" ]]; then
     if valid_data_target "$ROOT" "data-releases/$DATA_ID" &&
        [[ "$(data_current_target "$ROOT")" == "data-releases/$DATA_ID" ]]; then

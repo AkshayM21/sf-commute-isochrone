@@ -109,6 +109,19 @@ printed by `push.sh`:
 ssh <user@host> 'sudo /opt/sfci/.deploy-control/<code-release>/data-refresh.sh --promote-id <data-id>'
 ```
 
+During the one-time legacy migration only, a freshly prepared runtime may reject the adopted old
+bundle before the first immutable code cutover. If that release has already completed dependency
+installation and stopped at candidate validation, validate and promote the rebuilt data with that
+same release's root-owned control helper:
+
+```bash
+ssh <user@host> 'sudo /opt/sfci/.deploy-control/<code-release>/data-refresh.sh --promote-id <data-id> --bootstrap-code-id <code-release>'
+```
+
+This bootstrap form is rejected once `current` or `previous` exists, requires the legacy data tree
+to have been adopted first, and runs the staged-data readiness check from the matching frozen code
+release. Ordinary refreshes continue to require the active immutable release.
+
 The helper takes the same deployment lock, rejects symlinks and hardlinks, freezes the staged tree
 root-owned/read-only, and requires the three feeds plus the complete JSON/walk/RAPTOR/access/static
 artifact set. Using the active immutable code release and virtualenv, it runs the canonical
