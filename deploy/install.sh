@@ -606,13 +606,17 @@ direct_rule_to_array() {
   [[ "$marker" == "1" ]]
 }
 
-direct_rule_is_public_web() {
-  local line="$1"
-  "$PY_BIN" - "$line" <<'PY'
+direct_rule_classification() {
+  local kind="$1" line="$2"
+  "$PY_BIN" - "$kind" "$line" <<'PY'
 import ast
 import ipaddress
 import shlex
 import sys
+
+PUBLIC = 0
+SAFE = 10
+ERROR = 20
 
 
 def parse_fields(raw):
@@ -631,6 +635,19 @@ def next_value(tokens, index):
     return tokens[index + 1] if index + 1 < len(tokens) else ""
 
 
+def option_value(tokens, names, attached=()):
+    for index, token in enumerate(tokens):
+        if token in names:
+            return next_value(tokens, index), index
+        for name in names:
+            if token.startswith(name + "="):
+                return token.split("=", 1)[1], index
+        for short in attached:
+            if token.startswith(short) and len(token) > len(short):
+                return token[len(short):], index
+    return "", -1
+
+
 def port_spec_exposes_web(spec):
     for part in spec.lower().split(","):
         if part in {"http", "https"}:
@@ -646,60 +663,95 @@ def port_spec_exposes_web(spec):
 
 
 def destination_is_nonroutable(tokens):
-    for index, token in enumerate(tokens):
-        if token not in {"-d", "--dst", "--destination"}:
-            continue
-        if index > 0 and tokens[index - 1] == "!":
-            return False
-        try:
-            network = ipaddress.ip_network(next_value(tokens, index), strict=False)
-        except ValueError:
-            return False
-        if network.version == 4:
-            return network.is_loopback or network.is_link_local
-        ula = ipaddress.ip_network("fc00::/7")
-        return network.is_loopback or network.is_link_local or network.subnet_of(ula)
-    return False
+    value, index = option_value(
+        tokens, {"-d", "--dst", "--destination"}, attached=("-d",)
+    )
+    if index < 0 or (index > 0 and tokens[index - 1] == "!"):
+        return False
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return False
+    if network.version == 4:
+        return network.is_loopback or network.is_link_local
+    ula = ipaddress.ip_network("fc00::/7")
+    return network.is_loopback or network.is_link_local or network.subnet_of(ula)
 
 
 try:
-    tokens = parse_fields(sys.argv[1])
-except (SyntaxError, ValueError):
-    raise SystemExit(0)
+    kind = sys.argv[1]
+    fields = parse_fields(sys.argv[2])
+    if not fields or fields[0] not in {"ipv4", "ipv6", "eb"}:
+        raise ValueError("invalid direct-rule family")
+    if kind == "rules":
+        if len(fields) < 5 or not fields[3].lstrip("-").isdigit():
+            raise ValueError("invalid direct-rule record")
+        chain = fields[2]
+        tokens = fields[4:]
+    elif kind == "passthroughs":
+        command = fields[1:]
+        if command[:1] == ["-t"] or command[:1] == ["--table"]:
+            if len(command) < 3:
+                raise ValueError("missing passthrough table")
+            command = command[2:]
+        if not command:
+            raise ValueError("missing passthrough command")
+        operation = command[0]
+        exposing_ops = {"-A", "--append", "-I", "--insert", "-R", "--replace"}
+        safe_ops = {
+            "-N", "--new-chain", "-D", "--delete", "-F", "--flush", "-X",
+            "--delete-chain", "-Z", "--zero",
+        }
+        if operation in {"-P", "--policy"}:
+            if len(command) != 3:
+                raise ValueError("invalid passthrough policy")
+            chain, policy = command[1], command[2].upper()
+            raise SystemExit(PUBLIC if chain in {"INPUT", "FORWARD"} and policy == "ACCEPT" else SAFE)
+        attached_op = operation[:2] if len(operation) > 2 and operation[:2] in {"-A", "-I", "-R"} else ""
+        if operation in safe_ops:
+            raise SystemExit(SAFE)
+        if operation in exposing_ops:
+            if len(command) < 2:
+                raise ValueError("missing passthrough chain")
+            chain = command[1]
+            tokens = command[2:]
+        elif attached_op:
+            chain = operation[2:]
+            tokens = command[1:]
+        else:
+            raise ValueError("unknown passthrough operation")
+    else:
+        raise ValueError("invalid direct-rule kind")
+except (IndexError, SyntaxError, ValueError):
+    raise SystemExit(ERROR)
 
-chain = ""
-if "-A" in tokens:
-    chain = next_value(tokens, tokens.index("-A"))
-elif len(tokens) >= 4 and tokens[0] in {"ipv4", "ipv6", "eb"}:
-    chain = tokens[2]
-if chain == "OUTPUT" or "-N" in tokens or destination_is_nonroutable(tokens):
-    raise SystemExit(1)
+if chain in {"OUTPUT", "POSTROUTING"} or destination_is_nonroutable(tokens):
+    raise SystemExit(SAFE)
 
-protocol = ""
-for index, token in enumerate(tokens):
-    if token in {"-p", "--protocol"}:
-        protocol = next_value(tokens, index).lower()
-if protocol and protocol != "tcp":
-    raise SystemExit(1)
+protocol, _ = option_value(tokens, {"-p", "--protocol"}, attached=("-p",))
+if protocol and protocol.lower() != "tcp":
+    raise SystemExit(SAFE)
 
-jump = ""
-for index, token in enumerate(tokens):
-    if token in {"-j", "--jump", "-g", "--goto"}:
-        jump = next_value(tokens, index).upper()
-    elif token.startswith(("--jump=", "--goto=")):
-        jump = token.split("=", 1)[1].upper()
-if not jump or jump in {"DROP", "REJECT", "RETURN"}:
-    raise SystemExit(1)
+jump, _ = option_value(
+    tokens, {"-j", "--jump", "-g", "--goto"}, attached=("-j", "-g")
+)
+if not jump:
+    raise SystemExit(ERROR)
+jump = jump.upper()
+if jump in {"DROP", "REJECT", "RETURN", "LOG", "NFLOG", "MARK", "CONNMARK"}:
+    raise SystemExit(SAFE)
 
 port_specs = []
-for index, token in enumerate(tokens):
-    if token in {"--dport", "--dports", "--destination-port"}:
-        port_specs.append(next_value(tokens, index))
-    elif token.startswith(("--dport=", "--dports=", "--destination-port=")):
-        port_specs.append(token.split("=", 1)[1])
+for names in (
+    {"--dport", "--destination-port"},
+    {"--dports"},
+):
+    value, index = option_value(tokens, names)
+    if index >= 0:
+        port_specs.append(value)
 
 # An accepting/jumping TCP rule without a destination-port restriction includes web traffic.
-raise SystemExit(0 if not port_specs or any(port_spec_exposes_web(spec) for spec in port_specs) else 1)
+raise SystemExit(PUBLIC if not port_specs or any(port_spec_exposes_web(spec) for spec in port_specs) else SAFE)
 PY
 }
 
@@ -755,23 +807,35 @@ close_zone_web_ingress() {
     fi
   done <<<"$forward_ports"
   if [[ "$zone" == "public" || "$preserve_cloudflare" == "0" ]]; then
-    firewall_call "$mode" --zone="$zone" --set-target=DROP >/dev/null
+    if [[ "$mode" == "permanent" ]]; then
+      firewall_call "$mode" --zone="$zone" --set-target=DROP >/dev/null
+    else
+      # firewalld 1.3.x exposes zone target mutation only through --permanent. The caller reloads
+      # after the permanent pass; the runtime pass proves that target was applied.
+      [[ "$(firewall_call "$mode" --zone="$zone" --get-target)" == "DROP" ]]
+    fi
   fi
 }
 
 close_direct_web_ingress() {
-  local mode="$1" kind line lines
+  local mode="$1" kind line lines classification
   for kind in rules passthroughs; do
     lines="$(firewall_call "$mode" --direct "--get-all-$kind" 2>/dev/null)" || return 1
     while IFS= read -r line; do
       [[ -n "$line" ]] || continue
-      direct_rule_is_public_web "$line" || continue
+      if direct_rule_classification "$kind" "$line"; then
+        classification=0
+      else
+        classification=$?
+        [[ "$classification" == "10" ]] && continue
+        return 1
+      fi
       direct_rule_to_array "$line" || return 1
       ((${#DIRECT_FIELDS[@]} > 0)) || return 1
       if [[ "$kind" == "rules" ]]; then
-        firewall_call "$mode" --direct --remove-rule "${DIRECT_FIELDS[@]}" >/dev/null
+        firewall_call "$mode" --direct --remove-rule "${DIRECT_FIELDS[@]}" >/dev/null || return 1
       else
-        firewall_call "$mode" --direct --remove-passthrough "${DIRECT_FIELDS[@]}" >/dev/null
+        firewall_call "$mode" --direct --remove-passthrough "${DIRECT_FIELDS[@]}" >/dev/null || return 1
       fi
     done <<<"$lines"
   done
@@ -791,7 +855,7 @@ close_non_cloudflare_web_ingress() {
 verify_no_non_cloudflare_web_ingress() {
   local mode="$1" skip_cloudflare="${2:-1}"
   local zone zones target service port rule services ports rich_rules forward_ports
-  local direct_rules passthroughs policies policy policy_info policy_value
+  local direct_rules passthroughs policies policy policy_info policy_value classification
   zones="$(firewall_call "$mode" --get-zones)" || return 1
   [[ -n "$zones" ]] || return 1
   for zone in $zones; do
@@ -825,12 +889,22 @@ verify_no_non_cloudflare_web_ingress() {
   direct_rules="$(firewall_call "$mode" --direct --get-all-rules 2>/dev/null)" || return 1
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    direct_rule_is_public_web "$rule" && return 1
+    if direct_rule_classification rules "$rule"; then
+      return 1
+    else
+      classification=$?
+      [[ "$classification" == "10" ]] || return 1
+    fi
   done <<<"$direct_rules"
   passthroughs="$(firewall_call "$mode" --direct --get-all-passthroughs 2>/dev/null)" || return 1
   while IFS= read -r rule; do
     [[ -n "$rule" ]] || continue
-    direct_rule_is_public_web "$rule" && return 1
+    if direct_rule_classification passthroughs "$rule"; then
+      return 1
+    else
+      classification=$?
+      [[ "$classification" == "10" ]] || return 1
+    fi
   done <<<"$passthroughs"
   policies="$(firewall_call "$mode" --get-policies 2>/dev/null)" || return 1
   for policy in $policies; do

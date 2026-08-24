@@ -23,13 +23,64 @@ def bash_script(script: str, *, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def direct_rule_helper(script: str, rule: str) -> subprocess.CompletedProcess[str]:
+def direct_rule_helper(
+    script: str, rule: str, *, python: str | None = None
+) -> subprocess.CompletedProcess[str]:
     install = (ROOT / "deploy" / "install.sh").read_text()
     start = install.index("direct_rule_fields() {")
     end = install.index("\nfirewall_call() {", start)
     functions = install[start:end]
     return subprocess.run(
-        ["bash", "-c", f"PY_BIN={sys.executable!s}\n{functions}\n{script}", "sfci-test", rule],
+        [
+            "bash",
+            "-c",
+            f"PY_BIN={python or sys.executable}\n{functions}\n{script}",
+            "sfci-test",
+            rule,
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+
+def direct_firewall_flow_helper(
+    flow: str,
+    rule: str,
+    *,
+    python: str | None = None,
+    removal_status: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    install = (ROOT / "deploy" / "install.sh").read_text()
+    start = install.index("direct_rule_fields() {")
+    end = install.index("\nverify_cloudflare_zone() {", start)
+    functions = install[start:end]
+    mock = r'''
+TEST_RULE="$1"
+REMOVE_STATUS="$2"
+firewall_call() {
+  local joined="$*"
+  case "$joined" in
+    *--get-zones*) printf '%s\n' public ;;
+    *--get-target*) printf '%s\n' DROP ;;
+    *--list-services*|*--list-ports*|*--list-rich-rules*|*--list-forward-ports*) return 0 ;;
+    *--get-all-rules*) printf '%s\n' "$TEST_RULE" ;;
+    *--get-all-passthroughs*|*--get-policies*) return 0 ;;
+    *--remove-rule*|*--remove-passthrough*) return "$REMOVE_STATUS" ;;
+    *) return 1 ;;
+  esac
+}
+service_exposes_web() { return 1; }
+'''
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"PY_BIN={python or sys.executable}\n{functions}\n{mock}\n{flow}",
+            "sfci-test",
+            rule,
+            str(removal_status),
+        ],
         check=False,
         text=True,
         capture_output=True,
@@ -511,6 +562,11 @@ def test_transaction_covers_legacy_firewall_proxy_and_first_install_rollback() -
     assert "stop_origin" in install
     assert "close_zone_web_ingress permanent cloudflare 0" in install
     assert "verify_no_non_cloudflare_web_ingress permanent 0" in install
+    close_zone = install[install.index("close_zone_web_ingress()") : install.index("close_direct_web_ingress()")]
+    assert 'if [[ "$mode" == "permanent" ]]' in close_zone
+    assert 'firewall_call "$mode" --zone="$zone" --set-target=DROP' in close_zone
+    assert 'firewall_call "$mode" --zone="$zone" --get-target' in close_zone
+    assert install.count("--set-target=DROP") == 1
     assert 'restore_caddy "$CADDY_HAD_FILE" "$CADDY_WAS_ACTIVE" "$CADDY_WAS_ENABLED"' in install
     assert "caddy_enabled=%s" in install
     assert 'PUBLIC_SMOKE_URL must be exactly https://$PUBLIC_HOST' in install
@@ -525,29 +581,43 @@ def test_transaction_covers_legacy_firewall_proxy_and_first_install_rollback() -
 
 def test_direct_firewall_classifier_ignores_only_provably_non_public_web_rules() -> None:
     safe_rules = (
-        "ipv4 -N BareMetalInstanceServices",
-        "ipv4 -A OUTPUT -d 169.254.0.0/16 -j BareMetalInstanceServices",
-        "ipv4 -A BareMetalInstanceServices -d 169.254.0.2/32 -p tcp --dport 80 -j ACCEPT",
-        "ipv6 -A BareMetalInstanceServices -d fd00:c1::a9fe:0002/128 -p tcp --dport 80 -j ACCEPT",
-        "ipv4 -A INPUT -p tcp --dport 22 -j ACCEPT",
-        "ipv4 -A INPUT -p udp --dport 80 -j ACCEPT",
-        "ipv4 -A INPUT -p tcp --dport 80 -j DROP",
+        ("passthroughs", "ipv4 -N BareMetalInstanceServices"),
+        ("passthroughs", "ipv4 -A OUTPUT -d 169.254.0.0/16 -j BareMetalInstanceServices"),
+        ("passthroughs", "ipv4 -A BareMetalInstanceServices -d 169.254.0.2/32 -p tcp --dport 80 -j ACCEPT"),
+        ("passthroughs", "ipv6 -A BareMetalInstanceServices -d fd00:c1::a9fe:0002/128 -p tcp --dport 80 -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p tcp --dport 22 -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p udp --dport 80 -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -p tcp --dport 80 -j DROP"),
+        ("passthroughs", "ipv4 -A POSTROUTING -p tcp --dport 80 -j MARK"),
     )
     public_rules = (
-        "ipv4 filter INPUT 0 -p tcp --dport 80 -j ACCEPT",
-        "ipv4 -A INPUT -p tcp --dport 443 -j ACCEPT",
-        "ipv4 -A INPUT -p tcp -j ACCEPT",
-        "ipv4 -A INPUT -d 10.0.0.8/32 -p tcp --dport 80 -j ACCEPT",
-        "ipv4 -A INPUT ! -d 169.254.0.2/32 -p tcp --dport 80 -j ACCEPT",
-        "ipv4 ['-A', 'PREROUTING', '-p', 'tcp', '--dport', '80', '-j', 'DNAT']",
+        ("rules", "ipv4 filter INPUT 0 -p tcp --dport 80 -j ACCEPT"),
+        ("rules", "ipv4 filter INPUT 0 -ptcp --dport=80 -jACCEPT"),
+        ("passthroughs", "ipv4 -A INPUT -p tcp --dport 443 -j ACCEPT"),
+        ("passthroughs", "ipv4 -A INPUT -p tcp -j ACCEPT"),
+        ("passthroughs", "ipv4 -A INPUT -d 10.0.0.8/32 -p tcp --dport 80 -j ACCEPT"),
+        ("passthroughs", "ipv4 -A INPUT ! -d 169.254.0.2/32 -p tcp --dport 80 -j ACCEPT"),
+        ("passthroughs", "ipv4 ['-A', 'PREROUTING', '-p', 'tcp', '--dport', '80', '-j', 'DNAT']"),
+        ("passthroughs", "ipv4 -P INPUT ACCEPT"),
     )
 
-    for rule in safe_rules:
-        result = direct_rule_helper('direct_rule_is_public_web "$1"', rule)
-        assert result.returncode != 0, (rule, result.stderr)
-    for rule in public_rules:
-        result = direct_rule_helper('direct_rule_is_public_web "$1"', rule)
-        assert result.returncode == 0, (rule, result.stderr)
+    for kind, rule in safe_rules:
+        result = direct_rule_helper(f'direct_rule_classification {kind} "$1"', rule)
+        assert result.returncode == 10, (rule, result.returncode, result.stderr)
+    for kind, rule in public_rules:
+        result = direct_rule_helper(f'direct_rule_classification {kind} "$1"', rule)
+        assert result.returncode == 0, (rule, result.returncode, result.stderr)
+
+    malformed = direct_rule_helper(
+        'direct_rule_classification rules "$1"', "ipv4 filter INPUT not-a-priority -j ACCEPT"
+    )
+    assert malformed.returncode == 20
+    missing_python = direct_rule_helper(
+        'direct_rule_classification rules "$1"',
+        "ipv4 filter INPUT 0 -p tcp --dport 80 -j ACCEPT",
+        python="/definitely/missing/python",
+    )
+    assert missing_python.returncode not in {0, 10}
 
 
 def test_direct_firewall_parser_preserves_quoted_and_list_arguments() -> None:
@@ -579,6 +649,34 @@ def test_direct_firewall_parser_preserves_quoted_and_list_arguments() -> None:
         "<-j>",
         "<ACCEPT>",
     ]
+
+
+def test_direct_firewall_flows_fail_on_classifier_or_removal_errors() -> None:
+    public_rule = "ipv4 filter INPUT 0 -p tcp --dport 80 -j ACCEPT"
+    safe_rule = "ipv4 filter INPUT 0 -p tcp --dport 22 -j ACCEPT"
+
+    assert direct_firewall_flow_helper(
+        "close_direct_web_ingress runtime", safe_rule
+    ).returncode == 0
+    assert direct_firewall_flow_helper(
+        "verify_no_non_cloudflare_web_ingress runtime", safe_rule
+    ).returncode == 0
+    assert direct_firewall_flow_helper(
+        "close_direct_web_ingress runtime", public_rule, removal_status=9
+    ).returncode != 0
+    assert direct_firewall_flow_helper(
+        "verify_no_non_cloudflare_web_ingress runtime", public_rule
+    ).returncode != 0
+    assert direct_firewall_flow_helper(
+        "close_direct_web_ingress runtime",
+        public_rule,
+        python="/definitely/missing/python",
+    ).returncode != 0
+    assert direct_firewall_flow_helper(
+        "verify_no_non_cloudflare_web_ingress runtime",
+        public_rule,
+        python="/definitely/missing/python",
+    ).returncode != 0
 
 
 def test_transaction_metadata_env_and_rollback_paths_are_hardened() -> None:
