@@ -167,8 +167,10 @@ freeze_and_validate() {
   chmod 700 "$tree"
   validate_tree_links "$tree"
   chown -R -h root:root "$tree"
-  chmod -R a-w "$tree"
-  chmod 555 "$tree"
+  # Builder umasks vary. Normalize the immutable release to service-readable permissions instead
+  # of merely removing write bits (which would turn a mode-600 upload into unreadable mode 400).
+  find "$tree" -xdev -type d -exec chmod 555 {} +
+  find "$tree" -xdev -type f -exec chmod 444 {} +
   validate_tree_links "$tree"
   bad="$(find "$tree" -xdev \( ! -user root -o ! -group root -o -perm /222 \) -print -quit)"
   [[ -z "$bad" ]] || { echo "data release did not freeze root-owned/read-only: $bad" >&2; return 1; }

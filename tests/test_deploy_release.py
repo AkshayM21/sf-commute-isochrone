@@ -349,6 +349,8 @@ def test_scripts_encode_safe_staging_data_and_secret_contracts() -> None:
     assert "matching frozen code" in docs
     assert 'systemctl stop sfci' in data_refresh
     assert 'freeze_and_validate "$STAGE"' in data_refresh
+    assert 'find "$tree" -xdev -type d -exec chmod 555 {} +' in data_refresh
+    assert 'find "$tree" -xdev -type f -exec chmod 444 {} +' in data_refresh
     assert 'prune_data_releases "$ROOT"' in data_refresh
     for required_feed in ("muni_current.zip", "bart_gtfs.zip", "caltrain.zip"):
         assert required_feed in data_refresh
