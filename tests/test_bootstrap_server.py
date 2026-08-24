@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -120,6 +121,31 @@ def test_server_is_bound_before_runtime_loader_starts():
         server_runner=lambda server: server.run(),
     )
     assert result is None
+    assert events == ["bind", "load", "run"]
+
+
+def test_default_waitress_factory_uses_only_create_server_options(monkeypatch):
+    events = []
+
+    class BoundServer:
+        def run(self):
+            events.append("run")
+
+    def create_server(app, **kwargs):
+        events.append("bind")
+        assert kwargs == {
+            "host": "127.0.0.1",
+            "port": 0,
+            "threads": 8,
+            "channel_timeout": 120,
+        }
+        return BoundServer()
+
+    monkeypatch.setitem(sys.modules, "waitress", types.SimpleNamespace(create_server=create_server))
+    state = RuntimeState(lambda: events.append("load") or Target())
+    app = BootstrapWSGI(state)
+
+    assert serve_app(app, "127.0.0.1", 0) is None
     assert events == ["bind", "load", "run"]
 
 

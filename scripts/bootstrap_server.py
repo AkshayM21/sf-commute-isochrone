@@ -251,7 +251,6 @@ def serve_app(
                 host=host,
                 port=port,
                 threads=8,
-                _quiet=False,
                 channel_timeout=120,
             )
             if server_runner is None:
