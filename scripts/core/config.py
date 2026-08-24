@@ -7,6 +7,30 @@ import os
 import datetime as dt
 from pathlib import Path
 
+
+def normalize_mtime_ns(value: int) -> int:
+    """Canonicalize non-negative nanosecond mtimes to portable whole-second precision."""
+    result = int(value)
+    return result if result < 0 else result - result % 1_000_000_000
+
+
+def portable_mtime_ns(stat_result: os.stat_result) -> int:
+    """Return whole-second mtime in nanosecond units for cross-host artifact metadata.
+
+    The deployment path includes rsync protocol 29, which preserves mtimes only to whole seconds.
+    Keeping nanosecond units avoids an artifact schema migration while making local and deployed
+    metadata compare identically. Size remains the paired direct-source discriminator.
+    """
+    return normalize_mtime_ns(stat_result.st_mtime_ns)
+
+
+def normalize_source_mtimes(values) -> tuple:
+    """Normalize the mtime member of readable ``(name, size, mtime_ns)`` metadata."""
+    return tuple(
+        (item[0], item[1], None if item[2] is None else normalize_mtime_ns(item[2]))
+        for item in values
+    )
+
 ROOT = Path(__file__).resolve().parents[2]   # scripts/core/config.py -> repo root
 
 

@@ -392,10 +392,14 @@ class RaptorEngine:
         grid_source = config.neigh_path()
         try:
             grid_st = grid_source.stat()
-            actual_grid = (grid_source.name, int(grid_st.st_size), int(grid_st.st_mtime_ns))
+            actual_grid = (
+                grid_source.name,
+                int(grid_st.st_size),
+                config.portable_mtime_ns(grid_st),
+            )
         except OSError:
             actual_grid = (Path(grid_source).name, -1, -1)
-        stored_grid = tuple((str(name), int(size), int(mtime))
+        stored_grid = tuple((str(name), int(size), config.normalize_mtime_ns(mtime))
                             for name, size, mtime in zip(grid_names, grid_sizes, grid_mtimes))
         if stored_grid != (actual_grid,):
             raise ValueError(f"access table {access_path.name} is stale relative to the neighborhood/grid source")
@@ -589,7 +593,7 @@ class RaptorEngine:
         names = np.asarray(z["raptor_source_names"]).astype(str)
         sizes = np.asarray(z["raptor_source_sizes"])
         mtimes = np.asarray(z["raptor_source_mtimes_ns"])
-        expected_sources = tuple(self.data.get("source_mtimes", ()))
+        expected_sources = config.normalize_source_mtimes(self.data.get("source_mtimes", ()))
         if (names.ndim != 1 or sizes.ndim != 1 or mtimes.ndim != 1
                 or not (len(names) == len(sizes) == len(mtimes))
                 or any(not str(name).strip() for name in names)
@@ -597,17 +601,21 @@ class RaptorEngine:
                 or np.any(sizes < -1) or np.any(mtimes < -1)):
             raise ValueError(f"access table {access_path.name} has invalid RAPTOR source metadata")
         actual_sources = tuple((str(name), None if int(size) < 0 else int(size),
-                                None if int(mtime) < 0 else int(mtime))
+                                None if int(mtime) < 0
+                                else config.normalize_mtime_ns(mtime))
                                for name, size, mtime in zip(names, sizes, mtimes))
         if expected_sources and actual_sources != expected_sources:
             raise ValueError(f"access table {access_path.name} is stale relative to the RAPTOR feeds")
         graph_path = config.DATA / "walk_graph.npz"
         try:
             st = graph_path.stat()
-            graph_source = (int(st.st_size), int(st.st_mtime_ns))
+            graph_source = (int(st.st_size), config.portable_mtime_ns(st))
         except OSError:
             graph_source = (None, None)
-        stored_graph = (int(np.asarray(z["walk_graph_size"])), int(np.asarray(z["walk_graph_mtime_ns"])))
+        stored_graph = (
+            int(np.asarray(z["walk_graph_size"])),
+            config.normalize_mtime_ns(np.asarray(z["walk_graph_mtime_ns"])),
+        )
         if graph_source != (None, None) and stored_graph != graph_source:
             raise ValueError(f"access table {access_path.name} is stale relative to the walking graph")
 

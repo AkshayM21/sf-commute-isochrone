@@ -346,7 +346,7 @@ def _source_mtimes(gtfs_paths):
         p = Path(path)
         try:
             st = p.stat()
-            result.append((p.name, int(st.st_size), int(st.st_mtime_ns)))
+            result.append((p.name, int(st.st_size), config.portable_mtime_ns(st)))
         except OSError:
             result.append((p.name, None, None))
     return tuple(result)
@@ -506,7 +506,8 @@ def _validate_cache_data(data, expected=None):
                 return False
             if float(data["footpath_m"]) != float(expected["footpath_m"]):
                 return False
-            if tuple(tuple(x) for x in data["source_mtimes"]) != tuple(tuple(x) for x in expected["source_mtimes"]):
+            if config.normalize_source_mtimes(data["source_mtimes"]) != \
+                    config.normalize_source_mtimes(expected["source_mtimes"]):
                 return False
         return True
     except (AttributeError, IndexError, KeyError, TypeError, ValueError, OverflowError):

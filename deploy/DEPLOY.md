@@ -102,6 +102,12 @@ rsync -av --delete --no-owner --no-group --rsync-path='sudo rsync' \
   <inactive-data-tree>/ <user@host>:/opt/sfci/data-incoming/<data-id>/
 ```
 
+Artifact freshness metadata uses source name, size, and mtime canonicalized to whole-second
+precision because the macOS-compatible rsync protocol truncates subsecond timestamps. Existing
+nanosecond-valued artifacts are normalized when read, so this does not require a coordinated cache
+migration. The accepted tradeoff is that a same-size source rewritten twice within one second is
+not distinguished by metadata alone; the stage builder's atomic publication flow avoids that case.
+
 Use an eight-digit service date or fourteen-digit UTC timestamp and run the root-owned helper
 printed by `push.sh`:
 

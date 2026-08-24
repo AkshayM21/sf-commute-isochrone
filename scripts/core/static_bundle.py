@@ -13,6 +13,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import config
+
 
 def source_metadata(path: str | Path) -> dict[str, Any] | None:
     try:
@@ -20,7 +22,11 @@ def source_metadata(path: str | Path) -> dict[str, Any] | None:
         st = p.stat()
     except OSError:
         return None
-    return {"name": p.name, "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+    return {
+        "name": p.name,
+        "size": int(st.st_size),
+        "mtime_ns": config.portable_mtime_ns(st),
+    }
 
 
 def build_static_bundle(output: str | Path, gtfs, *, grid_m: int, service_date=None,
@@ -31,7 +37,7 @@ def build_static_bundle(output: str | Path, gtfs, *, grid_m: int, service_date=N
     this build-only seam, preserving the lean server boot when a valid bundle exists.
     """
     import geopandas as gpd
-    from . import config, feeds, grid
+    from . import feeds, grid
 
     gtfs = list(gtfs)
     if source_mtimes is None:

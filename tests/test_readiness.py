@@ -13,7 +13,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 
-from core import readiness, raptor_build  # noqa: E402
+from core import config, readiness, raptor_build  # noqa: E402
 
 
 TARGET = dt.date(2026, 8, 19)       # Wednesday
@@ -258,7 +258,9 @@ def test_static_bundle_and_aggregate_readiness(tmp_path):
     feed = _feed(tmp_path / "feed.zip")
     feeds = {role: feed for role in readiness.DEFAULT_REQUIRED_FEEDS}
     stat = feed.stat()
-    bundle["source_mtimes"] = [(feed.name, stat.st_size, stat.st_mtime_ns)] * 3
+    bundle["source_mtimes"] = [
+        (feed.name, stat.st_size, config.portable_mtime_ns(stat))
+    ] * 3
     result = readiness.check_readiness(feeds, _raptor(), _walk(), _access(), bundle,
                                        now=dt.datetime(2026, 8, 16, 12, tzinfo=readiness.LA),
                                        grid_m=200)
@@ -282,7 +284,7 @@ def test_static_bundle_requires_current_grid_resolution_and_source_metadata(tmp_
     stat = source.stat()
     bundle = _static()
     bundle.update({"grid_source_name": source.name, "grid_source_size": stat.st_size,
-                   "grid_source_mtime_ns": stat.st_mtime_ns})
+                   "grid_source_mtime_ns": config.portable_mtime_ns(stat)})
     assert readiness.validate_static_bundle(
         bundle, TARGET, expected_grid_m=200, expected_grid_source=source
     ).reason_code == "ok"
@@ -304,12 +306,18 @@ def test_static_bundle_rejects_changed_direct_gtfs_metadata(tmp_path):
         feeds.append(path)
     stat = [p.stat() for p in feeds]
     bundle = _static()
-    bundle["source_mtimes"] = [(p.name, s.st_size, s.st_mtime_ns) for p, s in zip(feeds, stat)]
-    expected = tuple((p.name, s.st_size, s.st_mtime_ns) for p, s in zip(feeds, stat))
+    bundle["source_mtimes"] = [
+        (p.name, s.st_size, config.portable_mtime_ns(s)) for p, s in zip(feeds, stat)
+    ]
+    expected = tuple(
+        (p.name, s.st_size, config.portable_mtime_ns(s)) for p, s in zip(feeds, stat)
+    )
     assert readiness.validate_static_bundle(bundle, TARGET,
                                             expected_gtfs_sources=expected).reason_code == "ok"
-    feeds[0].write_bytes(b"new current feed")
-    changed = tuple((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in feeds)
+    feeds[0].write_bytes(b"new current feed with a different size")
+    changed = tuple(
+        (p.name, p.stat().st_size, config.portable_mtime_ns(p.stat())) for p in feeds
+    )
     assert readiness.validate_static_bundle(bundle, TARGET,
                                             expected_gtfs_sources=changed).reason_code \
         == "runtime_load_failed"
@@ -355,3 +363,13 @@ def test_runtime_state_reason_codes_and_contract_completeness():
         "runtime_load_failed", "wrong_engine", "ok",
     }
     assert readiness.REASON_CODES == approved
+
+
+def test_source_metadata_accepts_legacy_nanoseconds_after_rsync_truncation():
+    local = (("muni.zip", 1234, 1_777_777_777_987_654_321),)
+    transferred = (("muni.zip", 1234, 1_777_777_777_000_000_000),)
+
+    assert readiness._same_source_metadata(local, transferred)
+    assert readiness._grid_source_metadata(
+        {"name": "grid.geojson", "size": 10, "mtime_ns": local[0][2]}
+    ) == ("grid.geojson", 10, transferred[0][2])

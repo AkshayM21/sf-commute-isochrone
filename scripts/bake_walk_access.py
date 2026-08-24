@@ -68,7 +68,7 @@ def _source_arrays(source_mtimes):
     for name, size, mtime in source_mtimes:
         names.append(str(name))
         sizes.append(-1 if size is None else int(size))
-        mtimes.append(-1 if mtime is None else int(mtime))
+        mtimes.append(-1 if mtime is None else config.normalize_mtime_ns(mtime))
     return (np.asarray(names, dtype="U"), np.asarray(sizes, dtype=np.int64),
             np.asarray(mtimes, dtype=np.int64))
 
@@ -236,10 +236,14 @@ def validate_artifact(path, *, n_stops=None, service_date=None, grid_m=None,
             try:
                 grid_source = Path(grid_source_path)
                 stat = grid_source.stat()
-                expected_grid = (grid_source.name, int(stat.st_size), int(stat.st_mtime_ns))
+                expected_grid = (
+                    grid_source.name,
+                    int(stat.st_size),
+                    config.portable_mtime_ns(stat),
+                )
             except OSError:
                 expected_grid = (Path(grid_source_path).name, -1, -1)
-            stored_grid = tuple((str(name), int(size), int(mtime))
+            stored_grid = tuple((str(name), int(size), config.normalize_mtime_ns(mtime))
                                 for name, size, mtime in zip(grid_names, grid_sizes, grid_mtimes))
             if stored_grid != (expected_grid,):
                 return False
@@ -434,7 +438,10 @@ def validate_artifact(path, *, n_stops=None, service_date=None, grid_m=None,
         if walk_graph_path is not None:
             try:
                 st = Path(walk_graph_path).stat()
-                if (int(np.asarray(z["walk_graph_size"])), int(np.asarray(z["walk_graph_mtime_ns"]))) != (st.st_size, st.st_mtime_ns):
+                if (
+                    int(np.asarray(z["walk_graph_size"])),
+                    config.normalize_mtime_ns(np.asarray(z["walk_graph_mtime_ns"])),
+                ) != (st.st_size, config.portable_mtime_ns(st)):
                     return False
             except OSError:
                 pass
@@ -465,7 +472,7 @@ def bake():
         grid_st = grid_source.stat()
         grid_names = np.asarray([grid_source.name], dtype="U")
         grid_sizes = np.asarray([int(grid_st.st_size)], dtype=np.int64)
-        grid_mtimes = np.asarray([int(grid_st.st_mtime_ns)], dtype=np.int64)
+        grid_mtimes = np.asarray([config.portable_mtime_ns(grid_st)], dtype=np.int64)
     except OSError:
         grid_names = np.asarray([grid_source.name], dtype="U")
         grid_sizes = np.asarray([-1], dtype=np.int64)
@@ -477,7 +484,8 @@ def bake():
     graph_path = config.DATA / "walk_graph.npz"
     try:
         graph_st = graph_path.stat()
-        graph_size, graph_mtime = int(graph_st.st_size), int(graph_st.st_mtime_ns)
+        graph_size = int(graph_st.st_size)
+        graph_mtime = config.portable_mtime_ns(graph_st)
     except OSError:
         graph_size = graph_mtime = -1
     wg = walk.WalkGraph.load()
@@ -563,18 +571,25 @@ def bake():
             # Feed/graph changes during the expensive bake must not publish an artifact whose
             # source metadata describes an earlier graph.  The old canonical artifact remains
             # untouched on this failure; a later invocation retries from fresh inputs.
-            if raptor_build._source_mtimes(gtfs) != tuple(data.get("source_mtimes", ())):
+            if raptor_build._source_mtimes(gtfs) != \
+                    config.normalize_source_mtimes(data.get("source_mtimes", ())):
                 raise RuntimeError("GTFS source changed during access bake")
             try:
                 current_graph = graph_path.stat()
-                current_graph_meta = (int(current_graph.st_size), int(current_graph.st_mtime_ns))
+                current_graph_meta = (
+                    int(current_graph.st_size),
+                    config.portable_mtime_ns(current_graph),
+                )
             except OSError:
                 current_graph_meta = (-1, -1)
             if current_graph_meta != (graph_size, graph_mtime):
                 raise RuntimeError("walking graph changed during access bake")
             try:
                 current_grid = grid_source.stat()
-                current_grid_meta = (int(current_grid.st_size), int(current_grid.st_mtime_ns))
+                current_grid_meta = (
+                    int(current_grid.st_size),
+                    config.portable_mtime_ns(current_grid),
+                )
             except OSError:
                 current_grid_meta = (-1, -1)
             if current_grid_meta != (int(grid_sizes[0]), int(grid_mtimes[0])):

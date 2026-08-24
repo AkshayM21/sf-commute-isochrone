@@ -76,10 +76,13 @@ if _STATIC.exists():
             "size": _b.get("grid_source_size"),
             "mtime_ns": _b.get("grid_source_mtime_ns"),
         }
-        if (tuple(tuple(v) for v in _b.get("source_mtimes", ())) == _GTFS_SOURCES
+        if (config.normalize_source_mtimes(_b.get("source_mtimes", ())) == _GTFS_SOURCES
                 and _b.get("grid_m") == GRID_M
                 and _GRID_SOURCE_META is not None
-                and _bundle_grid_meta == _GRID_SOURCE_META
+                and _bundle_grid_meta.get("name") == _GRID_SOURCE_META.get("name")
+                and _bundle_grid_meta.get("size") == _GRID_SOURCE_META.get("size")
+                and config.normalize_mtime_ns(_bundle_grid_meta.get("mtime_ns"))
+                    == _GRID_SOURCE_META.get("mtime_ns")
                 and isinstance(_b.get("svc_date"), str) and len(_b["svc_date"]) == 8
                 and _bundle_shape_ok):
             _bundle = _b

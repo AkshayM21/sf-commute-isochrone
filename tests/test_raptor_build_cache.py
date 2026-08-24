@@ -5,6 +5,7 @@ requiring a local GTFS download or running the expensive parser.
 """
 import datetime as dt
 import multiprocessing
+import os
 import pickle
 import sys
 import threading
@@ -17,6 +18,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "scripts"))
 from core import raptor_build
+
+
+def test_source_metadata_is_second_aligned_for_cross_host_transfers(tmp_path):
+    feed = tmp_path / "feed.zip"
+    feed.write_bytes(b"feed")
+    os.utime(feed, ns=(1_777_777_777_987_654_321,) * 2)
+
+    assert raptor_build._source_mtimes([feed]) == (
+        ("feed.zip", 4, 1_777_777_777_000_000_000),
+    )
 
 
 def _payload(marker=None):
@@ -221,8 +232,9 @@ def test_feed_source_mtime_change_invalidates_canonical_cache(monkeypatch, tmp_p
     paths[:] = [feed]
     first = raptor_build.load_or_build(paths, date, verbose=False)
     assert first["marker"] == 1
-    time.sleep(0.001)
+    original_mtime_ns = feed.stat().st_mtime_ns
     feed.write_bytes(b"two")
+    os.utime(feed, ns=(original_mtime_ns + 2_000_000_000,) * 2)
     second = raptor_build.load_or_build(paths, date, verbose=False)
     assert second["marker"] == 2
     assert len(builds) == 2

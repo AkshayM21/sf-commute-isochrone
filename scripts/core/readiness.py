@@ -659,7 +659,7 @@ def validate_static_bundle(value: str | Path | Mapping[str, Any],
             expected = _grid_source_metadata(expected_grid_source)
             if expected is None:
                 return _result("runtime_load_failed")
-            if (source_name, source_size, source_mtime_ns) != expected:
+            if (source_name, source_size, config.normalize_mtime_ns(source_mtime_ns)) != expected:
                 return _result("runtime_load_failed")
         if expected_gtfs_sources is not None:
             actual_sources = value.get("source_mtimes")
@@ -717,7 +717,8 @@ def _same_source_metadata(actual: Any, expected: Any) -> bool:
         if len(got) != 3 or len(want) != 3 or str(got[0]) != str(want[0]):
             return False
         try:
-            if int(got[1]) != int(want[1]) or int(got[2]) != int(want[2]):
+            if int(got[1]) != int(want[1]) or \
+                    config.normalize_mtime_ns(got[2]) != config.normalize_mtime_ns(want[2]):
                 return False
         except (TypeError, ValueError, OverflowError):
             return False
@@ -736,7 +737,7 @@ def _direct_source_metadata(feeds: Mapping[str, str | Path]) -> tuple[tuple[str,
             st = path.stat()
         except OSError:
             return None
-        values.append((path.name, int(st.st_size), int(st.st_mtime_ns)))
+        values.append((path.name, int(st.st_size), config.portable_mtime_ns(st)))
     return tuple(values)
 
 
@@ -758,13 +759,13 @@ def _grid_source_metadata(value: str | Path | Mapping[str, Any] | tuple[Any, ...
             if not isinstance(name, str) or not name.strip() or size_i is None or size_i < 0 \
                     or mtime_i is None or mtime_i < 0:
                 return None
-            return name, size_i, mtime_i
+            return name, size_i, config.normalize_mtime_ns(mtime_i)
         if isinstance(value, (tuple, list)) and len(value) == 3:
             return _grid_source_metadata({"name": value[0], "size": value[1],
                                           "mtime_ns": value[2]})
         path = Path(value)
         st = path.stat()
-        return path.name, int(st.st_size), int(st.st_mtime_ns)
+        return path.name, int(st.st_size), config.portable_mtime_ns(st)
     except (OSError, TypeError, ValueError, OverflowError):
         return None
 

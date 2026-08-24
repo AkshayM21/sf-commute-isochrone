@@ -209,7 +209,7 @@ import json
 import sys
 from pathlib import Path
 
-from core import readiness
+from core import config, readiness
 
 tree = Path(sys.argv[1])
 bundle = json.loads((tree / "server_static.json").read_text())
@@ -230,9 +230,10 @@ feeds = {
     "caltrain": tree / "caltrain.zip",
 }
 feed_sources = tuple(
-    (path.name, path.stat().st_size, path.stat().st_mtime_ns) for path in feeds.values()
+    (path.name, path.stat().st_size, config.portable_mtime_ns(path.stat()))
+    for path in feeds.values()
 )
-bundle_sources = tuple(tuple(value) for value in bundle.get("source_mtimes", ()))
+bundle_sources = config.normalize_source_mtimes(bundle.get("source_mtimes", ()))
 if bundle_sources != feed_sources:
     raise SystemExit("server_static.json was not built from the staged feed files")
 access = tree / "raptor_cache" / f"access_walk_{grid_m}m_{service_date}.npz"
@@ -244,7 +245,8 @@ if not raptor_candidates:
 failures = []
 for raptor in raptor_candidates:
     cache_check, cache_data = readiness.load_raptor_state(raptor, service_date)
-    if not cache_check.ready or tuple(cache_data.get("source_mtimes", ())) != feed_sources:
+    if not cache_check.ready or \
+            config.normalize_source_mtimes(cache_data.get("source_mtimes", ())) != feed_sources:
         failures.append(f"{raptor.name}:stale_feed_sources")
         continue
     result = readiness.check_readiness(

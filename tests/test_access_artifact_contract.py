@@ -222,9 +222,13 @@ def test_engine_rejects_stale_neighborhood_grid_source(tmp_path, monkeypatch):
     _write(artifact, bad={
         "grid_source_names": np.asarray([grid.name], dtype="U"),
         "grid_source_sizes": np.asarray([grid.stat().st_size + 1], dtype=np.int64),
-        "grid_source_mtimes_ns": np.asarray([grid.stat().st_mtime_ns], dtype=np.int64),
+        "grid_source_mtimes_ns": np.asarray(
+            [bake_walk_access.config.portable_mtime_ns(grid.stat())], dtype=np.int64
+        ),
         "walk_graph_size": np.int64(graph.stat().st_size),
-        "walk_graph_mtime_ns": np.int64(graph.stat().st_mtime_ns),
+        "walk_graph_mtime_ns": np.int64(
+            bake_walk_access.config.portable_mtime_ns(graph.stat())
+        ),
     })
     engine = object.__new__(raptor_engine.RaptorEngine)
     engine.service_date = dt.date(2026, 8, 19)
