@@ -1,6 +1,6 @@
 # Privacy
 
-Last updated: 2026-08-23
+Last updated: 2026-09-02
 
 SF Commute Isochrone has no accounts, sign-in flow, advertising audience, or
 user profile system. It does not sell personal information.
@@ -48,11 +48,11 @@ the URL fragment. Choosing another workplace replaces the saved workplace.
 
 ## External network services
 
-The hosted service is delivered through **Cloudflare**. Map tiles are requested
-from **CARTO**, and the basemap includes **OpenStreetMap** data and attribution.
-Those services receive ordinary web requests necessary to deliver the site or
-map tiles, and have their own privacy policies. Leaflet is loaded from the
-unpkg CDN.
+The hosted service is delivered through **Cloudflare**. Basemap tiles are
+requested from the **OpenStreetMap tile service** with visible OpenStreetMap
+attribution. Those services receive ordinary web requests necessary to deliver
+the site or map tiles, and have their own privacy policies. Leaflet is loaded
+from the unpkg CDN.
 
 ## Logs and retention
 

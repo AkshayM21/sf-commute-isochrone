@@ -6,13 +6,16 @@
  */
 
 export const BASE_TILES = Object.freeze({
-  dark: "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-  light: "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+  // OpenStreetMap's standard raster endpoint is genuinely keyless.  Keep the same source for
+  // both themes; app.css applies a restrained dark filter to the tile pane so appearance remains
+  // theme-aware without requiring a second provider, a token, or a secret in the browser.
+  dark: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  light: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
 });
 
 export const TILE_OPTS = Object.freeze({
   maxZoom: 19,
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
 });
 
 export const ALT_CASING = Object.freeze(["#ff3db4", "#11c7c7", "#f59000", "#a16bff", "#7ed957", "#ff6b6b"]);
@@ -127,7 +130,12 @@ export function createMapRenderer({ L, map, getTheme = () => "dark", getCellStyl
   }
   function setTheme(theme) {
     const next = theme === "light" ? "light" : "dark";
-    if (next !== baseTheme) { map.removeLayer(baseLayer); baseLayer = L.tileLayer(BASE_TILES[next], TILE_OPTS).addTo(map); baseLayer.bringToBack(); baseTheme = next; }
+    if (next !== baseTheme) {
+      if (BASE_TILES[next] !== BASE_TILES[baseTheme]) {
+        map.removeLayer(baseLayer); baseLayer = L.tileLayer(BASE_TILES[next], TILE_OPTS).addTo(map); baseLayer.bringToBack();
+      }
+      baseTheme = next;
+    }
     focusHaloLayer.setStyle(() => focusHaloStyle(next)); focusLayer.setStyle(() => focusStyle(next));
   }
   function showCellFocus(feature) { focusHaloLayer.clearLayers(); focusLayer.clearLayers(); if (feature) { focusHaloLayer.addData(feature); focusLayer.addData(feature); } }

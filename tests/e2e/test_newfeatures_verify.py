@@ -114,6 +114,17 @@ def test_compare_family_focus(page):
     choices = page.locator("#route-choices-panel .route-choice:visible")
     options = page.evaluate("() => window.__SFCI_E2E__.compareList.length")
     assert options >= 2, f"expected >=2 route options, got {options}"
+    # The current inspector intentionally keeps lower-ranked exact choices behind one
+    # Additional disclosure.  Materialize them before exercising hover/lock behavior when the
+    # fresh GTFS generation yields only one featured choice for this fixed origin.
+    if choices.count() < 2:
+        more = page.locator("#all-routes-toggle")
+        assert more.is_visible(), "route inspector hid alternatives without an Additional disclosure"
+        more.click()
+        page.wait_for_function(
+            "() => [...document.querySelectorAll('#route-choices-panel .route-choice')]"
+            ".filter(el => el.getClientRects().length).length >= 2"
+        )
     assert choices.count() >= 2, "route inspector omitted its exact route-choice controls"
     drawn0 = page.evaluate("() => { const d=window.__SFCI_E2E__.drawn; return d&&d.multi?{f:d.famKey,b:d.branchKey}:null; }")
     assert drawn0, "pin should draw the selected route with its alternative context"
@@ -183,7 +194,7 @@ def test_footer_modals(page):
     how = page.inner_text("#howmodal .card")
     assert "How it works" in how
     assert "data sources" in how.lower()  # h3 is uppercased via CSS; inner_text reflects that
-    for src in ("511 SF Bay Open Data", "OpenStreetMap", "USGS 3DEP", "DataSF", "CARTO"):
+    for src in ("511 SF Bay Open Data", "OpenStreetMap", "USGS 3DEP", "DataSF"):
         assert src in page.inner_html("#howmodal .card"), f"missing data source: {src}"
     shot(page, "nf_06_how_modal")
     page.keyboard.press("Escape")

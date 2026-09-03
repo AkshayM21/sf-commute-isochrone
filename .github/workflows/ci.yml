@@ -44,3 +44,4 @@ jobs:
           tests/test_planned_compact_trace.py
           tests/test_planned_trace.py
           tests/test_perf_benchmark.py
+          tests/test_production_smoke.py

@@ -238,6 +238,12 @@ curl -fsSI https://<your-public-hostname>/
 ssh <user@host> 'sudo systemctl status sfci caddy --no-pager'
 ```
 
+The `Production smoke` GitHub Actions workflow also runs every six hours and on demand. It checks
+public liveness/readiness, the served keyless-basemap source contract, one fixed public `/compute`
+request, and a reachable `/itinerary`; it does not download third-party map tiles or print response
+bodies. Run it manually after a provider or deployment change. Because the contract check is not a
+pixel-level visual comparison, visually inspect the map whenever the basemap provider changes.
+
 For ordinary code updates, repeat the source staging and run the printed promotion command. Do not
 rsync into `/opt/sfci/current` and do not restart the service before the installer has completed
 its candidate checks:

@@ -25,9 +25,11 @@ arrival, transfer, accessibility, or service availability.
   Geofabrik extract and clips it for local routing. If you distribute a
   derivative database, review the ODbL's attribution, notice, and share-alike
   obligations.
-- Basemap tiles are provided by [CARTO](https://carto.com/attributions), using
-  OpenStreetMap data. Use of CARTO tiles is subject to CARTO's terms and
-  attribution requirements.
+- The browser uses the keyless [OpenStreetMap tile service](https://operations.osmfoundation.org/policies/tiles/)
+  for the basemap. Follow the tile usage policy, retain the visible
+  [OpenStreetMap attribution](https://www.openstreetmap.org/copyright), and use a
+  suitable alternative provider or self-hosted tiles if traffic grows beyond the
+  public service's permitted use.
 - Elevation inputs come from the [USGS 3D Elevation Program
   (3DEP)](https://www.usgs.gov/3d-elevation-program). USGS data is generally
   public domain, but names and logos are not an endorsement and may have

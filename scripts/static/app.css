@@ -46,6 +46,22 @@
     font-size:13px;font-weight:700;text-decoration:none;transition:transform .16s cubic-bezier(.25,1,.5,1)}
   .skip-link:focus-visible{transform:translateY(0)}
   #map{position:absolute;inset:0;background:var(--bg-map)}.leaflet-container{background:var(--bg-map)}
+  /* The keyless OSM raster is intentionally reused for both themes.  Filtering only the tile
+     pane keeps routes, labels, cells, and Leaflet controls crisp while giving dark mode a quiet
+     map surface without another provider or browser-visible API credential. */
+  :root[data-theme="dark"] .leaflet-tile-pane{filter:invert(1) grayscale(1) brightness(.65) contrast(1.2)}
+  :root[data-theme="light"] .leaflet-tile-pane{filter:none}
+  /* Keep the provider licence visible instead of letting the right rail cover Leaflet's
+     bottom-right attribution control. Once a route is pinned the legend disappears, so the
+     lower-left corner becomes the stable unobstructed home for attribution. */
+  @media (min-width:720px){
+    .leaflet-bottom.leaflet-right{right:330px}
+    body.route-pinned .leaflet-bottom.leaflet-right{right:auto;left:0}
+  }
+  @media (max-width:719px){
+    .leaflet-bottom.leaflet-right{top:0;bottom:auto}
+    .leaflet-control-attribution{max-width:calc(100vw - 54px);white-space:normal}
+  }
   #panel{position:absolute;top:0;right:0;width:330px;height:100%;background:var(--panel);color:var(--ink);
     z-index:1000;display:flex;flex-direction:column;overflow-y:auto;border-left:1px solid var(--line);
     transition:opacity .18s cubic-bezier(.25,1,.5,1),visibility 0s linear 0s}

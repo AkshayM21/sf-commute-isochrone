@@ -29,7 +29,7 @@ sfcommutemap.com, www.sfcommutemap.com {
 
 	# Tiny set of defensive response headers (Cloudflare adds a few too — these don't duplicate).
 	header {
-		# We embed Leaflet from unpkg + Cloudflare tile maps -- so unsafe-inline for style and
+		# We embed Leaflet from unpkg + OpenStreetMap tiles -- so unsafe-inline for style and
 		# script-src is intentional. Tighten if you ever move assets fully on-origin.
 		-Server
 		Referrer-Policy "strict-origin-when-cross-origin"

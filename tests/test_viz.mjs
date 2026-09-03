@@ -2773,8 +2773,32 @@ test("map renderer pure geometry decisions preserve route stack and labels", () 
   assert.deepEqual(mapRenderer.normalizeGeometry([{ mode: "walk", pts: [[37.7, -122.4], ["bad"]] }]), []);
 });
 
+test("basemap uses a keyless OSM endpoint with complete attribution", () => {
+  assert.equal(mapRenderer.BASE_TILES.dark, mapRenderer.BASE_TILES.light,
+    "theme changes must not require separate provider endpoints or credentials");
+  for (const [theme, url] of Object.entries(mapRenderer.BASE_TILES)) {
+    assert.match(url, /^https:\/\/tile\.openstreetmap\.org\/\{z\}\/\{x\}\/\{y\}\.png$/,
+      `${theme} basemap must use the keyless OSM raster service`);
+    assert.doesNotMatch(url, /carto|api.?key|token|access.?token/i,
+      `${theme} basemap must not carry provider credentials or CARTO's key-required endpoint`);
+  }
+  assert.match(mapRenderer.TILE_OPTS.attribution, /openstreetmap\.org\/copyright/);
+  assert.doesNotMatch(mapRenderer.TILE_OPTS.attribution, /carto/i);
+  assert.match(APP_CSS, /:root\[data-theme="dark"\] \.leaflet-tile-pane\{filter:/,
+    "dark mode is provided by the existing theme layer, not a second tile provider");
+  assert.match(APP_CSS, /:root\[data-theme="light"\] \.leaflet-tile-pane\{filter:none\}/);
+  assert.match(APP_CSS, /@media \(min-width:720px\)\{[\s\S]*\.leaflet-bottom\.leaflet-right\{right:330px\}/,
+    "desktop attribution must sit outside the persistent settings rail");
+  assert.match(APP_CSS, /body\.route-pinned \.leaflet-bottom\.leaflet-right\{right:auto;left:0\}/,
+    "pinned-route attribution must move into the unobstructed corner");
+  assert.match(APP_CSS, /@media \(max-width:719px\)\{[\s\S]*\.leaflet-bottom\.leaflet-right\{top:0;bottom:auto\}/,
+    "mobile attribution must remain above the bottom sheet");
+  assert.doesNotMatch(TSRC, /basemaps\.cartocdn\.com|carto\.com\/attributions/,
+    "the served page must not advertise the retired key-required CARTO source");
+});
+
 test("map renderer injected Leaflet lifecycle owns layers, marker, route draw, and removal", () => {
-  const added = [], removed = [], panes = {};
+  const added = [], removed = [], panes = {}, tileURLs = [];
   const map = {
     createPane(name) { panes[name] = { style: {} }; }, getPane(name) { return panes[name]; },
     addLayer(layer) { added.push(layer); return this; }, removeLayer(layer) { removed.push(layer); return this; },
@@ -2787,7 +2811,8 @@ test("map renderer injected Leaflet lifecycle owns layers, marker, route draw, a
     bringToBack() {}, setLatLng(ll) { this.latlng = ll; return this; },
   }, extra);
   const L = {
-    geoJSON: () => layer(), layerGroup: () => layer(), svg: () => layer(), tileLayer: () => layer(),
+    geoJSON: () => layer(), layerGroup: () => layer(), svg: () => layer(),
+    tileLayer: (url) => { tileURLs.push(url); return layer(); },
     polyline: (pts, options) => layer({ pts, options }), marker: (ll, options) => layer({ ll, options }),
     divIcon: (options) => options, latLng: (lat, lng) => ({ lat, lng }),
     latLngBounds: (points) => ({ points, isValid: () => true, getNorth: () => 1, getSouth: () => 0,
@@ -2795,6 +2820,10 @@ test("map renderer injected Leaflet lifecycle owns layers, marker, route draw, a
   };
   const renderer = mapRenderer.createMapRenderer({ L, map, getCellStyle: () => ({}), getViewInsets: () => ({}) });
   assert.deepEqual(Object.keys(panes), ["cellsPane", "cellFocusHaloPane", "cellFocusPane", "routePane"]);
+  assert.deepEqual(tileURLs, [mapRenderer.BASE_TILES.dark]);
+  renderer.setTheme("light");
+  renderer.setTheme("dark");
+  assert.equal(tileURLs.length, 1, "CSS-only theme changes must not recreate the shared tile layer");
   renderer.createCells({ type: "FeatureCollection", features: [] });
   renderer.setDestinationMarker([37.78, -122.41]);
   const drawn = renderer.drawOne([{ mode: "transit", name: "N", min: 18, pts: [[37.7, -122.4], [37.78, -122.41]] }], "#fff", 18, 18);
